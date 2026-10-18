@@ -15,6 +15,12 @@ enum Edit {
     Insert { at: usize, text: String },
     /// `text.chars().count()` chars were removed starting at char index `at`.
     Remove { at: usize, text: String },
+    /// `removed` was replaced by `inserted` starting at char index `at`.
+    Replace {
+        at: usize,
+        removed: String,
+        inserted: String,
+    },
 }
 
 #[derive(Debug, Clone, Default)]
@@ -76,9 +82,15 @@ impl Buffer {
 
     /// 0-based `(line, column)` of the cursor.
     pub fn line_col(&self) -> (usize, usize) {
-        let line = self.rope.char_to_line(self.cursor);
+        self.line_col_at(self.cursor)
+    }
+
+    /// 0-based `(line, column)` of an arbitrary character index.
+    pub fn line_col_at(&self, idx: usize) -> (usize, usize) {
+        let idx = idx.min(self.rope.len_chars());
+        let line = self.rope.char_to_line(idx);
         let line_start = self.rope.line_to_char(line);
-        (line, self.cursor - line_start)
+        (line, idx - line_start)
     }
 
     pub fn is_dirty(&self) -> bool {
@@ -95,6 +107,107 @@ impl Buffer {
 
     pub fn can_redo(&self) -> bool {
         !self.redo.is_empty()
+    }
+
+    /// Content of `line` without its trailing newline (and `\r`).
+    pub fn line(&self, line: usize) -> String {
+        if line >= self.rope.len_lines() {
+            return String::new();
+        }
+        let n = self.line_content_len(line);
+        self.rope.line(line).chars().take(n).collect()
+    }
+
+    /// Number of characters in `line`, excluding the trailing newline (and `\r`).
+    pub fn line_char_len(&self, line: usize) -> usize {
+        if line >= self.rope.len_lines() {
+            0
+        } else {
+            self.line_content_len(line)
+        }
+    }
+
+    /// The characters in `range`, clamped to the buffer.
+    pub fn slice(&self, range: std::ops::Range<usize>) -> String {
+        let start = range.start.min(self.rope.len_chars());
+        let end = range.end.min(self.rope.len_chars()).max(start);
+        self.rope.slice(start..end).to_string()
+    }
+
+    /// Byte offset, within `line`'s text, of character column `col`.
+    pub fn char_col_to_byte(&self, line: usize, col: usize) -> usize {
+        if line >= self.rope.len_lines() {
+            return 0;
+        }
+        let n = self.line_content_len(line).min(col);
+        self.rope
+            .line(line)
+            .chars()
+            .take(n)
+            .map(char::len_utf8)
+            .sum()
+    }
+
+    /// The character index of `col` within `line`. Inverse of `line_col_at` for a line.
+    pub fn char_index_at(&self, line: usize, col: usize) -> usize {
+        if line >= self.rope.len_lines() {
+            return self.rope.len_chars();
+        }
+        self.rope.line_to_char(line) + self.line_content_len(line).min(col)
+    }
+
+    /// Replace `range` with `text` as a single undoable step.
+    pub fn replace(&mut self, range: std::ops::Range<usize>, text: &str) {
+        let start = range.start.min(self.rope.len_chars());
+        let end = range.end.min(self.rope.len_chars()).max(start);
+        let removed = self.rope.slice(start..end).to_string();
+        if removed.is_empty() && text.is_empty() {
+            return;
+        }
+
+        self.rope.remove(start..end);
+        self.rope.insert(start, text);
+        self.cursor = start + text.chars().count();
+        self.undo.push(Edit::Replace {
+            at: start,
+            removed,
+            inserted: text.to_string(),
+        });
+        self.redo.clear();
+        self.dirty = true;
+    }
+
+    /// Delete `range`, as a single undoable step.
+    pub fn delete_range(&mut self, range: std::ops::Range<usize>) {
+        self.replace(range, "");
+    }
+
+    pub fn move_home(&mut self) {
+        let (line, _) = self.line_col();
+        self.cursor = self.rope.line_to_char(line);
+    }
+
+    pub fn move_end(&mut self) {
+        let (line, _) = self.line_col();
+        self.cursor = self.rope.line_to_char(line) + self.line_content_len(line);
+    }
+
+    /// Convert a character index to a UTF-16 offset (what the platform sends us).
+    pub fn char_to_utf16(&self, char_idx: usize) -> usize {
+        let n = char_idx.min(self.rope.len_chars());
+        self.rope.chars().take(n).map(char::len_utf16).sum()
+    }
+
+    /// Convert a UTF-16 offset to a character index.
+    pub fn utf16_to_char(&self, utf16_idx: usize) -> usize {
+        let mut units = 0usize;
+        for (i, c) in self.rope.chars().enumerate() {
+            if units >= utf16_idx {
+                return i;
+            }
+            units += c.len_utf16();
+        }
+        self.rope.len_chars()
     }
 
     /// Insert `text` at the cursor, advancing it. Contiguous typing coalesces into one
@@ -208,6 +321,15 @@ impl Buffer {
                 self.rope.insert(*at, text);
                 self.cursor = *at + text.chars().count();
             }
+            Edit::Replace {
+                at,
+                removed,
+                inserted,
+            } => {
+                self.rope.remove(*at..*at + inserted.chars().count());
+                self.rope.insert(*at, removed);
+                self.cursor = *at + removed.chars().count();
+            }
         }
         self.redo.push(edit);
         self.dirty = true;
@@ -226,6 +348,15 @@ impl Buffer {
             Edit::Remove { at, text } => {
                 self.rope.remove(*at..*at + text.chars().count());
                 self.cursor = *at;
+            }
+            Edit::Replace {
+                at,
+                removed,
+                inserted,
+            } => {
+                self.rope.remove(*at..*at + removed.chars().count());
+                self.rope.insert(*at, inserted);
+                self.cursor = *at + inserted.chars().count();
             }
         }
         self.undo.push(edit);
@@ -360,5 +491,66 @@ mod tests {
         assert!(!b.is_dirty());
         b.undo();
         assert!(b.is_dirty());
+    }
+
+    #[test]
+    fn replace_is_one_undo_step() {
+        let mut b = Buffer::from_text("hello world");
+        b.replace(6..11, "there");
+        assert_eq!(b.text(), "hello there");
+        assert_eq!(b.cursor(), 11);
+        assert!(b.undo());
+        assert_eq!(b.text(), "hello world");
+        assert!(b.redo());
+        assert_eq!(b.text(), "hello there");
+    }
+
+    #[test]
+    fn line_accessors() {
+        let b = Buffer::from_text("hello\nhi\r\nbye");
+        assert_eq!(b.line(0), "hello");
+        assert_eq!(b.line(1), "hi");
+        assert_eq!(b.line(2), "bye");
+        assert_eq!(b.line(3), "");
+        assert_eq!(b.line_char_len(0), 5);
+        assert_eq!(b.line_char_len(1), 2);
+    }
+
+    #[test]
+    fn slice_clamps() {
+        let b = Buffer::from_text("abc");
+        assert_eq!(b.slice(1..2), "b");
+        assert_eq!(b.slice(1..99), "bc");
+    }
+
+    #[test]
+    fn utf16_conversions_multibyte() {
+        let b = Buffer::from_text("a\u{1F600}b");
+        assert_eq!(b.len_chars(), 3);
+        assert_eq!(b.char_to_utf16(1), 1);
+        assert_eq!(b.char_to_utf16(2), 3);
+        assert_eq!(b.char_to_utf16(3), 4);
+        assert_eq!(b.utf16_to_char(1), 1);
+        assert_eq!(b.utf16_to_char(3), 2);
+        assert_eq!(b.utf16_to_char(4), 3);
+    }
+
+    #[test]
+    fn char_col_to_byte_offsets() {
+        let b = Buffer::from_text("h\u{e9}llo");
+        assert_eq!(b.char_col_to_byte(0, 0), 0);
+        assert_eq!(b.char_col_to_byte(0, 1), 1);
+        assert_eq!(b.char_col_to_byte(0, 2), 3);
+        assert_eq!(b.char_col_to_byte(0, 99), 6);
+    }
+
+    #[test]
+    fn home_and_end() {
+        let mut b = Buffer::from_text("hello\nworld");
+        b.set_cursor(8);
+        b.move_home();
+        assert_eq!(b.line_col(), (1, 0));
+        b.move_end();
+        assert_eq!(b.line_col(), (1, 5));
     }
 }

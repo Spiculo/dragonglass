@@ -1,18 +1,29 @@
-//! Dragon Glass UI spike (Phase 0).
+//! Dragon Glass UI spike (Phase 0/1).
 //!
-//! Goal: prove GPUI builds and opens a native window on this platform, and that it can
-//! drive `dragonglass-core`. Everything below is throwaway scaffolding.
+//! Opens a vault, loads a note into the in-house editor, and shows vault stats. Throwaway
+//! wiring around `dragonglass-core` and the `editor` view.
+
+mod editor;
 
 use dragonglass_core::{Note, Vault};
+use editor::Editor;
 use gpui::{
-    div, prelude::*, px, rgb, size, App, Application, Bounds, Context, Render, Window,
-    WindowBounds, WindowOptions,
+    div, prelude::*, px, rgb, size, App, Application, Bounds, Context, FocusHandle, Focusable,
+    Render, Window, WindowBounds, WindowOptions,
 };
 
 struct DragonGlassApp {
+    editor: gpui::Entity<Editor>,
     vault_path: String,
     notes: usize,
     links: usize,
+    focus_handle: FocusHandle,
+}
+
+impl Focusable for DragonGlassApp {
+    fn focus_handle(&self, _: &App) -> FocusHandle {
+        self.focus_handle.clone()
+    }
 }
 
 impl Render for DragonGlassApp {
@@ -20,21 +31,23 @@ impl Render for DragonGlassApp {
         div()
             .flex()
             .flex_col()
-            .gap_2()
-            .p_6()
             .size_full()
             .bg(rgb(0x1e1e1e))
             .text_color(rgb(0xe6e6e6))
-            .child(div().text_2xl().child("Dragon Glass"))
             .child(
                 div()
+                    .flex()
+                    .flex_row()
+                    .gap_4()
+                    .px_4()
+                    .py_2()
+                    .bg(rgb(0x252526))
                     .text_sm()
-                    .text_color(rgb(0x9a9a9a))
-                    .child("Phase 0 spike"),
+                    .child("Dragon Glass")
+                    .child(self.vault_path.clone())
+                    .child(format!("{} notes / {} links", self.notes, self.links)),
             )
-            .child(div().mt_4().child(format!("vault: {}", self.vault_path)))
-            .child(div().child(format!("notes: {}", self.notes)))
-            .child(div().child(format!("links: {}", self.links)))
+            .child(div().flex_1().w_full().p_2().child(self.editor.clone()))
     }
 }
 
@@ -59,26 +72,50 @@ fn main() {
         .map(|n| n.links().len())
         .sum();
 
+    // Open the note with the most links, so there is something worth looking at.
+    let first_note = note_refs
+        .iter()
+        .max_by_key(|r| Note::load(&r.path).map(|n| n.links().len()).unwrap_or(0))
+        .map(|r| r.path.clone());
+
     let display_path = vault_path.clone();
 
     Application::new().run(move |cx: &mut App| {
-        let bounds = Bounds::centered(None, size(px(720.0), px(480.0)), cx);
+        editor::init(cx);
 
-        let mut options = WindowOptions::default();
-        options.window_bounds = Some(WindowBounds::Windowed(bounds));
-        if let Some(titlebar) = options.titlebar.as_mut() {
-            titlebar.title = Some("Dragon Glass".into());
+        let editor = cx.new(Editor::new);
+        if let Some(path) = &first_note {
+            editor.update(cx, |editor, _cx| {
+                let _ = editor.load(path);
+            });
         }
 
-        cx.open_window(options, |_, cx| {
-            cx.new(|_| DragonGlassApp {
-                vault_path: display_path.clone(),
-                notes: note_count,
-                links: link_count,
-            })
-        })
-        .expect("failed to open window");
+        let bounds = Bounds::centered(None, size(px(900.0), px(600.0)), cx);
+        let options = WindowOptions {
+            window_bounds: Some(WindowBounds::Windowed(bounds)),
+            titlebar: Some(gpui::TitlebarOptions {
+                title: Some("Dragon Glass".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
 
-        cx.activate(true);
+        let editor_for_window = editor.clone();
+        let window = cx
+            .open_window(options, move |_window, cx| {
+                cx.new(|cx| DragonGlassApp {
+                    editor: editor_for_window.clone(),
+                    vault_path: display_path.clone(),
+                    notes: note_count,
+                    links: link_count,
+                    focus_handle: cx.focus_handle(),
+                })
+            })
+            .expect("failed to open window");
+
+        let _ = window.update(cx, |view, window, cx| {
+            window.focus(&view.editor.focus_handle(cx));
+            cx.activate(true);
+        });
     });
 }
