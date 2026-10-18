@@ -1,0 +1,19 @@
+# Stray opencode state that got copied into the project root
+/~
+
+# Local test corpus (copy of a vault; never commit)
+/test-vault/
+
+# Rust build output
+/target/
+**/*.rs.bk
+
+# Per-vault index cache (lives inside vaults, git-ignored by Dragon Glass)
+.dragon-glass/
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+desktop.ini
+*.pdb
+*.lnk

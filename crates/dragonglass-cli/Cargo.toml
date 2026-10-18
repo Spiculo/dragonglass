@@ -1,0 +1,15 @@
+[package]
+name = "dragonglass-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Headless CLI for Dragon Glass vaults."
+
+[[bin]]
+name = "dragon-glass"
+path = "src/main.rs"
+
+[dependencies]
+dragonglass-core.workspace = true
+anyhow.workspace = true

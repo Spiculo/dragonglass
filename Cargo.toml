@@ -1,0 +1,15 @@
+[workspace]
+resolver = "2"
+members = ["crates/dragonglass-core", "crates/dragonglass-cli"]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+license = "GPL-3.0-or-later"
+rust-version = "1.85"
+
+[workspace.dependencies]
+dragonglass-core = { path = "crates/dragonglass-core" }
+anyhow = "1"
+thiserror = "1"
+walkdir = "2"

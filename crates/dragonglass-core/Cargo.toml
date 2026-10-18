@@ -1,0 +1,11 @@
+[package]
+name = "dragonglass-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Headless engine for Dragon Glass: vault, parsing, index, link graph."
+
+[dependencies]
+walkdir.workspace = true
+thiserror.workspace = true
