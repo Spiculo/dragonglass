@@ -7,11 +7,13 @@ pub mod buffer;
 pub mod frontmatter;
 pub mod note;
 pub mod tags;
+pub mod tree;
 pub mod vault;
 pub mod wikilink;
 
 pub use buffer::Buffer;
 pub use note::Note;
+pub use tree::{NodeKind, TreeNode};
 pub use vault::{NoteRef, Vault};
 
 #[derive(Debug, thiserror::Error)]

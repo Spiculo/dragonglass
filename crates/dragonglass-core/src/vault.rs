@@ -73,6 +73,11 @@ impl Vault {
         notes.sort_by(|a, b| a.relative.cmp(&b.relative));
         notes
     }
+
+    /// The vault's directory tree, for the sidebar.
+    pub fn tree(&self) -> crate::TreeNode {
+        crate::tree::build(&self.notes())
+    }
 }
 
 fn is_skipped(path: &Path, root: &Path) -> bool {
