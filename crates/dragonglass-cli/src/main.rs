@@ -1,15 +1,20 @@
 //! `dragon-glass` — headless CLI over a vault.
 //!
 //! Usage:
-//!   dragon-glass stats  [vault]
-//!   dragon-glass broken [vault]
+//!   dragon-glass stats       [vault]
+//!   dragon-glass broken      [vault]
+//!   dragon-glass git-init    [vault]
+//!   dragon-glass git-status  [vault]
+//!   dragon-glass git-commit  [vault] <message>
+//!   dragon-glass git-pull    [vault]
+//!   dragon-glass git-push    [vault]
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use anyhow::{Context, Result};
-use dragonglass_core::{Note, NoteRef, Vault};
+use anyhow::{bail, Context, Result};
+use dragonglass_core::{git, Note, NoteRef, Vault};
 
 fn main() -> ExitCode {
     match run() {
@@ -23,14 +28,26 @@ fn main() -> ExitCode {
 
 fn run() -> Result<()> {
     let mut args = std::env::args().skip(1);
-    let (command, path) = match args.next().as_deref() {
+    let first = args.next();
+
+    match first.as_deref() {
         None | Some("-h") | Some("--help") => {
             print_help();
             return Ok(());
         }
+        Some("git-init") => return git_init(args.next()),
+        Some("git-status") => return git_status(args.next()),
+        Some("git-commit") => return git_commit(args.collect()),
+        Some("git-pull") => return git_pull(args.next()),
+        Some("git-push") => return git_push(args.next()),
+        _ => {}
+    }
+
+    let (command, path) = match first.as_deref() {
         Some("stats") => ("stats", args.next()),
         Some("broken") => ("broken", args.next()),
         Some(other) => ("stats", Some(other.to_string())),
+        None => unreachable!("handled above"),
     };
 
     let root = PathBuf::from(path.unwrap_or_else(|| ".".to_string()));
@@ -113,12 +130,76 @@ fn display_path(path: &Path) -> String {
     s.strip_prefix(r"\\?\").map(str::to_string).unwrap_or(s)
 }
 
+fn vault_arg(path: Option<String>) -> PathBuf {
+    PathBuf::from(path.unwrap_or_else(|| ".".to_string()))
+}
+
+fn git_init(path: Option<String>) -> Result<()> {
+    let root = vault_arg(path);
+    git::init(&root)?;
+    println!("initialized git repository at {}", display_path(&root));
+    Ok(())
+}
+
+fn git_status(path: Option<String>) -> Result<()> {
+    let root = vault_arg(path);
+    let status = git::status(&root)?;
+    println!("branch:     {}", status.branch);
+    println!("changed:    {}", status.changed);
+    println!("untracked:  {}", status.untracked);
+    println!("ahead:      {}", status.ahead);
+    println!("behind:     {}", status.behind);
+    if !status.conflicted.is_empty() {
+        println!("conflicted: {}", status.conflicted.join(", "));
+    }
+    Ok(())
+}
+
+fn git_commit(args: Vec<String>) -> Result<()> {
+    let (root, message) = match args.len() {
+        0 => bail!("usage: dragon-glass git-commit [vault] <message>"),
+        1 => (vault_arg(None), args[0].clone()),
+        _ => (vault_arg(Some(args[0].clone())), args[1..].join(" ")),
+    };
+
+    if git::commit_all(&root, &message)? {
+        println!("committed: {message}");
+    } else {
+        println!("nothing to commit");
+    }
+    Ok(())
+}
+
+fn git_pull(path: Option<String>) -> Result<()> {
+    report_outcome(git::pull(&vault_arg(path))?);
+    Ok(())
+}
+
+fn git_push(path: Option<String>) -> Result<()> {
+    report_outcome(git::push(&vault_arg(path))?);
+    Ok(())
+}
+
+fn report_outcome(outcome: git::Outcome) {
+    match outcome {
+        git::Outcome::UpToDate => println!("already up to date"),
+        git::Outcome::Updated => println!("updated"),
+        git::Outcome::NoRemote => println!("no remote configured"),
+        git::Outcome::Conflicts(files) => println!("{}", git::conflict_instructions(&files)),
+    }
+}
+
 fn print_help() {
     println!(
         "dragon-glass — headless vault tooling\n\n\
          USAGE:\n  \
-           dragon-glass stats  [vault]   summarize a vault\n  \
-           dragon-glass broken [vault]   list unresolved [[links]]\n\n\
+           dragon-glass stats       [vault]           summarize a vault\n  \
+           dragon-glass broken      [vault]           list unresolved [[links]]\n  \
+           dragon-glass git-init    [vault]           create a git repository\n  \
+           dragon-glass git-status  [vault]           show git status\n  \
+           dragon-glass git-commit  [vault] <message> stage everything and commit\n  \
+           dragon-glass git-pull    [vault]           fast-forward from the remote\n  \
+           dragon-glass git-push    [vault]           push to the remote\n\n\
          vault defaults to the current directory."
     );
 }

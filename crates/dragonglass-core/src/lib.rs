@@ -5,6 +5,7 @@
 
 pub mod buffer;
 pub mod frontmatter;
+pub mod git;
 pub mod markdown;
 pub mod note;
 pub mod search;
@@ -26,6 +27,9 @@ pub enum Error {
 
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
+
+    #[error("{command} failed: {message}")]
+    Git { command: String, message: String },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

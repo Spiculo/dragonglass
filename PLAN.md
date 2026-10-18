@@ -51,13 +51,15 @@ publish/export, **Mermaid diagrams**.
 | UI | **GPUI** (Zed's framework, Apache-2.0) | GPU-rendered, truly native, single codebase |
 | Editor | **Own, on GPUI** | rope buffer + cosmic-text shaping + tree-sitter; port Zed's (GPL) editor code where useful |
 | Math | **KaTeX** | `$` / `$$`, native host bridge |
-| Git | `git2` (libgit2) | auto-commit / push / pull; conflicts surfaced as terminal instructions |
+| Git | the user's `git` binary | init/status/commit/pull/push; reuses their credentials and SSH config; conflicts surfaced as terminal instructions |
 | Plugins | `wasmtime` (WASM sandbox) | sandboxed, language-agnostic — **post-v1** |
 
 **Rejected:** Tauri and any webview stack — still a browser engine, fails the "not
 Electron" bar. Mermaid — a JS library; deferred (see §2). **Zed's `editor` crate as a
 dependency** — `publish = false` and depends on `client`, `dap`, `rpc`, `project`,
-`workspace`, `telemetry`; consuming it means vendoring all of Zed.
+`workspace`, `telemetry`; consuming it means vendoring all of Zed. **`libgit2`/`git2`** —
+linking it would duplicate the user's credential helper, SSH agent and merge behaviour;
+driving their `git` binary avoids a heavy native dep and behaves exactly as they expect.
 
 **License:** GPL-3.0-or-later. GPUI is Apache-2.0 (compatible). GPL-3.0 also means we may
 port code from Zed's GPL editor into our own crates without adopting its dependency graph.
@@ -197,7 +199,8 @@ optimize for shipping working code over schedule precision.
 3. **Obsidian JS plugin compat:** not required; own plugins are a plus (post-v1). ✅
 4. **Platforms:** Windows + Linux priority; no mobile; macOS later. ✅
 5. **Team:** solo. ✅
-6. **Sync:** git-based, designed around it. ✅
+6. **Sync:** git-based; drive the user's `git` binary (their credentials, SSH and merge
+   behaviour). ✅
 7. **Name:** Dragon Glass. ✅
 8. **Idle behavior:** beat Obsidian — ~0% CPU idle, event-driven, unload idle docs. ✅
 9. **Git conflicts:** no native merge UI; print copy-paste resolution instructions. ✅
@@ -218,6 +221,7 @@ optimize for shipping working code over schedule precision.
 ## 9. Open items
 
 - Editor element API (how GPUI widgets wrap the buffer) — Phase 1 design output.
+- Wire git (status indicator, commit/pull/push commands) into the UI.
 - Linux GPUI build (Wayland/X11 + Vulkan system deps) — Phase 0 remainder.
 - Distribution format specifics (winget vs. MSI; AppImage/deb/Flatpak combo) — Phase 2+.
 - Plugin host API surface once we reach Phase 3 (WASM engine decided; API not).
