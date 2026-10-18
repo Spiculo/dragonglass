@@ -19,8 +19,14 @@ pub struct Split<'a> {
 pub fn split(src: &str) -> Split<'_> {
     let s = src.strip_prefix('\u{feff}').unwrap_or(src);
 
-    let Some(after_open) = s.strip_prefix("---\r\n").or_else(|| s.strip_prefix("---\n")) else {
-        return Split { frontmatter: None, body: src };
+    let Some(after_open) = s
+        .strip_prefix("---\r\n")
+        .or_else(|| s.strip_prefix("---\n"))
+    else {
+        return Split {
+            frontmatter: None,
+            body: src,
+        };
     };
 
     let open_len = s.len() - after_open.len();
@@ -38,7 +44,10 @@ pub fn split(src: &str) -> Split<'_> {
     }
 
     // Unterminated fence: treat the whole document as body.
-    Split { frontmatter: None, body: src }
+    Split {
+        frontmatter: None,
+        body: src,
+    }
 }
 
 #[cfg(test)]

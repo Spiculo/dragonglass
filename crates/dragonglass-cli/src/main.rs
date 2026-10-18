@@ -60,7 +60,9 @@ fn run() -> Result<()> {
         for link in note.links() {
             total_links += 1;
             if !link.target.is_empty() {
-                *unique_targets.entry(link.target.to_lowercase()).or_default() += 1;
+                *unique_targets
+                    .entry(link.target.to_lowercase())
+                    .or_default() += 1;
             }
             match resolver.resolve(&link.target) {
                 Resolution::Resolved | Resolution::SelfRef => {}
@@ -79,7 +81,10 @@ fn run() -> Result<()> {
 
     println!("vault:      {}", display_path(vault.root()));
     println!("notes:      {}", loaded.len());
-    println!("links:      {total_links} ({} unique targets)", unique_targets.len());
+    println!(
+        "links:      {total_links} ({} unique targets)",
+        unique_targets.len()
+    );
     println!("broken:     {broken}");
     println!("ambiguous:  {ambiguous}");
     println!("attachments:{attachments}");

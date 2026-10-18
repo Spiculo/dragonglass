@@ -27,7 +27,10 @@ impl NoteRef {
 
     /// Vault-relative path without its extension, e.g. `notes/Index`.
     pub fn path_no_ext(&self) -> &str {
-        self.relative.rsplit_once('.').map(|(s, _)| s).unwrap_or(&self.relative)
+        self.relative
+            .rsplit_once('.')
+            .map(|(s, _)| s)
+            .unwrap_or(&self.relative)
     }
 }
 

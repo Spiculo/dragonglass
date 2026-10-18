@@ -95,15 +95,19 @@ fn parse_inline_list(value: &str) -> Vec<String> {
         .trim_start_matches('[')
         .trim_end_matches(']')
         .split(',')
-        .map(|s| s.trim().trim_matches(['"', '\'']).trim_start_matches('#').to_string())
+        .map(|s| {
+            s.trim()
+                .trim_matches(['"', '\''])
+                .trim_start_matches('#')
+                .to_string()
+        })
         .filter(|s| !s.is_empty())
         .collect()
 }
 
 fn is_atx_heading(line: &str) -> bool {
     let mut chars = line.chars();
-    matches!(chars.next(), Some('#'))
-        && matches!(chars.next(), None | Some(' ') | Some('\t'))
+    matches!(chars.next(), Some('#')) && matches!(chars.next(), None | Some(' ') | Some('\t'))
 }
 
 fn is_tag_char(c: char) -> bool {
