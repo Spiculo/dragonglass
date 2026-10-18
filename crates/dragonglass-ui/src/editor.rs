@@ -11,15 +11,28 @@ use std::path::{Path, PathBuf};
 
 use dragonglass_core::{storage, Buffer};
 use gpui::{
-    actions, div, fill, point, prelude::*, px, relative, rgb, size, App, Bounds, Context,
-    CursorStyle, ElementId, ElementInputHandler, Entity, EntityInputHandler, FocusHandle,
+    actions, div, fill, point, prelude::*, px, relative, rgb, size, AnyElement, App, Bounds,
+    Context, CursorStyle, ElementId, ElementInputHandler, Entity, EntityInputHandler, FocusHandle,
     Focusable, GlobalElementId, InspectorElementId, KeyBinding, LayoutId, PaintQuad, Pixels, Point,
     Render, ShapedLine, SharedString, Style, TextRun, UTF16Selection, Window,
 };
 
 actions!(
     editor_actions,
-    [Backspace, Delete, Left, Right, Up, Down, Home, End, Enter, Paste, Save]
+    [
+        Backspace,
+        Delete,
+        Left,
+        Right,
+        Up,
+        Down,
+        Home,
+        End,
+        Enter,
+        Paste,
+        Save,
+        ToggleReading
+    ]
 );
 
 /// Register the editor's default key bindings. Obsidian-compatible where it matters.
@@ -38,12 +51,15 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("cmd-v", Paste, None),
         KeyBinding::new("ctrl-s", Save, None),
         KeyBinding::new("cmd-s", Save, None),
+        KeyBinding::new("ctrl-e", ToggleReading, None),
+        KeyBinding::new("cmd-e", ToggleReading, None),
     ]);
 }
 
 pub struct Editor {
     buffer: Buffer,
     path: Option<PathBuf>,
+    reading: bool,
     focus_handle: FocusHandle,
     font_size: Pixels,
     line_height: Pixels,
@@ -57,6 +73,7 @@ impl Editor {
         Self {
             buffer: Buffer::new(),
             path: None,
+            reading: false,
             focus_handle: cx.focus_handle(),
             font_size: px(14.0),
             line_height: px(20.0),
@@ -146,6 +163,11 @@ impl Editor {
         let _ = self.save();
         cx.notify();
     }
+
+    fn toggle_reading(&mut self, _: &ToggleReading, _window: &mut Window, cx: &mut Context<Self>) {
+        self.reading = !self.reading;
+        cx.notify();
+    }
 }
 
 impl Focusable for Editor {
@@ -162,8 +184,45 @@ impl Render for Editor {
             .and_then(|p| p.file_name())
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_default();
+        let dirty = self.buffer.is_dirty();
+        let reading = self.reading;
+
+        let body: AnyElement = if reading {
+            div()
+                .id("reading-scroll")
+                .flex_1()
+                .min_h(px(0.0))
+                .overflow_y_scroll()
+                .child(crate::reading::reading_view(&self.buffer.text()))
+                .into_any_element()
+        } else {
+            div()
+                .id("editor-scroll")
+                .flex_1()
+                .min_h(px(0.0))
+                .cursor(CursorStyle::IBeam)
+                .overflow_y_scroll()
+                .on_action(cx.listener(Self::backspace))
+                .on_action(cx.listener(Self::delete))
+                .on_action(cx.listener(Self::left))
+                .on_action(cx.listener(Self::right))
+                .on_action(cx.listener(Self::up))
+                .on_action(cx.listener(Self::down))
+                .on_action(cx.listener(Self::home))
+                .on_action(cx.listener(Self::end))
+                .on_action(cx.listener(Self::enter))
+                .on_action(cx.listener(Self::paste))
+                .on_action(cx.listener(Self::on_save))
+                .child(EditorText {
+                    editor: cx.entity(),
+                })
+                .into_any_element()
+        };
 
         div()
+            .key_context("Editor")
+            .track_focus(&self.focus_handle)
+            .on_action(cx.listener(Self::toggle_reading))
             .flex()
             .flex_col()
             .size_full()
@@ -171,40 +230,25 @@ impl Render for Editor {
                 div()
                     .flex()
                     .flex_row()
-                    .gap_2()
+                    .justify_between()
                     .px_2()
                     .py_1()
                     .bg(rgb(0x1b1b1b))
                     .text_xs()
                     .text_color(rgb(0x9a9a9a))
-                    .child(title)
-                    .when(self.buffer.is_dirty(), |d| {
-                        d.child(div().text_color(rgb(0xe0b050)).child("\u{25CF}"))
-                    }),
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .gap_2()
+                            .child(title)
+                            .when(dirty, |d| {
+                                d.child(div().text_color(rgb(0xe0b050)).child("\u{25CF}"))
+                            }),
+                    )
+                    .child(if reading { "read" } else { "edit" }),
             )
-            .child(
-                div()
-                    .key_context("Editor")
-                    .track_focus(&self.focus_handle)
-                    .cursor(CursorStyle::IBeam)
-                    .size_full()
-                    .id("editor-scroll")
-                    .overflow_y_scroll()
-                    .on_action(cx.listener(Self::backspace))
-                    .on_action(cx.listener(Self::delete))
-                    .on_action(cx.listener(Self::left))
-                    .on_action(cx.listener(Self::right))
-                    .on_action(cx.listener(Self::up))
-                    .on_action(cx.listener(Self::down))
-                    .on_action(cx.listener(Self::home))
-                    .on_action(cx.listener(Self::end))
-                    .on_action(cx.listener(Self::enter))
-                    .on_action(cx.listener(Self::paste))
-                    .on_action(cx.listener(Self::on_save))
-                    .child(EditorText {
-                        editor: cx.entity(),
-                    }),
-            )
+            .child(body)
     }
 }
 

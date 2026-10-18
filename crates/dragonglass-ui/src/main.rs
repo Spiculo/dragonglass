@@ -3,6 +3,7 @@
 //! Opens a vault, shows its directory tree, and loads notes into the in-house editor.
 
 mod editor;
+mod reading;
 
 use std::path::PathBuf;
 

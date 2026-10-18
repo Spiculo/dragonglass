@@ -5,6 +5,7 @@
 
 pub mod buffer;
 pub mod frontmatter;
+pub mod markdown;
 pub mod note;
 pub mod storage;
 pub mod tags;
