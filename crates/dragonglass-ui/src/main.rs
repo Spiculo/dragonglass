@@ -1,14 +1,15 @@
 //! Dragon Glass UI (Phase 0/1).
 //!
 //! Opens a vault, shows its directory tree, loads notes into the in-house editor, and
-//! provides a quick switcher (Ctrl+O) and full-text search (Ctrl+Shift+F).
+//! provides a quick switcher (Ctrl+O), full-text search (Ctrl+Shift+F) and a git menu
+//! (Ctrl+G).
 
 mod editor;
 mod reading;
 
 use std::path::PathBuf;
 
-use dragonglass_core::{search, NodeKind, Note, NoteRef, TreeNode, Vault};
+use dragonglass_core::{git, search, NodeKind, Note, NoteRef, TreeNode, Vault};
 use editor::Editor;
 use gpui::{
     actions, div, prelude::*, px, rgb, size, AnyElement, App, Application, Bounds, Context,
@@ -16,18 +17,34 @@ use gpui::{
     WindowBounds, WindowOptions,
 };
 
-actions!(app_actions, [OpenSwitcher, OpenSearch]);
+actions!(app_actions, [OpenSwitcher, OpenSearch, OpenGit]);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SwitcherMode {
     QuickSwitch,
     Search,
+    GitMenu,
+    CommitInput,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum GitAction {
+    Commit,
+    Pull,
+    Push,
+    Init,
+    Refresh,
+}
+
+enum Item {
+    Note { relative: String },
+    Git(GitAction),
 }
 
 struct SwitcherItem {
     label: String,
     detail: String,
-    relative: String,
+    item: Item,
 }
 
 struct Switcher {
@@ -46,6 +63,8 @@ struct DragonGlassApp {
     vault_path: String,
     notes: usize,
     links: usize,
+    git_status: Option<git::Status>,
+    status_message: Option<String>,
     switcher: Option<Switcher>,
     switcher_focus: FocusHandle,
     focus_handle: FocusHandle,
@@ -67,6 +86,14 @@ impl DragonGlassApp {
         cx.notify();
     }
 
+    fn refresh_git(&mut self) {
+        self.git_status = if git::is_repo(&self.vault_root) {
+            git::status(&self.vault_root).ok()
+        } else {
+            None
+        };
+    }
+
     fn compute_results(&self, mode: SwitcherMode, query: &str) -> Vec<SwitcherItem> {
         match mode {
             SwitcherMode::QuickSwitch => search::fuzzy_notes(&self.note_refs, query, 20)
@@ -74,7 +101,9 @@ impl DragonGlassApp {
                 .map(|note| SwitcherItem {
                     label: note.stem().to_string(),
                     detail: note.relative.clone(),
-                    relative: note.relative.clone(),
+                    item: Item::Note {
+                        relative: note.relative,
+                    },
                 })
                 .collect(),
             SwitcherMode::Search => search::full_text(&self.note_refs, query, 50)
@@ -82,9 +111,40 @@ impl DragonGlassApp {
                 .map(|hit| SwitcherItem {
                     label: format!("{}:{}", hit.relative, hit.line_number),
                     detail: hit.line,
-                    relative: hit.relative,
+                    item: Item::Note {
+                        relative: hit.relative,
+                    },
                 })
                 .collect(),
+            SwitcherMode::GitMenu => {
+                let mut items = Vec::new();
+                if self.git_status.is_some() {
+                    items.push(git_item(
+                        "Commit",
+                        "stage everything and commit",
+                        GitAction::Commit,
+                    ));
+                    items.push(git_item(
+                        "Pull",
+                        "fast-forward from the remote",
+                        GitAction::Pull,
+                    ));
+                    items.push(git_item("Push", "push to the remote", GitAction::Push));
+                    items.push(git_item(
+                        "Refresh",
+                        "re-read git status",
+                        GitAction::Refresh,
+                    ));
+                } else {
+                    items.push(git_item(
+                        "Initialize repository",
+                        "git init -b main",
+                        GitAction::Init,
+                    ));
+                }
+                items
+            }
+            SwitcherMode::CommitInput => Vec::new(),
         }
     }
 
@@ -113,6 +173,45 @@ impl DragonGlassApp {
         self.open_panel(SwitcherMode::Search, window, cx);
     }
 
+    fn open_git(&mut self, _: &OpenGit, window: &mut Window, cx: &mut Context<Self>) {
+        self.refresh_git();
+        self.open_panel(SwitcherMode::GitMenu, window, cx);
+    }
+
+    fn run_git_action(&mut self, action: GitAction) {
+        let root = self.vault_root.clone();
+        self.status_message = Some(match action {
+            GitAction::Init => match git::init(&root) {
+                Ok(()) => "initialized git repository".to_string(),
+                Err(e) => format!("git init failed: {e}"),
+            },
+            GitAction::Pull => match git::pull(&root) {
+                Ok(outcome) => describe_outcome(outcome),
+                Err(e) => format!("git pull failed: {e}"),
+            },
+            GitAction::Push => match git::push(&root) {
+                Ok(outcome) => describe_outcome(outcome),
+                Err(e) => format!("git push failed: {e}"),
+            },
+            GitAction::Refresh => "status refreshed".to_string(),
+            GitAction::Commit => "unreachable".to_string(),
+        });
+        self.refresh_git();
+    }
+
+    fn commit(&mut self, message: &str) {
+        let message = message.trim();
+        if message.is_empty() {
+            return;
+        }
+        self.status_message = Some(match git::commit_all(&self.vault_root, message) {
+            Ok(true) => format!("committed: {message}"),
+            Ok(false) => "nothing to commit".to_string(),
+            Err(e) => format!("git commit failed: {e}"),
+        });
+        self.refresh_git();
+    }
+
     fn on_switcher_key(
         &mut self,
         event: &KeyDownEvent,
@@ -130,9 +229,37 @@ impl DragonGlassApp {
                 return;
             }
             "enter" => {
+                if panel.mode == SwitcherMode::CommitInput {
+                    let message = panel.query.clone();
+                    self.commit(&message);
+                    self.close_panel(window, cx);
+                    return;
+                }
+
                 if let Some(item) = panel.results.get(panel.selected) {
-                    let relative = item.relative.clone();
-                    self.open_note(&relative, cx);
+                    match &item.item {
+                        Item::Note { relative } => {
+                            let relative = relative.clone();
+                            self.open_note(&relative, cx);
+                            self.close_panel(window, cx);
+                            return;
+                        }
+                        Item::Git(action) => {
+                            let action = *action;
+                            if action == GitAction::Commit {
+                                panel.mode = SwitcherMode::CommitInput;
+                                panel.query.clear();
+                                panel.results.clear();
+                                panel.selected = 0;
+                                self.switcher = Some(panel);
+                                cx.notify();
+                                return;
+                            }
+                            self.run_git_action(action);
+                            self.close_panel(window, cx);
+                            return;
+                        }
+                    }
                 }
                 self.close_panel(window, cx);
                 return;
@@ -166,6 +293,28 @@ impl DragonGlassApp {
 
         self.switcher = Some(panel);
         cx.notify();
+    }
+}
+
+fn git_item(label: &str, detail: &str, action: GitAction) -> SwitcherItem {
+    SwitcherItem {
+        label: label.to_string(),
+        detail: detail.to_string(),
+        item: Item::Git(action),
+    }
+}
+
+fn describe_outcome(outcome: git::Outcome) -> String {
+    match outcome {
+        git::Outcome::UpToDate => "already up to date".to_string(),
+        git::Outcome::Updated => "updated".to_string(),
+        git::Outcome::NoRemote => "no remote configured".to_string(),
+        git::Outcome::Conflicts(files) => {
+            format!(
+                "conflicts in {} file(s) — resolve in a terminal",
+                files.len()
+            )
+        }
     }
 }
 
@@ -204,14 +353,25 @@ fn flatten(node: &TreeNode, depth: usize, out: &mut Vec<Row>) {
     }
 }
 
-fn label_color(is_dir: bool, is_active: bool) -> gpui::Hsla {
-    if is_dir {
-        rgb(0x8a8a8a).into()
-    } else if is_active {
-        rgb(0xffffff).into()
-    } else {
-        rgb(0xd4d4d4).into()
+fn git_label(status: &Option<git::Status>) -> String {
+    let Some(status) = status else {
+        return "git: none".to_string();
+    };
+
+    let mut parts = vec![format!("git:{}", status.branch)];
+    if status.changed + status.untracked > 0 {
+        parts.push(format!("\u{00B1}{}", status.changed + status.untracked));
     }
+    if status.ahead > 0 {
+        parts.push(format!("\u{2191}{}", status.ahead));
+    }
+    if status.behind > 0 {
+        parts.push(format!("\u{2193}{}", status.behind));
+    }
+    if !status.conflicted.is_empty() {
+        parts.push(format!("!{}", status.conflicted.len()));
+    }
+    parts.join(" ")
 }
 
 impl Render for DragonGlassApp {
@@ -231,6 +391,14 @@ impl Render for DragonGlassApp {
             .children(rows.into_iter().enumerate().map(move |(i, row)| {
                 let indent = px(8.0 + row.depth as f32 * 12.0);
                 let is_active = !row.is_dir && row.path.as_deref() == active.as_deref();
+                let color = if row.is_dir {
+                    rgb(0x8a8a8a)
+                } else if is_active {
+                    rgb(0xffffff)
+                } else {
+                    rgb(0xd4d4d4)
+                };
+
                 let mut base = div()
                     .id(ElementId::Name(format!("row-{i}").into()))
                     .pl(indent)
@@ -238,7 +406,7 @@ impl Render for DragonGlassApp {
                     .py_1()
                     .text_sm()
                     .cursor_pointer()
-                    .text_color(label_color(row.is_dir, is_active))
+                    .text_color(color)
                     .child(row.name.clone());
 
                 if is_active {
@@ -262,6 +430,8 @@ impl Render for DragonGlassApp {
             let prefix = match panel.mode {
                 SwitcherMode::QuickSwitch => ">",
                 SwitcherMode::Search => "find:",
+                SwitcherMode::GitMenu => "git:",
+                SwitcherMode::CommitInput => "commit:",
             };
             let rows = panel.results.iter().enumerate().map(|(i, item)| {
                 let mut row = div()
@@ -309,6 +479,7 @@ impl Render for DragonGlassApp {
             .text_color(rgb(0xe6e6e6))
             .on_action(cx.listener(Self::open_switcher))
             .on_action(cx.listener(Self::open_search))
+            .on_action(cx.listener(Self::open_git))
             .child(
                 div()
                     .flex()
@@ -320,7 +491,13 @@ impl Render for DragonGlassApp {
                     .text_sm()
                     .child("Dragon Glass")
                     .child(self.vault_path.clone())
-                    .child(format!("{} notes / {} links", self.notes, self.links)),
+                    .child(git_label(&self.git_status))
+                    .child(format!("{} notes / {} links", self.notes, self.links))
+                    .child(
+                        div()
+                            .text_color(rgb(0xa0a0a0))
+                            .child(self.status_message.clone().unwrap_or_default()),
+                    ),
             )
             .children(panel)
             .child(
@@ -358,6 +535,11 @@ fn main() {
 
     let tree = vault.tree();
     let vault_root = vault.root().to_path_buf();
+    let initial_git = if git::is_repo(&vault_root) {
+        git::status(&vault_root).ok()
+    } else {
+        None
+    };
     let display_path = vault_path.clone();
 
     // Open the note with the most links, so there is something worth looking at.
@@ -374,6 +556,8 @@ fn main() {
             KeyBinding::new("cmd-o", OpenSwitcher, None),
             KeyBinding::new("ctrl-shift-f", OpenSearch, None),
             KeyBinding::new("cmd-shift-f", OpenSearch, None),
+            KeyBinding::new("ctrl-g", OpenGit, None),
+            KeyBinding::new("cmd-g", OpenGit, None),
         ]);
 
         let editor = cx.new(Editor::new);
@@ -405,6 +589,8 @@ fn main() {
                     vault_path: display_path.clone(),
                     notes: note_count,
                     links: link_count,
+                    git_status: initial_git.clone(),
+                    status_message: None,
                     switcher: None,
                     switcher_focus: cx.focus_handle(),
                     focus_handle: cx.focus_handle(),
