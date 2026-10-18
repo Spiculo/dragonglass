@@ -163,7 +163,7 @@ optimize for shipping working code over schedule precision.
 
 | Phase | Duration | Contents | Milestone |
 |---|---|---|---|
-| **0 — Foundations** | 3–5 wk | repo + CI (Windows/Linux) ✅, `core` crate ✅, FS vault model ✅, **GPUI spike ✅** | GPUI builds + opens a window on Windows ✅; editor approach = build our own ✅ |
+| **0 — Foundations** | 3–5 wk | repo + CI (Windows/Linux) ✅, `core` crate ✅, FS vault model ✅, **GPUI spike ✅** | GPUI builds on Windows ✅ and Linux ✅; editor approach = build our own ✅ |
 | **1 — Alpha** | 3–5 mo | rope buffer + undo/redo, editor element (source + live preview), file tree, tabs, quick switcher, full-text search, tags, wikilinks + backlinks, reading mode, KaTeX, **git init/commit/push/pull** | dogfood on your own vault, zero data loss, git round-trip works |
 | **2 — Beta** | 3–4 mo | graph view, outline, daily notes, templates, properties, bookmarks, command palette, hotkeys, themes/CSS, embeds, attachments, file recovery, update prompt | feature-complete core |
 | **3 — Power** | 3–5 mo | WASM plugins, CLI, URI scheme, multi-window, workspaces, query/Bases views | public beta |
@@ -179,8 +179,8 @@ optimize for shipping working code over schedule precision.
 - **Native text editing is the hard part** (IME, BiDi, selection, multi-cursor, undo,
   a11y). Mitigation: build on a rope buffer + GPUI text shaping, port Zed's GPL editor
   code for the fiddly parts, and grow it incrementally behind tests.
-- **GPUI on Windows+Linux** — validated on Windows (Phase 0). Linux still to confirm
-  (Wayland/X11 + Vulkan system deps). Mitigation: CI job once deps are pinned.
+- **GPUI on Windows+Linux** — validated: builds and opens a window on Windows; builds on
+  Linux (Wayland + X11 + Vulkan) in a container. CI covers both.
 - **Solo bandwidth** — phases are sequential and cuttable; milestones are shippable.
 - **Scope creep** (Canvas, Bases, Dataview, Mermaid) — gated behind v1.
 - **Git on large vaults** (attachments, big repos) — debounced commits + LFS guidance;
@@ -221,7 +221,12 @@ optimize for shipping working code over schedule precision.
 ## 9. Open items
 
 - Editor element API (how GPUI widgets wrap the buffer) — Phase 1 design output.
-- Wire git (status indicator, commit/pull/push commands) into the UI.
-- Linux GPUI build (Wayland/X11 + Vulkan system deps) — Phase 0 remainder.
 - Distribution format specifics (winget vs. MSI; AppImage/deb/Flatpak combo) — Phase 2+.
 - Plugin host API surface once we reach Phase 3 (WASM engine decided; API not).
+
+### Pinned dependencies
+
+- **`libc` is pinned to `=0.2.188`** in `Cargo.lock`. Zed's `zed-async-tar` fork depends on
+  `xattr 0.2.3`, which references `libc::ENOATTR`; libc removed that constant for Linux in
+  0.2.189+. `rustix` requires `>= 0.2.182`, so 0.2.188 is the only valid window. Drop the
+  pin once Zed updates its `async-tar` fork. Linux builds fail loudly if it moves.

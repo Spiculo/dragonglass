@@ -30,14 +30,26 @@ jobs:
       - name: Test
         run: cargo test
 
-  # The UI crate depends on GPUI, which needs a GPU/display stack and a long build.
-  # Enable this job once we've pinned the Linux system dependencies.
+  # GPUI needs a GPU/display stack and a long build, so this is a separate job.
   ui:
-    name: ui build (windows)
-    runs-on: windows-latest
-    if: false
+    name: ui build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - name: Linux system dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config cmake clang libclang-dev libssl-dev \
+            libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libx11-dev \
+            libx11-xcb-dev libxcb1-dev libxcb-render0-dev libxcb-shape0-dev \
+            libxcb-xfixes0-dev libvulkan-dev libfontconfig1-dev libfreetype-dev \
+            libasound2-dev
       - run: cargo build -p dragonglass-ui
