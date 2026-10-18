@@ -28,6 +28,10 @@ impl DragonGlassApp {
     fn open_note(&mut self, relative: &str, cx: &mut Context<Self>) {
         let path = self.vault_root.join(relative);
         self.editor.update(cx, |editor, cx| {
+            // Don't lose edits when switching notes.
+            if editor.is_dirty() {
+                let _ = editor.save();
+            }
             if editor.load(&path).is_ok() {
                 cx.notify();
             }

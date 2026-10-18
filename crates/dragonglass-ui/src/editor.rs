@@ -7,19 +7,19 @@
 //! Phase 1 spike scope: single cursor, no selection, no horizontal scroll, no wrapping.
 
 use std::ops::Range;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use dragonglass_core::Buffer;
+use dragonglass_core::{storage, Buffer};
 use gpui::{
-    actions, div, fill, point, prelude::*, px, relative, size, App, Bounds, Context, CursorStyle,
-    ElementId, ElementInputHandler, Entity, EntityInputHandler, FocusHandle, Focusable,
-    GlobalElementId, InspectorElementId, KeyBinding, LayoutId, PaintQuad, Pixels, Point, Render,
-    ShapedLine, SharedString, Style, TextRun, UTF16Selection, Window,
+    actions, div, fill, point, prelude::*, px, relative, rgb, size, App, Bounds, Context,
+    CursorStyle, ElementId, ElementInputHandler, Entity, EntityInputHandler, FocusHandle,
+    Focusable, GlobalElementId, InspectorElementId, KeyBinding, LayoutId, PaintQuad, Pixels, Point,
+    Render, ShapedLine, SharedString, Style, TextRun, UTF16Selection, Window,
 };
 
 actions!(
     editor_actions,
-    [Backspace, Delete, Left, Right, Up, Down, Home, End, Enter, Paste]
+    [Backspace, Delete, Left, Right, Up, Down, Home, End, Enter, Paste, Save]
 );
 
 /// Register the editor's default key bindings. Obsidian-compatible where it matters.
@@ -36,11 +36,14 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("enter", Enter, None),
         KeyBinding::new("ctrl-v", Paste, None),
         KeyBinding::new("cmd-v", Paste, None),
+        KeyBinding::new("ctrl-s", Save, None),
+        KeyBinding::new("cmd-s", Save, None),
     ]);
 }
 
 pub struct Editor {
     buffer: Buffer,
+    path: Option<PathBuf>,
     focus_handle: FocusHandle,
     font_size: Pixels,
     line_height: Pixels,
@@ -53,6 +56,7 @@ impl Editor {
     pub fn new(cx: &mut Context<Self>) -> Self {
         Self {
             buffer: Buffer::new(),
+            path: None,
             focus_handle: cx.focus_handle(),
             font_size: px(14.0),
             line_height: px(20.0),
@@ -68,7 +72,22 @@ impl Editor {
         self.buffer = Buffer::from_text(&text);
         self.buffer.mark_saved();
         self.marked_range = None;
+        self.path = Some(path.to_path_buf());
         Ok(())
+    }
+
+    /// Write the buffer back to its file, atomically.
+    pub fn save(&mut self) -> std::io::Result<()> {
+        let Some(path) = self.path.clone() else {
+            return Ok(());
+        };
+        storage::write_atomic(&path, &self.buffer.text())?;
+        self.buffer.mark_saved();
+        Ok(())
+    }
+
+    pub fn is_dirty(&self) -> bool {
+        self.buffer.is_dirty()
     }
 
     fn backspace(&mut self, _: &Backspace, _window: &mut Window, cx: &mut Context<Self>) {
@@ -122,6 +141,11 @@ impl Editor {
             cx.notify();
         }
     }
+
+    fn on_save(&mut self, _: &Save, _window: &mut Window, cx: &mut Context<Self>) {
+        let _ = self.save();
+        cx.notify();
+    }
 }
 
 impl Focusable for Editor {
@@ -132,26 +156,55 @@ impl Focusable for Editor {
 
 impl Render for Editor {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let title = self
+            .path
+            .as_ref()
+            .and_then(|p| p.file_name())
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+
         div()
-            .key_context("Editor")
-            .track_focus(&self.focus_handle)
-            .cursor(CursorStyle::IBeam)
+            .flex()
+            .flex_col()
             .size_full()
-            .id("editor-scroll")
-            .overflow_y_scroll()
-            .on_action(cx.listener(Self::backspace))
-            .on_action(cx.listener(Self::delete))
-            .on_action(cx.listener(Self::left))
-            .on_action(cx.listener(Self::right))
-            .on_action(cx.listener(Self::up))
-            .on_action(cx.listener(Self::down))
-            .on_action(cx.listener(Self::home))
-            .on_action(cx.listener(Self::end))
-            .on_action(cx.listener(Self::enter))
-            .on_action(cx.listener(Self::paste))
-            .child(EditorText {
-                editor: cx.entity(),
-            })
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .gap_2()
+                    .px_2()
+                    .py_1()
+                    .bg(rgb(0x1b1b1b))
+                    .text_xs()
+                    .text_color(rgb(0x9a9a9a))
+                    .child(title)
+                    .when(self.buffer.is_dirty(), |d| {
+                        d.child(div().text_color(rgb(0xe0b050)).child("\u{25CF}"))
+                    }),
+            )
+            .child(
+                div()
+                    .key_context("Editor")
+                    .track_focus(&self.focus_handle)
+                    .cursor(CursorStyle::IBeam)
+                    .size_full()
+                    .id("editor-scroll")
+                    .overflow_y_scroll()
+                    .on_action(cx.listener(Self::backspace))
+                    .on_action(cx.listener(Self::delete))
+                    .on_action(cx.listener(Self::left))
+                    .on_action(cx.listener(Self::right))
+                    .on_action(cx.listener(Self::up))
+                    .on_action(cx.listener(Self::down))
+                    .on_action(cx.listener(Self::home))
+                    .on_action(cx.listener(Self::end))
+                    .on_action(cx.listener(Self::enter))
+                    .on_action(cx.listener(Self::paste))
+                    .on_action(cx.listener(Self::on_save))
+                    .child(EditorText {
+                        editor: cx.entity(),
+                    }),
+            )
     }
 }
 
