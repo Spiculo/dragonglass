@@ -17,3 +17,4 @@ dragonglass-core = { path = "crates/dragonglass-core" }
 anyhow = "1"
 thiserror = "1"
 walkdir = "2"
+ropey = "1.6"

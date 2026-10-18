@@ -3,12 +3,14 @@
 //! Everything here is a plain Rust library so it can be unit-tested, driven by the CLI,
 //! and reused by the GPUI application.
 
+pub mod buffer;
 pub mod frontmatter;
 pub mod note;
 pub mod tags;
 pub mod vault;
 pub mod wikilink;
 
+pub use buffer::Buffer;
 pub use note::Note;
 pub use vault::{NoteRef, Vault};
 

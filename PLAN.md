@@ -44,21 +44,23 @@ publish/export, **Mermaid diagrams**.
 | Layer | Choice | Notes |
 |---|---|---|
 | Core engine | **Rust** — `dragonglass-core` (headless) | vault/FS, parser, index, link graph, search; testable without UI |
-| Text buffer | `ropey` | rope for large docs |
-| Parsing | `tree-sitter` + `tree-sitter-markdown`; `comrak` as reference | incremental, folding, syntax highlighting |
+| Text buffer | **rope** (`ropey`) + own undo/cursor | the editor's spine; unit-tested headless |
+| Parsing | `tree-sitter` + `tree-sitter-md`; `comrak` as reference | incremental, folding, syntax highlighting |
 | Search index | `tantivy` | full-text + operators; rebuildable cache |
 | FS watch | `notify` | external-change reconciliation |
 | UI | **GPUI** (Zed's framework, Apache-2.0) | GPU-rendered, truly native, single codebase |
-| Editor | **Zed `editor` crate** (GPL-3.0-or-later) | reuse Zed's text editing: IME, selection, multi-cursor, a11y |
+| Editor | **Own, on GPUI** | rope buffer + cosmic-text shaping + tree-sitter; port Zed's (GPL) editor code where useful |
 | Math | **KaTeX** | `$` / `$$`, native host bridge |
 | Git | `git2` (libgit2) | auto-commit / push / pull; conflicts surfaced as terminal instructions |
 | Plugins | `wasmtime` (WASM sandbox) | sandboxed, language-agnostic — **post-v1** |
 
 **Rejected:** Tauri and any webview stack — still a browser engine, fails the "not
-Electron" bar. Mermaid — a JS library; deferred (see §2).
+Electron" bar. Mermaid — a JS library; deferred (see §2). **Zed's `editor` crate as a
+dependency** — `publish = false` and depends on `client`, `dap`, `rpc`, `project`,
+`workspace`, `telemetry`; consuming it means vendoring all of Zed.
 
-**License:** GPL-3.0-or-later. Reusing Zed's `editor` crate (GPL-3.0-or-later) makes this
-OSS/private-safe and is the biggest Phase 0–1 time saver. GPUI (Apache-2.0) is compatible.
+**License:** GPL-3.0-or-later. GPUI is Apache-2.0 (compatible). GPL-3.0 also means we may
+port code from Zed's GPL editor into our own crates without adopting its dependency graph.
 
 **Architecture:** FS events → incremental tree-sitter parse → in-memory doc cache → index
 (Tantivy + link graph) → UI queries. On-disk data stays plain text; the index lives **in
@@ -148,7 +150,7 @@ the vault** at `.dragon-glass/` and is a **rebuildable cache** (auto-added to th
   (Exact index/search latency budgets to be set in Phase 0.)
 - **Data safety:** never lose data; atomic writes + backups; plain text = no lock-in.
 - **Security:** no network by default; plugins sandboxed (post-v1).
-- **Accessibility:** keyboard-first, screen-reader support (inherited from GPUI/Zed editor).
+- **Accessibility:** keyboard-first, screen-reader support.
 
 ---
 
@@ -159,8 +161,8 @@ optimize for shipping working code over schedule precision.
 
 | Phase | Duration | Contents | Milestone |
 |---|---|---|---|
-| **0 — Foundations** | 3–5 wk | repo + CI (Windows/Linux), `core` crate, FS vault model, **Zed `editor` + GPUI spike** | Zed editor builds on Windows/Linux; text-editing / IME risks validated or fallback chosen |
-| **1 — Alpha** | 3–5 mo | editor (source + live preview), file tree, tabs, quick switcher, full-text search, tags, wikilinks + backlinks, reading mode, KaTeX, **git init/commit/push/pull** | dogfood on your own vault, zero data loss, git round-trip works |
+| **0 — Foundations** | 3–5 wk | repo + CI (Windows/Linux) ✅, `core` crate ✅, FS vault model ✅, **GPUI spike ✅** | GPUI builds + opens a window on Windows ✅; editor approach = build our own ✅ |
+| **1 — Alpha** | 3–5 mo | rope buffer + undo/redo, editor element (source + live preview), file tree, tabs, quick switcher, full-text search, tags, wikilinks + backlinks, reading mode, KaTeX, **git init/commit/push/pull** | dogfood on your own vault, zero data loss, git round-trip works |
 | **2 — Beta** | 3–4 mo | graph view, outline, daily notes, templates, properties, bookmarks, command palette, hotkeys, themes/CSS, embeds, attachments, file recovery, update prompt | feature-complete core |
 | **3 — Power** | 3–5 mo | WASM plugins, CLI, URI scheme, multi-window, workspaces, query/Bases views | public beta |
 | **4 — Ecosystem** | TBD | plugin/theme store, importers (Notion/Evernote/Roam), export/publish, MCP | ecosystem |
@@ -172,11 +174,11 @@ optimize for shipping working code over schedule precision.
 
 ## 7. Risks
 
-- **Native text editing is the hard part** (IME, BiDi, selection, a11y). Mitigation: reuse
-  Zed's GPL `editor` crate rather than build from scratch; validate in Phase 0.
-- **GPUI / Zed `editor` on Windows+Linux** — the editor crate is not designed as a
-  standalone library; extraction glue is real work. Mitigation: spike first, fallback is
-  Qt 6 or a `ropey` + `cosmic-text` editor.
+- **Native text editing is the hard part** (IME, BiDi, selection, multi-cursor, undo,
+  a11y). Mitigation: build on a rope buffer + GPUI text shaping, port Zed's GPL editor
+  code for the fiddly parts, and grow it incrementally behind tests.
+- **GPUI on Windows+Linux** — validated on Windows (Phase 0). Linux still to confirm
+  (Wayland/X11 + Vulkan system deps). Mitigation: CI job once deps are pinned.
 - **Solo bandwidth** — phases are sequential and cuttable; milestones are shippable.
 - **Scope creep** (Canvas, Bases, Dataview, Mermaid) — gated behind v1.
 - **Git on large vaults** (attachments, big repos) — debounced commits + LFS guidance;
@@ -203,7 +205,8 @@ optimize for shipping working code over schedule precision.
 11. **Plugin substrate:** WASM, language-agnostic (JS, Python, Rust — anything targeting
     WASM); shell/`bash` scripts run via the CLI/automation escape hatch. ✅
 12. **License:** GPL-3.0-or-later (open source). ✅
-13. **Editor:** reuse Zed's GPL `editor` crate + GPUI. ✅
+13. **Editor:** build our own on GPUI (rope buffer, cosmic-text, tree-sitter); port Zed's
+    GPL editor code where useful — its `editor` crate is not library-usable. ✅
 14. **Keybindings:** match Obsidian defaults. ✅
 15. **Theming:** our own; Obsidian community CSS themes not supported. ✅
 16. **Updates:** no auto-update; in-app "update available" prompt. ✅
@@ -214,6 +217,7 @@ optimize for shipping working code over schedule precision.
 
 ## 9. Open items
 
-- Zed `editor` crate extraction strategy (fork vs. vendor vs. submodule) — Phase 0 output.
+- Editor element API (how GPUI widgets wrap the buffer) — Phase 1 design output.
+- Linux GPUI build (Wayland/X11 + Vulkan system deps) — Phase 0 remainder.
 - Distribution format specifics (winget vs. MSI; AppImage/deb/Flatpak combo) — Phase 2+.
 - Plugin host API surface once we reach Phase 3 (WASM engine decided; API not).

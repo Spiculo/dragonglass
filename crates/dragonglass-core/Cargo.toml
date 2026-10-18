@@ -10,3 +10,4 @@ description = "Headless engine for Dragon Glass: vault, parsing, index, link gra
 [dependencies]
 walkdir.workspace = true
 thiserror.workspace = true
+ropey.workspace = true
