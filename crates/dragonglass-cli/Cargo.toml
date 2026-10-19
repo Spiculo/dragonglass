@@ -13,4 +13,5 @@ path = "src/main.rs"
 
 [dependencies]
 dragonglass-core.workspace = true
+dragonglass-plugins.workspace = true
 anyhow.workspace = true

@@ -13,10 +13,11 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use dragonglass_core::{
     api, git, graph, history, html, query, storage, update, Note, NoteRef, Vault,
 };
+use dragonglass_plugins as plugins;
 
 fn main() -> ExitCode {
     match run() {
@@ -48,6 +49,8 @@ fn run() -> Result<()> {
         Some("serve") => return serve(args.collect()),
         Some("check-update") => return check_update(args.collect()),
         Some("graph") => return graph_cmd(args.collect()),
+        Some("plugins") => return plugins_cmd(args.collect()),
+        Some("run") => return run_plugin(args.collect()),
         _ => {}
     }
 
@@ -185,6 +188,51 @@ fn git_pull(path: Option<String>) -> Result<()> {
 
 fn git_push(path: Option<String>) -> Result<()> {
     report_outcome(git::push(&vault_arg(path))?);
+    Ok(())
+}
+
+fn plugins_cmd(args: Vec<String>) -> Result<()> {
+    let root = vault_arg(args.first().cloned());
+    let found = plugins::discover(&root);
+
+    if found.is_empty() {
+        println!(
+            "no plugins installed in {}",
+            display_path(&plugins::plugins_dir(&root))
+        );
+        return Ok(());
+    }
+
+    for plugin in found {
+        let version = plugin.manifest.version.clone().unwrap_or_default();
+        println!(
+            "{}  {}  {}",
+            plugin.manifest.id, plugin.manifest.name, version
+        );
+        for command in &plugin.manifest.commands {
+            println!("    {}  {}", command.id, command.title);
+        }
+    }
+    Ok(())
+}
+
+fn run_plugin(args: Vec<String>) -> Result<()> {
+    if args.len() < 3 {
+        bail!("usage: dragon-glass run <vault> <plugin-id> <command-id> [note]");
+    }
+
+    let root = PathBuf::from(&args[0]);
+    let plugin_id = &args[1];
+    let command = &args[2];
+    let note = args.get(3).map(String::as_str);
+
+    let found = plugins::discover(&root);
+    let plugin = found
+        .iter()
+        .find(|plugin| plugin.manifest.id == *plugin_id)
+        .ok_or_else(|| anyhow!("plugin not found: {plugin_id}"))?;
+
+    println!("{}", plugins::run_command(plugin, command, &root, note)?);
     Ok(())
 }
 
@@ -367,7 +415,9 @@ fn print_help() {
            dragon-glass query       <vault> \"<query>\"  filter notes by property or tag\n  \
            dragon-glass serve       [vault] [addr]     read-only HTTP API (loopback)\n  \
            dragon-glass check-update <source> [current]  compare against an advertised version\n  \
-           dragon-glass graph       [vault] [note]     print the link graph\n\n\
+           dragon-glass graph       [vault] [note]     print the link graph\n  \
+           dragon-glass plugins     [vault]            list installed plugins\n  \
+           dragon-glass run         <vault> <plugin> <command> [note]  run a plugin command\n\n\
          vault defaults to the current directory."
     );
 }

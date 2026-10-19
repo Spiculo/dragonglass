@@ -1,9 +1,18 @@
 [workspace]
 resolver = "2"
-members = ["crates/dragonglass-core", "crates/dragonglass-cli", "crates/dragonglass-ui"]
+members = [
+    "crates/dragonglass-core",
+    "crates/dragonglass-cli",
+    "crates/dragonglass-ui",
+    "crates/dragonglass-plugins",
+]
 # Keep the default build fast: the UI crate pulls in GPUI, which is a heavy dependency.
 # Build it explicitly with `cargo build -p dragonglass-ui`.
-default-members = ["crates/dragonglass-core", "crates/dragonglass-cli"]
+default-members = [
+    "crates/dragonglass-core",
+    "crates/dragonglass-cli",
+    "crates/dragonglass-plugins",
+]
 
 [workspace.package]
 version = "0.0.1"
@@ -14,6 +23,7 @@ publish = false
 
 [workspace.dependencies]
 dragonglass-core = { path = "crates/dragonglass-core" }
+dragonglass-plugins = { path = "crates/dragonglass-plugins" }
 anyhow = "1"
 thiserror = "1"
 walkdir = "2"

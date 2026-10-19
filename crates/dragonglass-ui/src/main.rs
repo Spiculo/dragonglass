@@ -16,6 +16,7 @@ use dragonglass_core::{
     bookmarks, config, conflict, git, graph, markdown, query, search, storage, templates, update,
     NodeKind, Note, NoteRef, TreeNode, Vault,
 };
+use dragonglass_plugins as plugins;
 use editor::Editor;
 use gpui::{
     actions, div, prelude::*, px, size, AnyElement, App, Application, Bounds, Context, ElementId,
@@ -72,6 +73,7 @@ enum CommandId {
     CheckUpdates,
     OpenGraph,
     RunQuery,
+    Plugin(usize),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -129,6 +131,9 @@ struct DragonGlassApp {
     show_graph: bool,
     query_results: Vec<query::Row>,
     show_query: bool,
+    /// Installed plugins, and a flattened list of `(plugin index, command id, title)`.
+    plugins: Vec<plugins::PluginInfo>,
+    plugin_commands: Vec<(usize, String, String)>,
     config: config::Config,
     active: Option<String>,
     vault_path: String,
@@ -396,7 +401,17 @@ impl DragonGlassApp {
                 command_item("Check for updates", "", CommandId::CheckUpdates),
                 command_item("Graph view", "ctrl+shift+g", CommandId::OpenGraph),
                 command_item("Run a query", "", CommandId::RunQuery),
-            ],
+            ]
+            .into_iter()
+            .chain(
+                self.plugin_commands
+                    .iter()
+                    .enumerate()
+                    .map(|(index, (_, _, title))| {
+                        command_item(title, "plugin", CommandId::Plugin(index))
+                    }),
+            )
+            .collect(),
         }
     }
 
@@ -433,6 +448,33 @@ impl DragonGlassApp {
 
     fn open_commands(&mut self, _: &OpenCommands, window: &mut Window, cx: &mut Context<Self>) {
         self.open_panel(SwitcherMode::CommandsMenu, window, cx);
+    }
+
+    fn run_plugin_command(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some((plugin_index, command_id, title)) = self.plugin_commands.get(index).cloned()
+        else {
+            return;
+        };
+        let Some(plugin) = self.plugins.get(plugin_index) else {
+            return;
+        };
+
+        let note = self.active.clone();
+        let outcome = plugins::run_command(plugin, &command_id, &self.vault_root, note.as_deref());
+
+        self.status_message = Some(match outcome {
+            Ok(output) => {
+                let trimmed = output.trim();
+                let short: String = trimmed.chars().take(200).collect();
+                if short.is_empty() {
+                    format!("{title}: (no output)")
+                } else {
+                    format!("{title}: {short}")
+                }
+            }
+            Err(e) => format!("{title} failed: {e}"),
+        });
+        cx.notify();
     }
 
     fn open_graph(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -777,6 +819,7 @@ impl DragonGlassApp {
                                     cx.notify();
                                     return;
                                 }
+                                CommandId::Plugin(index) => self.run_plugin_command(index, cx),
                                 _ => {}
                             }
                             self.close_panel(window, cx);
@@ -1267,6 +1310,18 @@ fn main() {
     let initial_theme = load_theme(&vault_root);
     let initial_graph = graph::build(&note_refs);
     let initial_config = config::load(&vault_root);
+    let initial_plugins = plugins::discover(&vault_root);
+    let initial_plugin_commands: Vec<(usize, String, String)> = initial_plugins
+        .iter()
+        .enumerate()
+        .flat_map(|(index, plugin)| {
+            plugin
+                .manifest
+                .commands
+                .iter()
+                .map(move |command| (index, command.id.clone(), command.title.clone()))
+        })
+        .collect();
     let update_source = std::env::var("DRAGON_GLASS_UPDATE_URL").ok();
     let update_available = update_source.as_deref().and_then(|source| {
         update::latest_if_newer(env!("CARGO_PKG_VERSION"), source)
@@ -1362,6 +1417,8 @@ fn main() {
             show_graph: false,
             query_results: Vec::new(),
             show_query: false,
+            plugins: initial_plugins,
+            plugin_commands: initial_plugin_commands,
             config: initial_config,
         });
 
