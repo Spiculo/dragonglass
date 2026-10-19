@@ -245,11 +245,11 @@ reading mode, quick switcher, full-text search, tags, wikilinks/backlinks data, 
 daily notes + templates, properties display/edit, git sync, KaTeX/dialect still to expand.
 Remaining: word wrap, horizontal scroll, richer live preview.
 
-**Phase 2 — nearly done.** Properties, daily/weekly/monthly notes, templates, outline,
-bookmarks, command palette, theming (light/dark), embeds and attachments, file-recovery
-snapshots, graph view (local, deterministic force layout), external-change conflict
-handling, and the update-available prompt are in. Remaining: hotkey editor, snippets,
-graph filters/grouping, paste/drag image capture into the attachments folder.
+**Phase 2 — done except image capture.** Properties, daily/weekly/monthly notes, templates,
+outline, bookmarks, command palette, hotkey editor, theming (light/dark, user themes,
+snippets), embeds and attachments, file-recovery snapshots, graph view with filters, depth
+and folder grouping, external-change handling and the update prompt are all in. Remaining:
+pasting or dropping an image into the editor to file it in the attachments folder.
 
 **Phase 3 — done except the online store.** Everything listed is in: command palette,
 CLI/headless mode, HTML export, query views, graph view, the WASM plugin host (with note
@@ -264,9 +264,9 @@ markdown, which drops straight into a vault).
 ### Phase 1 remainder
 
 Word wrap landed (the editor wraps at spaces, and caret/selection/mouse/vertical movement
-follow visual rows). Comments, callouts and `==highlights==` are parsed, and callouts and
-highlights render in exported HTML. Still open: in-app `==highlight==` styling, math
-typesetting (KaTeX has no native equivalent — the syntax is currently shown as text),
-richer source/live-preview modes, and horizontal scroll (largely moot now that text wraps).
+follow visual rows). Comments, callouts and `==highlights==` are parsed; callouts and
+highlights render in the app and in exported HTML. Still open: math typesetting (KaTeX has no
+native equivalent — the syntax is currently shown as text), richer source/live-preview modes,
+and horizontal scroll (largely moot now that text wraps).
 
 **Phase 5 — not started.** macOS cross-compile, signing/notarization, platform polish.
