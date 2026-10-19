@@ -1600,6 +1600,7 @@ name = "dragonglass-core"
 version = "0.0.1"
 dependencies = [
  "ropey",
+ "serde_json",
  "thiserror 1.0.69",
  "walkdir",
 ]

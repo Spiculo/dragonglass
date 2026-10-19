@@ -13,6 +13,7 @@ pub mod git;
 pub mod graph;
 pub mod history;
 pub mod html;
+pub mod import;
 pub mod markdown;
 pub mod note;
 pub mod query;
@@ -46,6 +47,9 @@ pub enum Error {
 
     #[error("unsupported frontmatter on line {line}: {text}")]
     UnsupportedFrontmatter { line: usize, text: String },
+
+    #[error("json error: {0}")]
+    Json(#[from] serde_json::Error),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

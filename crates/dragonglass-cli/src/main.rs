@@ -15,7 +15,7 @@ use std::process::ExitCode;
 
 use anyhow::{anyhow, bail, Context, Result};
 use dragonglass_core::{
-    api, git, graph, history, html, query, storage, update, uri, Note, NoteRef, Vault,
+    api, git, graph, history, html, import, query, storage, update, uri, Note, NoteRef, Vault,
 };
 use dragonglass_plugins as plugins;
 
@@ -52,6 +52,7 @@ fn run() -> Result<()> {
         Some("plugins") => return plugins_cmd(args.collect()),
         Some("run") => return run_plugin(args.collect()),
         Some("uri") => return uri_cmd(args.collect()),
+        Some("import") => return import_cmd(args.collect()),
         _ => {}
     }
 
@@ -190,6 +191,73 @@ fn git_pull(path: Option<String>) -> Result<()> {
 fn git_push(path: Option<String>) -> Result<()> {
     report_outcome(git::push(&vault_arg(path))?);
     Ok(())
+}
+
+fn import_cmd(args: Vec<String>) -> Result<()> {
+    if args.len() < 3 {
+        bail!("usage: dragon-glass import <vault> <enex|roam> <file> [folder]");
+    }
+
+    let root = PathBuf::from(&args[0]);
+    let format = args[1].to_ascii_lowercase();
+    let source = PathBuf::from(&args[2]);
+    let folder = args
+        .get(3)
+        .cloned()
+        .unwrap_or_else(|| "Imported".to_string());
+
+    let text = std::fs::read_to_string(&source)
+        .with_context(|| format!("reading {}", display_path(&source)))?;
+
+    let notes = match format.as_str() {
+        "enex" | "evernote" => import::evernote_enex(&text),
+        "roam" => import::roam_pages(&text)?,
+        other => bail!("unknown import format: {other} (expected enex or roam)"),
+    };
+
+    if notes.is_empty() {
+        println!("no notes found in {}", display_path(&source));
+        return Ok(());
+    }
+
+    let out_dir = root.join(&folder);
+    std::fs::create_dir_all(&out_dir)?;
+
+    let mut written = 0usize;
+    let mut used: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    for note in &notes {
+        let base = sanitize_file_name(&note.title);
+        let base = if base.is_empty() {
+            "Untitled".to_string()
+        } else {
+            base
+        };
+
+        let mut name = base.clone();
+        let mut counter = 1;
+        while !used.insert(name.clone()) {
+            counter += 1;
+            name = format!("{base} {counter}");
+        }
+
+        storage::write_atomic(&out_dir.join(format!("{name}.md")), &note.markdown)?;
+        written += 1;
+    }
+
+    println!("imported {written} notes into {}", display_path(&out_dir));
+    Ok(())
+}
+
+fn sanitize_file_name(name: &str) -> String {
+    name.chars()
+        .map(|c| match c {
+            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '-',
+            other => other,
+        })
+        .collect::<String>()
+        .trim()
+        .to_string()
 }
 
 fn uri_cmd(args: Vec<String>) -> Result<()> {
@@ -447,7 +515,8 @@ fn print_help() {
            dragon-glass graph       [vault] [note]     print the link graph\n  \
            dragon-glass plugins     [vault]            list installed plugins\n  \
            dragon-glass run         <vault> <plugin> <command> [note]  run a plugin command\n  \
-           dragon-glass uri         <dragonglass://...>  resolve a URI\n\n\
+           dragon-glass uri         <dragonglass://...>  resolve a URI\n  \
+           dragon-glass import      <vault> <enex|roam> <file> [folder]  import notes\n\n\
          vault defaults to the current directory."
     );
 }
