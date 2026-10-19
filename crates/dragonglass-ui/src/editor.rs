@@ -190,6 +190,16 @@ impl Editor {
         self.reading = !self.reading;
     }
 
+    /// Whether the editor is currently in reading mode.
+    pub fn is_reading(&self) -> bool {
+        self.reading
+    }
+
+    /// Set reading mode explicitly (used when restoring a workspace).
+    pub fn set_reading_mode(&mut self, reading: bool) {
+        self.reading = reading;
+    }
+
     /// Tell the editor where the vault lives, for resolving embeds.
     pub fn set_vault_root(&mut self, root: &Path) {
         self.vault_root = Some(root.to_path_buf());

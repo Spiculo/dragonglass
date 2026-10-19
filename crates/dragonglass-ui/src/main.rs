@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use dragonglass_core::frontmatter::{Property, PropertyValue};
 use dragonglass_core::{
     bookmarks, config, conflict, git, graph, markdown, query, search, storage, templates, update,
-    NodeKind, Note, NoteRef, TreeNode, Vault,
+    workspace, NodeKind, Note, NoteRef, TreeNode, Vault,
 };
 use dragonglass_plugins as plugins;
 use editor::Editor;
@@ -55,6 +55,8 @@ enum SwitcherMode {
     PropertyInput,
     CommandsMenu,
     QueryInput,
+    WorkspaceName,
+    WorkspaceMenu,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -73,6 +75,8 @@ enum CommandId {
     CheckUpdates,
     OpenGraph,
     RunQuery,
+    SaveWorkspace,
+    LoadWorkspace,
     Plugin(usize),
 }
 
@@ -91,6 +95,7 @@ enum Item {
     Property { key: Option<String> },
     DeleteProperty { key: String },
     Command(CommandId),
+    Workspace(String),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -134,6 +139,7 @@ struct DragonGlassApp {
     /// Installed plugins, and a flattened list of `(plugin index, command id, title)`.
     plugins: Vec<plugins::PluginInfo>,
     plugin_commands: Vec<(usize, String, String)>,
+    workspaces: Vec<workspace::Workspace>,
     config: config::Config,
     active: Option<String>,
     vault_path: String,
@@ -386,6 +392,16 @@ impl DragonGlassApp {
             }
             SwitcherMode::PropertyInput => Vec::new(),
             SwitcherMode::QueryInput => Vec::new(),
+            SwitcherMode::WorkspaceMenu => self
+                .workspaces
+                .iter()
+                .map(|workspace| SwitcherItem {
+                    label: workspace.name.clone(),
+                    detail: describe_workspace(workspace),
+                    item: Item::Workspace(workspace.name.clone()),
+                })
+                .collect(),
+            SwitcherMode::WorkspaceName => Vec::new(),
             SwitcherMode::CommandsMenu => vec![
                 command_item("Quick switcher", "ctrl+o", CommandId::QuickSwitch),
                 command_item("Search", "ctrl+shift+f", CommandId::Search),
@@ -401,6 +417,8 @@ impl DragonGlassApp {
                 command_item("Check for updates", "", CommandId::CheckUpdates),
                 command_item("Graph view", "ctrl+shift+g", CommandId::OpenGraph),
                 command_item("Run a query", "", CommandId::RunQuery),
+                command_item("Save workspace", "", CommandId::SaveWorkspace),
+                command_item("Load workspace", "", CommandId::LoadWorkspace),
             ]
             .into_iter()
             .chain(
@@ -448,6 +466,60 @@ impl DragonGlassApp {
 
     fn open_commands(&mut self, _: &OpenCommands, window: &mut Window, cx: &mut Context<Self>) {
         self.open_panel(SwitcherMode::CommandsMenu, window, cx);
+    }
+
+    fn save_workspace(&mut self, name: &str, cx: &mut Context<Self>) {
+        let name = name.trim();
+        if name.is_empty() {
+            return;
+        }
+
+        let reading = self.editor.read(cx).is_reading();
+        workspace::upsert(
+            &mut self.workspaces,
+            workspace::Workspace {
+                name: name.to_string(),
+                graph: self.show_graph,
+                reading,
+                note: self.active.clone(),
+            },
+        );
+
+        self.status_message = Some(match workspace::save(&self.vault_root, &self.workspaces) {
+            Ok(()) => format!("workspace saved: {name}"),
+            Err(e) => format!("could not save workspace: {e}"),
+        });
+        cx.notify();
+    }
+
+    fn apply_workspace(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(workspace) = self
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.name == name)
+            .cloned()
+        else {
+            return;
+        };
+
+        self.show_query = false;
+        if let Some(note) = &workspace.note {
+            self.open_note(note, cx);
+        }
+
+        self.editor.update(cx, |editor, cx| {
+            editor.set_reading_mode(workspace.reading);
+            cx.notify();
+        });
+
+        if workspace.graph {
+            self.open_graph(window, cx);
+        } else {
+            self.show_graph = false;
+        }
+
+        self.status_message = Some(format!("workspace: {name}"));
+        cx.notify();
     }
 
     fn run_plugin_command(&mut self, index: usize, cx: &mut Context<Self>) {
@@ -703,6 +775,13 @@ impl DragonGlassApp {
                     return;
                 }
 
+                if panel.mode == SwitcherMode::WorkspaceName {
+                    let name = panel.query.clone();
+                    self.save_workspace(&name, cx);
+                    self.close_panel(window, cx);
+                    return;
+                }
+
                 if let Some(item) = panel.results.get(panel.selected) {
                     match &item.item {
                         Item::Note { relative } => {
@@ -756,6 +835,12 @@ impl DragonGlassApp {
                                 .cloned()
                                 .collect();
                             self.apply_properties(&properties, cx);
+                            self.close_panel(window, cx);
+                            return;
+                        }
+                        Item::Workspace(name) => {
+                            let name = name.clone();
+                            self.apply_workspace(&name, window, cx);
                             self.close_panel(window, cx);
                             return;
                         }
@@ -820,6 +905,27 @@ impl DragonGlassApp {
                                     return;
                                 }
                                 CommandId::Plugin(index) => self.run_plugin_command(index, cx),
+                                CommandId::SaveWorkspace => {
+                                    panel.mode = SwitcherMode::WorkspaceName;
+                                    panel.query.clear();
+                                    panel.property_key = None;
+                                    panel.results.clear();
+                                    panel.selected = 0;
+                                    self.switcher = Some(panel);
+                                    cx.notify();
+                                    return;
+                                }
+                                CommandId::LoadWorkspace => {
+                                    panel.mode = SwitcherMode::WorkspaceMenu;
+                                    panel.query.clear();
+                                    panel.property_key = None;
+                                    panel.results =
+                                        self.compute_results(SwitcherMode::WorkspaceMenu, "");
+                                    panel.selected = 0;
+                                    self.switcher = Some(panel);
+                                    cx.notify();
+                                    return;
+                                }
                                 _ => {}
                             }
                             self.close_panel(window, cx);
@@ -917,6 +1023,20 @@ fn query_view(rows: &[query::Row], theme: Theme) -> AnyElement {
         )
         .children(items)
         .into_any_element()
+}
+
+fn describe_workspace(workspace: &workspace::Workspace) -> String {
+    let mut parts = Vec::new();
+    if workspace.graph {
+        parts.push("graph");
+    }
+    if workspace.reading {
+        parts.push("reading");
+    }
+    if let Some(note) = &workspace.note {
+        parts.push(note);
+    }
+    parts.join(" · ")
 }
 
 fn git_item(label: &str, detail: &str, action: GitAction) -> SwitcherItem {
@@ -1184,6 +1304,8 @@ impl Render for DragonGlassApp {
                 SwitcherMode::PropertyInput => "value:",
                 SwitcherMode::CommandsMenu => "command:",
                 SwitcherMode::QueryInput => "query:",
+                SwitcherMode::WorkspaceName => "workspace name:",
+                SwitcherMode::WorkspaceMenu => "workspace:",
             };
             let rows = panel.results.iter().enumerate().map(|(i, item)| {
                 let mut row = div()
@@ -1311,6 +1433,7 @@ fn main() {
     let initial_graph = graph::build(&note_refs);
     let initial_config = config::load(&vault_root);
     let initial_plugins = plugins::discover(&vault_root);
+    let initial_workspaces = workspace::load(&vault_root);
     let initial_plugin_commands: Vec<(usize, String, String)> = initial_plugins
         .iter()
         .enumerate()
@@ -1419,6 +1542,7 @@ fn main() {
             show_query: false,
             plugins: initial_plugins,
             plugin_commands: initial_plugin_commands,
+            workspaces: initial_workspaces,
             config: initial_config,
         });
 

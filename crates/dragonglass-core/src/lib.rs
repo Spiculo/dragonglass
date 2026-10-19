@@ -24,6 +24,7 @@ pub mod tree;
 pub mod update;
 pub mod vault;
 pub mod wikilink;
+pub mod workspace;
 pub mod wrap;
 
 pub use buffer::Buffer;
