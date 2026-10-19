@@ -260,6 +260,10 @@ with filters/depth/folder grouping, external-change handling and the update prom
   the local store covers installation from a directory. A network store would contradict that.
 - **End-to-end-encrypted sync.** Listed conditionally ("if pursued") and not pursued; git sync
   covers the sync requirement.
+- **Packaging.** `register-uri`/`unregister-uri` install the `dragonglass://` handler on
+  Windows (HKCU) and Linux (desktop file + `xdg-mime`), and a release profile is defined. What
+  is missing is distributable installers (MSI/winget, AppImage/deb) and, on Windows, an icon
+  and version resource.
 - **Mobile.** Explicitly deferred by the locked decisions.
 - **Full LaTeX layout.** Math is transliterated to Unicode (commands, scripts, fractions,
   roots, blackboard letters) rather than typeset on a baseline grid; a native TeX layout
