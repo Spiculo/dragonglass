@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use anyhow::{bail, Context, Result};
-use dragonglass_core::{git, Note, NoteRef, Vault};
+use dragonglass_core::{git, history, Note, NoteRef, Vault};
 
 fn main() -> ExitCode {
     match run() {
@@ -40,6 +40,7 @@ fn run() -> Result<()> {
         Some("git-commit") => return git_commit(args.collect()),
         Some("git-pull") => return git_pull(args.next()),
         Some("git-push") => return git_push(args.next()),
+        Some("history") => return history_cmd(args.collect()),
         _ => {}
     }
 
@@ -180,6 +181,30 @@ fn git_push(path: Option<String>) -> Result<()> {
     Ok(())
 }
 
+fn history_cmd(args: Vec<String>) -> Result<()> {
+    if args.len() < 2 {
+        bail!("usage: dragon-glass history <vault> <note-relative-path> [snapshot-id]");
+    }
+
+    let root = PathBuf::from(&args[0]);
+    let note = args[1].clone();
+
+    if let Some(id) = args.get(2) {
+        print!("{}", history::read(&root, &note, id)?);
+        return Ok(());
+    }
+
+    let ids = history::list(&root, &note);
+    if ids.is_empty() {
+        println!("no snapshots for {note}");
+        return Ok(());
+    }
+    for id in ids {
+        println!("{id}");
+    }
+    Ok(())
+}
+
 fn report_outcome(outcome: git::Outcome) {
     match outcome {
         git::Outcome::UpToDate => println!("already up to date"),
@@ -199,7 +224,9 @@ fn print_help() {
            dragon-glass git-status  [vault]           show git status\n  \
            dragon-glass git-commit  [vault] <message> stage everything and commit\n  \
            dragon-glass git-pull    [vault]           fast-forward from the remote\n  \
-           dragon-glass git-push    [vault]           push to the remote\n\n\
+           dragon-glass git-push    [vault]           push to the remote\n  \
+           dragon-glass history     <vault> <note>    list snapshots for a note\n  \
+           dragon-glass history     <vault> <note> <id>  print a snapshot\n\n\
          vault defaults to the current directory."
     );
 }

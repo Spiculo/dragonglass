@@ -10,7 +10,7 @@ use std::ops::Range;
 use std::path::{Path, PathBuf};
 
 use dragonglass_core::frontmatter::{self, Property};
-use dragonglass_core::{storage, Buffer};
+use dragonglass_core::{history, storage, Buffer};
 use gpui::{
     actions, div, fill, point, prelude::*, px, relative, size, AnyElement, App, Bounds,
     ClipboardItem, Context, CursorStyle, ElementId, ElementInputHandler, Entity,
@@ -133,7 +133,22 @@ impl Editor {
         let Some(path) = self.path.clone() else {
             return Ok(());
         };
-        storage::write_atomic(&path, &self.buffer.text())?;
+
+        let new_content = self.buffer.text();
+
+        // Keep a snapshot of whatever is about to be overwritten.
+        if let (Some(root), Ok(existing)) =
+            (self.vault_root.as_ref(), std::fs::read_to_string(&path))
+        {
+            if existing != new_content {
+                if let Ok(relative) = path.strip_prefix(root) {
+                    let relative = relative.to_string_lossy().replace('\\', "/");
+                    let _ = history::record(root, &relative, &existing);
+                }
+            }
+        }
+
+        storage::write_atomic(&path, &new_content)?;
         self.buffer.mark_saved();
         Ok(())
     }

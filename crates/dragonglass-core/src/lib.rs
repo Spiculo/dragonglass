@@ -7,6 +7,7 @@ pub mod bookmarks;
 pub mod buffer;
 pub mod frontmatter;
 pub mod git;
+pub mod history;
 pub mod markdown;
 pub mod note;
 pub mod search;
