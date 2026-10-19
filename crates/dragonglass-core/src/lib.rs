@@ -15,6 +15,7 @@ pub mod history;
 pub mod html;
 pub mod import;
 pub mod markdown;
+pub mod mcp;
 pub mod note;
 pub mod query;
 pub mod search;

@@ -15,7 +15,7 @@ use std::process::ExitCode;
 
 use anyhow::{anyhow, bail, Context, Result};
 use dragonglass_core::{
-    api, git, graph, history, html, import, query, storage, update, uri, Note, NoteRef, Vault,
+    api, git, graph, history, html, import, mcp, query, storage, update, uri, Note, NoteRef, Vault,
 };
 use dragonglass_plugins as plugins;
 
@@ -53,6 +53,7 @@ fn run() -> Result<()> {
         Some("run") => return run_plugin(args.collect()),
         Some("uri") => return uri_cmd(args.collect()),
         Some("import") => return import_cmd(args.collect()),
+        Some("mcp") => return mcp_cmd(args.collect()),
         _ => {}
     }
 
@@ -191,6 +192,11 @@ fn git_pull(path: Option<String>) -> Result<()> {
 fn git_push(path: Option<String>) -> Result<()> {
     report_outcome(git::push(&vault_arg(path))?);
     Ok(())
+}
+
+fn mcp_cmd(args: Vec<String>) -> Result<()> {
+    let root = vault_arg(args.first().cloned());
+    mcp::serve(&root).map_err(Into::into)
 }
 
 fn import_cmd(args: Vec<String>) -> Result<()> {
@@ -516,7 +522,8 @@ fn print_help() {
            dragon-glass plugins     [vault]            list installed plugins\n  \
            dragon-glass run         <vault> <plugin> <command> [note]  run a plugin command\n  \
            dragon-glass uri         <dragonglass://...>  resolve a URI\n  \
-           dragon-glass import      <vault> <enex|roam> <file> [folder]  import notes\n\n\
+           dragon-glass import      <vault> <enex|roam> <file> [folder]  import notes\n  \
+           dragon-glass mcp         [vault]            MCP server over stdio (read-only)\n\n\
          vault defaults to the current directory."
     );
 }
