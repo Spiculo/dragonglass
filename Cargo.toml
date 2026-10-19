@@ -21,6 +21,12 @@ license = "GPL-3.0-or-later"
 rust-version = "1.85"
 publish = false
 
+# Shipping profile: no debug info, one codegen unit for a smaller, faster binary.
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
+
 [workspace.dependencies]
 dragonglass-core = { path = "crates/dragonglass-core" }
 dragonglass-plugins = { path = "crates/dragonglass-plugins" }

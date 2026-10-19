@@ -58,6 +58,8 @@ fn run() -> Result<()> {
         Some("store") => return store_cmd(args.collect()),
         Some("install") => return install_cmd(args.collect()),
         Some("pdf") => return pdf_cmd(args.collect()),
+        Some("register-uri") => return register_uri(args.collect(), false),
+        Some("unregister-uri") => return register_uri(args.collect(), true),
         _ => {}
     }
 
@@ -196,6 +198,182 @@ fn git_pull(path: Option<String>) -> Result<()> {
 fn git_push(path: Option<String>) -> Result<()> {
     report_outcome(git::push(&vault_arg(path))?);
     Ok(())
+}
+
+/// One filesystem or process change needed to register the URI scheme.
+///
+/// `WriteFile`/`RemoveFile` are only used on Linux, hence the dead-code allowance.
+#[allow(dead_code)]
+enum Step {
+    Run(Vec<String>),
+    WriteFile(PathBuf, String),
+    RemoveFile(PathBuf),
+}
+
+impl Step {
+    fn describe(&self) -> String {
+        match self {
+            Step::Run(parts) => parts.join(" "),
+            Step::WriteFile(path, _) => format!("write {}", display_path(path)),
+            Step::RemoveFile(path) => format!("delete {}", display_path(path)),
+        }
+    }
+
+    fn apply(&self) -> Result<()> {
+        match self {
+            Step::Run(parts) => {
+                let (program, arguments) = parts
+                    .split_first()
+                    .ok_or_else(|| anyhow!("empty command"))?;
+                let status = std::process::Command::new(program)
+                    .args(arguments)
+                    .status()?;
+                if !status.success() {
+                    bail!("command failed: {}", parts.join(" "));
+                }
+            }
+            Step::WriteFile(path, contents) => {
+                if let Some(parent) = path.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                std::fs::write(path, contents)?;
+            }
+            Step::RemoveFile(path) => {
+                if path.exists() {
+                    std::fs::remove_file(path)?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Register (or unregister) the `dragonglass://` handler. Dry run unless `--apply`.
+fn register_uri(args: Vec<String>, unregister: bool) -> Result<()> {
+    let apply = args.iter().any(|argument| argument == "--apply");
+    let explicit = args
+        .iter()
+        .find(|argument| !argument.starts_with("--"))
+        .cloned();
+
+    let exe = match explicit {
+        Some(path) => path,
+        None => std::env::current_exe()
+            .map(|path| path.to_string_lossy().to_string())
+            .map_err(|_| anyhow!("cannot determine the executable path; pass it as an argument"))?,
+    };
+
+    let steps = if unregister {
+        unregister_plan()
+    } else {
+        register_plan(&exe)
+    };
+
+    if steps.is_empty() {
+        println!("URI registration is not implemented on this platform");
+        return Ok(());
+    }
+
+    for step in &steps {
+        println!("{}", step.describe());
+    }
+
+    if apply {
+        for step in &steps {
+            step.apply()?;
+        }
+        println!("applied {} step(s)", steps.len());
+    } else {
+        println!("(dry run; pass --apply to make these changes)");
+    }
+
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn register_plan(exe: &str) -> Vec<Step> {
+    let key = r"HKCU\Software\Classes\dragonglass";
+    vec![
+        Step::Run(vec![
+            "reg".into(),
+            "add".into(),
+            key.into(),
+            "/ve".into(),
+            "/d".into(),
+            "URL:Dragon Glass protocol".into(),
+            "/f".into(),
+        ]),
+        Step::Run(vec![
+            "reg".into(),
+            "add".into(),
+            key.into(),
+            "/v".into(),
+            "URL Protocol".into(),
+            "/d".into(),
+            String::new(),
+            "/f".into(),
+        ]),
+        Step::Run(vec![
+            "reg".into(),
+            "add".into(),
+            format!("{key}\\shell\\open\\command"),
+            "/ve".into(),
+            "/d".into(),
+            format!("\"{exe}\" \"%1\""),
+            "/f".into(),
+        ]),
+    ]
+}
+
+#[cfg(target_os = "windows")]
+fn unregister_plan() -> Vec<Step> {
+    vec![Step::Run(vec![
+        "reg".into(),
+        "delete".into(),
+        r"HKCU\Software\Classes\dragonglass".into(),
+        "/f".into(),
+    ])]
+}
+
+#[cfg(target_os = "linux")]
+fn desktop_file_path() -> PathBuf {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+    home.join(".local/share/applications/dragon-glass.desktop")
+}
+
+#[cfg(target_os = "linux")]
+fn register_plan(exe: &str) -> Vec<Step> {
+    let contents = format!(
+        "[Desktop Entry]\nType=Application\nName=Dragon Glass\nExec={exe} %u\n\
+         Terminal=false\nMimeType=x-scheme-handler/dragonglass;\nNoDisplay=true\n"
+    );
+
+    vec![
+        Step::WriteFile(desktop_file_path(), contents),
+        Step::Run(vec![
+            "xdg-mime".into(),
+            "default".into(),
+            "dragon-glass.desktop".into(),
+            "x-scheme-handler/dragonglass".into(),
+        ]),
+    ]
+}
+
+#[cfg(target_os = "linux")]
+fn unregister_plan() -> Vec<Step> {
+    vec![Step::RemoveFile(desktop_file_path())]
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "linux")))]
+fn register_plan(_exe: &str) -> Vec<Step> {
+    Vec::new()
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "linux")))]
+fn unregister_plan() -> Vec<Step> {
+    Vec::new()
 }
 
 fn pdf_cmd(args: Vec<String>) -> Result<()> {
@@ -615,7 +793,9 @@ fn print_help() {
            dragon-glass mcp         [vault]            MCP server over stdio (read-only)\n  \
            dragon-glass store       <store-dir> [query]  list installable packages\n  \
            dragon-glass install     <vault> <store-dir> <id>  install a package\n  \
-           dragon-glass pdf         <vault> <note> <out.pdf>  print a note to PDF\n\n\
+           dragon-glass pdf         <vault> <note> <out.pdf>  print a note to PDF\n  \
+           dragon-glass register-uri [exe] [--apply]   register the dragonglass scheme\n  \
+           dragon-glass unregister-uri [--apply]       remove the scheme registration\n\n\
          vault defaults to the current directory."
     );
 }
