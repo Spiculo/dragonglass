@@ -261,8 +261,9 @@ with filters/depth/folder grouping, external-change handling and the update prom
 - **End-to-end-encrypted sync.** Listed conditionally ("if pursued") and not pursued; git sync
   covers the sync requirement.
 - **Mobile.** Explicitly deferred by the locked decisions.
-- **Math typesetting.** `$…$` and `$$…$$` are shown as text. KaTeX is a JavaScript library and
-  has no native equivalent; a native typesetter is a project of its own.
+- **Full LaTeX layout.** Math is transliterated to Unicode (commands, scripts, fractions,
+  roots, blackboard letters) rather than typeset on a baseline grid; a native TeX layout
+  engine is a project of its own.
 - **Mermaid diagrams.** Out of scope per the locked decisions.
 - **Horizontal scroll.** Moot now that the editor wraps.
 
@@ -279,8 +280,8 @@ markdown, which drops straight into a vault).
 ### Phase 1 remainder
 
 Word wrap landed (the editor wraps at spaces, and caret/selection/mouse/vertical movement
-follow visual rows). Comments, callouts and `==highlights==` are parsed; callouts and
-highlights render in the app and in exported HTML. A live preview pane renders the reading
-view beside the editor. Open: math typesetting (see §11) and horizontal scroll (moot).
+follow visual rows). Comments, callouts, `==highlights==` and `$math$` are parsed; callouts,
+highlights and math render in the app and in exported HTML. A live preview pane renders the
+reading view beside the editor. Open: full LaTeX layout (see §11) and horizontal scroll (moot).
 
 **Phase 5 — not started.** macOS cross-compile, signing/notarization, platform polish.
