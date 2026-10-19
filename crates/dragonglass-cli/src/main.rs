@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use anyhow::{bail, Context, Result};
-use dragonglass_core::{git, history, html, storage, Note, NoteRef, Vault};
+use dragonglass_core::{git, history, html, query, storage, Note, NoteRef, Vault};
 
 fn main() -> ExitCode {
     match run() {
@@ -42,6 +42,7 @@ fn run() -> Result<()> {
         Some("git-push") => return git_push(args.next()),
         Some("history") => return history_cmd(args.collect()),
         Some("export") => return export(args.collect()),
+        Some("query") => return query_cmd(args.collect()),
         _ => {}
     }
 
@@ -182,6 +183,35 @@ fn git_push(path: Option<String>) -> Result<()> {
     Ok(())
 }
 
+fn query_cmd(args: Vec<String>) -> Result<()> {
+    if args.len() < 2 {
+        bail!("usage: dragon-glass query <vault> \"<query>\"");
+    }
+
+    let root = PathBuf::from(&args[0]);
+    let expression = args[1..].join(" ");
+    let vault =
+        Vault::open(&root).with_context(|| format!("opening vault {}", display_path(&root)))?;
+    let rows = query::run(&vault.notes(), &expression);
+
+    if rows.is_empty() {
+        println!("no matches");
+        return Ok(());
+    }
+
+    println!("{:<40} properties", "note");
+    for row in rows {
+        let properties = row
+            .values
+            .iter()
+            .map(|(key, value)| format!("{key}={value}"))
+            .collect::<Vec<_>>()
+            .join("  ");
+        println!("{:<40} {}", row.relative, properties);
+    }
+    Ok(())
+}
+
 fn export(args: Vec<String>) -> Result<()> {
     if args.len() < 2 {
         bail!("usage: dragon-glass export <vault> <out-dir>");
@@ -268,7 +298,8 @@ fn print_help() {
            dragon-glass git-push    [vault]           push to the remote\n  \
            dragon-glass history     <vault> <note>    list snapshots for a note\n  \
            dragon-glass history     <vault> <note> <id>  print a snapshot\n  \
-           dragon-glass export      <vault> <out-dir>   render notes to HTML\n\n\
+           dragon-glass export      <vault> <out-dir>   render notes to HTML\n  \
+           dragon-glass query       <vault> \"<query>\"  filter notes by property or tag\n\n\
          vault defaults to the current directory."
     );
 }
