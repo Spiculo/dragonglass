@@ -245,14 +245,16 @@ reading mode, quick switcher, full-text search, tags, wikilinks/backlinks data, 
 daily notes + templates, properties display/edit, git sync, KaTeX/dialect still to expand.
 Remaining: word wrap, horizontal scroll, richer live preview.
 
-**Phase 2 — largely done.** Properties, daily notes, templates, outline, bookmarks,
-command palette, theming (light/dark), embeds and attachments, file-recovery snapshots.
-Remaining: graph view, periodic notes, hotkey editor, external-change conflict handling,
-update-available prompt, snippets, global/local graph filters.
+**Phase 2 — nearly done.** Properties, daily/weekly/monthly notes, templates, outline,
+bookmarks, command palette, theming (light/dark), embeds and attachments, file-recovery
+snapshots, graph view (local, deterministic force layout), external-change conflict
+handling, and the update-available prompt are in. Remaining: hotkey editor, snippets,
+graph filters/grouping, paste/drag image capture into the attachments folder.
 
-**Phase 3 — partly done.** Command palette, CLI/headless mode, static HTML export and
-Bases/DataView-style query views are in. Remaining: WASM plugin API + manifest,
-theme/plugin store, URI scheme, multi-window, workspaces.
+**Phase 3 — mostly done.** Command palette, CLI/headless mode, static HTML export,
+Bases/DataView-style query views (core + in-app table), and the graph view are in.
+Remaining: WASM plugin API + manifest, theme/plugin store, URI scheme, multi-window,
+workspaces (layout presets).
 
 **Phase 4 — partly done.** Static HTML export and a read-only local HTTP API
 (`/health`, `/notes`, `/search`, `/query`, `/note`) are in. Remaining: importers
