@@ -45,11 +45,11 @@ publish/export, **Mermaid diagrams**.
 |---|---|---|
 | Core engine | **Rust** — `dragonglass-core` (headless) | vault/FS, parser, index, link graph, search; testable without UI |
 | Text buffer | **rope** (`ropey`) + own undo/cursor | the editor's spine; unit-tested headless |
-| Parsing | `tree-sitter` + `tree-sitter-md`; `comrak` as reference | incremental, folding, syntax highlighting |
-| Search index | `tantivy` | full-text + operators; rebuildable cache |
+| Parsing | own line tokenizer (`syntax`) | one token kind per character, for syntax highlighting |
+| Search index | on-demand scan (`search`) | no index to build or keep fresh, which is what keeps idle CPU at zero |
 | FS watch | `notify` | external-change reconciliation |
 | UI | **GPUI** (Zed's framework, Apache-2.0) | GPU-rendered, truly native, single codebase |
-| Editor | **Own, on GPUI** | rope buffer + cosmic-text shaping + tree-sitter; port Zed's (GPL) editor code where useful |
+| Editor | **Own, on GPUI** | rope buffer + GPUI text shaping + own tokenizer; port Zed's (GPL) editor code where useful |
 | Math | **KaTeX** | `$` / `$$`, native host bridge |
 | Git | the user's `git` binary | init/status/commit/pull/push; reuses their credentials and SSH config; conflicts surfaced as terminal instructions |
 | Plugins | `wasmtime` (WASM sandbox) | sandboxed, language-agnostic — **post-v1** |
