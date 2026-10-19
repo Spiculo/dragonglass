@@ -12,7 +12,8 @@ use std::path::{Path, PathBuf};
 
 use dragonglass_core::frontmatter::{Property, PropertyValue};
 use dragonglass_core::{
-    bookmarks, git, markdown, search, storage, templates, NodeKind, Note, NoteRef, TreeNode, Vault,
+    bookmarks, conflict, git, markdown, search, storage, templates, NodeKind, Note, NoteRef,
+    TreeNode, Vault,
 };
 use editor::Editor;
 use gpui::{
@@ -100,6 +101,8 @@ struct DragonGlassApp {
     properties: Vec<Property>,
     bookmarks: Vec<String>,
     theme: Theme,
+    conflict: bool,
+    watcher: Option<notify::RecommendedWatcher>,
     active: Option<String>,
     vault_path: String,
     notes: usize,
@@ -124,8 +127,57 @@ impl DragonGlassApp {
             }
         });
         self.active = Some(relative.to_string());
+        self.conflict = false;
         self.refresh_properties(cx);
         cx.notify();
+    }
+
+    /// React to a note changing on disk while it is open.
+    fn on_external_change(&mut self, changed: &str, cx: &mut Context<Self>) {
+        let Some(active) = self.active.clone() else {
+            return;
+        };
+        let active_path = self.vault_root.join(&active);
+
+        let same_file = match (
+            active_path.canonicalize(),
+            Path::new(changed).canonicalize(),
+        ) {
+            (Ok(a), Ok(b)) => a == b,
+            _ => active_path.to_string_lossy() == changed,
+        };
+        if !same_file {
+            return;
+        }
+
+        eprintln!("[dragon-glass] external change to open note: {changed}");
+
+        let Ok(disk) = std::fs::read_to_string(&active_path) else {
+            return;
+        };
+        let (buffer, dirty) = {
+            let editor = self.editor.read(cx);
+            (editor.text(), editor.is_dirty())
+        };
+
+        match conflict::classify(&buffer, dirty, &disk) {
+            conflict::Resolution::Ignore => {}
+            conflict::Resolution::Reload => {
+                self.editor.update(cx, |editor, cx| {
+                    let _ = editor.reload();
+                    cx.notify();
+                });
+                self.conflict = false;
+                self.status_message = Some("reloaded from disk (changed externally)".to_string());
+                cx.notify();
+            }
+            conflict::Resolution::Conflict => {
+                self.conflict = true;
+                self.status_message =
+                    Some("changed on disk — saving will overwrite the file".to_string());
+                cx.notify();
+            }
+        }
     }
 
     fn refresh_git(&mut self) {
@@ -703,6 +755,12 @@ fn git_label(status: &Option<git::Status>) -> String {
 impl Render for DragonGlassApp {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = *cx.global::<Theme>();
+
+        // A conflict is resolved once the editor is clean again (saved or reloaded).
+        if self.conflict && !self.editor.read(cx).is_dirty() {
+            self.conflict = false;
+        }
+
         let mut rows = Vec::new();
         flatten(&self.tree, 0, &mut rows);
         let me = cx.entity();
@@ -925,6 +983,9 @@ impl Render for DragonGlassApp {
                     .child(self.vault_path.clone())
                     .child(git_label(&self.git_status))
                     .child(format!("{} notes / {} links", self.notes, self.links))
+                    .when(self.conflict, |d| {
+                        d.child(div().text_color(theme.warn).child("changed on disk"))
+                    })
                     .child(
                         div()
                             .text_color(theme.muted)
@@ -1025,28 +1086,70 @@ fn main() {
             ..Default::default()
         };
 
-        let editor_for_window = editor.clone();
-        let window = cx
-            .open_window(options, move |_window, cx| {
-                cx.new(|cx| DragonGlassApp {
-                    editor: editor_for_window.clone(),
-                    vault_root: vault_root.clone(),
-                    tree: tree.clone(),
-                    note_refs: note_refs.clone(),
-                    properties: initial_properties,
-                    bookmarks: initial_bookmarks,
-                    theme: initial_theme,
-                    active: first_rel.clone(),
-                    vault_path: display_path.clone(),
-                    notes: note_count,
-                    links: link_count,
-                    git_status: initial_git.clone(),
-                    status_message: None,
-                    switcher: None,
-                    switcher_focus: cx.focus_handle(),
-                    focus_handle: cx.focus_handle(),
-                })
+        let app_view = cx.new(|cx| DragonGlassApp {
+            editor: editor.clone(),
+            vault_root: vault_root.clone(),
+            tree: tree.clone(),
+            note_refs: note_refs.clone(),
+            properties: initial_properties,
+            bookmarks: initial_bookmarks,
+            theme: initial_theme,
+            active: first_rel.clone(),
+            vault_path: display_path.clone(),
+            notes: note_count,
+            links: link_count,
+            git_status: initial_git.clone(),
+            status_message: None,
+            switcher: None,
+            switcher_focus: cx.focus_handle(),
+            focus_handle: cx.focus_handle(),
+            conflict: false,
+            watcher: None,
+        });
+
+        // Watch the vault so external edits to the open note are noticed. This is
+        // event-driven: the watcher thread blocks, so idle CPU stays at zero.
+        let (change_tx, change_rx) = smol::channel::unbounded::<String>();
+        let watcher =
+            match notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
+                if let Ok(event) = event {
+                    for path in event.paths {
+                        if path
+                            .extension()
+                            .map(|e| e.eq_ignore_ascii_case("md"))
+                            .unwrap_or(false)
+                        {
+                            let _ = change_tx.send_blocking(path.to_string_lossy().to_string());
+                        }
+                    }
+                }
+            }) {
+                Ok(mut watcher) => {
+                    use notify::Watcher as _;
+                    let _ = watcher.watch(&vault_root, notify::RecursiveMode::Recursive);
+                    Some(watcher)
+                }
+                Err(_) => None,
+            };
+
+        app_view.update(cx, |this, cx| {
+            this.watcher = watcher;
+            cx.spawn(async move |this, cx| {
+                while let Ok(changed) = change_rx.recv().await {
+                    let alive = this
+                        .update(cx, |app, cx| app.on_external_change(&changed, cx))
+                        .is_ok();
+                    if !alive {
+                        break;
+                    }
+                }
             })
+            .detach();
+        });
+
+        let view_for_window = app_view.clone();
+        let window = cx
+            .open_window(options, move |_window, _cx| view_for_window.clone())
             .expect("failed to open window");
 
         let _ = window.update(cx, |view, window, cx| {

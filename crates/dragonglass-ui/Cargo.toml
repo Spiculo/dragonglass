@@ -16,3 +16,5 @@ dragonglass-core.workspace = true
 anyhow.workspace = true
 chrono = "0.4"
 gpui = "0.2.2"
+notify = "8.2"
+smol = "2"

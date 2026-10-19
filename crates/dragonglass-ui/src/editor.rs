@@ -157,6 +157,19 @@ impl Editor {
         self.buffer.is_dirty()
     }
 
+    /// Re-read the note from disk, discarding in-memory edits.
+    pub fn reload(&mut self) -> std::io::Result<()> {
+        let Some(path) = self.path.clone() else {
+            return Ok(());
+        };
+        let text = std::fs::read_to_string(&path)?;
+        self.buffer = Buffer::from_text(&text);
+        self.buffer.mark_saved();
+        self.anchor = None;
+        self.marked_range = None;
+        Ok(())
+    }
+
     /// Toggle between edit and reading mode (used by the command palette).
     pub fn toggle_reading_mode(&mut self) {
         self.reading = !self.reading;
