@@ -1839,6 +1839,10 @@ fn main() {
         if let Some(path) = &first_path {
             editor.update(cx, |editor, _cx| {
                 let _ = editor.load(path);
+                // Handy for screenshots and for exercising the reading view.
+                if std::env::var("DRAGON_GLASS_READING").is_ok() {
+                    editor.set_reading_mode(true);
+                }
             });
         }
         let initial_properties = editor.read(cx).properties();

@@ -526,8 +526,19 @@ impl Focusable for Editor {
 }
 
 impl Render for Editor {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = *cx.global::<Theme>();
+
+        // Text style for rich runs (highlights) in reading mode.
+        let style = window.text_style();
+        let run_template = TextRun {
+            len: 0,
+            font: style.font(),
+            color: style.color,
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        };
 
         let title = self
             .path
@@ -575,6 +586,7 @@ impl Render for Editor {
                     self.vault_root.as_deref(),
                     0,
                     theme,
+                    &run_template,
                 ))
                 .into_any_element()
         } else {

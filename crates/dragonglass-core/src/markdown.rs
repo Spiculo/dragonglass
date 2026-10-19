@@ -572,6 +572,27 @@ mod tests {
     }
 
     #[test]
+    fn highlight_runs_reconstruct_the_text() {
+        // GPUI's StyledText::with_runs asserts the run lengths rebuild the rendered text,
+        // which is the input with the `==` delimiters removed.
+        for sample in [
+            "",
+            "plain",
+            "==all==",
+            "a ==b== c",
+            "==a== and ==b==",
+            "un==closed",
+            "===",
+        ] {
+            let rebuilt: String = split_highlights(sample)
+                .into_iter()
+                .map(|(segment, _)| segment)
+                .collect();
+            assert_eq!(rebuilt, sample.replace("==", ""), "sample: {sample:?}");
+        }
+    }
+
+    #[test]
     fn highlights_split_into_runs() {
         assert_eq!(
             split_highlights("a ==b== c"),

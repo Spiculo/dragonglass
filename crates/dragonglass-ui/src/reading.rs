@@ -1,10 +1,13 @@
 //! Reading mode: render parsed markdown blocks as styled GPUI elements, including
 //! embedded images and transcluded notes.
+//!
+//! Paragraph and list text goes through `StyledText` when it contains `==highlights==`, so
+//! highlighted spans get a background while the text still wraps normally.
 
 use std::path::{Path, PathBuf};
 
 use dragonglass_core::markdown::{self, Block};
-use gpui::{div, img, prelude::*, px, relative, AnyElement, IntoElement};
+use gpui::{div, img, prelude::*, px, relative, AnyElement, IntoElement, StyledText, TextRun};
 
 use crate::theme::Theme;
 
@@ -16,8 +19,11 @@ pub fn reading_view(
     vault_root: Option<&Path>,
     depth: usize,
     theme: Theme,
+    template: &TextRun,
 ) -> impl IntoElement {
     let blocks = markdown::parse_blocks(src);
+    let template = template.clone();
+
     div()
         .flex()
         .flex_col()
@@ -27,11 +33,17 @@ pub fn reading_view(
         .children(
             blocks
                 .into_iter()
-                .map(move |block| render_block(block, vault_root, depth, theme)),
+                .map(move |block| render_block(block, vault_root, depth, theme, &template)),
         )
 }
 
-fn render_block(block: Block, vault_root: Option<&Path>, depth: usize, theme: Theme) -> AnyElement {
+fn render_block(
+    block: Block,
+    vault_root: Option<&Path>,
+    depth: usize,
+    theme: Theme,
+    template: &TextRun,
+) -> AnyElement {
     match block {
         Block::Heading { level, text } => {
             let size = match level {
@@ -46,11 +58,7 @@ fn render_block(block: Block, vault_root: Option<&Path>, depth: usize, theme: Th
                 .child(text)
                 .into_any_element()
         }
-        Block::Paragraph(text) => div()
-            .text_size(px(15.0))
-            .line_height(relative(1.5))
-            .child(text.replace('\n', " "))
-            .into_any_element(),
+        Block::Paragraph(text) => rich_text(&text.replace('\n', " "), 15.0, theme, template),
         Block::ListItem {
             depth,
             marker,
@@ -62,7 +70,7 @@ fn render_block(block: Block, vault_root: Option<&Path>, depth: usize, theme: Th
             .gap_2()
             .pl(px(8.0 + depth as f32 * 16.0))
             .child(div().text_color(theme.muted).child(marker))
-            .child(div().text_size(px(15.0)).child(text))
+            .child(rich_text(&text, 15.0, theme, template))
             .into_any_element(),
         Block::Code { text, .. } => div()
             .bg(theme.code_bg)
@@ -107,15 +115,50 @@ fn render_block(block: Block, vault_root: Option<&Path>, depth: usize, theme: Th
                         .child(title),
                 )
                 .when(!text.trim().is_empty(), |d| {
-                    d.child(div().text_size(px(15.0)).child(text.replace('\n', " ")))
+                    d.child(rich_text(&text.replace('\n', " "), 15.0, theme, template))
                 })
                 .into_any_element()
         }
-        Block::Embed { target } => render_embed(&target, vault_root, depth, theme),
+        Block::Embed { target } => render_embed(&target, vault_root, depth, theme, template),
     }
 }
 
-fn render_embed(target: &str, vault_root: Option<&Path>, depth: usize, theme: Theme) -> AnyElement {
+/// Plain text, unless it contains `==highlights==`.
+fn rich_text(text: &str, size: f32, theme: Theme, template: &TextRun) -> AnyElement {
+    let parts = markdown::split_highlights(text);
+    let container = div().text_size(px(size)).line_height(relative(1.5));
+
+    if !parts.iter().any(|(_, highlighted)| *highlighted) {
+        return container.child(text.to_string()).into_any_element();
+    }
+
+    // The `==` delimiters are dropped, so render the rebuilt string.
+    let display: String = parts.iter().map(|(segment, _)| segment.as_str()).collect();
+    let runs: Vec<TextRun> = parts
+        .iter()
+        .filter(|(segment, _)| !segment.is_empty())
+        .map(|(segment, highlighted)| TextRun {
+            len: segment.len(),
+            font: template.font.clone(),
+            color: template.color,
+            background_color: highlighted.then_some(theme.star),
+            underline: None,
+            strikethrough: None,
+        })
+        .collect();
+
+    container
+        .child(StyledText::new(display).with_runs(runs))
+        .into_any_element()
+}
+
+fn render_embed(
+    target: &str,
+    vault_root: Option<&Path>,
+    depth: usize,
+    theme: Theme,
+    template: &TextRun,
+) -> AnyElement {
     let Some(root) = vault_root else {
         return placeholder(target, "no vault root", theme);
     };
@@ -141,7 +184,7 @@ fn render_embed(target: &str, vault_root: Option<&Path>, depth: usize, theme: Th
             .border_l_1()
             .border_color(theme.border)
             .pl_3()
-            .child(reading_view(&text, Some(root), depth + 1, theme))
+            .child(reading_view(&text, Some(root), depth + 1, theme, template))
             .into_any_element(),
         Err(_) => placeholder(target, "note not found", theme),
     }
