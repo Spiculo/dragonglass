@@ -140,6 +140,11 @@ impl Editor {
         self.buffer.is_dirty()
     }
 
+    /// Toggle between edit and reading mode (used by the command palette).
+    pub fn toggle_reading_mode(&mut self) {
+        self.reading = !self.reading;
+    }
+
     /// Tell the editor where the vault lives, for resolving embeds.
     pub fn set_vault_root(&mut self, root: &Path) {
         self.vault_root = Some(root.to_path_buf());

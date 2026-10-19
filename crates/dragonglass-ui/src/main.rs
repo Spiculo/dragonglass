@@ -28,7 +28,8 @@ actions!(
         OpenGit,
         OpenDaily,
         OpenProperties,
-        ToggleBookmark
+        ToggleBookmark,
+        OpenCommands
     ]
 );
 
@@ -40,6 +41,19 @@ enum SwitcherMode {
     CommitInput,
     PropertiesMenu,
     PropertyInput,
+    CommandsMenu,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CommandId {
+    QuickSwitch,
+    Search,
+    Daily,
+    Properties,
+    Bookmark,
+    Git,
+    ToggleReading,
+    Save,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -56,6 +70,7 @@ enum Item {
     Git(GitAction),
     Property { key: Option<String> },
     DeleteProperty { key: String },
+    Command(CommandId),
 }
 
 struct SwitcherItem {
@@ -128,6 +143,10 @@ impl DragonGlassApp {
 
     /// Open (or create) today's daily note, using `Templates/Daily.md` when present.
     fn open_daily(&mut self, _: &OpenDaily, window: &mut Window, cx: &mut Context<Self>) {
+        self.create_daily(window, cx);
+    }
+
+    fn create_daily(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let now = chrono::Local::now();
         let date = now.format("%Y-%m-%d").to_string();
         let time = now.format("%H:%M").to_string();
@@ -243,6 +262,16 @@ impl DragonGlassApp {
                 items
             }
             SwitcherMode::PropertyInput => Vec::new(),
+            SwitcherMode::CommandsMenu => vec![
+                command_item("Quick switcher", "ctrl+o", CommandId::QuickSwitch),
+                command_item("Search", "ctrl+shift+f", CommandId::Search),
+                command_item("Daily note", "ctrl+shift+d", CommandId::Daily),
+                command_item("Properties", "ctrl+shift+p", CommandId::Properties),
+                command_item("Toggle bookmark", "ctrl+shift+b", CommandId::Bookmark),
+                command_item("Git", "ctrl+g", CommandId::Git),
+                command_item("Toggle reading mode", "ctrl+e", CommandId::ToggleReading),
+                command_item("Save", "ctrl+s", CommandId::Save),
+            ],
         }
     }
 
@@ -277,6 +306,10 @@ impl DragonGlassApp {
         self.open_panel(SwitcherMode::GitMenu, window, cx);
     }
 
+    fn open_commands(&mut self, _: &OpenCommands, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_panel(SwitcherMode::CommandsMenu, window, cx);
+    }
+
     fn refresh_properties(&mut self, cx: &mut Context<Self>) {
         self.properties = self.editor.read(cx).properties();
     }
@@ -287,6 +320,10 @@ impl DragonGlassApp {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.toggle_bookmark_now(cx);
+    }
+
+    fn toggle_bookmark_now(&mut self, cx: &mut Context<Self>) {
         let Some(active) = self.active.clone() else {
             return;
         };
@@ -459,6 +496,50 @@ impl DragonGlassApp {
                             self.close_panel(window, cx);
                             return;
                         }
+                        Item::Command(command) => {
+                            let command = *command;
+
+                            let next_mode = match command {
+                                CommandId::QuickSwitch => Some(SwitcherMode::QuickSwitch),
+                                CommandId::Search => Some(SwitcherMode::Search),
+                                CommandId::Git => {
+                                    self.refresh_git();
+                                    Some(SwitcherMode::GitMenu)
+                                }
+                                CommandId::Properties => {
+                                    self.refresh_properties(cx);
+                                    Some(SwitcherMode::PropertiesMenu)
+                                }
+                                _ => None,
+                            };
+
+                            if let Some(mode) = next_mode {
+                                panel.mode = mode;
+                                panel.query.clear();
+                                panel.property_key = None;
+                                panel.results = self.compute_results(mode, "");
+                                panel.selected = 0;
+                                self.switcher = Some(panel);
+                                cx.notify();
+                                return;
+                            }
+
+                            match command {
+                                CommandId::Daily => self.create_daily(window, cx),
+                                CommandId::Bookmark => self.toggle_bookmark_now(cx),
+                                CommandId::ToggleReading => self.editor.update(cx, |editor, cx| {
+                                    editor.toggle_reading_mode();
+                                    cx.notify();
+                                }),
+                                CommandId::Save => self.editor.update(cx, |editor, cx| {
+                                    let _ = editor.save();
+                                    cx.notify();
+                                }),
+                                _ => {}
+                            }
+                            self.close_panel(window, cx);
+                            return;
+                        }
                     }
                 }
                 self.close_panel(window, cx);
@@ -501,6 +582,14 @@ fn git_item(label: &str, detail: &str, action: GitAction) -> SwitcherItem {
         label: label.to_string(),
         detail: detail.to_string(),
         item: Item::Git(action),
+    }
+}
+
+fn command_item(label: &str, hint: &str, command: CommandId) -> SwitcherItem {
+    SwitcherItem {
+        label: label.to_string(),
+        detail: hint.to_string(),
+        item: Item::Command(command),
     }
 }
 
@@ -731,6 +820,7 @@ impl Render for DragonGlassApp {
                 SwitcherMode::CommitInput => "commit:",
                 SwitcherMode::PropertiesMenu => "properties:",
                 SwitcherMode::PropertyInput => "value:",
+                SwitcherMode::CommandsMenu => "command:",
             };
             let rows = panel.results.iter().enumerate().map(|(i, item)| {
                 let mut row = div()
@@ -782,6 +872,7 @@ impl Render for DragonGlassApp {
             .on_action(cx.listener(Self::open_daily))
             .on_action(cx.listener(Self::open_properties))
             .on_action(cx.listener(Self::toggle_bookmark))
+            .on_action(cx.listener(Self::open_commands))
             .child(
                 div()
                     .flex()
@@ -868,6 +959,8 @@ fn main() {
             KeyBinding::new("cmd-shift-p", OpenProperties, None),
             KeyBinding::new("ctrl-shift-b", ToggleBookmark, None),
             KeyBinding::new("cmd-shift-b", ToggleBookmark, None),
+            KeyBinding::new("ctrl-p", OpenCommands, None),
+            KeyBinding::new("cmd-p", OpenCommands, None),
         ]);
 
         let editor = cx.new(Editor::new);
