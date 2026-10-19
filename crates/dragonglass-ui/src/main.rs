@@ -12,8 +12,8 @@ use std::path::{Path, PathBuf};
 
 use dragonglass_core::frontmatter::{Property, PropertyValue};
 use dragonglass_core::{
-    bookmarks, conflict, git, markdown, search, storage, templates, NodeKind, Note, NoteRef,
-    TreeNode, Vault,
+    bookmarks, conflict, git, markdown, search, storage, templates, update, NodeKind, Note,
+    NoteRef, TreeNode, Vault,
 };
 use editor::Editor;
 use gpui::{
@@ -59,6 +59,7 @@ enum CommandId {
     ToggleReading,
     Save,
     ToggleTheme,
+    CheckUpdates,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -103,6 +104,8 @@ struct DragonGlassApp {
     theme: Theme,
     conflict: bool,
     watcher: Option<notify::RecommendedWatcher>,
+    update_source: Option<String>,
+    update_available: Option<String>,
     active: Option<String>,
     vault_path: String,
     notes: usize,
@@ -329,6 +332,7 @@ impl DragonGlassApp {
                 command_item("Toggle reading mode", "ctrl+e", CommandId::ToggleReading),
                 command_item("Save", "ctrl+s", CommandId::Save),
                 command_item("Toggle theme", "ctrl+shift+l", CommandId::ToggleTheme),
+                command_item("Check for updates", "", CommandId::CheckUpdates),
             ],
         }
     }
@@ -371,6 +375,23 @@ impl DragonGlassApp {
     fn toggle_theme(&mut self, _: &ToggleTheme, window: &mut Window, cx: &mut Context<Self>) {
         self.toggle_theme_now(cx);
         let _ = window;
+    }
+
+    fn check_updates(&mut self) {
+        self.status_message = Some(match &self.update_source {
+            None => "update checks are not configured (set DRAGON_GLASS_UPDATE_URL)".to_string(),
+            Some(source) => match update::latest_if_newer(env!("CARGO_PKG_VERSION"), source) {
+                Ok(Some(latest)) => {
+                    self.update_available = Some(latest.clone());
+                    format!("update available: {latest}")
+                }
+                Ok(None) => {
+                    self.update_available = None;
+                    "up to date".to_string()
+                }
+                Err(e) => format!("update check failed: {e}"),
+            },
+        });
     }
 
     fn toggle_theme_now(&mut self, cx: &mut Context<Self>) {
@@ -611,6 +632,7 @@ impl DragonGlassApp {
                                     cx.notify();
                                 }),
                                 CommandId::ToggleTheme => self.toggle_theme_now(cx),
+                                CommandId::CheckUpdates => self.check_updates(),
                                 _ => {}
                             }
                             self.close_panel(window, cx);
@@ -986,6 +1008,13 @@ impl Render for DragonGlassApp {
                     .when(self.conflict, |d| {
                         d.child(div().text_color(theme.warn).child("changed on disk"))
                     })
+                    .when_some(self.update_available.clone(), |d, latest| {
+                        d.child(
+                            div()
+                                .text_color(theme.star)
+                                .child(format!("update available: {latest}")),
+                        )
+                    })
                     .child(
                         div()
                             .text_color(theme.muted)
@@ -1031,6 +1060,12 @@ fn main() {
     let vault_root = vault.root().to_path_buf();
     let initial_bookmarks = bookmarks::load(&vault_root);
     let initial_theme = load_theme(&vault_root);
+    let update_source = std::env::var("DRAGON_GLASS_UPDATE_URL").ok();
+    let update_available = update_source.as_deref().and_then(|source| {
+        update::latest_if_newer(env!("CARGO_PKG_VERSION"), source)
+            .ok()
+            .flatten()
+    });
     let initial_git = if git::is_repo(&vault_root) {
         git::status(&vault_root).ok()
     } else {
@@ -1105,6 +1140,8 @@ fn main() {
             focus_handle: cx.focus_handle(),
             conflict: false,
             watcher: None,
+            update_source,
+            update_available,
         });
 
         // Watch the vault so external edits to the open note are noticed. This is

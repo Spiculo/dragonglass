@@ -19,6 +19,7 @@ pub mod storage;
 pub mod tags;
 pub mod templates;
 pub mod tree;
+pub mod update;
 pub mod vault;
 pub mod wikilink;
 

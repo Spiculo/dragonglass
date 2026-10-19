@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use anyhow::{bail, Context, Result};
-use dragonglass_core::{api, git, history, html, query, storage, Note, NoteRef, Vault};
+use dragonglass_core::{api, git, history, html, query, storage, update, Note, NoteRef, Vault};
 
 fn main() -> ExitCode {
     match run() {
@@ -44,6 +44,7 @@ fn run() -> Result<()> {
         Some("export") => return export(args.collect()),
         Some("query") => return query_cmd(args.collect()),
         Some("serve") => return serve(args.collect()),
+        Some("check-update") => return check_update(args.collect()),
         _ => {}
     }
 
@@ -184,6 +185,23 @@ fn git_push(path: Option<String>) -> Result<()> {
     Ok(())
 }
 
+fn check_update(args: Vec<String>) -> Result<()> {
+    let Some(source) = args.first() else {
+        bail!("usage: dragon-glass check-update <source> [current-version]");
+    };
+
+    let current = args
+        .get(1)
+        .cloned()
+        .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string());
+
+    match update::latest_if_newer(&current, source)? {
+        Some(latest) => println!("update available: {latest} (running {current})"),
+        None => println!("up to date ({current})"),
+    }
+    Ok(())
+}
+
 fn serve(args: Vec<String>) -> Result<()> {
     let root = PathBuf::from(args.first().cloned().unwrap_or_else(|| ".".to_string()));
     let addr = args
@@ -312,7 +330,8 @@ fn print_help() {
            dragon-glass history     <vault> <note> <id>  print a snapshot\n  \
            dragon-glass export      <vault> <out-dir>   render notes to HTML\n  \
            dragon-glass query       <vault> \"<query>\"  filter notes by property or tag\n  \
-           dragon-glass serve       [vault] [addr]     read-only HTTP API (loopback)\n\n\
+           dragon-glass serve       [vault] [addr]     read-only HTTP API (loopback)\n  \
+           dragon-glass check-update <source> [current]  compare against an advertised version\n\n\
          vault defaults to the current directory."
     );
 }
