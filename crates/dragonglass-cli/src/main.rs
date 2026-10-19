@@ -15,8 +15,8 @@ use std::process::ExitCode;
 
 use anyhow::{anyhow, bail, Context, Result};
 use dragonglass_core::{
-    api, git, graph, history, html, import, mcp, query, storage, store, update, uri, Note, NoteRef,
-    Vault,
+    api, git, graph, history, html, import, mcp, pdf, query, storage, store, update, uri, Note,
+    NoteRef, Vault,
 };
 use dragonglass_plugins as plugins;
 
@@ -57,6 +57,7 @@ fn run() -> Result<()> {
         Some("mcp") => return mcp_cmd(args.collect()),
         Some("store") => return store_cmd(args.collect()),
         Some("install") => return install_cmd(args.collect()),
+        Some("pdf") => return pdf_cmd(args.collect()),
         _ => {}
     }
 
@@ -194,6 +195,29 @@ fn git_pull(path: Option<String>) -> Result<()> {
 
 fn git_push(path: Option<String>) -> Result<()> {
     report_outcome(git::push(&vault_arg(path))?);
+    Ok(())
+}
+
+fn pdf_cmd(args: Vec<String>) -> Result<()> {
+    if args.len() < 3 {
+        bail!("usage: dragon-glass pdf <vault> <note-relative-path> <out.pdf>");
+    }
+
+    let root = PathBuf::from(&args[0]);
+    let note = &args[1];
+    let out = PathBuf::from(&args[2]);
+
+    let source =
+        std::fs::read_to_string(root.join(note)).with_context(|| format!("reading note {note}"))?;
+    let title = Path::new(note)
+        .file_stem()
+        .map(|stem| stem.to_string_lossy().to_string())
+        .unwrap_or_default();
+
+    let document = pdf::from_markdown(&source, &title);
+    storage::write_atomic(&out, &document)?;
+
+    println!("wrote {} ({} bytes)", display_path(&out), document.len());
     Ok(())
 }
 
@@ -590,7 +614,8 @@ fn print_help() {
            dragon-glass import      <vault> <enex|roam> <file> [folder]  import notes\n  \
            dragon-glass mcp         [vault]            MCP server over stdio (read-only)\n  \
            dragon-glass store       <store-dir> [query]  list installable packages\n  \
-           dragon-glass install     <vault> <store-dir> <id>  install a package\n\n\
+           dragon-glass install     <vault> <store-dir> <id>  install a package\n  \
+           dragon-glass pdf         <vault> <note> <out.pdf>  print a note to PDF\n\n\
          vault defaults to the current directory."
     );
 }

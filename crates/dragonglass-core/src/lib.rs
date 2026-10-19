@@ -17,6 +17,7 @@ pub mod import;
 pub mod markdown;
 pub mod mcp;
 pub mod note;
+pub mod pdf;
 pub mod query;
 pub mod search;
 pub mod storage;
