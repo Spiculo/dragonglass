@@ -11,7 +11,7 @@ use std::path::PathBuf;
 
 use dragonglass_core::frontmatter::{Property, PropertyValue};
 use dragonglass_core::{
-    git, markdown, search, storage, templates, NodeKind, Note, NoteRef, TreeNode, Vault,
+    bookmarks, git, markdown, search, storage, templates, NodeKind, Note, NoteRef, TreeNode, Vault,
 };
 use editor::Editor;
 use gpui::{
@@ -22,7 +22,14 @@ use gpui::{
 
 actions!(
     app_actions,
-    [OpenSwitcher, OpenSearch, OpenGit, OpenDaily, OpenProperties]
+    [
+        OpenSwitcher,
+        OpenSearch,
+        OpenGit,
+        OpenDaily,
+        OpenProperties,
+        ToggleBookmark
+    ]
 );
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -72,6 +79,7 @@ struct DragonGlassApp {
     tree: TreeNode,
     note_refs: Vec<NoteRef>,
     properties: Vec<Property>,
+    bookmarks: Vec<String>,
     active: Option<String>,
     vault_path: String,
     notes: usize,
@@ -271,6 +279,25 @@ impl DragonGlassApp {
 
     fn refresh_properties(&mut self, cx: &mut Context<Self>) {
         self.properties = self.editor.read(cx).properties();
+    }
+
+    fn toggle_bookmark(
+        &mut self,
+        _: &ToggleBookmark,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(active) = self.active.clone() else {
+            return;
+        };
+
+        let added = bookmarks::toggle(&mut self.bookmarks, &active);
+        self.status_message = Some(match bookmarks::save(&self.vault_root, &self.bookmarks) {
+            Ok(()) if added => format!("bookmarked {active}"),
+            Ok(()) => format!("removed bookmark {active}"),
+            Err(e) => format!("could not save bookmarks: {e}"),
+        });
+        cx.notify();
     }
 
     fn open_properties(&mut self, _: &OpenProperties, window: &mut Window, cx: &mut Context<Self>) {
@@ -554,6 +581,37 @@ impl Render for DragonGlassApp {
         let me = cx.entity();
         let active = self.active.clone();
 
+        let bookmark_rows: Vec<AnyElement> = self
+            .bookmarks
+            .iter()
+            .enumerate()
+            .map(|(i, relative)| {
+                let relative = relative.clone();
+                let me = me.clone();
+                let name = relative
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or(&relative)
+                    .trim_end_matches(".md")
+                    .to_string();
+                div()
+                    .id(ElementId::Name(format!("bookmark-{i}").into()))
+                    .pl(px(16.0))
+                    .pr_2()
+                    .py_1()
+                    .text_sm()
+                    .cursor_pointer()
+                    .text_color(rgb(0xffd479))
+                    .child(format!("\u{2605} {name}"))
+                    .on_mouse_down(MouseButton::Left, move |_ev, _window, cx| {
+                        me.update(cx, |this, cx| {
+                            this.open_note(&relative, cx);
+                        });
+                    })
+                    .into_any_element()
+            })
+            .collect();
+
         let sidebar = div()
             .id("sidebar")
             .w(px(240.0))
@@ -561,6 +619,25 @@ impl Render for DragonGlassApp {
             .overflow_y_scroll()
             .bg(rgb(0x181818))
             .py_2()
+            .when(!bookmark_rows.is_empty(), move |d| {
+                d.child(
+                    div()
+                        .px_2()
+                        .py_1()
+                        .text_xs()
+                        .text_color(rgb(0x6a6a6a))
+                        .child("BOOKMARKS"),
+                )
+                .children(bookmark_rows)
+            })
+            .child(
+                div()
+                    .px_2()
+                    .py_1()
+                    .text_xs()
+                    .text_color(rgb(0x6a6a6a))
+                    .child("FILES"),
+            )
             .children(rows.into_iter().enumerate().map(move |(i, row)| {
                 let indent = px(8.0 + row.depth as f32 * 12.0);
                 let is_active = !row.is_dir && row.path.as_deref() == active.as_deref();
@@ -704,6 +781,7 @@ impl Render for DragonGlassApp {
             .on_action(cx.listener(Self::open_git))
             .on_action(cx.listener(Self::open_daily))
             .on_action(cx.listener(Self::open_properties))
+            .on_action(cx.listener(Self::toggle_bookmark))
             .child(
                 div()
                     .flex()
@@ -760,6 +838,7 @@ fn main() {
 
     let tree = vault.tree();
     let vault_root = vault.root().to_path_buf();
+    let initial_bookmarks = bookmarks::load(&vault_root);
     let initial_git = if git::is_repo(&vault_root) {
         git::status(&vault_root).ok()
     } else {
@@ -787,6 +866,8 @@ fn main() {
             KeyBinding::new("cmd-shift-d", OpenDaily, None),
             KeyBinding::new("ctrl-shift-p", OpenProperties, None),
             KeyBinding::new("cmd-shift-p", OpenProperties, None),
+            KeyBinding::new("ctrl-shift-b", ToggleBookmark, None),
+            KeyBinding::new("cmd-shift-b", ToggleBookmark, None),
         ]);
 
         let editor = cx.new(Editor::new);
@@ -817,6 +898,7 @@ fn main() {
                     tree: tree.clone(),
                     note_refs: note_refs.clone(),
                     properties: initial_properties,
+                    bookmarks: initial_bookmarks,
                     active: first_rel.clone(),
                     vault_path: display_path.clone(),
                     notes: note_count,
