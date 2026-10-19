@@ -27,6 +27,10 @@ pub enum Block {
     },
     Quote(String),
     Rule,
+    /// A standalone `![[target]]` or `![alt](target)` embed.
+    Embed {
+        target: String,
+    },
 }
 
 /// Parse a document (frontmatter is skipped) into display blocks.
@@ -133,9 +137,51 @@ fn flush_paragraph(paragraph: &mut Vec<&str>, blocks: &mut Vec<Block>) {
     if paragraph.is_empty() {
         return;
     }
+
+    if paragraph.len() == 1 {
+        if let Some(target) = standalone_embed(paragraph[0]) {
+            paragraph.clear();
+            blocks.push(Block::Embed { target });
+            return;
+        }
+    }
+
     let text = paragraph.join("\n");
     paragraph.clear();
     blocks.push(Block::Paragraph(text));
+}
+
+/// A line that is nothing but an embed, as Obsidian writes embedded images and notes.
+fn standalone_embed(line: &str) -> Option<String> {
+    let trimmed = line.trim();
+
+    if trimmed.starts_with("![[") && trimmed.ends_with("]]") {
+        let inner = &trimmed[3..trimmed.len() - 2];
+        let target = inner
+            .split('|')
+            .next()
+            .unwrap_or(inner)
+            .split('#')
+            .next()
+            .unwrap_or(inner)
+            .trim();
+        if !target.is_empty() {
+            return Some(target.to_string());
+        }
+    }
+
+    if let Some(rest) = trimmed.strip_prefix("![") {
+        if let Some(end) = rest.find("](") {
+            if let Some(source) = rest[end + 2..].strip_suffix(')') {
+                let source = source.trim();
+                if !source.is_empty() {
+                    return Some(source.to_string());
+                }
+            }
+        }
+    }
+
+    None
 }
 
 fn is_fence(trimmed: &str) -> bool {
@@ -334,6 +380,42 @@ mod tests {
     #[test]
     fn horizontal_rule() {
         assert_eq!(parse_blocks("---\n"), vec![Block::Rule]);
+    }
+
+    #[test]
+    fn standalone_wikilink_embed() {
+        let blocks = parse_blocks("![[image.png]]\n\ntext\n");
+        assert_eq!(
+            blocks,
+            vec![
+                Block::Embed {
+                    target: "image.png".into()
+                },
+                Block::Paragraph("text".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn markdown_image_embed() {
+        let blocks = parse_blocks("![alt](attachments/pic.png)\n");
+        assert_eq!(
+            blocks,
+            vec![Block::Embed {
+                target: "attachments/pic.png".into()
+            }]
+        );
+    }
+
+    #[test]
+    fn embed_with_alias_and_heading() {
+        let blocks = parse_blocks("![[Note#Section|Alias]]\n");
+        assert_eq!(
+            blocks,
+            vec![Block::Embed {
+                target: "Note".into()
+            }]
+        );
     }
 
     #[test]

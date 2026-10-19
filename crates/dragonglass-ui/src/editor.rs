@@ -82,6 +82,8 @@ pub fn init(cx: &mut App) {
 pub struct Editor {
     buffer: Buffer,
     path: Option<PathBuf>,
+    /// Vault root, used to resolve embeds and attachments.
+    vault_root: Option<PathBuf>,
     reading: bool,
     /// Selection anchor. `None` means no selection; the cursor is the active end.
     anchor: Option<usize>,
@@ -99,6 +101,7 @@ impl Editor {
         Self {
             buffer: Buffer::new(),
             path: None,
+            vault_root: None,
             reading: false,
             anchor: None,
             selecting: false,
@@ -135,6 +138,11 @@ impl Editor {
 
     pub fn is_dirty(&self) -> bool {
         self.buffer.is_dirty()
+    }
+
+    /// Tell the editor where the vault lives, for resolving embeds.
+    pub fn set_vault_root(&mut self, root: &Path) {
+        self.vault_root = Some(root.to_path_buf());
     }
 
     /// Parsed frontmatter properties. Empty when absent or unsupported.
@@ -445,7 +453,11 @@ impl Render for Editor {
                 .flex_1()
                 .min_h(px(0.0))
                 .overflow_y_scroll()
-                .child(crate::reading::reading_view(&self.buffer.text()))
+                .child(crate::reading::reading_view(
+                    &self.buffer.text(),
+                    self.vault_root.as_deref(),
+                    0,
+                ))
                 .into_any_element()
         } else {
             div()

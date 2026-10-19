@@ -1,9 +1,15 @@
-//! Reading mode: render parsed markdown blocks as styled GPUI elements.
+//! Reading mode: render parsed markdown blocks as styled GPUI elements, including
+//! embedded images and transcluded notes.
+
+use std::path::{Path, PathBuf};
 
 use dragonglass_core::markdown::{self, Block};
-use gpui::{div, prelude::*, px, relative, rgb, AnyElement, IntoElement};
+use gpui::{div, img, prelude::*, px, relative, rgb, AnyElement, IntoElement};
 
-pub fn reading_view(src: &str) -> impl IntoElement {
+/// Guard against `![[a]]` → `a` → `![[a]]` cycles.
+const MAX_EMBED_DEPTH: usize = 3;
+
+pub fn reading_view(src: &str, vault_root: Option<&Path>, depth: usize) -> impl IntoElement {
     let blocks = markdown::parse_blocks(src);
     div()
         .flex()
@@ -11,10 +17,14 @@ pub fn reading_view(src: &str) -> impl IntoElement {
         .gap_3()
         .p_4()
         .text_color(rgb(0xd4d4d4))
-        .children(blocks.into_iter().map(render_block))
+        .children(
+            blocks
+                .into_iter()
+                .map(|block| render_block(block, vault_root, depth)),
+        )
 }
 
-fn render_block(block: Block) -> AnyElement {
+fn render_block(block: Block, vault_root: Option<&Path>, depth: usize) -> AnyElement {
     match block {
         Block::Heading { level, text } => {
             let size = match level {
@@ -67,5 +77,70 @@ fn render_block(block: Block) -> AnyElement {
             .w_full()
             .bg(rgb(0x3a3a3a))
             .into_any_element(),
+        Block::Embed { target } => render_embed(&target, vault_root, depth),
     }
+}
+
+fn render_embed(target: &str, vault_root: Option<&Path>, depth: usize) -> AnyElement {
+    let Some(root) = vault_root else {
+        return placeholder(target, "no vault root");
+    };
+
+    if is_image(target) {
+        let path = root.join(target);
+        return if path.exists() {
+            img(path)
+                .max_w(px(480.0))
+                .max_h(px(360.0))
+                .into_any_element()
+        } else {
+            placeholder(target, "image not found")
+        };
+    }
+
+    if depth >= MAX_EMBED_DEPTH {
+        return placeholder(target, "embed depth limit");
+    }
+
+    match std::fs::read_to_string(resolve_note(root, target)) {
+        Ok(text) => div()
+            .border_l_1()
+            .border_color(rgb(0x3a3a3a))
+            .pl_3()
+            .child(reading_view(&text, Some(root), depth + 1))
+            .into_any_element(),
+        Err(_) => placeholder(target, "note not found"),
+    }
+}
+
+fn is_image(target: &str) -> bool {
+    matches!(
+        Path::new(target)
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase())
+            .as_deref(),
+        Some("png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "svg" | "avif" | "ico")
+    )
+}
+
+fn resolve_note(root: &Path, target: &str) -> PathBuf {
+    let candidate = root.join(target);
+    if candidate.extension().is_some() {
+        candidate
+    } else {
+        root.join(format!("{target}.md"))
+    }
+}
+
+fn placeholder(target: &str, reason: &str) -> AnyElement {
+    div()
+        .px_3()
+        .py_2()
+        .bg(rgb(0x242424))
+        .rounded_md()
+        .text_sm()
+        .text_color(rgb(0x8a8a8a))
+        .child(format!("embed: {target} ({reason})"))
+        .into_any_element()
 }

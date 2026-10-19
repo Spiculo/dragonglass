@@ -796,6 +796,7 @@ fn main() {
             });
         }
         let initial_properties = editor.read(cx).properties();
+        editor.update(cx, |editor, _cx| editor.set_vault_root(&vault_root));
 
         let bounds = Bounds::centered(None, size(px(1000.0), px(640.0)), cx);
         let options = WindowOptions {
