@@ -252,12 +252,21 @@ handling, and the update-available prompt are in. Remaining: hotkey editor, snip
 graph filters/grouping, paste/drag image capture into the attachments folder.
 
 **Phase 3 — mostly done.** Command palette, CLI/headless mode, static HTML export,
-Bases/DataView-style query views (core + in-app table), and the graph view are in.
-Remaining: WASM plugin API + manifest, theme/plugin store, URI scheme, multi-window,
-workspaces (layout presets).
+Bases/DataView-style query views (core + in-app table), the graph view, and the WASM plugin
+host (manifest, discovery, sandboxed wasmtime, CLI + command palette) are in. Remaining:
+theme/plugin store, URI scheme, multi-window, workspaces (layout presets), enabling plugins
+to write back into notes.
 
 **Phase 4 — partly done.** Static HTML export and a read-only local HTTP API
 (`/health`, `/notes`, `/search`, `/query`, `/note`) are in. Remaining: importers
 (Notion/Evernote/Roam), PDF export, a full MCP surface, optional E2E sync.
+
+### Phase 1 remainder
+
+Word wrap landed (the editor wraps at spaces, and caret/selection/mouse/vertical movement
+follow visual rows). Comments, callouts and `==highlights==` are parsed, and callouts and
+highlights render in exported HTML. Still open: in-app `==highlight==` styling, math
+typesetting (KaTeX has no native equivalent — the syntax is currently shown as text),
+richer source/live-preview modes, and horizontal scroll (largely moot now that text wraps).
 
 **Phase 5 — not started.** macOS cross-compile, signing/notarization, platform polish.
