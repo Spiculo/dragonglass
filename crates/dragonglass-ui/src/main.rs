@@ -13,9 +13,44 @@ use std::path::{Path, PathBuf};
 
 use dragonglass_core::frontmatter::{Property, PropertyValue};
 use dragonglass_core::{
-    bookmarks, config, conflict, git, graph, markdown, query, search, storage, store, templates,
-    update, uri, workspace, NodeKind, Note, NoteRef, TreeNode, Vault,
+    bookmarks, config, conflict, git, graph, keymap, markdown, query, search, storage, store,
+    templates, update, uri, workspace, NodeKind, Note, NoteRef, TreeNode, Vault,
 };
+
+/// Actions the hotkey editor can rebind: `(action, default key, label)`.
+const HOTKEYS: &[(&str, &str, &str)] = &[
+    ("OpenCommands", "ctrl+p", "Command palette"),
+    ("OpenSwitcher", "ctrl+o", "Quick switcher"),
+    ("OpenSearch", "ctrl+shift+f", "Search"),
+    ("OpenGraph", "ctrl+shift+g", "Graph view"),
+    ("OpenDaily", "ctrl+shift+d", "Daily note"),
+    ("OpenWeekly", "ctrl+shift+w", "Weekly note"),
+    ("OpenMonthly", "ctrl+shift+m", "Monthly note"),
+    ("OpenProperties", "ctrl+shift+p", "Properties"),
+    ("ToggleBookmark", "ctrl+shift+b", "Toggle bookmark"),
+    ("OpenGit", "ctrl+g", "Git"),
+    ("ToggleTheme", "ctrl+shift+l", "Toggle theme"),
+    ("NewWindow", "ctrl+n", "New window"),
+];
+
+/// Bind a saved override by action name.
+fn bind_named(cx: &mut App, key: &str, action: &str) {
+    match action {
+        "OpenCommands" => cx.bind_keys([KeyBinding::new(key, OpenCommands, None)]),
+        "OpenSwitcher" => cx.bind_keys([KeyBinding::new(key, OpenSwitcher, None)]),
+        "OpenSearch" => cx.bind_keys([KeyBinding::new(key, OpenSearch, None)]),
+        "OpenGraph" => cx.bind_keys([KeyBinding::new(key, OpenGraph, None)]),
+        "OpenDaily" => cx.bind_keys([KeyBinding::new(key, OpenDaily, None)]),
+        "OpenWeekly" => cx.bind_keys([KeyBinding::new(key, OpenWeekly, None)]),
+        "OpenMonthly" => cx.bind_keys([KeyBinding::new(key, OpenMonthly, None)]),
+        "OpenProperties" => cx.bind_keys([KeyBinding::new(key, OpenProperties, None)]),
+        "ToggleBookmark" => cx.bind_keys([KeyBinding::new(key, ToggleBookmark, None)]),
+        "OpenGit" => cx.bind_keys([KeyBinding::new(key, OpenGit, None)]),
+        "ToggleTheme" => cx.bind_keys([KeyBinding::new(key, ToggleTheme, None)]),
+        "NewWindow" => cx.bind_keys([KeyBinding::new(key, NewWindow, None)]),
+        _ => {}
+    }
+}
 use dragonglass_plugins as plugins;
 use editor::Editor;
 use gpui::{
@@ -58,6 +93,8 @@ enum SwitcherMode {
     QueryInput,
     WorkspaceName,
     WorkspaceMenu,
+    HotkeyMenu,
+    HotkeyCapture,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -80,6 +117,7 @@ enum CommandId {
     LoadWorkspace,
     UserTheme(usize),
     NewWindow,
+    Hotkeys,
     Plugin(usize),
 }
 
@@ -99,6 +137,7 @@ enum Item {
     DeleteProperty { key: String },
     Command(CommandId),
     Workspace(String),
+    Hotkey(String),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -120,6 +159,8 @@ struct Switcher {
     selected: usize,
     /// When editing an existing property, its key; `None` when adding one.
     property_key: Option<String>,
+    /// Action being rebound, while capturing a keystroke.
+    capture_action: Option<String>,
 }
 
 struct DragonGlassApp {
@@ -144,6 +185,7 @@ struct DragonGlassApp {
     plugin_commands: Vec<(usize, String, String)>,
     workspaces: Vec<workspace::Workspace>,
     user_themes: Vec<(String, Theme)>,
+    bindings: Vec<keymap::Binding>,
     config: config::Config,
     active: Option<String>,
     vault_path: String,
@@ -406,6 +448,16 @@ impl DragonGlassApp {
                 })
                 .collect(),
             SwitcherMode::WorkspaceName => Vec::new(),
+            SwitcherMode::HotkeyMenu => HOTKEYS
+                .iter()
+                .map(|(action, default, label)| SwitcherItem {
+                    label: (*label).to_string(),
+                    detail: keymap::key_for_action(&self.bindings, action)
+                        .unwrap_or_else(|| (*default).to_string()),
+                    item: Item::Hotkey((*action).to_string()),
+                })
+                .collect(),
+            SwitcherMode::HotkeyCapture => Vec::new(),
             SwitcherMode::CommandsMenu => vec![
                 command_item("Quick switcher", "ctrl+o", CommandId::QuickSwitch),
                 command_item("Search", "ctrl+shift+f", CommandId::Search),
@@ -422,6 +474,7 @@ impl DragonGlassApp {
                 command_item("Graph view", "ctrl+shift+g", CommandId::OpenGraph),
                 command_item("Run a query", "", CommandId::RunQuery),
                 command_item("Save workspace", "", CommandId::SaveWorkspace),
+                command_item("Keyboard shortcuts", "", CommandId::Hotkeys),
                 command_item("Load workspace", "", CommandId::LoadWorkspace),
                 command_item("New window", "ctrl+n", CommandId::NewWindow),
             ]
@@ -453,6 +506,7 @@ impl DragonGlassApp {
             results: self.compute_results(mode, ""),
             selected: 0,
             property_key: None,
+            capture_action: None,
         });
         window.focus(&self.switcher_focus);
         cx.notify();
@@ -686,6 +740,7 @@ impl DragonGlassApp {
             plugin_commands: self.plugin_commands.clone(),
             workspaces: self.workspaces.clone(),
             user_themes: self.user_themes.clone(),
+            bindings: self.bindings.clone(),
             config: self.config.clone(),
         });
 
@@ -850,6 +905,34 @@ impl DragonGlassApp {
         };
         let mut query_changed = false;
 
+        // Capturing a new shortcut for the hotkey editor.
+        if panel.mode == SwitcherMode::HotkeyCapture {
+            if event.keystroke.key == "escape" {
+                self.close_panel(window, cx);
+                return;
+            }
+
+            let key = event.keystroke.unparse().to_lowercase();
+            if let Some(action) = panel.capture_action.clone() {
+                keymap::upsert(
+                    &mut self.bindings,
+                    keymap::Binding {
+                        key: key.clone(),
+                        action: action.clone(),
+                    },
+                );
+                let saved = keymap::save(&self.vault_root, &self.bindings);
+                bind_named(cx, &key, &action);
+
+                self.status_message = Some(match saved {
+                    Ok(()) => format!("bound {key} to {action}"),
+                    Err(e) => format!("bound {key} to {action} (not saved: {e})"),
+                });
+            }
+            self.close_panel(window, cx);
+            return;
+        }
+
         match event.keystroke.key.as_str() {
             "escape" => {
                 self.close_panel(window, cx);
@@ -960,6 +1043,16 @@ impl DragonGlassApp {
                             self.close_panel(window, cx);
                             return;
                         }
+                        Item::Hotkey(action) => {
+                            panel.mode = SwitcherMode::HotkeyCapture;
+                            panel.capture_action = Some(action.clone());
+                            panel.query.clear();
+                            panel.results.clear();
+                            panel.selected = 0;
+                            self.switcher = Some(panel);
+                            cx.notify();
+                            return;
+                        }
                         Item::Workspace(name) => {
                             let name = name.clone();
                             self.apply_workspace(&name, window, cx);
@@ -1029,6 +1122,17 @@ impl DragonGlassApp {
                                 CommandId::Plugin(index) => self.run_plugin_command(index, cx),
                                 CommandId::UserTheme(index) => self.apply_user_theme(index, cx),
                                 CommandId::NewWindow => self.open_new_window(window, cx),
+                                CommandId::Hotkeys => {
+                                    panel.mode = SwitcherMode::HotkeyMenu;
+                                    panel.query.clear();
+                                    panel.property_key = None;
+                                    panel.results =
+                                        self.compute_results(SwitcherMode::HotkeyMenu, "");
+                                    panel.selected = 0;
+                                    self.switcher = Some(panel);
+                                    cx.notify();
+                                    return;
+                                }
                                 CommandId::SaveWorkspace => {
                                     panel.mode = SwitcherMode::WorkspaceName;
                                     panel.query.clear();
@@ -1470,6 +1574,8 @@ impl Render for DragonGlassApp {
                 SwitcherMode::QueryInput => "query:",
                 SwitcherMode::WorkspaceName => "workspace name:",
                 SwitcherMode::WorkspaceMenu => "workspace:",
+                SwitcherMode::HotkeyMenu => "shortcut:",
+                SwitcherMode::HotkeyCapture => "press a key:",
             };
             let rows = panel.results.iter().enumerate().map(|(i, item)| {
                 let mut row = div()
@@ -1609,6 +1715,7 @@ fn main() {
     let initial_config = config::load(&vault_root);
     let initial_plugins = plugins::discover(&vault_root);
     let initial_workspaces = workspace::load(&vault_root);
+    let initial_bindings = keymap::load(&vault_root);
     let initial_plugin_commands: Vec<(usize, String, String)> = initial_plugins
         .iter()
         .enumerate()
@@ -1679,6 +1786,11 @@ fn main() {
         ]);
         graph_view::init(cx);
 
+        // Saved shortcut overrides win over the defaults registered above.
+        for binding in &initial_bindings {
+            bind_named(cx, &binding.key, &binding.action);
+        }
+
         let editor = cx.new(Editor::new);
         if let Some(path) = &first_path {
             editor.update(cx, |editor, _cx| {
@@ -1729,6 +1841,7 @@ fn main() {
             plugin_commands: initial_plugin_commands,
             workspaces: initial_workspaces,
             user_themes: initial_user_themes,
+            bindings: initial_bindings,
             config: initial_config,
         });
 

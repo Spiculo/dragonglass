@@ -14,6 +14,7 @@ pub mod graph;
 pub mod history;
 pub mod html;
 pub mod import;
+pub mod keymap;
 pub mod markdown;
 pub mod mcp;
 pub mod note;
