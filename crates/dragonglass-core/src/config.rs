@@ -15,6 +15,8 @@ pub struct Config {
     pub attachments_folder: String,
     /// Optional accent colour as `RRGGBB`.
     pub accent: Option<String>,
+    /// Whether `.dragon-glass/snippets` overrides are applied.
+    pub snippets: bool,
 }
 
 impl Default for Config {
@@ -26,6 +28,7 @@ impl Default for Config {
             templates_folder: "Templates".to_string(),
             attachments_folder: "attachments".to_string(),
             accent: None,
+            snippets: true,
         }
     }
 }
@@ -41,6 +44,7 @@ impl Config {
         if let Some(accent) = &self.accent {
             out.push_str(&format!("accent={accent}\n"));
         }
+        out.push_str(&format!("snippets={}\n", self.snippets));
         out
     }
 
@@ -67,6 +71,9 @@ impl Config {
                 "templates_folder" => config.templates_folder = value,
                 "attachments_folder" => config.attachments_folder = value,
                 "accent" => config.accent = Some(value),
+                "snippets" => {
+                    config.snippets = !matches!(value.to_lowercase().as_str(), "false" | "0" | "no")
+                }
                 _ => {}
             }
         }
@@ -120,6 +127,8 @@ mod tests {
         let config = Config::from_text("# comment\nbogus\ndaily_folder=Notes\nunknown=1\n");
         assert_eq!(config.daily_folder, "Notes");
         assert_eq!(config.weekly_folder, "Weekly");
+        assert!(config.snippets);
+        assert!(!Config::from_text("snippets=false").snippets);
     }
 
     #[test]

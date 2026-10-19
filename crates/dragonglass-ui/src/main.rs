@@ -121,6 +121,7 @@ enum CommandId {
     Hotkeys,
     GraphFilter,
     GraphDepth,
+    ToggleSnippets,
     Plugin(usize),
 }
 
@@ -189,6 +190,9 @@ struct DragonGlassApp {
     workspaces: Vec<workspace::Workspace>,
     user_themes: Vec<(String, Theme)>,
     bindings: Vec<keymap::Binding>,
+    /// The selected theme before snippets are layered on.
+    base_theme: Theme,
+    snippet_overrides: Vec<(String, String)>,
     config: config::Config,
     active: Option<String>,
     vault_path: String,
@@ -481,6 +485,7 @@ impl DragonGlassApp {
                 command_item("Keyboard shortcuts", "", CommandId::Hotkeys),
                 command_item("Graph: filter", "", CommandId::GraphFilter),
                 command_item("Graph: cycle depth", "", CommandId::GraphDepth),
+                command_item("Toggle snippets", "", CommandId::ToggleSnippets),
                 command_item("Load workspace", "", CommandId::LoadWorkspace),
                 command_item("New window", "ctrl+n", CommandId::NewWindow),
             ]
@@ -747,6 +752,8 @@ impl DragonGlassApp {
             workspaces: self.workspaces.clone(),
             user_themes: self.user_themes.clone(),
             bindings: self.bindings.clone(),
+            base_theme: self.base_theme,
+            snippet_overrides: self.snippet_overrides.clone(),
             config: self.config.clone(),
         });
 
@@ -769,13 +776,46 @@ impl DragonGlassApp {
         let _ = cx.open_window(options, move |_window, _cx| view.clone());
     }
 
+    /// The theme with snippets layered on, if enabled.
+    fn effective_theme(&self) -> Theme {
+        if self.config.snippets {
+            self.base_theme.with_overrides(&self.snippet_overrides)
+        } else {
+            self.base_theme
+        }
+    }
+
+    /// Recompute the effective theme and push it to every view.
+    fn refresh_theme(&mut self, cx: &mut Context<Self>) {
+        let theme = self.effective_theme();
+        self.theme = theme;
+        cx.set_global(theme);
+        self.editor.update(cx, |_, cx| cx.notify());
+        cx.notify();
+    }
+
+    fn toggle_snippets(&mut self, cx: &mut Context<Self>) {
+        self.config.snippets = !self.config.snippets;
+        let message = match config::save(&self.vault_root, &self.config) {
+            Ok(()) => format!(
+                "snippets: {}",
+                if self.config.snippets { "on" } else { "off" }
+            ),
+            Err(e) => format!("snippets toggled (not saved: {e})"),
+        };
+        self.refresh_theme(cx);
+        self.status_message = Some(message);
+        cx.notify();
+    }
+
     fn apply_user_theme(&mut self, index: usize, cx: &mut Context<Self>) {
         let Some((name, theme)) = self.user_themes.get(index).cloned() else {
             return;
         };
 
-        self.theme = theme;
+        self.base_theme = theme;
         cx.set_global(theme);
+        self.refresh_theme(cx);
         self.status_message = Some(match save_theme(&self.vault_root, theme, Some(&name)) {
             Ok(()) => format!("theme: {name}"),
             Err(e) => format!("theme: {name} (not saved: {e})"),
@@ -807,9 +847,9 @@ impl DragonGlassApp {
     }
 
     fn toggle_theme_now(&mut self, cx: &mut Context<Self>) {
-        self.theme = self.theme.toggled();
-        cx.set_global(self.theme);
-        let message = match save_theme(&self.vault_root, self.theme, None) {
+        self.base_theme = self.base_theme.toggled();
+        self.refresh_theme(cx);
+        let message = match save_theme(&self.vault_root, self.base_theme, None) {
             Ok(()) => format!("theme: {}", self.theme.name()),
             Err(e) => format!("theme: {} (not saved: {e})", self.theme.name()),
         };
@@ -1165,6 +1205,7 @@ impl DragonGlassApp {
                                     self.close_panel(window, cx);
                                     return;
                                 }
+                                CommandId::ToggleSnippets => self.toggle_snippets(cx),
                                 CommandId::Hotkeys => {
                                     panel.mode = SwitcherMode::HotkeyMenu;
                                     panel.query.clear();
@@ -1755,6 +1796,7 @@ fn main() {
     let initial_bookmarks = bookmarks::load(&vault_root);
     let initial_user_themes = load_user_themes(&vault_root);
     let initial_theme = load_theme(&vault_root, &initial_user_themes);
+    let initial_snippets = store::load_overrides(&store::snippets_dir(&vault_root));
     let initial_graph = graph::build(&note_refs);
     let initial_config = config::load(&vault_root);
     let initial_plugins = plugins::discover(&vault_root);
@@ -1890,6 +1932,8 @@ fn main() {
             workspaces: initial_workspaces,
             user_themes: initial_user_themes,
             bindings: initial_bindings,
+            base_theme: initial_theme,
+            snippet_overrides: initial_snippets,
             config: initial_config,
         });
 

@@ -126,9 +126,57 @@ impl Theme {
 
         theme
     }
+    /// Apply further `key=RRGGBB` overrides (used by snippets).
+    pub fn with_overrides(&self, colors: &[(String, String)]) -> Self {
+        let mut theme = *self;
+        let base = if theme.dark {
+            Self::dark()
+        } else {
+            Self::light()
+        };
+
+        // Rebuild from the base with the extra overrides so snippets layer predictably.
+        let mut merged: Vec<(String, String)> = vec![
+            ("bg".into(), hex(base.bg)),
+            ("panel".into(), hex(base.panel)),
+            ("panel_alt".into(), hex(base.panel_alt)),
+            ("header".into(), hex(base.header)),
+            ("input_bg".into(), hex(base.input_bg)),
+            ("chip".into(), hex(base.chip)),
+            ("border".into(), hex(base.border)),
+            ("text".into(), hex(base.text)),
+            ("text_dim".into(), hex(base.text_dim)),
+            ("muted".into(), hex(base.muted)),
+            ("accent".into(), hex(base.accent)),
+            ("accent_text".into(), hex(base.accent_text)),
+            ("warn".into(), hex(base.warn)),
+            ("star".into(), hex(base.star)),
+            ("code_bg".into(), hex(base.code_bg)),
+            ("code_text".into(), hex(base.code_text)),
+        ];
+
+        for (key, value) in colors {
+            match merged.iter_mut().find(|(existing, _)| existing == key) {
+                Some(existing) => existing.1 = value.clone(),
+                None => merged.push((key.clone(), value.clone())),
+            }
+        }
+
+        theme = Self::from_colors(theme.dark, &merged);
+        theme
+    }
 }
 
-/// Parse `RRGGBB` (with or without a leading `#`) into a colour.
+/// `RRGGBB` for a colour, for round-tripping through the override list.
+fn hex(color: Hsla) -> String {
+    let rgba = gpui::Rgba::from(color);
+    format!(
+        "{:02x}{:02x}{:02x}",
+        (rgba.r * 255.0).round() as u8,
+        (rgba.g * 255.0).round() as u8,
+        (rgba.b * 255.0).round() as u8
+    )
+}
 pub fn parse_hex(value: &str) -> Option<Hsla> {
     let cleaned = value.trim().trim_start_matches('#');
     if cleaned.len() != 6 {

@@ -90,6 +90,45 @@ pub fn themes_dir(vault_root: &Path) -> PathBuf {
     vault_root.join(".dragon-glass").join("themes")
 }
 
+/// Directory holding user snippets (small style overrides).
+pub fn snippets_dir(vault_root: &Path) -> PathBuf {
+    vault_root.join(".dragon-glass").join("snippets")
+}
+
+/// Merge colour overrides from every `*.txt` snippet, sorted by name so later files win.
+pub fn load_overrides(dir: &Path) -> Vec<(String, String)> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+
+    let mut files: Vec<PathBuf> = entries
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.extension()
+                .and_then(|extension| extension.to_str())
+                .map(|extension| extension.eq_ignore_ascii_case("txt"))
+                .unwrap_or(false)
+        })
+        .collect();
+    files.sort();
+
+    let mut overrides: Vec<(String, String)> = Vec::new();
+    for file in files {
+        let Ok(text) = std::fs::read_to_string(&file) else {
+            continue;
+        };
+        for (key, value) in parse_theme(&text, "").colors {
+            match overrides.iter_mut().find(|(existing, _)| *existing == key) {
+                Some(existing) => existing.1 = value,
+                None => overrides.push((key, value)),
+            }
+        }
+    }
+
+    overrides
+}
+
 /// A theme described by a `theme.txt` file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ThemeFile {
@@ -255,6 +294,25 @@ mod tests {
                 ("text".to_string(), "eeeeee".to_string())
             ]
         );
+    }
+
+    #[test]
+    fn merges_snippet_overrides_in_name_order() {
+        let dir = temp_dir("snippets");
+        std::fs::write(dir.join("01-first.txt"), "bg=111111\naccent=222222\n").unwrap();
+        std::fs::write(dir.join("02-second.txt"), "accent=333333\n").unwrap();
+        std::fs::write(dir.join("notes.md"), "bg=ffffff\n").unwrap();
+
+        let overrides = load_overrides(&dir);
+        assert_eq!(
+            overrides,
+            vec![
+                ("bg".to_string(), "111111".to_string()),
+                ("accent".to_string(), "333333".to_string()),
+            ]
+        );
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
