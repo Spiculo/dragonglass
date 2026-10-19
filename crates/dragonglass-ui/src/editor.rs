@@ -136,6 +136,18 @@ impl Editor {
         self.buffer.is_dirty()
     }
 
+    /// Current document text.
+    pub fn text(&self) -> String {
+        self.buffer.text()
+    }
+
+    /// Move the caret to the start of `line` (0-based) and clear any selection.
+    pub fn jump_to_line(&mut self, line: usize) {
+        let line = line.min(self.buffer.line_count().saturating_sub(1));
+        self.buffer.set_cursor(self.buffer.char_index_at(line, 0));
+        self.anchor = None;
+    }
+
     /// The selected character range, if any.
     fn selection(&self) -> Option<Range<usize>> {
         let anchor = self.anchor?;

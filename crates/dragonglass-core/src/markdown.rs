@@ -142,6 +142,45 @@ fn is_fence(trimmed: &str) -> bool {
     trimmed.starts_with("```") || trimmed.starts_with("~~~")
 }
 
+/// A heading and the 1-based source line it appears on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Heading {
+    pub level: u8,
+    pub text: String,
+    pub line: usize,
+}
+
+/// Headings in document order, with source line numbers. Frontmatter is skipped but
+/// still counted, and headings inside fenced code are ignored.
+pub fn headings(src: &str) -> Vec<Heading> {
+    let body = frontmatter::split(src).body;
+    let offset = src.len().saturating_sub(body.len());
+    let prefix_lines = src[..offset].matches('\n').count();
+
+    let mut out = Vec::new();
+    let mut in_fence = false;
+
+    for (i, line) in body.lines().enumerate() {
+        let trimmed = line.trim();
+        if is_fence(trimmed) {
+            in_fence = !in_fence;
+            continue;
+        }
+        if in_fence {
+            continue;
+        }
+        if let Some((level, text)) = heading(trimmed) {
+            out.push(Heading {
+                level,
+                text,
+                line: prefix_lines + i + 1,
+            });
+        }
+    }
+
+    out
+}
+
 fn heading(trimmed: &str) -> Option<(u8, String)> {
     let level = trimmed.chars().take_while(|c| *c == '#').count();
     if level == 0 || level > 6 {
@@ -295,5 +334,35 @@ mod tests {
     #[test]
     fn horizontal_rule() {
         assert_eq!(parse_blocks("---\n"), vec![Block::Rule]);
+    }
+
+    #[test]
+    fn headings_report_source_lines() {
+        let src = "---\ntitle: x\n---\n# One\n\ntext\n## Two\n";
+        let found = headings(src);
+        assert_eq!(
+            found,
+            vec![
+                Heading {
+                    level: 1,
+                    text: "One".into(),
+                    line: 4
+                },
+                Heading {
+                    level: 2,
+                    text: "Two".into(),
+                    line: 7
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn headings_skip_fenced_code() {
+        let src = "# Real\n```\n# Fake\n```\n## Also\n";
+        let found = headings(src);
+        assert_eq!(found.len(), 2);
+        assert_eq!(found[0].text, "Real");
+        assert_eq!(found[1].text, "Also");
     }
 }

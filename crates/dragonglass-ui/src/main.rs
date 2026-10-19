@@ -9,7 +9,7 @@ mod reading;
 
 use std::path::PathBuf;
 
-use dragonglass_core::{git, search, NodeKind, Note, NoteRef, TreeNode, Vault};
+use dragonglass_core::{git, markdown, search, NodeKind, Note, NoteRef, TreeNode, Vault};
 use editor::Editor;
 use gpui::{
     actions, div, prelude::*, px, rgb, size, AnyElement, App, Application, Bounds, Context,
@@ -426,6 +426,53 @@ impl Render for DragonGlassApp {
                 }
             }));
 
+        let headings = {
+            let editor = self.editor.read(cx);
+            markdown::headings(&editor.text())
+        };
+
+        let outline: Option<AnyElement> = if headings.is_empty() {
+            None
+        } else {
+            let me = cx.entity();
+            let rows = headings.iter().enumerate().map(|(i, heading)| {
+                let indent = px(8.0 + heading.level.saturating_sub(1) as f32 * 10.0);
+                let line = heading.line;
+                let me = me.clone();
+                div()
+                    .id(ElementId::Name(format!("outline-{i}").into()))
+                    .pl(indent)
+                    .pr_2()
+                    .py_1()
+                    .text_sm()
+                    .cursor_pointer()
+                    .text_color(rgb(0xd4d4d4))
+                    .child(heading.text.clone())
+                    .on_mouse_down(MouseButton::Left, move |_ev, window, cx| {
+                        me.update(cx, |this, cx| {
+                            this.editor.update(cx, |editor, cx| {
+                                editor.jump_to_line(line.saturating_sub(1));
+                                cx.notify();
+                            });
+                            window.focus(&this.editor.focus_handle(cx));
+                            cx.notify();
+                        });
+                    })
+            });
+
+            Some(
+                div()
+                    .id("outline")
+                    .w(px(200.0))
+                    .h_full()
+                    .overflow_y_scroll()
+                    .bg(rgb(0x181818))
+                    .py_2()
+                    .children(rows)
+                    .into_any_element(),
+            )
+        };
+
         let panel: Option<AnyElement> = self.switcher.as_ref().map(|panel| {
             let prefix = match panel.mode {
                 SwitcherMode::QuickSwitch => ">",
@@ -507,7 +554,8 @@ impl Render for DragonGlassApp {
                     .flex_1()
                     .min_h(px(0.0))
                     .child(sidebar)
-                    .child(div().flex_1().w_full().p_2().child(self.editor.clone())),
+                    .child(div().flex_1().w_full().p_2().child(self.editor.clone()))
+                    .children(outline),
             )
     }
 }
