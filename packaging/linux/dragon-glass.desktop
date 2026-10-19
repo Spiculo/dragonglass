@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Dragon Glass
+Comment=Native, local-first markdown knowledge base
+Exec=dragon-glass-app %u
+Terminal=false
+Categories=Office;Utility;TextEditor;
+MimeType=x-scheme-handler/dragonglass;
+StartupNotify=true
