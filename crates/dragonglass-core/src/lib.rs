@@ -20,6 +20,7 @@ pub mod note;
 pub mod query;
 pub mod search;
 pub mod storage;
+pub mod store;
 pub mod tags;
 pub mod templates;
 pub mod tree;

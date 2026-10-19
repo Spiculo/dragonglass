@@ -13,8 +13,8 @@ use std::path::{Path, PathBuf};
 
 use dragonglass_core::frontmatter::{Property, PropertyValue};
 use dragonglass_core::{
-    bookmarks, config, conflict, git, graph, markdown, query, search, storage, templates, update,
-    uri, workspace, NodeKind, Note, NoteRef, TreeNode, Vault,
+    bookmarks, config, conflict, git, graph, markdown, query, search, storage, store, templates,
+    update, uri, workspace, NodeKind, Note, NoteRef, TreeNode, Vault,
 };
 use dragonglass_plugins as plugins;
 use editor::Editor;
@@ -41,7 +41,8 @@ actions!(
         OpenWeekly,
         OpenMonthly,
         CloseQuery,
-        RunQuery
+        RunQuery,
+        NewWindow
     ]
 );
 
@@ -77,6 +78,8 @@ enum CommandId {
     RunQuery,
     SaveWorkspace,
     LoadWorkspace,
+    UserTheme(usize),
+    NewWindow,
     Plugin(usize),
 }
 
@@ -140,6 +143,7 @@ struct DragonGlassApp {
     plugins: Vec<plugins::PluginInfo>,
     plugin_commands: Vec<(usize, String, String)>,
     workspaces: Vec<workspace::Workspace>,
+    user_themes: Vec<(String, Theme)>,
     config: config::Config,
     active: Option<String>,
     vault_path: String,
@@ -419,8 +423,17 @@ impl DragonGlassApp {
                 command_item("Run a query", "", CommandId::RunQuery),
                 command_item("Save workspace", "", CommandId::SaveWorkspace),
                 command_item("Load workspace", "", CommandId::LoadWorkspace),
+                command_item("New window", "ctrl+n", CommandId::NewWindow),
             ]
             .into_iter()
+            .chain(
+                self.user_themes
+                    .iter()
+                    .enumerate()
+                    .map(|(index, (name, _))| {
+                        command_item(&format!("Theme: {name}"), "", CommandId::UserTheme(index))
+                    }),
+            )
             .chain(
                 self.plugin_commands
                     .iter()
@@ -629,6 +642,87 @@ impl DragonGlassApp {
         cx.notify();
     }
 
+    fn new_window(&mut self, _: &NewWindow, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_new_window(window, cx);
+    }
+
+    /// Open another window on the same vault, with its own editor and panes.
+    fn open_new_window(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        let editor = cx.new(Editor::new);
+        editor.update(cx, |editor, _cx| {
+            editor.set_vault_root(&self.vault_root);
+            if let Some(active) = &self.active {
+                let _ = editor.load(&self.vault_root.join(active));
+            }
+        });
+
+        let sibling = cx.new(|cx| DragonGlassApp {
+            editor: editor.clone(),
+            vault_root: self.vault_root.clone(),
+            tree: self.tree.clone(),
+            note_refs: self.note_refs.clone(),
+            properties: Vec::new(),
+            bookmarks: self.bookmarks.clone(),
+            theme: self.theme,
+            active: self.active.clone(),
+            vault_path: self.vault_path.clone(),
+            notes: self.notes,
+            links: self.links,
+            git_status: self.git_status.clone(),
+            status_message: None,
+            switcher: None,
+            switcher_focus: cx.focus_handle(),
+            focus_handle: cx.focus_handle(),
+            conflict: false,
+            watcher: None,
+            update_source: self.update_source.clone(),
+            update_available: self.update_available.clone(),
+            full_graph: self.full_graph.clone(),
+            graph_view: None,
+            show_graph: false,
+            query_results: Vec::new(),
+            show_query: false,
+            plugins: self.plugins.clone(),
+            plugin_commands: self.plugin_commands.clone(),
+            workspaces: self.workspaces.clone(),
+            user_themes: self.user_themes.clone(),
+            config: self.config.clone(),
+        });
+
+        let graph_view = cx.new(|cx| GraphView::new(sibling.downgrade(), cx));
+        sibling.update(cx, |app, _cx| {
+            app.graph_view = Some(graph_view);
+        });
+
+        let bounds = Bounds::centered(None, size(px(1000.0), px(640.0)), cx);
+        let options = WindowOptions {
+            window_bounds: Some(WindowBounds::Windowed(bounds)),
+            titlebar: Some(gpui::TitlebarOptions {
+                title: Some("Dragon Glass".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let view = sibling.clone();
+        let _ = cx.open_window(options, move |_window, _cx| view.clone());
+    }
+
+    fn apply_user_theme(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some((name, theme)) = self.user_themes.get(index).cloned() else {
+            return;
+        };
+
+        self.theme = theme;
+        cx.set_global(theme);
+        self.status_message = Some(match save_theme(&self.vault_root, theme, Some(&name)) {
+            Ok(()) => format!("theme: {name}"),
+            Err(e) => format!("theme: {name} (not saved: {e})"),
+        });
+        self.editor.update(cx, |_, cx| cx.notify());
+        cx.notify();
+    }
+
     fn toggle_theme(&mut self, _: &ToggleTheme, window: &mut Window, cx: &mut Context<Self>) {
         self.toggle_theme_now(cx);
         let _ = window;
@@ -654,7 +748,7 @@ impl DragonGlassApp {
     fn toggle_theme_now(&mut self, cx: &mut Context<Self>) {
         self.theme = self.theme.toggled();
         cx.set_global(self.theme);
-        let message = match save_theme(&self.vault_root, self.theme) {
+        let message = match save_theme(&self.vault_root, self.theme, None) {
             Ok(()) => format!("theme: {}", self.theme.name()),
             Err(e) => format!("theme: {} (not saved: {e})", self.theme.name()),
         };
@@ -933,6 +1027,8 @@ impl DragonGlassApp {
                                     return;
                                 }
                                 CommandId::Plugin(index) => self.run_plugin_command(index, cx),
+                                CommandId::UserTheme(index) => self.apply_user_theme(index, cx),
+                                CommandId::NewWindow => self.open_new_window(window, cx),
                                 CommandId::SaveWorkspace => {
                                     panel.mode = SwitcherMode::WorkspaceName;
                                     panel.query.clear();
@@ -1083,17 +1179,57 @@ fn command_item(label: &str, hint: &str, command: CommandId) -> SwitcherItem {
     }
 }
 
-fn load_theme(root: &Path) -> Theme {
-    match std::fs::read_to_string(root.join(".dragon-glass/theme.txt")) {
-        Ok(text) if text.trim() == "light" => Theme::light(),
+fn load_theme(root: &Path, user_themes: &[(String, Theme)]) -> Theme {
+    let Ok(text) = std::fs::read_to_string(root.join(".dragon-glass/theme.txt")) else {
+        return Theme::dark();
+    };
+    let value = text.trim();
+
+    if let Some(name) = value.strip_prefix("theme:") {
+        return user_themes
+            .iter()
+            .find(|(candidate, _)| candidate == name)
+            .map(|(_, theme)| *theme)
+            .unwrap_or_else(Theme::dark);
+    }
+
+    match value {
+        "light" => Theme::light(),
         _ => Theme::dark(),
     }
 }
 
-fn save_theme(root: &Path, theme: Theme) -> std::io::Result<()> {
+/// User themes installed under `.dragon-glass/themes/<id>/theme.txt`.
+fn load_user_themes(root: &Path) -> Vec<(String, Theme)> {
+    let Ok(entries) = std::fs::read_dir(store::themes_dir(root)) else {
+        return Vec::new();
+    };
+
+    let mut themes: Vec<(String, Theme)> = entries
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| {
+            let fallback = entry.file_name().to_string_lossy().to_string();
+            let text = std::fs::read_to_string(entry.path().join("theme.txt")).ok()?;
+            let parsed = store::parse_theme(&text, &fallback);
+            Some((
+                parsed.name.clone(),
+                Theme::from_colors(parsed.dark, &parsed.colors),
+            ))
+        })
+        .collect();
+
+    themes.sort_by(|a, b| a.0.cmp(&b.0));
+    themes
+}
+
+fn save_theme(root: &Path, theme: Theme, name: Option<&str>) -> std::io::Result<()> {
     let dir = root.join(".dragon-glass");
     std::fs::create_dir_all(&dir)?;
-    storage::write_atomic(&dir.join("theme.txt"), &format!("{}\n", theme.name()))
+    let value = match name {
+        Some(name) => format!("theme:{name}"),
+        None => theme.name().to_string(),
+    };
+    storage::write_atomic(&dir.join("theme.txt"), &format!("{value}\n"))
 }
 
 fn describe_outcome(outcome: git::Outcome) -> String {
@@ -1390,6 +1526,7 @@ impl Render for DragonGlassApp {
             .on_action(cx.listener(Self::open_commands))
             .on_action(cx.listener(Self::toggle_theme))
             .on_action(cx.listener(Self::close_query))
+            .on_action(cx.listener(Self::new_window))
             .child(
                 div()
                     .flex()
@@ -1466,7 +1603,8 @@ fn main() {
     let tree = vault.tree();
     let vault_root = vault.root().to_path_buf();
     let initial_bookmarks = bookmarks::load(&vault_root);
-    let initial_theme = load_theme(&vault_root);
+    let initial_user_themes = load_user_themes(&vault_root);
+    let initial_theme = load_theme(&vault_root, &initial_user_themes);
     let initial_graph = graph::build(&note_refs);
     let initial_config = config::load(&vault_root);
     let initial_plugins = plugins::discover(&vault_root);
@@ -1536,6 +1674,8 @@ fn main() {
             KeyBinding::new("ctrl-shift-g", OpenGraph, None),
             KeyBinding::new("cmd-shift-g", OpenGraph, None),
             KeyBinding::new("escape", CloseQuery, None),
+            KeyBinding::new("ctrl-n", NewWindow, None),
+            KeyBinding::new("cmd-n", NewWindow, None),
         ]);
         graph_view::init(cx);
 
@@ -1588,6 +1728,7 @@ fn main() {
             plugins: initial_plugins,
             plugin_commands: initial_plugin_commands,
             workspaces: initial_workspaces,
+            user_themes: initial_user_themes,
             config: initial_config,
         });
 

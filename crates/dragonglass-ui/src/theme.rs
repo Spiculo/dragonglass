@@ -93,6 +93,49 @@ impl Theme {
             "light"
         }
     }
+
+    /// Build a theme from `key=RRGGBB` overrides on top of the dark or light base.
+    pub fn from_colors(dark: bool, colors: &[(String, String)]) -> Self {
+        let mut theme = if dark { Self::dark() } else { Self::light() };
+
+        for (key, value) in colors {
+            let Some(color) = parse_hex(value) else {
+                continue;
+            };
+            match key.as_str() {
+                "bg" => theme.bg = color,
+                "panel" => theme.panel = color,
+                "panel_alt" | "panel-alt" => theme.panel_alt = color,
+                "header" => theme.header = color,
+                "input_bg" | "input-bg" => theme.input_bg = color,
+                "chip" => theme.chip = color,
+                "border" => theme.border = color,
+                "text" => theme.text = color,
+                "text_dim" | "text-dim" => theme.text_dim = color,
+                "muted" => theme.muted = color,
+                "accent" => theme.accent = color,
+                "accent_text" | "accent-text" => theme.accent_text = color,
+                "warn" => theme.warn = color,
+                "star" => theme.star = color,
+                "code_bg" | "code-bg" => theme.code_bg = color,
+                "code_text" | "code-text" => theme.code_text = color,
+                "selection" => theme.selection = color,
+                _ => {}
+            }
+        }
+
+        theme
+    }
+}
+
+/// Parse `RRGGBB` (with or without a leading `#`) into a colour.
+pub fn parse_hex(value: &str) -> Option<Hsla> {
+    let cleaned = value.trim().trim_start_matches('#');
+    if cleaned.len() != 6 {
+        return None;
+    }
+    let value = u32::from_str_radix(cleaned, 16).ok()?;
+    Some(rgb(value).into())
 }
 
 impl Global for Theme {}

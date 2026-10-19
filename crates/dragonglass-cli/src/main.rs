@@ -15,7 +15,8 @@ use std::process::ExitCode;
 
 use anyhow::{anyhow, bail, Context, Result};
 use dragonglass_core::{
-    api, git, graph, history, html, import, mcp, query, storage, update, uri, Note, NoteRef, Vault,
+    api, git, graph, history, html, import, mcp, query, storage, store, update, uri, Note, NoteRef,
+    Vault,
 };
 use dragonglass_plugins as plugins;
 
@@ -54,6 +55,8 @@ fn run() -> Result<()> {
         Some("uri") => return uri_cmd(args.collect()),
         Some("import") => return import_cmd(args.collect()),
         Some("mcp") => return mcp_cmd(args.collect()),
+        Some("store") => return store_cmd(args.collect()),
+        Some("install") => return install_cmd(args.collect()),
         _ => {}
     }
 
@@ -191,6 +194,68 @@ fn git_pull(path: Option<String>) -> Result<()> {
 
 fn git_push(path: Option<String>) -> Result<()> {
     report_outcome(git::push(&vault_arg(path))?);
+    Ok(())
+}
+
+fn store_cmd(args: Vec<String>) -> Result<()> {
+    let Some(directory) = args.first() else {
+        bail!("usage: dragon-glass store <store-dir> [query]");
+    };
+
+    let store_path = PathBuf::from(directory);
+    let query = args.get(1).map(|value| value.to_ascii_lowercase());
+
+    let packages: Vec<store::Package> = store::scan(&store_path)
+        .into_iter()
+        .filter(|package| {
+            query
+                .as_ref()
+                .map(|query| {
+                    package.id.to_lowercase().contains(query)
+                        || package.name.to_lowercase().contains(query)
+                })
+                .unwrap_or(true)
+        })
+        .collect();
+
+    if packages.is_empty() {
+        println!("no packages in {}", display_path(&store_path));
+        return Ok(());
+    }
+
+    for package in packages {
+        let kind = match package.kind {
+            store::PackageKind::Plugin => "plugin",
+            store::PackageKind::Theme => "theme",
+        };
+        println!(
+            "{:<20} {:<7} {:<24} {}",
+            package.id,
+            kind,
+            package.name,
+            package.version.unwrap_or_default()
+        );
+    }
+    Ok(())
+}
+
+fn install_cmd(args: Vec<String>) -> Result<()> {
+    if args.len() < 3 {
+        bail!("usage: dragon-glass install <vault> <store-dir> <package-id>");
+    }
+
+    let vault = PathBuf::from(&args[0]);
+    let store_path = PathBuf::from(&args[1]);
+    let id = &args[2];
+
+    let packages = store::scan(&store_path);
+    let package = packages
+        .iter()
+        .find(|package| package.id == *id)
+        .ok_or_else(|| anyhow!("package not found: {id}"))?;
+
+    let installed = store::install(&vault, package)?;
+    println!("installed {id} to {}", display_path(&installed));
     Ok(())
 }
 
@@ -523,7 +588,9 @@ fn print_help() {
            dragon-glass run         <vault> <plugin> <command> [note]  run a plugin command\n  \
            dragon-glass uri         <dragonglass://...>  resolve a URI\n  \
            dragon-glass import      <vault> <enex|roam> <file> [folder]  import notes\n  \
-           dragon-glass mcp         [vault]            MCP server over stdio (read-only)\n\n\
+           dragon-glass mcp         [vault]            MCP server over stdio (read-only)\n  \
+           dragon-glass store       <store-dir> [query]  list installable packages\n  \
+           dragon-glass install     <vault> <store-dir> <id>  install a package\n\n\
          vault defaults to the current directory."
     );
 }
