@@ -479,13 +479,20 @@ fn import_cmd(args: Vec<String>) -> Result<()> {
         .cloned()
         .unwrap_or_else(|| "Imported".to_string());
 
-    let text = std::fs::read_to_string(&source)
-        .with_context(|| format!("reading {}", display_path(&source)))?;
-
     let notes = match format.as_str() {
-        "enex" | "evernote" => import::evernote_enex(&text),
-        "roam" => import::roam_pages(&text)?,
-        other => bail!("unknown import format: {other} (expected enex or roam)"),
+        "enex" | "evernote" => {
+            let text = std::fs::read_to_string(&source)
+                .with_context(|| format!("reading {}", display_path(&source)))?;
+            import::evernote_enex(&text)
+        }
+        "roam" => {
+            let text = std::fs::read_to_string(&source)
+                .with_context(|| format!("reading {}", display_path(&source)))?;
+            import::roam_pages(&text)?
+        }
+        // A Notion export is a directory of markdown files.
+        "notion" => import::notion_export(&source),
+        other => bail!("unknown import format: {other} (expected enex, roam or notion)"),
     };
 
     if notes.is_empty() {
@@ -789,7 +796,7 @@ fn print_help() {
            dragon-glass plugins     [vault]            list installed plugins\n  \
            dragon-glass run         <vault> <plugin> <command> [note]  run a plugin command\n  \
            dragon-glass uri         <dragonglass://...>  resolve a URI\n  \
-           dragon-glass import      <vault> <enex|roam> <file> [folder]  import notes\n  \
+           dragon-glass import      <vault> <enex|roam|notion> <file|dir> [folder]  import notes\n  \
            dragon-glass mcp         [vault]            MCP server over stdio (read-only)\n  \
            dragon-glass store       <store-dir> [query]  list installable packages\n  \
            dragon-glass install     <vault> <store-dir> <id>  install a package\n  \

@@ -3,6 +3,8 @@
 //! Supported so far: Evernote `.enex` exports and Roam JSON exports. Both funnel through
 //! the small HTML-to-markdown converter below.
 
+use std::path::Path;
+
 use crate::Result;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -233,6 +235,94 @@ fn decode_entities(value: &str) -> String {
         .replace("&amp;", "&")
 }
 
+/// Notion page titles carry a trailing 32-hex id, which we strip.
+pub fn notion_title(stem: &str) -> String {
+    if let Some((head, tail)) = stem.rsplit_once(' ') {
+        if tail.len() == 32 && tail.chars().all(|c| c.is_ascii_hexdigit()) {
+            return head.trim().to_string();
+        }
+    }
+    stem.trim().to_string()
+}
+
+/// Clean a Notion markdown export: percent-escaped spaces and page-id suffixes in links.
+pub fn notion_markdown(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+
+    for line in text.lines() {
+        let mut rest = line;
+
+        while let Some(start) = rest.find("](") {
+            out.push_str(&rest[..start + 2]);
+            let after = &rest[start + 2..];
+
+            let Some(end) = after.find(')') else {
+                out.push_str(after);
+                rest = "";
+                break;
+            };
+
+            out.push_str(&clean_link_target(&after[..end]));
+            out.push(')');
+            rest = &after[end + 1..];
+        }
+
+        out.push_str(rest);
+        out.push('\n');
+    }
+
+    out
+}
+
+fn clean_link_target(target: &str) -> String {
+    let decoded = target.replace("%20", " ");
+
+    match decoded.strip_suffix(".md") {
+        Some(stem) => format!("{}.md", notion_title(stem)),
+        None => decoded,
+    }
+}
+
+/// Read a Notion export directory into notes with cleaned titles and links.
+pub fn notion_export(root: &Path) -> Vec<ImportedNote> {
+    let mut notes = Vec::new();
+
+    for entry in walkdir::WalkDir::new(root)
+        .into_iter()
+        .filter_map(|entry| entry.ok())
+    {
+        if !entry.file_type().is_file() {
+            continue;
+        }
+
+        let path = entry.path();
+        let is_markdown = path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .map(|extension| extension.eq_ignore_ascii_case("md"))
+            .unwrap_or(false);
+        if !is_markdown {
+            continue;
+        }
+
+        let Ok(text) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        let stem = path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .unwrap_or("Untitled");
+
+        notes.push(ImportedNote {
+            title: notion_title(stem),
+            markdown: notion_markdown(&text),
+        });
+    }
+
+    notes.sort_by(|a, b| a.title.cmp(&b.title));
+    notes
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -288,5 +378,52 @@ mod tests {
     #[test]
     fn rejects_invalid_roam_json() {
         assert!(roam_pages("not json").is_err());
+    }
+
+    #[test]
+    fn strips_notion_page_ids() {
+        assert_eq!(
+            notion_title("My Page 0123456789abcdef0123456789abcdef"),
+            "My Page"
+        );
+        // A short suffix is part of the title.
+        assert_eq!(notion_title("My Page abc123"), "My Page abc123");
+    }
+
+    #[test]
+    fn cleans_notion_links() {
+        let text = "See [Other](Other%20Page%200123456789abcdef0123456789abcdef.md) now\n";
+        assert_eq!(notion_markdown(text), "See [Other](Other Page.md) now\n");
+    }
+
+    #[test]
+    fn reads_a_notion_export_directory() {
+        let dir = std::env::temp_dir().join(format!(
+            "dragon-glass-notion-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("nested")).unwrap();
+
+        std::fs::write(
+            dir.join("Page One 0123456789abcdef0123456789abcdef.md"),
+            "# Page One\n\nbody\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("nested")
+                .join("Page Two 0123456789abcdef0123456789abcdef.md"),
+            "# Page Two\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("ignore.txt"), "not markdown").unwrap();
+
+        let notes = notion_export(&dir);
+        assert_eq!(notes.len(), 2);
+        assert_eq!(notes[0].title, "Page One");
+        assert_eq!(notes[1].title, "Page Two");
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
