@@ -22,6 +22,7 @@ pub mod tags;
 pub mod templates;
 pub mod tree;
 pub mod update;
+pub mod uri;
 pub mod vault;
 pub mod wikilink;
 pub mod workspace;

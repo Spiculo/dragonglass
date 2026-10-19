@@ -15,7 +15,7 @@ use std::process::ExitCode;
 
 use anyhow::{anyhow, bail, Context, Result};
 use dragonglass_core::{
-    api, git, graph, history, html, query, storage, update, Note, NoteRef, Vault,
+    api, git, graph, history, html, query, storage, update, uri, Note, NoteRef, Vault,
 };
 use dragonglass_plugins as plugins;
 
@@ -51,6 +51,7 @@ fn run() -> Result<()> {
         Some("graph") => return graph_cmd(args.collect()),
         Some("plugins") => return plugins_cmd(args.collect()),
         Some("run") => return run_plugin(args.collect()),
+        Some("uri") => return uri_cmd(args.collect()),
         _ => {}
     }
 
@@ -188,6 +189,34 @@ fn git_pull(path: Option<String>) -> Result<()> {
 
 fn git_push(path: Option<String>) -> Result<()> {
     report_outcome(git::push(&vault_arg(path))?);
+    Ok(())
+}
+
+fn uri_cmd(args: Vec<String>) -> Result<()> {
+    let Some(raw) = args.first() else {
+        bail!("usage: dragon-glass uri <dragonglass://...>");
+    };
+
+    let parsed = uri::parse(raw).ok_or_else(|| anyhow!("not a dragonglass URI: {raw}"))?;
+    println!("action: {}", parsed.action);
+    if let Some(vault) = &parsed.vault {
+        println!("vault:  {vault}");
+    }
+    if let Some(note) = &parsed.note {
+        let path = parsed
+            .vault
+            .as_ref()
+            .map(|vault| PathBuf::from(vault).join(note))
+            .unwrap_or_else(|| PathBuf::from(note));
+        println!(
+            "note:   {} (exists: {})",
+            display_path(&path),
+            path.exists()
+        );
+    }
+    if let Some(query) = &parsed.query {
+        println!("query:  {query}");
+    }
     Ok(())
 }
 
@@ -417,7 +446,8 @@ fn print_help() {
            dragon-glass check-update <source> [current]  compare against an advertised version\n  \
            dragon-glass graph       [vault] [note]     print the link graph\n  \
            dragon-glass plugins     [vault]            list installed plugins\n  \
-           dragon-glass run         <vault> <plugin> <command> [note]  run a plugin command\n\n\
+           dragon-glass run         <vault> <plugin> <command> [note]  run a plugin command\n  \
+           dragon-glass uri         <dragonglass://...>  resolve a URI\n\n\
          vault defaults to the current directory."
     );
 }

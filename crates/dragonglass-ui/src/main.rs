@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use dragonglass_core::frontmatter::{Property, PropertyValue};
 use dragonglass_core::{
     bookmarks, config, conflict, git, graph, markdown, query, search, storage, templates, update,
-    workspace, NodeKind, Note, NoteRef, TreeNode, Vault,
+    uri, workspace, NodeKind, Note, NoteRef, TreeNode, Vault,
 };
 use dragonglass_plugins as plugins;
 use editor::Editor;
@@ -534,17 +534,45 @@ impl DragonGlassApp {
         let note = self.active.clone();
         let outcome = plugins::run_command(plugin, &command_id, &self.vault_root, note.as_deref());
 
-        self.status_message = Some(match outcome {
-            Ok(output) => {
-                let trimmed = output.trim();
-                let short: String = trimmed.chars().take(200).collect();
-                if short.is_empty() {
-                    format!("{title}: (no output)")
-                } else {
-                    format!("{title}: {short}")
+        self.status_message = Some({
+            let mut applied: Vec<&'static str> = Vec::new();
+            let message = match outcome {
+                Ok(output) => {
+                    let response = plugins::parse_response(&output);
+
+                    if let Some(text) = response.insert {
+                        self.editor.update(cx, |editor, cx| {
+                            editor.insert_at_cursor(&text);
+                            cx.notify();
+                        });
+                        applied.push("inserted");
+                    }
+                    if let Some(text) = response.append {
+                        self.editor.update(cx, |editor, cx| {
+                            editor.append_to_note(&text);
+                            cx.notify();
+                        });
+                        applied.push("appended");
+                    }
+
+                    response.message.unwrap_or_else(|| {
+                        let short: String = output.trim().chars().take(200).collect();
+                        if short.is_empty() {
+                            "(no output)".to_string()
+                        } else {
+                            short
+                        }
+                    })
                 }
-            }
-            Err(e) => format!("{title} failed: {e}"),
+                Err(e) => format!("failed: {e}"),
+            };
+
+            let suffix = if applied.is_empty() {
+                String::new()
+            } else {
+                format!(" [{}]", applied.join(", "))
+            };
+            format!("{title}: {message}{suffix}")
         });
         cx.notify();
     }
@@ -1406,9 +1434,18 @@ impl Render for DragonGlassApp {
 }
 
 fn main() {
-    let vault_path = std::env::args()
+    // The first argument may be a vault path or a `dragonglass://` URI, so the app can be
+    // registered as the OS handler for the scheme.
+    let argument = std::env::args()
         .nth(1)
         .unwrap_or_else(|| "test-vault".to_string());
+    let (vault_path, uri_note) = match uri::parse(&argument) {
+        Some(parsed) => (
+            parsed.vault.clone().unwrap_or_else(|| ".".to_string()),
+            parsed.note.clone(),
+        ),
+        None => (argument, None),
+    };
 
     let vault = match Vault::open(&vault_path) {
         Ok(v) => v,
@@ -1462,8 +1499,16 @@ fn main() {
     let first = note_refs
         .iter()
         .max_by_key(|r| Note::load(&r.path).map(|n| n.links().len()).unwrap_or(0));
-    let first_path = first.map(|r| r.path.clone());
-    let first_rel = first.map(|r| r.relative.clone());
+
+    // A URI note wins over the default; otherwise open the note with the most links.
+    let first_rel = uri_note
+        .filter(|note| {
+            note_refs
+                .iter()
+                .any(|candidate| &candidate.relative == note)
+        })
+        .or_else(|| first.map(|r| r.relative.clone()));
+    let first_path = first_rel.as_ref().map(|relative| vault_root.join(relative));
 
     Application::new().run(move |cx: &mut App| {
         editor::init(cx);

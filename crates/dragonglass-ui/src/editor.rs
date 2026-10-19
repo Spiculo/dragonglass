@@ -200,6 +200,18 @@ impl Editor {
         self.reading = reading;
     }
 
+    /// Insert text at the caret (used by plugins).
+    pub fn insert_at_cursor(&mut self, text: &str) {
+        self.insert_text(text);
+    }
+
+    /// Append text to the end of the note.
+    pub fn append_to_note(&mut self, text: &str) {
+        self.buffer.set_cursor(self.buffer.len_chars());
+        self.buffer.insert(text);
+        self.anchor = None;
+    }
+
     /// Tell the editor where the vault lives, for resolving embeds.
     pub fn set_vault_root(&mut self, root: &Path) {
         self.vault_root = Some(root.to_path_buf());
