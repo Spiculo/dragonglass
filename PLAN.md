@@ -230,3 +230,31 @@ optimize for shipping working code over schedule precision.
   `xattr 0.2.3`, which references `libc::ENOATTR`; libc removed that constant for Linux in
   0.2.189+. `rustix` requires `>= 0.2.182`, so 0.2.188 is the only valid window. Drop the
   pin once Zed updates its `async-tar` fork. Linux builds fail loudly if it moves.
+
+---
+
+## 10. Progress
+
+**Phase 0 — complete.** Workspace, CI (Windows + Linux, including the GPUI build), core
+engine, CLI, GPUI validated on both platforms.
+
+**Phase 1 — complete except two items.** Vault open/round-trip, file tree, rope buffer with
+undo/redo, in-house GPUI editor (caret, mouse placement, drag selection, shift-extend,
+copy/cut/paste/select-all, IME), atomic save + dirty indicator + autosave on switch,
+reading mode, quick switcher, full-text search, tags, wikilinks/backlinks data, outline pane,
+daily notes + templates, properties display/edit, git sync, KaTeX/dialect still to expand.
+Remaining: word wrap, horizontal scroll, richer live preview.
+
+**Phase 2 — largely done.** Properties, daily notes, templates, outline, bookmarks,
+command palette, theming (light/dark), embeds and attachments, file-recovery snapshots.
+Remaining: graph view, periodic notes, hotkey editor, external-change conflict handling,
+update-available prompt, snippets, global/local graph filters.
+
+**Phase 3 — started.** Command palette and CLI/headless export are in. Remaining: WASM
+plugin API + manifest, theme/plugin store, URI scheme, multi-window, workspaces,
+DataView/Bases-style query views.
+
+**Phase 4 — started.** Static HTML export is in. Remaining: importers
+(Notion/Evernote/Roam), PDF export, local HTTP API / MCP surface, optional E2E sync.
+
+**Phase 5 — not started.** macOS cross-compile, signing/notarization, platform polish.
