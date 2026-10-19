@@ -250,11 +250,12 @@ command palette, theming (light/dark), embeds and attachments, file-recovery sna
 Remaining: graph view, periodic notes, hotkey editor, external-change conflict handling,
 update-available prompt, snippets, global/local graph filters.
 
-**Phase 3 — started.** Command palette and CLI/headless export are in. Remaining: WASM
-plugin API + manifest, theme/plugin store, URI scheme, multi-window, workspaces,
-DataView/Bases-style query views.
+**Phase 3 — partly done.** Command palette, CLI/headless mode, static HTML export and
+Bases/DataView-style query views are in. Remaining: WASM plugin API + manifest,
+theme/plugin store, URI scheme, multi-window, workspaces.
 
-**Phase 4 — started.** Static HTML export is in. Remaining: importers
-(Notion/Evernote/Roam), PDF export, local HTTP API / MCP surface, optional E2E sync.
+**Phase 4 — partly done.** Static HTML export and a read-only local HTTP API
+(`/health`, `/notes`, `/search`, `/query`, `/note`) are in. Remaining: importers
+(Notion/Evernote/Roam), PDF export, a full MCP surface, optional E2E sync.
 
 **Phase 5 — not started.** macOS cross-compile, signing/notarization, platform polish.

@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use anyhow::{bail, Context, Result};
-use dragonglass_core::{git, history, html, query, storage, Note, NoteRef, Vault};
+use dragonglass_core::{api, git, history, html, query, storage, Note, NoteRef, Vault};
 
 fn main() -> ExitCode {
     match run() {
@@ -43,6 +43,7 @@ fn run() -> Result<()> {
         Some("history") => return history_cmd(args.collect()),
         Some("export") => return export(args.collect()),
         Some("query") => return query_cmd(args.collect()),
+        Some("serve") => return serve(args.collect()),
         _ => {}
     }
 
@@ -183,6 +184,17 @@ fn git_push(path: Option<String>) -> Result<()> {
     Ok(())
 }
 
+fn serve(args: Vec<String>) -> Result<()> {
+    let root = PathBuf::from(args.first().cloned().unwrap_or_else(|| ".".to_string()));
+    let addr = args
+        .get(1)
+        .cloned()
+        .unwrap_or_else(|| "127.0.0.1:7456".to_string());
+
+    println!("serving {} at http://{addr}", display_path(&root));
+    api::serve(&root, &addr).map_err(Into::into)
+}
+
 fn query_cmd(args: Vec<String>) -> Result<()> {
     if args.len() < 2 {
         bail!("usage: dragon-glass query <vault> \"<query>\"");
@@ -299,7 +311,8 @@ fn print_help() {
            dragon-glass history     <vault> <note>    list snapshots for a note\n  \
            dragon-glass history     <vault> <note> <id>  print a snapshot\n  \
            dragon-glass export      <vault> <out-dir>   render notes to HTML\n  \
-           dragon-glass query       <vault> \"<query>\"  filter notes by property or tag\n\n\
+           dragon-glass query       <vault> \"<query>\"  filter notes by property or tag\n  \
+           dragon-glass serve       [vault] [addr]     read-only HTTP API (loopback)\n\n\
          vault defaults to the current directory."
     );
 }

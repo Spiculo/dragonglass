@@ -3,6 +3,7 @@
 //! Everything here is a plain Rust library so it can be unit-tested, driven by the CLI,
 //! and reused by the GPUI application.
 
+pub mod api;
 pub mod bookmarks;
 pub mod buffer;
 pub mod frontmatter;
