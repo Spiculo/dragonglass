@@ -1,0 +1,14 @@
+# Installer manifest. The InstallerSha256 is a placeholder: the release workflow must
+# fill it in with the real hash of the built setup executable before submitting to winget.
+PackageIdentifier: DragonGlass.DragonGlass
+PackageVersion: 0.0.1
+InstallerType: inno
+Scope: user
+Installers:
+  - Architecture: x64
+    InstallerUrl: https://github.com/anomalyco/dragonglass/releases/download/v0.0.1/dragon-glass-0.0.1-setup.exe
+    InstallerSha256: REPLACE_WITH_RELEASE_SHA256
+    InstallerSwitches:
+      Silent: /VERYSILENT /SUPPRESSMSGBOXES /NORESTART
+ManifestType: installer
+ManifestVersion: 1.6.0

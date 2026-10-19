@@ -1,0 +1,19 @@
+PackageIdentifier: DragonGlass.DragonGlass
+PackageVersion: 0.0.1
+PackageLocale: en-US
+Publisher: Dragon Glass contributors
+PublisherUrl: https://github.com/anomalyco/dragonglass
+PackageName: Dragon Glass
+PackageUrl: https://github.com/anomalyco/dragonglass
+License: GPL-3.0-or-later
+LicenseUrl: https://www.gnu.org/licenses/gpl-3.0.txt
+ShortDescription: Native, local-first markdown knowledge base
+Description: A fast, native, Obsidian-compatible note vault that keeps notes as plain text. No Electron; your vault stays a folder of markdown files.
+Moniker: dragonglass
+Tags:
+  - notes
+  - markdown
+  - obsidian
+  - knowledge-base
+ManifestType: defaultLocale
+ManifestVersion: 1.6.0

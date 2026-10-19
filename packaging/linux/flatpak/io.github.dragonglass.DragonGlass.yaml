@@ -1,0 +1,42 @@
+# Flatpak manifest for Dragon Glass.
+#
+# Build with: flatpak-builder --user --install --force-clean build packaging/linux/flatpak/io.github.dragonglass.DragonGlass.yaml
+#
+# The build is offline (no network at build time): sources are expected to be vendored
+# alongside the manifest, which suits an app that already keeps everything local.
+
+app-id: io.github.dragonglass.DragonGlass
+runtime: org.freedesktop.Platform
+runtime-version: "24.08"
+sdk: org.freedesktop.Sdk
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.rust-stable
+command: dragon-glass-app
+
+finish-args:
+  # Notes live in the user's vault, wherever they keep it.
+  - --filesystem=home
+  - --share=ipc
+  - --socket=wayland
+  - --socket=fallback-x11
+  - --device=dri
+  # No network: Dragon Glass is offline-first and does not phone home.
+  - --unshare=network
+
+build-options:
+  append-path: /usr/lib/sdk/rust-stable/bin
+  env:
+    CARGO_HOME: /run/build/dragon-glass/cargo
+
+modules:
+  - name: dragon-glass
+    buildsystem: simple
+    build-commands:
+      - cargo build --release --offline -p dragonglass-ui -p dragonglass-cli
+      - install -Dm755 target/release/dragon-glass-app /app/bin/dragon-glass-app
+      - install -Dm755 target/release/dragon-glass /app/bin/dragon-glass
+      - install -Dm644 packaging/linux/dragon-glass.desktop /app/share/applications/io.github.dragonglass.DragonGlass.desktop
+      - install -Dm644 packaging/windows/dragon-glass.ico /app/share/icons/hicolor/32x32/apps/io.github.dragonglass.DragonGlass.png
+    sources:
+      - type: dir
+        path: ../../..
