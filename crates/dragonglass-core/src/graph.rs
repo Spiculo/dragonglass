@@ -111,6 +111,49 @@ pub fn build(notes: &[NoteRef]) -> Graph {
     Graph { nodes, edges }
 }
 
+/// Keep only nodes whose path contains `query`, and the edges between them.
+pub fn filter(graph: &Graph, query: &str) -> Graph {
+    let needle = query.trim().to_lowercase();
+    if needle.is_empty() {
+        return graph.clone();
+    }
+
+    let mut remap: HashMap<usize, usize> = HashMap::new();
+    let mut nodes = Vec::new();
+
+    for node in &graph.nodes {
+        if node.relative.to_lowercase().contains(&needle) {
+            remap.insert(node.id, nodes.len());
+            nodes.push(Node {
+                id: nodes.len(),
+                relative: node.relative.clone(),
+                links: node.links,
+            });
+        }
+    }
+
+    let edges = graph
+        .edges
+        .iter()
+        .filter_map(|edge| {
+            Some(Edge {
+                from: *remap.get(&edge.from)?,
+                to: *remap.get(&edge.to)?,
+            })
+        })
+        .collect();
+
+    Graph { nodes, edges }
+}
+
+/// The top-level folder of a vault-relative path, or `""` for a root note.
+pub fn folder_of(relative: &str) -> &str {
+    match relative.split_once('/') {
+        Some((folder, _)) => folder,
+        None => "",
+    }
+}
+
 /// The subgraph within `depth` hops of `root`, capped at `max_nodes`.
 pub fn local(graph: &Graph, root: usize, depth: usize, max_nodes: usize) -> Graph {
     if graph.nodes.is_empty() || root >= graph.nodes.len() {
@@ -267,6 +310,9 @@ mod tests {
 
     fn note(dir: &std::path::Path, name: &str, body: &str) -> NoteRef {
         let path = dir.join(name);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
         std::fs::write(&path, body).unwrap();
         NoteRef {
             path,
@@ -311,6 +357,33 @@ mod tests {
         assert_eq!(local.nodes.len(), 4);
 
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn filters_by_path_substring() {
+        let dir = vault("filter");
+        let notes = vec![
+            note(&dir, "projects/a.md", "[[b]]\n"),
+            note(&dir, "projects/b.md", "[[a]]\n"),
+            note(&dir, "other/c.md", "[[a]]\n"),
+        ];
+        let graph = build(&notes);
+
+        let filtered = filter(&graph, "projects");
+        assert_eq!(filtered.nodes.len(), 2);
+        // a -> b and b -> a both survive; c -> a does not.
+        assert_eq!(filtered.edges.len(), 2);
+        assert_eq!(filtered.nodes[0].relative, "projects/a.md");
+
+        assert_eq!(filter(&graph, "  ").nodes.len(), 3);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn folder_of_uses_the_first_component() {
+        assert_eq!(folder_of("projects/deep/a.md"), "projects");
+        assert_eq!(folder_of("a.md"), "");
     }
 
     #[test]

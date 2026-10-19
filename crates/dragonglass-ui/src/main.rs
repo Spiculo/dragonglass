@@ -95,6 +95,7 @@ enum SwitcherMode {
     WorkspaceMenu,
     HotkeyMenu,
     HotkeyCapture,
+    GraphFilterInput,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -118,6 +119,8 @@ enum CommandId {
     UserTheme(usize),
     NewWindow,
     Hotkeys,
+    GraphFilter,
+    GraphDepth,
     Plugin(usize),
 }
 
@@ -458,6 +461,7 @@ impl DragonGlassApp {
                 })
                 .collect(),
             SwitcherMode::HotkeyCapture => Vec::new(),
+            SwitcherMode::GraphFilterInput => Vec::new(),
             SwitcherMode::CommandsMenu => vec![
                 command_item("Quick switcher", "ctrl+o", CommandId::QuickSwitch),
                 command_item("Search", "ctrl+shift+f", CommandId::Search),
@@ -475,6 +479,8 @@ impl DragonGlassApp {
                 command_item("Run a query", "", CommandId::RunQuery),
                 command_item("Save workspace", "", CommandId::SaveWorkspace),
                 command_item("Keyboard shortcuts", "", CommandId::Hotkeys),
+                command_item("Graph: filter", "", CommandId::GraphFilter),
+                command_item("Graph: cycle depth", "", CommandId::GraphDepth),
                 command_item("Load workspace", "", CommandId::LoadWorkspace),
                 command_item("New window", "ctrl+n", CommandId::NewWindow),
             ]
@@ -987,6 +993,20 @@ impl DragonGlassApp {
                     return;
                 }
 
+                if panel.mode == SwitcherMode::GraphFilterInput {
+                    let filter = panel.query.clone();
+                    self.open_graph(window, cx);
+                    if let Some(view) = self.graph_view.clone() {
+                        view.update(cx, |view, cx| {
+                            view.set_filter(&filter);
+                            cx.notify();
+                        });
+                    }
+                    self.status_message = Some(format!("graph filter: {filter}"));
+                    self.close_panel(window, cx);
+                    return;
+                }
+
                 if let Some(item) = panel.results.get(panel.selected) {
                     match &item.item {
                         Item::Note { relative } => {
@@ -1122,6 +1142,29 @@ impl DragonGlassApp {
                                 CommandId::Plugin(index) => self.run_plugin_command(index, cx),
                                 CommandId::UserTheme(index) => self.apply_user_theme(index, cx),
                                 CommandId::NewWindow => self.open_new_window(window, cx),
+                                CommandId::GraphFilter => {
+                                    panel.mode = SwitcherMode::GraphFilterInput;
+                                    panel.query.clear();
+                                    panel.property_key = None;
+                                    panel.results.clear();
+                                    panel.selected = 0;
+                                    self.switcher = Some(panel);
+                                    cx.notify();
+                                    return;
+                                }
+                                CommandId::GraphDepth => {
+                                    if let Some(view) = self.graph_view.clone() {
+                                        let next = view.read(cx).depth() % 3 + 1;
+                                        self.open_graph(window, cx);
+                                        view.update(cx, |view, cx| {
+                                            view.set_depth(next);
+                                            cx.notify();
+                                        });
+                                        self.status_message = Some(format!("graph depth: {next}"));
+                                    }
+                                    self.close_panel(window, cx);
+                                    return;
+                                }
                                 CommandId::Hotkeys => {
                                     panel.mode = SwitcherMode::HotkeyMenu;
                                     panel.query.clear();
@@ -1576,6 +1619,7 @@ impl Render for DragonGlassApp {
                 SwitcherMode::WorkspaceMenu => "workspace:",
                 SwitcherMode::HotkeyMenu => "shortcut:",
                 SwitcherMode::HotkeyCapture => "press a key:",
+                SwitcherMode::GraphFilterInput => "graph filter:",
             };
             let rows = panel.results.iter().enumerate().map(|(i, item)| {
                 let mut row = div()

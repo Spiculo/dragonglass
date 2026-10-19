@@ -27,6 +27,11 @@ pub fn init(cx: &mut App) {
 pub struct GraphView {
     graph: Graph,
     positions: Vec<(f32, f32)>,
+    /// The whole vault graph, before the local window and filter are applied.
+    full: Graph,
+    focus: Option<String>,
+    filter: String,
+    depth: usize,
     app: WeakEntity<crate::DragonGlassApp>,
     focus_handle: FocusHandle,
     last_bounds: Option<Bounds<Pixels>>,
@@ -37,6 +42,10 @@ impl GraphView {
         Self {
             graph: Graph::default(),
             positions: Vec::new(),
+            full: Graph::default(),
+            focus: None,
+            filter: String::new(),
+            depth: DEPTH,
             app,
             focus_handle: cx.focus_handle(),
             last_bounds: None,
@@ -51,11 +60,39 @@ impl GraphView {
 
     /// The local graph around a vault-relative note.
     pub fn show_local(&mut self, full: &Graph, relative: &str) {
-        let local = match full.index_of(relative) {
-            Some(id) => graph::local(full, id, DEPTH, MAX_NODES),
-            None => full.clone(),
+        self.full = full.clone();
+        self.focus = Some(relative.to_string());
+        self.rebuild();
+    }
+
+    /// Restrict the graph to nodes whose path contains `filter`.
+    pub fn set_filter(&mut self, filter: &str) {
+        self.filter = filter.to_string();
+        self.rebuild();
+    }
+
+    /// Hops of the active note to show (1–3).
+    pub fn set_depth(&mut self, depth: usize) {
+        self.depth = depth.clamp(1, 3);
+        self.rebuild();
+    }
+
+    pub fn depth(&self) -> usize {
+        self.depth
+    }
+
+    fn rebuild(&mut self) {
+        let base = match self
+            .focus
+            .as_ref()
+            .and_then(|relative| self.full.index_of(relative))
+        {
+            Some(id) => graph::local(&self.full, id, self.depth, MAX_NODES),
+            None => self.full.clone(),
         };
-        self.set_graph(local);
+
+        let filtered = graph::filter(&base, &self.filter);
+        self.set_graph(filtered);
     }
 
     fn node_radius(links: usize) -> f32 {
@@ -140,8 +177,11 @@ impl Render for GraphView {
                     .bg(theme.panel_alt)
                     .text_xs()
                     .text_color(theme.muted)
-                    .child(format!("graph: {count} notes / {edges} links"))
-                    .child("click a node to open it · Esc to close"),
+                    .child(format!(
+                        "graph: {count} notes / {edges} links · depth {}",
+                        self.depth
+                    ))
+                    .child("click a node to open · Esc to close · colours group by folder"),
             )
             .child(
                 div()
@@ -151,6 +191,15 @@ impl Render for GraphView {
                     .child(GraphCanvas { view: cx.entity() }),
             )
     }
+}
+
+/// A stable colour per top-level folder, so related notes group visually.
+fn folder_color(folder: &str, dark: bool) -> gpui::Hsla {
+    let hash = folder.bytes().fold(7u32, |acc, byte| {
+        acc.wrapping_mul(31).wrapping_add(u32::from(byte))
+    });
+    let hue = (hash % 360) as f32 / 360.0;
+    gpui::hsla(hue, 0.55, if dark { 0.62 } else { 0.45 }, 1.0)
 }
 
 struct GraphCanvas {
@@ -258,7 +307,12 @@ impl Element for GraphCanvas {
             let (px_, py) = canvas_position(id);
             let center = to_screen(px_, py);
             let radius = GraphView::node_radius(node.links);
-            let color = if id == 0 { theme.accent } else { theme.star };
+            let folder = graph::folder_of(&node.relative);
+            let color = if id == 0 {
+                theme.accent
+            } else {
+                folder_color(folder, theme.dark)
+            };
             node_quads.push(fill(
                 Bounds::new(
                     point(center.x - px(radius), center.y - px(radius)),
