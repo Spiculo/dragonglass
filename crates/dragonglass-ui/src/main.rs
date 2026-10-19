@@ -122,6 +122,7 @@ enum CommandId {
     GraphFilter,
     GraphDepth,
     ToggleSnippets,
+    TogglePreview,
     Plugin(usize),
 }
 
@@ -184,6 +185,8 @@ struct DragonGlassApp {
     show_graph: bool,
     query_results: Vec<query::Row>,
     show_query: bool,
+    /// Show the reading view beside the editor.
+    split_preview: bool,
     /// Installed plugins, and a flattened list of `(plugin index, command id, title)`.
     plugins: Vec<plugins::PluginInfo>,
     plugin_commands: Vec<(usize, String, String)>,
@@ -486,6 +489,7 @@ impl DragonGlassApp {
                 command_item("Graph: filter", "", CommandId::GraphFilter),
                 command_item("Graph: cycle depth", "", CommandId::GraphDepth),
                 command_item("Toggle snippets", "", CommandId::ToggleSnippets),
+                command_item("Toggle preview pane", "", CommandId::TogglePreview),
                 command_item("Load workspace", "", CommandId::LoadWorkspace),
                 command_item("New window", "ctrl+n", CommandId::NewWindow),
             ]
@@ -685,8 +689,9 @@ impl DragonGlassApp {
         cx.notify();
     }
 
-    /// The centre pane: the graph when open, otherwise the editor.
-    fn center_view(&self, theme: Theme) -> AnyElement {
+    /// The centre pane: the graph, the query table, or the editor (optionally with a
+    /// preview pane beside it).
+    fn center_view(&self, theme: Theme, preview: Option<AnyElement>) -> AnyElement {
         if self.show_query {
             return query_view(&self.query_results, theme);
         }
@@ -695,7 +700,16 @@ impl DragonGlassApp {
                 return view.clone().into_any_element();
             }
         }
-        self.editor.clone().into_any_element()
+        match preview {
+            Some(preview) => div()
+                .flex()
+                .flex_row()
+                .size_full()
+                .child(div().flex_1().min_w(px(0.0)).child(self.editor.clone()))
+                .child(preview)
+                .into_any_element(),
+            None => self.editor.clone().into_any_element(),
+        }
     }
 
     fn close_query(&mut self, _: &CloseQuery, window: &mut Window, cx: &mut Context<Self>) {
@@ -748,6 +762,7 @@ impl DragonGlassApp {
             show_graph: false,
             query_results: Vec::new(),
             show_query: false,
+            split_preview: self.split_preview,
             plugins: self.plugins.clone(),
             plugin_commands: self.plugin_commands.clone(),
             workspaces: self.workspaces.clone(),
@@ -1207,6 +1222,14 @@ impl DragonGlassApp {
                                     return;
                                 }
                                 CommandId::ToggleSnippets => self.toggle_snippets(cx),
+                                CommandId::TogglePreview => {
+                                    self.split_preview = !self.split_preview;
+                                    self.status_message = Some(format!(
+                                        "preview pane: {}",
+                                        if self.split_preview { "on" } else { "off" }
+                                    ));
+                                    cx.notify();
+                                }
                                 CommandId::Hotkeys => {
                                     panel.mode = SwitcherMode::HotkeyMenu;
                                     panel.query.clear();
@@ -1492,8 +1515,43 @@ fn git_label(status: &Option<git::Status>) -> String {
 }
 
 impl Render for DragonGlassApp {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = *cx.global::<Theme>();
+
+        // A preview pane beside the editor, sharing the same document text.
+        let preview: Option<AnyElement> =
+            if self.split_preview && !self.show_graph && !self.show_query {
+                let style = window.text_style();
+                let template = gpui::TextRun {
+                    len: 0,
+                    font: style.font(),
+                    color: style.color,
+                    background_color: None,
+                    underline: None,
+                    strikethrough: None,
+                };
+                let text = self.editor.read(cx).text();
+
+                Some(
+                    div()
+                        .id("preview-scroll")
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .overflow_y_scroll()
+                        .border_l_1()
+                        .border_color(theme.border)
+                        .child(crate::reading::reading_view(
+                            &text,
+                            Some(&self.vault_root),
+                            0,
+                            theme,
+                            &template,
+                        ))
+                        .into_any_element(),
+                )
+            } else {
+                None
+            };
 
         // A conflict is resolved once the editor is clean again (saved or reloaded).
         if self.conflict && !self.editor.read(cx).is_dirty() {
@@ -1756,7 +1814,13 @@ impl Render for DragonGlassApp {
                     .flex_1()
                     .min_h(px(0.0))
                     .child(sidebar)
-                    .child(div().flex_1().w_full().p_2().child(self.center_view(theme)))
+                    .child(
+                        div()
+                            .flex_1()
+                            .w_full()
+                            .p_2()
+                            .child(self.center_view(theme, preview)),
+                    )
                     .children(outline),
             )
     }
@@ -1931,6 +1995,7 @@ fn main() {
             show_graph: false,
             query_results: Vec::new(),
             show_query: false,
+            split_preview: std::env::var("DRAGON_GLASS_PREVIEW").is_ok(),
             plugins: initial_plugins,
             plugin_commands: initial_plugin_commands,
             workspaces: initial_workspaces,
