@@ -6,6 +6,7 @@
 pub mod api;
 pub mod bookmarks;
 pub mod buffer;
+pub mod config;
 pub mod conflict;
 pub mod frontmatter;
 pub mod git;

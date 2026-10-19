@@ -13,8 +13,8 @@ use std::path::{Path, PathBuf};
 
 use dragonglass_core::frontmatter::{Property, PropertyValue};
 use dragonglass_core::{
-    bookmarks, conflict, git, graph, markdown, search, storage, templates, update, NodeKind, Note,
-    NoteRef, TreeNode, Vault,
+    bookmarks, config, conflict, git, graph, markdown, search, storage, templates, update,
+    NodeKind, Note, NoteRef, TreeNode, Vault,
 };
 use editor::Editor;
 use gpui::{
@@ -36,7 +36,9 @@ actions!(
         ToggleBookmark,
         OpenCommands,
         ToggleTheme,
-        OpenGraph
+        OpenGraph,
+        OpenWeekly,
+        OpenMonthly
     ]
 );
 
@@ -56,6 +58,8 @@ enum CommandId {
     QuickSwitch,
     Search,
     Daily,
+    Weekly,
+    Monthly,
     Properties,
     Bookmark,
     Git,
@@ -83,6 +87,12 @@ enum Item {
     Command(CommandId),
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Periodic {
+    Daily,
+    Weekly,
+    Monthly,
+}
 struct SwitcherItem {
     label: String,
     detail: String,
@@ -113,6 +123,7 @@ struct DragonGlassApp {
     full_graph: graph::Graph,
     graph_view: Option<gpui::Entity<GraphView>>,
     show_graph: bool,
+    config: config::Config,
     active: Option<String>,
     vault_path: String,
     notes: usize,
@@ -210,14 +221,45 @@ impl DragonGlassApp {
 
     /// Open (or create) today's daily note, using `Templates/Daily.md` when present.
     fn open_daily(&mut self, _: &OpenDaily, window: &mut Window, cx: &mut Context<Self>) {
-        self.create_daily(window, cx);
+        self.create_periodic(Periodic::Daily, window, cx);
     }
 
-    fn create_daily(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn open_weekly(&mut self, _: &OpenWeekly, window: &mut Window, cx: &mut Context<Self>) {
+        self.create_periodic(Periodic::Weekly, window, cx);
+    }
+
+    fn open_monthly(&mut self, _: &OpenMonthly, window: &mut Window, cx: &mut Context<Self>) {
+        self.create_periodic(Periodic::Monthly, window, cx);
+    }
+
+    /// Open or create a daily/weekly/monthly note, using the matching template.
+    fn create_periodic(&mut self, kind: Periodic, window: &mut Window, cx: &mut Context<Self>) {
+        use chrono::Datelike as _;
+
         let now = chrono::Local::now();
         let date = now.format("%Y-%m-%d").to_string();
         let time = now.format("%H:%M").to_string();
-        let relative = format!("Daily/{date}.md");
+        let iso = now.iso_week();
+
+        let (folder, title, template_name) = match kind {
+            Periodic::Daily => (
+                self.config.daily_folder.clone(),
+                date.clone(),
+                "Daily.md".to_string(),
+            ),
+            Periodic::Weekly => (
+                self.config.weekly_folder.clone(),
+                format!("{}-W{:02}", iso.year(), iso.week()),
+                "Weekly.md".to_string(),
+            ),
+            Periodic::Monthly => (
+                self.config.monthly_folder.clone(),
+                now.format("%Y-%m").to_string(),
+                "Monthly.md".to_string(),
+            ),
+        };
+
+        let relative = format!("{folder}/{title}.md");
         let path = self.vault_root.join(&relative);
 
         if !path.exists() {
@@ -225,21 +267,24 @@ impl DragonGlassApp {
                 let _ = std::fs::create_dir_all(parent);
             }
 
-            let template_path = self.vault_root.join("Templates/Daily.md");
+            let template_path = self
+                .vault_root
+                .join(&self.config.templates_folder)
+                .join(&template_name);
             let content = match std::fs::read_to_string(&template_path) {
                 Ok(template) => templates::render(
                     &template,
                     &[
                         ("date", date.as_str()),
                         ("time", time.as_str()),
-                        ("title", date.as_str()),
+                        ("title", title.as_str()),
                     ],
                 ),
-                Err(_) => format!("# {date}\n\n"),
+                Err(_) => format!("# {title}\n\n"),
             };
 
             if let Err(e) = storage::write_atomic(&path, &content) {
-                self.status_message = Some(format!("could not create daily note: {e}"));
+                self.status_message = Some(format!("could not create note: {e}"));
                 cx.notify();
                 return;
             }
@@ -333,6 +378,8 @@ impl DragonGlassApp {
                 command_item("Quick switcher", "ctrl+o", CommandId::QuickSwitch),
                 command_item("Search", "ctrl+shift+f", CommandId::Search),
                 command_item("Daily note", "ctrl+shift+d", CommandId::Daily),
+                command_item("Weekly note", "ctrl+shift+w", CommandId::Weekly),
+                command_item("Monthly note", "ctrl-shift-m", CommandId::Monthly),
                 command_item("Properties", "ctrl+shift+p", CommandId::Properties),
                 command_item("Toggle bookmark", "ctrl+shift+b", CommandId::Bookmark),
                 command_item("Git", "ctrl+g", CommandId::Git),
@@ -668,7 +715,15 @@ impl DragonGlassApp {
                             }
 
                             match command {
-                                CommandId::Daily => self.create_daily(window, cx),
+                                CommandId::Daily => {
+                                    self.create_periodic(Periodic::Daily, window, cx)
+                                }
+                                CommandId::Weekly => {
+                                    self.create_periodic(Periodic::Weekly, window, cx)
+                                }
+                                CommandId::Monthly => {
+                                    self.create_periodic(Periodic::Monthly, window, cx)
+                                }
                                 CommandId::Bookmark => self.toggle_bookmark_now(cx),
                                 CommandId::ToggleReading => self.editor.update(cx, |editor, cx| {
                                     editor.toggle_reading_mode();
@@ -1036,6 +1091,8 @@ impl Render for DragonGlassApp {
             .on_action(cx.listener(Self::open_search))
             .on_action(cx.listener(Self::open_git))
             .on_action(cx.listener(Self::open_daily))
+            .on_action(cx.listener(Self::open_weekly))
+            .on_action(cx.listener(Self::open_monthly))
             .on_action(cx.listener(Self::open_properties))
             .on_action(cx.listener(Self::toggle_bookmark))
             .on_action(cx.listener(Self::open_commands))
@@ -1109,6 +1166,7 @@ fn main() {
     let initial_bookmarks = bookmarks::load(&vault_root);
     let initial_theme = load_theme(&vault_root);
     let initial_graph = graph::build(&note_refs);
+    let initial_config = config::load(&vault_root);
     let update_source = std::env::var("DRAGON_GLASS_UPDATE_URL").ok();
     let update_available = update_source.as_deref().and_then(|source| {
         update::latest_if_newer(env!("CARGO_PKG_VERSION"), source)
@@ -1140,6 +1198,10 @@ fn main() {
             KeyBinding::new("cmd-g", OpenGit, None),
             KeyBinding::new("ctrl-shift-d", OpenDaily, None),
             KeyBinding::new("cmd-shift-d", OpenDaily, None),
+            KeyBinding::new("ctrl-shift-w", OpenWeekly, None),
+            KeyBinding::new("cmd-shift-w", OpenWeekly, None),
+            KeyBinding::new("ctrl-shift-m", OpenMonthly, None),
+            KeyBinding::new("cmd-shift-m", OpenMonthly, None),
             KeyBinding::new("ctrl-shift-p", OpenProperties, None),
             KeyBinding::new("cmd-shift-p", OpenProperties, None),
             KeyBinding::new("ctrl-shift-b", ToggleBookmark, None),
@@ -1197,6 +1259,7 @@ fn main() {
             full_graph: initial_graph.clone(),
             graph_view: None,
             show_graph: false,
+            config: initial_config,
         });
 
         let graph_view_entity = cx.new(|cx| GraphView::new(app_view.downgrade(), cx));
