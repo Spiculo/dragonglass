@@ -17,10 +17,7 @@ pub fn handle(root: &Path, request: &Value) -> Option<Value> {
     let method = request.get("method").and_then(|value| value.as_str())?;
 
     // Notifications carry no id and get no reply.
-    if id.is_none() {
-        return None;
-    }
-    let id = id.unwrap();
+    let id = id?;
 
     let result = match method {
         "initialize" => Ok(json!({
