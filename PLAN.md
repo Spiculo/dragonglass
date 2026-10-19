@@ -251,17 +251,15 @@ snapshots, graph view (local, deterministic force layout), external-change confl
 handling, and the update-available prompt are in. Remaining: hotkey editor, snippets,
 graph filters/grouping, paste/drag image capture into the attachments folder.
 
-**Phase 3 — mostly done.** Command palette, CLI/headless mode, static HTML export,
-Bases/DataView-style query views (core + in-app table), the graph view, the WASM plugin host
-(manifest, discovery, sandboxed wasmtime, CLI + palette, and note write-back via
-`{"insert"}`/`{"append"}`), URIs (`dragonglass://`, resolved by the CLI and accepted by the
-app), and workspaces (named layout presets). Remaining: theme/plugin store, multi-window.
+**Phase 3 — done except the online store.** Everything listed is in: command palette,
+CLI/headless mode, HTML export, query views, graph view, the WASM plugin host (with note
+write-back), URIs, workspaces, a **local** package store with user themes, and multi-window.
+A community (network) store is deliberately out of scope while the app stays offline-first.
 
-**Phase 4 — mostly done.** Static HTML export, a read-only local HTTP API
-(`/health`, `/notes`, `/search`, `/query`, `/note`), importers for Evernote `.enex` and Roam
-JSON, and an MCP server over stdio (`initialize`, `tools/list`, `tools/call` with
-`list_notes`, `search_notes`, `read_note`, `query_notes`). Remaining: PDF export and an
-optional E2E-encrypted sync.
+**Phase 4 — done except optional sync.** HTML and PDF export, the read-only local HTTP API,
+importers (Evernote/Roam), and an MCP server over stdio are in. End-to-end-encrypted sync
+remains optional and unstarted, and Notion import is not implemented (its export is simply
+markdown, which drops straight into a vault).
 
 ### Phase 1 remainder
 
