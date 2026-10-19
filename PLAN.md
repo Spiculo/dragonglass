@@ -252,14 +252,16 @@ handling, and the update-available prompt are in. Remaining: hotkey editor, snip
 graph filters/grouping, paste/drag image capture into the attachments folder.
 
 **Phase 3 — mostly done.** Command palette, CLI/headless mode, static HTML export,
-Bases/DataView-style query views (core + in-app table), the graph view, and the WASM plugin
-host (manifest, discovery, sandboxed wasmtime, CLI + command palette) are in. Remaining:
-theme/plugin store, URI scheme, multi-window, workspaces (layout presets), enabling plugins
-to write back into notes.
+Bases/DataView-style query views (core + in-app table), the graph view, the WASM plugin host
+(manifest, discovery, sandboxed wasmtime, CLI + palette, and note write-back via
+`{"insert"}`/`{"append"}`), URIs (`dragonglass://`, resolved by the CLI and accepted by the
+app), and workspaces (named layout presets). Remaining: theme/plugin store, multi-window.
 
-**Phase 4 — partly done.** Static HTML export and a read-only local HTTP API
-(`/health`, `/notes`, `/search`, `/query`, `/note`) are in. Remaining: importers
-(Notion/Evernote/Roam), PDF export, a full MCP surface, optional E2E sync.
+**Phase 4 — mostly done.** Static HTML export, a read-only local HTTP API
+(`/health`, `/notes`, `/search`, `/query`, `/note`), importers for Evernote `.enex` and Roam
+JSON, and an MCP server over stdio (`initialize`, `tools/list`, `tools/call` with
+`list_notes`, `search_notes`, `read_note`, `query_notes`). Remaining: PDF export and an
+optional E2E-encrypted sync.
 
 ### Phase 1 remainder
 
