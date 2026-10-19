@@ -9,6 +9,7 @@ mod reading;
 
 use std::path::PathBuf;
 
+use dragonglass_core::frontmatter::{Property, PropertyValue};
 use dragonglass_core::{
     git, markdown, search, storage, templates, NodeKind, Note, NoteRef, TreeNode, Vault,
 };
@@ -19,7 +20,10 @@ use gpui::{
     WindowBounds, WindowOptions,
 };
 
-actions!(app_actions, [OpenSwitcher, OpenSearch, OpenGit, OpenDaily]);
+actions!(
+    app_actions,
+    [OpenSwitcher, OpenSearch, OpenGit, OpenDaily, OpenProperties]
+);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SwitcherMode {
@@ -27,6 +31,8 @@ enum SwitcherMode {
     Search,
     GitMenu,
     CommitInput,
+    PropertiesMenu,
+    PropertyInput,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -41,6 +47,8 @@ enum GitAction {
 enum Item {
     Note { relative: String },
     Git(GitAction),
+    Property { key: Option<String> },
+    DeleteProperty { key: String },
 }
 
 struct SwitcherItem {
@@ -54,6 +62,8 @@ struct Switcher {
     query: String,
     results: Vec<SwitcherItem>,
     selected: usize,
+    /// When editing an existing property, its key; `None` when adding one.
+    property_key: Option<String>,
 }
 
 struct DragonGlassApp {
@@ -61,6 +71,7 @@ struct DragonGlassApp {
     vault_root: PathBuf,
     tree: TreeNode,
     note_refs: Vec<NoteRef>,
+    properties: Vec<Property>,
     active: Option<String>,
     vault_path: String,
     notes: usize,
@@ -85,6 +96,7 @@ impl DragonGlassApp {
             }
         });
         self.active = Some(relative.to_string());
+        self.refresh_properties(cx);
         cx.notify();
     }
 
@@ -196,6 +208,33 @@ impl DragonGlassApp {
                 items
             }
             SwitcherMode::CommitInput => Vec::new(),
+            SwitcherMode::PropertiesMenu => {
+                let mut items = vec![SwitcherItem {
+                    label: "Add property".to_string(),
+                    detail: "key: value".to_string(),
+                    item: Item::Property { key: None },
+                }];
+                for property in &self.properties {
+                    items.push(SwitcherItem {
+                        label: format!("Edit {}", property.key),
+                        detail: property.value.display(),
+                        item: Item::Property {
+                            key: Some(property.key.clone()),
+                        },
+                    });
+                }
+                for property in &self.properties {
+                    items.push(SwitcherItem {
+                        label: format!("Delete {}", property.key),
+                        detail: String::new(),
+                        item: Item::DeleteProperty {
+                            key: property.key.clone(),
+                        },
+                    });
+                }
+                items
+            }
+            SwitcherMode::PropertyInput => Vec::new(),
         }
     }
 
@@ -205,6 +244,7 @@ impl DragonGlassApp {
             query: String::new(),
             results: self.compute_results(mode, ""),
             selected: 0,
+            property_key: None,
         });
         window.focus(&self.switcher_focus);
         cx.notify();
@@ -227,6 +267,31 @@ impl DragonGlassApp {
     fn open_git(&mut self, _: &OpenGit, window: &mut Window, cx: &mut Context<Self>) {
         self.refresh_git();
         self.open_panel(SwitcherMode::GitMenu, window, cx);
+    }
+
+    fn refresh_properties(&mut self, cx: &mut Context<Self>) {
+        self.properties = self.editor.read(cx).properties();
+    }
+
+    fn open_properties(&mut self, _: &OpenProperties, window: &mut Window, cx: &mut Context<Self>) {
+        self.refresh_properties(cx);
+        self.open_panel(SwitcherMode::PropertiesMenu, window, cx);
+    }
+
+    fn apply_properties(&mut self, properties: &[Property], cx: &mut Context<Self>) {
+        let result = self.editor.update(cx, |editor, cx| {
+            let result = editor.set_properties(properties);
+            cx.notify();
+            result
+        });
+
+        match result {
+            Ok(()) => {
+                self.properties = properties.to_vec();
+                self.status_message = Some("properties updated".to_string());
+            }
+            Err(e) => self.status_message = Some(format!("could not save properties: {e}")),
+        }
     }
 
     fn run_git_action(&mut self, action: GitAction) {
@@ -287,6 +352,30 @@ impl DragonGlassApp {
                     return;
                 }
 
+                if panel.mode == SwitcherMode::PropertyInput {
+                    let query = panel.query.clone();
+                    let mut properties = self.properties.clone();
+
+                    if let Some(key) = panel.property_key.clone() {
+                        if let Some(property) = properties.iter_mut().find(|p| p.key == key) {
+                            property.value = PropertyValue::from_input(&query);
+                        }
+                    } else if let Some((key, value)) = query.split_once(':') {
+                        let key = key.trim().to_string();
+                        if !key.is_empty() {
+                            let value = PropertyValue::from_input(value.trim());
+                            match properties.iter_mut().find(|p| p.key == key) {
+                                Some(property) => property.value = value,
+                                None => properties.push(Property { key, value }),
+                            }
+                        }
+                    }
+
+                    self.apply_properties(&properties, cx);
+                    self.close_panel(window, cx);
+                    return;
+                }
+
                 if let Some(item) = panel.results.get(panel.selected) {
                     match &item.item {
                         Item::Note { relative } => {
@@ -307,6 +396,39 @@ impl DragonGlassApp {
                                 return;
                             }
                             self.run_git_action(action);
+                            self.close_panel(window, cx);
+                            return;
+                        }
+                        Item::Property { key } => {
+                            let existing = key.clone();
+                            let query = existing
+                                .as_ref()
+                                .and_then(|key| {
+                                    self.properties
+                                        .iter()
+                                        .find(|p| &p.key == key)
+                                        .map(|p| p.value.display())
+                                })
+                                .unwrap_or_default();
+
+                            panel.mode = SwitcherMode::PropertyInput;
+                            panel.property_key = existing;
+                            panel.query = query;
+                            panel.results.clear();
+                            panel.selected = 0;
+                            self.switcher = Some(panel);
+                            cx.notify();
+                            return;
+                        }
+                        Item::DeleteProperty { key } => {
+                            let key = key.clone();
+                            let properties: Vec<Property> = self
+                                .properties
+                                .iter()
+                                .filter(|p| p.key != key)
+                                .cloned()
+                                .collect();
+                            self.apply_properties(&properties, cx);
                             self.close_panel(window, cx);
                             return;
                         }
@@ -530,6 +652,8 @@ impl Render for DragonGlassApp {
                 SwitcherMode::Search => "find:",
                 SwitcherMode::GitMenu => "git:",
                 SwitcherMode::CommitInput => "commit:",
+                SwitcherMode::PropertiesMenu => "properties:",
+                SwitcherMode::PropertyInput => "value:",
             };
             let rows = panel.results.iter().enumerate().map(|(i, item)| {
                 let mut row = div()
@@ -579,6 +703,7 @@ impl Render for DragonGlassApp {
             .on_action(cx.listener(Self::open_search))
             .on_action(cx.listener(Self::open_git))
             .on_action(cx.listener(Self::open_daily))
+            .on_action(cx.listener(Self::open_properties))
             .child(
                 div()
                     .flex()
@@ -660,6 +785,8 @@ fn main() {
             KeyBinding::new("cmd-g", OpenGit, None),
             KeyBinding::new("ctrl-shift-d", OpenDaily, None),
             KeyBinding::new("cmd-shift-d", OpenDaily, None),
+            KeyBinding::new("ctrl-shift-p", OpenProperties, None),
+            KeyBinding::new("cmd-shift-p", OpenProperties, None),
         ]);
 
         let editor = cx.new(Editor::new);
@@ -668,6 +795,7 @@ fn main() {
                 let _ = editor.load(path);
             });
         }
+        let initial_properties = editor.read(cx).properties();
 
         let bounds = Bounds::centered(None, size(px(1000.0), px(640.0)), cx);
         let options = WindowOptions {
@@ -687,6 +815,7 @@ fn main() {
                     vault_root: vault_root.clone(),
                     tree: tree.clone(),
                     note_refs: note_refs.clone(),
+                    properties: initial_properties,
                     active: first_rel.clone(),
                     vault_path: display_path.clone(),
                     notes: note_count,

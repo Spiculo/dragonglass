@@ -9,6 +9,7 @@
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 
+use dragonglass_core::frontmatter::{self, Property};
 use dragonglass_core::{storage, Buffer};
 use gpui::{
     actions, div, fill, point, prelude::*, px, relative, rgb, rgba, size, AnyElement, App, Bounds,
@@ -134,6 +135,19 @@ impl Editor {
 
     pub fn is_dirty(&self) -> bool {
         self.buffer.is_dirty()
+    }
+
+    /// Parsed frontmatter properties. Empty when absent or unsupported.
+    pub fn properties(&self) -> Vec<Property> {
+        frontmatter::properties(&self.buffer.text()).unwrap_or_default()
+    }
+
+    /// Replace the frontmatter with `properties`, keep the body, and save.
+    pub fn set_properties(&mut self, properties: &[Property]) -> std::io::Result<()> {
+        let updated = frontmatter::with_properties(&self.buffer.text(), properties);
+        self.buffer = Buffer::from_text(&updated);
+        self.anchor = None;
+        self.save()
     }
 
     /// Current document text.
@@ -399,6 +413,32 @@ impl Render for Editor {
         let dirty = self.buffer.is_dirty();
         let reading = self.reading;
 
+        let properties = self.properties();
+        let chips: Option<AnyElement> = if properties.is_empty() {
+            None
+        } else {
+            Some(
+                div()
+                    .flex()
+                    .flex_row()
+                    .flex_wrap()
+                    .gap_2()
+                    .px_2()
+                    .pb_1()
+                    .children(properties.iter().map(|property| {
+                        div()
+                            .px_2()
+                            .py_1()
+                            .rounded_md()
+                            .bg(rgb(0x2a2a2a))
+                            .text_xs()
+                            .text_color(rgb(0xc0c0c0))
+                            .child(format!("{}: {}", property.key, property.value.display()))
+                    }))
+                    .into_any_element(),
+            )
+        };
+
         let body: AnyElement = if reading {
             div()
                 .id("reading-scroll")
@@ -454,24 +494,30 @@ impl Render for Editor {
             .child(
                 div()
                     .flex()
-                    .flex_row()
-                    .justify_between()
-                    .px_2()
-                    .py_1()
+                    .flex_col()
                     .bg(rgb(0x1b1b1b))
-                    .text_xs()
-                    .text_color(rgb(0x9a9a9a))
                     .child(
                         div()
                             .flex()
                             .flex_row()
-                            .gap_2()
-                            .child(title)
-                            .when(dirty, |d| {
-                                d.child(div().text_color(rgb(0xe0b050)).child("\u{25CF}"))
-                            }),
+                            .justify_between()
+                            .px_2()
+                            .py_1()
+                            .text_xs()
+                            .text_color(rgb(0x9a9a9a))
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_row()
+                                    .gap_2()
+                                    .child(title)
+                                    .when(dirty, |d| {
+                                        d.child(div().text_color(rgb(0xe0b050)).child("\u{25CF}"))
+                                    }),
+                            )
+                            .child(if reading { "read" } else { "edit" }),
                     )
-                    .child(if reading { "read" } else { "edit" }),
+                    .children(chips),
             )
             .child(body)
     }

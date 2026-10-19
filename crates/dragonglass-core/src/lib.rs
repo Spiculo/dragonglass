@@ -31,6 +31,9 @@ pub enum Error {
 
     #[error("{command} failed: {message}")]
     Git { command: String, message: String },
+
+    #[error("unsupported frontmatter on line {line}: {text}")]
+    UnsupportedFrontmatter { line: usize, text: String },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
