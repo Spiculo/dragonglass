@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use anyhow::{bail, Context, Result};
-use dragonglass_core::{git, history, Note, NoteRef, Vault};
+use dragonglass_core::{git, history, html, storage, Note, NoteRef, Vault};
 
 fn main() -> ExitCode {
     match run() {
@@ -41,6 +41,7 @@ fn run() -> Result<()> {
         Some("git-pull") => return git_pull(args.next()),
         Some("git-push") => return git_push(args.next()),
         Some("history") => return history_cmd(args.collect()),
+        Some("export") => return export(args.collect()),
         _ => {}
     }
 
@@ -181,6 +182,46 @@ fn git_push(path: Option<String>) -> Result<()> {
     Ok(())
 }
 
+fn export(args: Vec<String>) -> Result<()> {
+    if args.len() < 2 {
+        bail!("usage: dragon-glass export <vault> <out-dir>");
+    }
+
+    let root = PathBuf::from(&args[0]);
+    let out = PathBuf::from(&args[1]);
+    let vault =
+        Vault::open(&root).with_context(|| format!("opening vault {}", display_path(&root)))?;
+
+    std::fs::create_dir_all(&out)?;
+
+    let notes = vault.notes();
+    let mut index = String::from("<h1>Index</h1>\n<ul>\n");
+    let mut exported = 0usize;
+
+    for note_ref in &notes {
+        let Ok(note) = Note::load(&note_ref.path) else {
+            continue;
+        };
+
+        let file_name = format!("{}.html", note_ref.path_no_ext().replace('/', "__"));
+        let document = html::document(note_ref.stem(), &html::render_body(&note.source));
+        storage::write_atomic(&out.join(&file_name), &document)?;
+
+        index.push_str(&format!(
+            "<li><a href=\"{}\">{}</a></li>\n",
+            html::escape(&file_name),
+            html::escape(note_ref.stem())
+        ));
+        exported += 1;
+    }
+
+    index.push_str("</ul>\n");
+    storage::write_atomic(&out.join("index.html"), &html::document("Index", &index))?;
+
+    println!("exported {exported} notes to {}", display_path(&out));
+    Ok(())
+}
+
 fn history_cmd(args: Vec<String>) -> Result<()> {
     if args.len() < 2 {
         bail!("usage: dragon-glass history <vault> <note-relative-path> [snapshot-id]");
@@ -226,7 +267,8 @@ fn print_help() {
            dragon-glass git-pull    [vault]           fast-forward from the remote\n  \
            dragon-glass git-push    [vault]           push to the remote\n  \
            dragon-glass history     <vault> <note>    list snapshots for a note\n  \
-           dragon-glass history     <vault> <note> <id>  print a snapshot\n\n\
+           dragon-glass history     <vault> <note> <id>  print a snapshot\n  \
+           dragon-glass export      <vault> <out-dir>   render notes to HTML\n\n\
          vault defaults to the current directory."
     );
 }
