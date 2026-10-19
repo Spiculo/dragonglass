@@ -6,8 +6,9 @@
 
 mod editor;
 mod reading;
+mod theme;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use dragonglass_core::frontmatter::{Property, PropertyValue};
 use dragonglass_core::{
@@ -15,10 +16,11 @@ use dragonglass_core::{
 };
 use editor::Editor;
 use gpui::{
-    actions, div, prelude::*, px, rgb, size, AnyElement, App, Application, Bounds, Context,
-    ElementId, FocusHandle, Focusable, KeyBinding, KeyDownEvent, MouseButton, Render, Window,
-    WindowBounds, WindowOptions,
+    actions, div, prelude::*, px, size, AnyElement, App, Application, Bounds, Context, ElementId,
+    FocusHandle, Focusable, KeyBinding, KeyDownEvent, MouseButton, Render, Window, WindowBounds,
+    WindowOptions,
 };
+use theme::Theme;
 
 actions!(
     app_actions,
@@ -29,7 +31,8 @@ actions!(
         OpenDaily,
         OpenProperties,
         ToggleBookmark,
-        OpenCommands
+        OpenCommands,
+        ToggleTheme
     ]
 );
 
@@ -54,6 +57,7 @@ enum CommandId {
     Git,
     ToggleReading,
     Save,
+    ToggleTheme,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -95,6 +99,7 @@ struct DragonGlassApp {
     note_refs: Vec<NoteRef>,
     properties: Vec<Property>,
     bookmarks: Vec<String>,
+    theme: Theme,
     active: Option<String>,
     vault_path: String,
     notes: usize,
@@ -271,6 +276,7 @@ impl DragonGlassApp {
                 command_item("Git", "ctrl+g", CommandId::Git),
                 command_item("Toggle reading mode", "ctrl+e", CommandId::ToggleReading),
                 command_item("Save", "ctrl+s", CommandId::Save),
+                command_item("Toggle theme", "ctrl+shift+l", CommandId::ToggleTheme),
             ],
         }
     }
@@ -308,6 +314,23 @@ impl DragonGlassApp {
 
     fn open_commands(&mut self, _: &OpenCommands, window: &mut Window, cx: &mut Context<Self>) {
         self.open_panel(SwitcherMode::CommandsMenu, window, cx);
+    }
+
+    fn toggle_theme(&mut self, _: &ToggleTheme, window: &mut Window, cx: &mut Context<Self>) {
+        self.toggle_theme_now(cx);
+        let _ = window;
+    }
+
+    fn toggle_theme_now(&mut self, cx: &mut Context<Self>) {
+        self.theme = self.theme.toggled();
+        cx.set_global(self.theme);
+        let message = match save_theme(&self.vault_root, self.theme) {
+            Ok(()) => format!("theme: {}", self.theme.name()),
+            Err(e) => format!("theme: {} (not saved: {e})", self.theme.name()),
+        };
+        self.status_message = Some(message);
+        self.editor.update(cx, |_, cx| cx.notify());
+        cx.notify();
     }
 
     fn refresh_properties(&mut self, cx: &mut Context<Self>) {
@@ -535,6 +558,7 @@ impl DragonGlassApp {
                                     let _ = editor.save();
                                     cx.notify();
                                 }),
+                                CommandId::ToggleTheme => self.toggle_theme_now(cx),
                                 _ => {}
                             }
                             self.close_panel(window, cx);
@@ -591,6 +615,19 @@ fn command_item(label: &str, hint: &str, command: CommandId) -> SwitcherItem {
         detail: hint.to_string(),
         item: Item::Command(command),
     }
+}
+
+fn load_theme(root: &Path) -> Theme {
+    match std::fs::read_to_string(root.join(".dragon-glass/theme.txt")) {
+        Ok(text) if text.trim() == "light" => Theme::light(),
+        _ => Theme::dark(),
+    }
+}
+
+fn save_theme(root: &Path, theme: Theme) -> std::io::Result<()> {
+    let dir = root.join(".dragon-glass");
+    std::fs::create_dir_all(&dir)?;
+    storage::write_atomic(&dir.join("theme.txt"), &format!("{}\n", theme.name()))
 }
 
 fn describe_outcome(outcome: git::Outcome) -> String {
@@ -665,6 +702,7 @@ fn git_label(status: &Option<git::Status>) -> String {
 
 impl Render for DragonGlassApp {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = *cx.global::<Theme>();
         let mut rows = Vec::new();
         flatten(&self.tree, 0, &mut rows);
         let me = cx.entity();
@@ -690,7 +728,7 @@ impl Render for DragonGlassApp {
                     .py_1()
                     .text_sm()
                     .cursor_pointer()
-                    .text_color(rgb(0xffd479))
+                    .text_color(theme.star)
                     .child(format!("\u{2605} {name}"))
                     .on_mouse_down(MouseButton::Left, move |_ev, _window, cx| {
                         me.update(cx, |this, cx| {
@@ -706,7 +744,7 @@ impl Render for DragonGlassApp {
             .w(px(240.0))
             .h_full()
             .overflow_y_scroll()
-            .bg(rgb(0x181818))
+            .bg(theme.panel)
             .py_2()
             .when(!bookmark_rows.is_empty(), move |d| {
                 d.child(
@@ -714,7 +752,7 @@ impl Render for DragonGlassApp {
                         .px_2()
                         .py_1()
                         .text_xs()
-                        .text_color(rgb(0x6a6a6a))
+                        .text_color(theme.muted)
                         .child("BOOKMARKS"),
                 )
                 .children(bookmark_rows)
@@ -724,18 +762,18 @@ impl Render for DragonGlassApp {
                     .px_2()
                     .py_1()
                     .text_xs()
-                    .text_color(rgb(0x6a6a6a))
+                    .text_color(theme.muted)
                     .child("FILES"),
             )
             .children(rows.into_iter().enumerate().map(move |(i, row)| {
                 let indent = px(8.0 + row.depth as f32 * 12.0);
                 let is_active = !row.is_dir && row.path.as_deref() == active.as_deref();
                 let color = if row.is_dir {
-                    rgb(0x8a8a8a)
+                    theme.muted
                 } else if is_active {
-                    rgb(0xffffff)
+                    theme.accent_text
                 } else {
-                    rgb(0xd4d4d4)
+                    theme.text
                 };
 
                 let mut base = div()
@@ -749,7 +787,7 @@ impl Render for DragonGlassApp {
                     .child(row.name.clone());
 
                 if is_active {
-                    base = base.bg(rgb(0x2a3b57));
+                    base = base.bg(theme.accent);
                 }
 
                 match row.path {
@@ -785,7 +823,7 @@ impl Render for DragonGlassApp {
                     .py_1()
                     .text_sm()
                     .cursor_pointer()
-                    .text_color(rgb(0xd4d4d4))
+                    .text_color(theme.text)
                     .child(heading.text.clone())
                     .on_mouse_down(MouseButton::Left, move |_ev, window, cx| {
                         me.update(cx, |this, cx| {
@@ -805,7 +843,7 @@ impl Render for DragonGlassApp {
                     .w(px(200.0))
                     .h_full()
                     .overflow_y_scroll()
-                    .bg(rgb(0x181818))
+                    .bg(theme.panel)
                     .py_2()
                     .children(rows)
                     .into_any_element(),
@@ -831,9 +869,9 @@ impl Render for DragonGlassApp {
                     .py_1()
                     .text_sm()
                     .child(item.label.clone())
-                    .child(div().text_color(rgb(0x808080)).child(item.detail.clone()));
+                    .child(div().text_color(theme.muted).child(item.detail.clone()));
                 if i == panel.selected {
-                    row = row.bg(rgb(0x2a3b57));
+                    row = row.bg(theme.accent);
                 }
                 row
             });
@@ -845,15 +883,15 @@ impl Render for DragonGlassApp {
                 .on_key_down(cx.listener(Self::on_switcher_key))
                 .flex()
                 .flex_col()
-                .bg(rgb(0x232323))
+                .bg(theme.input_bg)
                 .border_b_1()
-                .border_color(rgb(0x3a3a3a))
+                .border_color(theme.border)
                 .max_h(px(320.0))
                 .child(
                     div()
                         .px_3()
                         .py_2()
-                        .text_color(rgb(0xffffff))
+                        .text_color(theme.text)
                         .child(format!("{prefix} {}", panel.query)),
                 )
                 .children(rows)
@@ -864,8 +902,8 @@ impl Render for DragonGlassApp {
             .flex()
             .flex_col()
             .size_full()
-            .bg(rgb(0x1e1e1e))
-            .text_color(rgb(0xe6e6e6))
+            .bg(theme.bg)
+            .text_color(theme.text)
             .on_action(cx.listener(Self::open_switcher))
             .on_action(cx.listener(Self::open_search))
             .on_action(cx.listener(Self::open_git))
@@ -873,6 +911,7 @@ impl Render for DragonGlassApp {
             .on_action(cx.listener(Self::open_properties))
             .on_action(cx.listener(Self::toggle_bookmark))
             .on_action(cx.listener(Self::open_commands))
+            .on_action(cx.listener(Self::toggle_theme))
             .child(
                 div()
                     .flex()
@@ -880,7 +919,7 @@ impl Render for DragonGlassApp {
                     .gap_4()
                     .px_4()
                     .py_2()
-                    .bg(rgb(0x252526))
+                    .bg(theme.header)
                     .text_sm()
                     .child("Dragon Glass")
                     .child(self.vault_path.clone())
@@ -888,7 +927,7 @@ impl Render for DragonGlassApp {
                     .child(format!("{} notes / {} links", self.notes, self.links))
                     .child(
                         div()
-                            .text_color(rgb(0xa0a0a0))
+                            .text_color(theme.muted)
                             .child(self.status_message.clone().unwrap_or_default()),
                     ),
             )
@@ -930,6 +969,7 @@ fn main() {
     let tree = vault.tree();
     let vault_root = vault.root().to_path_buf();
     let initial_bookmarks = bookmarks::load(&vault_root);
+    let initial_theme = load_theme(&vault_root);
     let initial_git = if git::is_repo(&vault_root) {
         git::status(&vault_root).ok()
     } else {
@@ -961,6 +1001,8 @@ fn main() {
             KeyBinding::new("cmd-shift-b", ToggleBookmark, None),
             KeyBinding::new("ctrl-p", OpenCommands, None),
             KeyBinding::new("cmd-p", OpenCommands, None),
+            KeyBinding::new("ctrl-shift-l", ToggleTheme, None),
+            KeyBinding::new("cmd-shift-l", ToggleTheme, None),
         ]);
 
         let editor = cx.new(Editor::new);
@@ -971,6 +1013,7 @@ fn main() {
         }
         let initial_properties = editor.read(cx).properties();
         editor.update(cx, |editor, _cx| editor.set_vault_root(&vault_root));
+        cx.set_global(initial_theme);
 
         let bounds = Bounds::centered(None, size(px(1000.0), px(640.0)), cx);
         let options = WindowOptions {
@@ -992,6 +1035,7 @@ fn main() {
                     note_refs: note_refs.clone(),
                     properties: initial_properties,
                     bookmarks: initial_bookmarks,
+                    theme: initial_theme,
                     active: first_rel.clone(),
                     vault_path: display_path.clone(),
                     notes: note_count,

@@ -12,12 +12,14 @@ use std::path::{Path, PathBuf};
 use dragonglass_core::frontmatter::{self, Property};
 use dragonglass_core::{storage, Buffer};
 use gpui::{
-    actions, div, fill, point, prelude::*, px, relative, rgb, rgba, size, AnyElement, App, Bounds,
+    actions, div, fill, point, prelude::*, px, relative, size, AnyElement, App, Bounds,
     ClipboardItem, Context, CursorStyle, ElementId, ElementInputHandler, Entity,
     EntityInputHandler, FocusHandle, Focusable, GlobalElementId, InspectorElementId, KeyBinding,
     LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point,
     Render, ShapedLine, SharedString, Style, TextRun, UTF16Selection, Window,
 };
+
+use crate::theme::Theme;
 
 actions!(
     editor_actions,
@@ -417,6 +419,8 @@ impl Focusable for Editor {
 
 impl Render for Editor {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = *cx.global::<Theme>();
+
         let title = self
             .path
             .as_ref()
@@ -443,9 +447,9 @@ impl Render for Editor {
                             .px_2()
                             .py_1()
                             .rounded_md()
-                            .bg(rgb(0x2a2a2a))
+                            .bg(theme.chip)
                             .text_xs()
-                            .text_color(rgb(0xc0c0c0))
+                            .text_color(theme.text_dim)
                             .child(format!("{}: {}", property.key, property.value.display()))
                     }))
                     .into_any_element(),
@@ -462,6 +466,7 @@ impl Render for Editor {
                     &self.buffer.text(),
                     self.vault_root.as_deref(),
                     0,
+                    theme,
                 ))
                 .into_any_element()
         } else {
@@ -512,7 +517,7 @@ impl Render for Editor {
                 div()
                     .flex()
                     .flex_col()
-                    .bg(rgb(0x1b1b1b))
+                    .bg(theme.panel_alt)
                     .child(
                         div()
                             .flex()
@@ -521,7 +526,7 @@ impl Render for Editor {
                             .px_2()
                             .py_1()
                             .text_xs()
-                            .text_color(rgb(0x9a9a9a))
+                            .text_color(theme.muted)
                             .child(
                                 div()
                                     .flex()
@@ -529,7 +534,7 @@ impl Render for Editor {
                                     .gap_2()
                                     .child(title)
                                     .when(dirty, |d| {
-                                        d.child(div().text_color(rgb(0xe0b050)).child("\u{25CF}"))
+                                        d.child(div().text_color(theme.warn).child("\u{25CF}"))
                                     }),
                             )
                             .child(if reading { "read" } else { "edit" }),
@@ -722,6 +727,7 @@ impl Element for EditorText {
         window: &mut Window,
         cx: &mut App,
     ) -> Prepaint {
+        let theme = *cx.global::<Theme>();
         let editor = self.editor.read(cx);
         let text_style = window.text_style();
         let font = text_style.font();
@@ -767,7 +773,7 @@ impl Element for EditorText {
                         point(bounds.left() + x0, top),
                         point(bounds.left() + x1, top + line_height),
                     ),
-                    rgba(0x3b82f640),
+                    theme.selection,
                 ));
             }
         }

@@ -4,27 +4,34 @@
 use std::path::{Path, PathBuf};
 
 use dragonglass_core::markdown::{self, Block};
-use gpui::{div, img, prelude::*, px, relative, rgb, AnyElement, IntoElement};
+use gpui::{div, img, prelude::*, px, relative, AnyElement, IntoElement};
+
+use crate::theme::Theme;
 
 /// Guard against `![[a]]` → `a` → `![[a]]` cycles.
 const MAX_EMBED_DEPTH: usize = 3;
 
-pub fn reading_view(src: &str, vault_root: Option<&Path>, depth: usize) -> impl IntoElement {
+pub fn reading_view(
+    src: &str,
+    vault_root: Option<&Path>,
+    depth: usize,
+    theme: Theme,
+) -> impl IntoElement {
     let blocks = markdown::parse_blocks(src);
     div()
         .flex()
         .flex_col()
         .gap_3()
         .p_4()
-        .text_color(rgb(0xd4d4d4))
+        .text_color(theme.text)
         .children(
             blocks
                 .into_iter()
-                .map(|block| render_block(block, vault_root, depth)),
+                .map(move |block| render_block(block, vault_root, depth, theme)),
         )
 }
 
-fn render_block(block: Block, vault_root: Option<&Path>, depth: usize) -> AnyElement {
+fn render_block(block: Block, vault_root: Option<&Path>, depth: usize, theme: Theme) -> AnyElement {
     match block {
         Block::Heading { level, text } => {
             let size = match level {
@@ -54,36 +61,36 @@ fn render_block(block: Block, vault_root: Option<&Path>, depth: usize) -> AnyEle
             .flex_row()
             .gap_2()
             .pl(px(8.0 + depth as f32 * 16.0))
-            .child(div().text_color(rgb(0x8a8a8a)).child(marker))
+            .child(div().text_color(theme.muted).child(marker))
             .child(div().text_size(px(15.0)).child(text))
             .into_any_element(),
         Block::Code { text, .. } => div()
-            .bg(rgb(0x111111))
+            .bg(theme.code_bg)
             .p_3()
             .rounded_md()
             .text_size(px(13.0))
-            .text_color(rgb(0xb8d4b8))
+            .text_color(theme.code_text)
             .child(text)
             .into_any_element(),
         Block::Quote(text) => div()
             .border_l_1()
-            .border_color(rgb(0x555555))
+            .border_color(theme.border)
             .pl_3()
-            .text_color(rgb(0xa8a8a8))
+            .text_color(theme.muted)
             .child(text.replace('\n', " "))
             .into_any_element(),
         Block::Rule => div()
             .h(px(1.0))
             .w_full()
-            .bg(rgb(0x3a3a3a))
+            .bg(theme.border)
             .into_any_element(),
-        Block::Embed { target } => render_embed(&target, vault_root, depth),
+        Block::Embed { target } => render_embed(&target, vault_root, depth, theme),
     }
 }
 
-fn render_embed(target: &str, vault_root: Option<&Path>, depth: usize) -> AnyElement {
+fn render_embed(target: &str, vault_root: Option<&Path>, depth: usize, theme: Theme) -> AnyElement {
     let Some(root) = vault_root else {
-        return placeholder(target, "no vault root");
+        return placeholder(target, "no vault root", theme);
     };
 
     if is_image(target) {
@@ -94,22 +101,22 @@ fn render_embed(target: &str, vault_root: Option<&Path>, depth: usize) -> AnyEle
                 .max_h(px(360.0))
                 .into_any_element()
         } else {
-            placeholder(target, "image not found")
+            placeholder(target, "image not found", theme)
         };
     }
 
     if depth >= MAX_EMBED_DEPTH {
-        return placeholder(target, "embed depth limit");
+        return placeholder(target, "embed depth limit", theme);
     }
 
     match std::fs::read_to_string(resolve_note(root, target)) {
         Ok(text) => div()
             .border_l_1()
-            .border_color(rgb(0x3a3a3a))
+            .border_color(theme.border)
             .pl_3()
-            .child(reading_view(&text, Some(root), depth + 1))
+            .child(reading_view(&text, Some(root), depth + 1, theme))
             .into_any_element(),
-        Err(_) => placeholder(target, "note not found"),
+        Err(_) => placeholder(target, "note not found", theme),
     }
 }
 
@@ -133,14 +140,14 @@ fn resolve_note(root: &Path, target: &str) -> PathBuf {
     }
 }
 
-fn placeholder(target: &str, reason: &str) -> AnyElement {
+fn placeholder(target: &str, reason: &str, theme: Theme) -> AnyElement {
     div()
         .px_3()
         .py_2()
-        .bg(rgb(0x242424))
+        .bg(theme.chip)
         .rounded_md()
         .text_sm()
-        .text_color(rgb(0x8a8a8a))
+        .text_color(theme.muted)
         .child(format!("embed: {target} ({reason})"))
         .into_any_element()
 }
