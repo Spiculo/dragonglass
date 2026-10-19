@@ -37,6 +37,10 @@ pub enum Block {
         title: String,
         text: String,
     },
+    /// Display math: `$$ … $$`.
+    Math {
+        tex: String,
+    },
 }
 
 /// Remove `%%comment%%` spans, which may run across lines.
@@ -130,6 +134,33 @@ pub fn parse_blocks(src: &str) -> Vec<Block> {
         if trimmed.is_empty() {
             flush_paragraph(&mut paragraph, &mut blocks);
             i += 1;
+            continue;
+        }
+
+        if let Some(tex) = single_line_math(trimmed) {
+            flush_paragraph(&mut paragraph, &mut blocks);
+            blocks.push(Block::Math { tex });
+            i += 1;
+            continue;
+        }
+
+        if trimmed == "$$" {
+            flush_paragraph(&mut paragraph, &mut blocks);
+            i += 1;
+
+            let mut tex = String::new();
+            while i < lines.len() && lines[i].trim() != "$$" {
+                tex.push_str(lines[i]);
+                tex.push('\n');
+                i += 1;
+            }
+            if i < lines.len() {
+                i += 1;
+            }
+
+            blocks.push(Block::Math {
+                tex: tex.trim_end().to_string(),
+            });
             continue;
         }
 
@@ -241,6 +272,16 @@ fn standalone_embed(line: &str) -> Option<String> {
 
 fn is_fence(trimmed: &str) -> bool {
     trimmed.starts_with("```") || trimmed.starts_with("~~~")
+}
+
+/// `$$…$$` on a single line.
+fn single_line_math(trimmed: &str) -> Option<String> {
+    let inner = trimmed.strip_prefix("$$")?.strip_suffix("$$")?;
+    if inner.is_empty() {
+        None
+    } else {
+        Some(inner.trim().to_string())
+    }
 }
 
 /// Recognise `[!kind] Title` at the start of a quoted block.
@@ -568,6 +609,20 @@ mod tests {
         assert_eq!(
             parse_blocks("> just a quote\n"),
             vec![Block::Quote("just a quote".into())]
+        );
+    }
+
+    #[test]
+    fn display_math_blocks() {
+        assert_eq!(
+            parse_blocks("$$x^2$$\n"),
+            vec![Block::Math { tex: "x^2".into() }]
+        );
+        assert_eq!(
+            parse_blocks("$$\n\\frac{a}{b}\n$$\n"),
+            vec![Block::Math {
+                tex: "\\frac{a}{b}".into()
+            }]
         );
     }
 

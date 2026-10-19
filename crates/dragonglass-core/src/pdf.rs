@@ -77,6 +77,13 @@ fn layout(src: &str, title: &str) -> Vec<(String, f32)> {
                 lines.push((String::new(), 11.0));
             }
             Block::Rule => lines.push(("-".repeat(60), 11.0)),
+            Block::Math { tex } => {
+                lines.push((String::new(), 11.0));
+                for line in crate::math::to_unicode(&tex).lines() {
+                    lines.push((format!("    {line}"), 11.5));
+                }
+                lines.push((String::new(), 11.0));
+            }
             Block::Embed { target } => lines.push((format!("[embed: {target}]"), 10.0)),
         }
     }

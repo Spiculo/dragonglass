@@ -16,6 +16,7 @@ pub mod html;
 pub mod import;
 pub mod keymap;
 pub mod markdown;
+pub mod math;
 pub mod mcp;
 pub mod note;
 pub mod pdf;

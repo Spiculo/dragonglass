@@ -4,6 +4,7 @@
 //! block model the reading view uses, so exported output matches what the app shows.
 
 use crate::markdown::{self, Block};
+use crate::math::{self, Span};
 use crate::wikilink;
 
 /// Minimal CSS for exported pages.
@@ -64,6 +65,7 @@ fn render_block(block: Block) -> String {
             inline(&text.replace('\n', " "))
         ),
         Block::Rule => "<hr>".to_string(),
+        Block::Math { tex } => format!("<p class=\"math\">{}</p>", escape(&math::to_unicode(&tex))),
         Block::Callout { kind, title, text } => {
             let body = if text.trim().is_empty() {
                 String::new()
@@ -95,8 +97,20 @@ fn render_block(block: Block) -> String {
     }
 }
 
-/// Turn `[[wikilinks]]` into links and escape everything else.
+/// Turn `[[wikilinks]]` into links, highlights into `<mark>`, math into spans, and escape
+/// everything else.
 fn inline(text: &str) -> String {
+    math::spans(text)
+        .into_iter()
+        .map(|span| match span {
+            Span::Text(text) => linked(&text),
+            Span::Highlight(text) => format!("<mark>{}</mark>", escape(&text)),
+            Span::Math(text) => format!("<span class=\"math\">{}</span>", escape(&text)),
+        })
+        .collect()
+}
+
+fn linked(text: &str) -> String {
     if !text.contains("[[") {
         return escape(text);
     }

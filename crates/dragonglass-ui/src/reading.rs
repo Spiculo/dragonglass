@@ -1,12 +1,13 @@
 //! Reading mode: render parsed markdown blocks as styled GPUI elements, including
 //! embedded images and transcluded notes.
 //!
-//! Paragraph and list text goes through `StyledText` when it contains `==highlights==`, so
-//! highlighted spans get a background while the text still wraps normally.
+//! Paragraph and list text goes through `StyledText` when it contains `==highlights==` or
+//! `$math$`, so those spans get a background while the text still wraps normally.
 
 use std::path::{Path, PathBuf};
 
 use dragonglass_core::markdown::{self, Block};
+use dragonglass_core::math::{self, Span};
 use gpui::{div, img, prelude::*, px, relative, AnyElement, IntoElement, StyledText, TextRun};
 
 use crate::theme::Theme;
@@ -92,6 +93,15 @@ fn render_block(
             .w_full()
             .bg(theme.border)
             .into_any_element(),
+        Block::Math { tex } => div()
+            .bg(theme.chip)
+            .rounded_md()
+            .px_3()
+            .py_2()
+            .text_size(px(15.0))
+            .text_color(theme.text)
+            .child(math::to_unicode(&tex))
+            .into_any_element(),
         Block::Callout { kind, title, text } => {
             let accent = match kind.as_str() {
                 "warning" | "caution" | "danger" | "error" => theme.warn,
@@ -123,25 +133,30 @@ fn render_block(
     }
 }
 
-/// Plain text, unless it contains `==highlights==`.
+/// Plain text, unless it contains `==highlights==` or `$math$`.
 fn rich_text(text: &str, size: f32, theme: Theme, template: &TextRun) -> AnyElement {
-    let parts = markdown::split_highlights(text);
+    let parts = math::spans(text);
     let container = div().text_size(px(size)).line_height(relative(1.5));
 
-    if !parts.iter().any(|(_, highlighted)| *highlighted) {
-        return container.child(text.to_string()).into_any_element();
+    if parts.iter().all(|span| matches!(span, Span::Text(_))) {
+        let plain: String = parts.iter().map(span_text).collect();
+        return container.child(plain).into_any_element();
     }
 
-    // The `==` delimiters are dropped, so render the rebuilt string.
-    let display: String = parts.iter().map(|(segment, _)| segment.as_str()).collect();
+    // Delimiters are dropped, so render the rebuilt string.
+    let display: String = parts.iter().map(span_text).collect();
     let runs: Vec<TextRun> = parts
         .iter()
-        .filter(|(segment, _)| !segment.is_empty())
-        .map(|(segment, highlighted)| TextRun {
-            len: segment.len(),
+        .filter(|span| !span_text(span).is_empty())
+        .map(|span| TextRun {
+            len: span_text(span).len(),
             font: template.font.clone(),
             color: template.color,
-            background_color: highlighted.then_some(theme.star),
+            background_color: match span {
+                Span::Highlight(_) => Some(theme.star),
+                Span::Math(_) => Some(theme.chip),
+                Span::Text(_) => None,
+            },
             underline: None,
             strikethrough: None,
         })
@@ -150,6 +165,12 @@ fn rich_text(text: &str, size: f32, theme: Theme, template: &TextRun) -> AnyElem
     container
         .child(StyledText::new(display).with_runs(runs))
         .into_any_element()
+}
+
+fn span_text(span: &Span) -> &str {
+    match span {
+        Span::Text(text) | Span::Highlight(text) | Span::Math(text) => text,
+    }
 }
 
 fn render_embed(
