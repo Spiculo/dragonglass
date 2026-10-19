@@ -9,7 +9,9 @@ mod reading;
 
 use std::path::PathBuf;
 
-use dragonglass_core::{git, markdown, search, NodeKind, Note, NoteRef, TreeNode, Vault};
+use dragonglass_core::{
+    git, markdown, search, storage, templates, NodeKind, Note, NoteRef, TreeNode, Vault,
+};
 use editor::Editor;
 use gpui::{
     actions, div, prelude::*, px, rgb, size, AnyElement, App, Application, Bounds, Context,
@@ -17,7 +19,7 @@ use gpui::{
     WindowBounds, WindowOptions,
 };
 
-actions!(app_actions, [OpenSwitcher, OpenSearch, OpenGit]);
+actions!(app_actions, [OpenSwitcher, OpenSearch, OpenGit, OpenDaily]);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SwitcherMode {
@@ -92,6 +94,55 @@ impl DragonGlassApp {
         } else {
             None
         };
+    }
+
+    /// Re-scan the vault after files are created or removed.
+    fn refresh_vault(&mut self) {
+        if let Ok(vault) = Vault::open(&self.vault_root) {
+            self.note_refs = vault.notes();
+            self.tree = vault.tree();
+            self.notes = self.note_refs.len();
+        }
+        self.refresh_git();
+    }
+
+    /// Open (or create) today's daily note, using `Templates/Daily.md` when present.
+    fn open_daily(&mut self, _: &OpenDaily, window: &mut Window, cx: &mut Context<Self>) {
+        let now = chrono::Local::now();
+        let date = now.format("%Y-%m-%d").to_string();
+        let time = now.format("%H:%M").to_string();
+        let relative = format!("Daily/{date}.md");
+        let path = self.vault_root.join(&relative);
+
+        if !path.exists() {
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+
+            let template_path = self.vault_root.join("Templates/Daily.md");
+            let content = match std::fs::read_to_string(&template_path) {
+                Ok(template) => templates::render(
+                    &template,
+                    &[
+                        ("date", date.as_str()),
+                        ("time", time.as_str()),
+                        ("title", date.as_str()),
+                    ],
+                ),
+                Err(_) => format!("# {date}\n\n"),
+            };
+
+            if let Err(e) = storage::write_atomic(&path, &content) {
+                self.status_message = Some(format!("could not create daily note: {e}"));
+                cx.notify();
+                return;
+            }
+            self.refresh_vault();
+        }
+
+        self.open_note(&relative, cx);
+        window.focus(&self.editor.focus_handle(cx));
+        cx.notify();
     }
 
     fn compute_results(&self, mode: SwitcherMode, query: &str) -> Vec<SwitcherItem> {
@@ -527,6 +578,7 @@ impl Render for DragonGlassApp {
             .on_action(cx.listener(Self::open_switcher))
             .on_action(cx.listener(Self::open_search))
             .on_action(cx.listener(Self::open_git))
+            .on_action(cx.listener(Self::open_daily))
             .child(
                 div()
                     .flex()
@@ -606,6 +658,8 @@ fn main() {
             KeyBinding::new("cmd-shift-f", OpenSearch, None),
             KeyBinding::new("ctrl-g", OpenGit, None),
             KeyBinding::new("cmd-g", OpenGit, None),
+            KeyBinding::new("ctrl-shift-d", OpenDaily, None),
+            KeyBinding::new("cmd-shift-d", OpenDaily, None),
         ]);
 
         let editor = cx.new(Editor::new);
