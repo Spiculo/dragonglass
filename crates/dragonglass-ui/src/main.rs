@@ -5,6 +5,7 @@
 //! (Ctrl+G).
 
 mod editor;
+mod graph_view;
 mod reading;
 mod theme;
 
@@ -12,7 +13,7 @@ use std::path::{Path, PathBuf};
 
 use dragonglass_core::frontmatter::{Property, PropertyValue};
 use dragonglass_core::{
-    bookmarks, conflict, git, markdown, search, storage, templates, update, NodeKind, Note,
+    bookmarks, conflict, git, graph, markdown, search, storage, templates, update, NodeKind, Note,
     NoteRef, TreeNode, Vault,
 };
 use editor::Editor;
@@ -21,6 +22,7 @@ use gpui::{
     FocusHandle, Focusable, KeyBinding, KeyDownEvent, MouseButton, Render, Window, WindowBounds,
     WindowOptions,
 };
+use graph_view::GraphView;
 use theme::Theme;
 
 actions!(
@@ -33,7 +35,8 @@ actions!(
         OpenProperties,
         ToggleBookmark,
         OpenCommands,
-        ToggleTheme
+        ToggleTheme,
+        OpenGraph
     ]
 );
 
@@ -60,6 +63,7 @@ enum CommandId {
     Save,
     ToggleTheme,
     CheckUpdates,
+    OpenGraph,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -106,6 +110,9 @@ struct DragonGlassApp {
     watcher: Option<notify::RecommendedWatcher>,
     update_source: Option<String>,
     update_available: Option<String>,
+    full_graph: graph::Graph,
+    graph_view: Option<gpui::Entity<GraphView>>,
+    show_graph: bool,
     active: Option<String>,
     vault_path: String,
     notes: usize,
@@ -333,6 +340,7 @@ impl DragonGlassApp {
                 command_item("Save", "ctrl+s", CommandId::Save),
                 command_item("Toggle theme", "ctrl+shift+l", CommandId::ToggleTheme),
                 command_item("Check for updates", "", CommandId::CheckUpdates),
+                command_item("Graph view", "ctrl+shift+g", CommandId::OpenGraph),
             ],
         }
     }
@@ -370,6 +378,45 @@ impl DragonGlassApp {
 
     fn open_commands(&mut self, _: &OpenCommands, window: &mut Window, cx: &mut Context<Self>) {
         self.open_panel(SwitcherMode::CommandsMenu, window, cx);
+    }
+
+    fn open_graph(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(view) = self.graph_view.clone() else {
+            return;
+        };
+
+        let active = self.active.clone();
+        let full = self.full_graph.clone();
+        view.update(cx, |graph_view, cx| {
+            match &active {
+                Some(relative) => graph_view.show_local(&full, relative),
+                None => graph_view.set_graph(full.clone()),
+            }
+            cx.notify();
+        });
+
+        self.show_graph = true;
+        window.focus(&view.focus_handle(cx));
+        cx.notify();
+    }
+
+    fn close_graph(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.show_graph {
+            return;
+        }
+        self.show_graph = false;
+        window.focus(&self.editor.focus_handle(cx));
+        cx.notify();
+    }
+
+    /// The centre pane: the graph when open, otherwise the editor.
+    fn center_view(&self) -> AnyElement {
+        if self.show_graph {
+            if let Some(view) = &self.graph_view {
+                return view.clone().into_any_element();
+            }
+        }
+        self.editor.clone().into_any_element()
     }
 
     fn toggle_theme(&mut self, _: &ToggleTheme, window: &mut Window, cx: &mut Context<Self>) {
@@ -633,6 +680,7 @@ impl DragonGlassApp {
                                 }),
                                 CommandId::ToggleTheme => self.toggle_theme_now(cx),
                                 CommandId::CheckUpdates => self.check_updates(),
+                                CommandId::OpenGraph => self.open_graph(window, cx),
                                 _ => {}
                             }
                             self.close_panel(window, cx);
@@ -1029,7 +1077,7 @@ impl Render for DragonGlassApp {
                     .flex_1()
                     .min_h(px(0.0))
                     .child(sidebar)
-                    .child(div().flex_1().w_full().p_2().child(self.editor.clone()))
+                    .child(div().flex_1().w_full().p_2().child(self.center_view()))
                     .children(outline),
             )
     }
@@ -1060,6 +1108,7 @@ fn main() {
     let vault_root = vault.root().to_path_buf();
     let initial_bookmarks = bookmarks::load(&vault_root);
     let initial_theme = load_theme(&vault_root);
+    let initial_graph = graph::build(&note_refs);
     let update_source = std::env::var("DRAGON_GLASS_UPDATE_URL").ok();
     let update_available = update_source.as_deref().and_then(|source| {
         update::latest_if_newer(env!("CARGO_PKG_VERSION"), source)
@@ -1099,7 +1148,10 @@ fn main() {
             KeyBinding::new("cmd-p", OpenCommands, None),
             KeyBinding::new("ctrl-shift-l", ToggleTheme, None),
             KeyBinding::new("cmd-shift-l", ToggleTheme, None),
+            KeyBinding::new("ctrl-shift-g", OpenGraph, None),
+            KeyBinding::new("cmd-shift-g", OpenGraph, None),
         ]);
+        graph_view::init(cx);
 
         let editor = cx.new(Editor::new);
         if let Some(path) = &first_path {
@@ -1142,6 +1194,14 @@ fn main() {
             watcher: None,
             update_source,
             update_available,
+            full_graph: initial_graph.clone(),
+            graph_view: None,
+            show_graph: false,
+        });
+
+        let graph_view_entity = cx.new(|cx| GraphView::new(app_view.downgrade(), cx));
+        app_view.update(cx, |app, _cx| {
+            app.graph_view = Some(graph_view_entity.clone());
         });
 
         // Watch the vault so external edits to the open note are noticed. This is

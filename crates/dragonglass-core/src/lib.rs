@@ -9,6 +9,7 @@ pub mod buffer;
 pub mod conflict;
 pub mod frontmatter;
 pub mod git;
+pub mod graph;
 pub mod history;
 pub mod html;
 pub mod markdown;

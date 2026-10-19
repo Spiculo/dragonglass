@@ -14,7 +14,9 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use anyhow::{bail, Context, Result};
-use dragonglass_core::{api, git, history, html, query, storage, update, Note, NoteRef, Vault};
+use dragonglass_core::{
+    api, git, graph, history, html, query, storage, update, Note, NoteRef, Vault,
+};
 
 fn main() -> ExitCode {
     match run() {
@@ -45,6 +47,7 @@ fn run() -> Result<()> {
         Some("query") => return query_cmd(args.collect()),
         Some("serve") => return serve(args.collect()),
         Some("check-update") => return check_update(args.collect()),
+        Some("graph") => return graph_cmd(args.collect()),
         _ => {}
     }
 
@@ -182,6 +185,38 @@ fn git_pull(path: Option<String>) -> Result<()> {
 
 fn git_push(path: Option<String>) -> Result<()> {
     report_outcome(git::push(&vault_arg(path))?);
+    Ok(())
+}
+
+fn graph_cmd(args: Vec<String>) -> Result<()> {
+    let root = PathBuf::from(args.first().cloned().unwrap_or_else(|| ".".to_string()));
+    let vault =
+        Vault::open(&root).with_context(|| format!("opening vault {}", display_path(&root)))?;
+
+    let full = graph::build(&vault.notes());
+
+    let view = match args.get(1) {
+        Some(note) => match full.index_of(note) {
+            Some(id) => graph::local(&full, id, 2, 100),
+            None => {
+                println!("not in graph: {note}");
+                return Ok(());
+            }
+        },
+        None => full,
+    };
+
+    println!("nodes: {}  edges: {}", view.nodes.len(), view.edges.len());
+
+    let mut nodes = view.nodes.clone();
+    nodes.sort_by(|a, b| {
+        b.links
+            .cmp(&a.links)
+            .then_with(|| a.relative.cmp(&b.relative))
+    });
+    for node in nodes.iter().take(25) {
+        println!("  {:<44} links={}", node.relative, node.links);
+    }
     Ok(())
 }
 
@@ -331,7 +366,8 @@ fn print_help() {
            dragon-glass export      <vault> <out-dir>   render notes to HTML\n  \
            dragon-glass query       <vault> \"<query>\"  filter notes by property or tag\n  \
            dragon-glass serve       [vault] [addr]     read-only HTTP API (loopback)\n  \
-           dragon-glass check-update <source> [current]  compare against an advertised version\n\n\
+           dragon-glass check-update <source> [current]  compare against an advertised version\n  \
+           dragon-glass graph       [vault] [note]     print the link graph\n\n\
          vault defaults to the current directory."
     );
 }
