@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 
 use dragonglass_core::frontmatter::{Property, PropertyValue};
 use dragonglass_core::{
-    bookmarks, config, conflict, git, graph, markdown, search, storage, templates, update,
+    bookmarks, config, conflict, git, graph, markdown, query, search, storage, templates, update,
     NodeKind, Note, NoteRef, TreeNode, Vault,
 };
 use editor::Editor;
@@ -38,7 +38,9 @@ actions!(
         ToggleTheme,
         OpenGraph,
         OpenWeekly,
-        OpenMonthly
+        OpenMonthly,
+        CloseQuery,
+        RunQuery
     ]
 );
 
@@ -51,6 +53,7 @@ enum SwitcherMode {
     PropertiesMenu,
     PropertyInput,
     CommandsMenu,
+    QueryInput,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -68,6 +71,7 @@ enum CommandId {
     ToggleTheme,
     CheckUpdates,
     OpenGraph,
+    RunQuery,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -123,6 +127,8 @@ struct DragonGlassApp {
     full_graph: graph::Graph,
     graph_view: Option<gpui::Entity<GraphView>>,
     show_graph: bool,
+    query_results: Vec<query::Row>,
+    show_query: bool,
     config: config::Config,
     active: Option<String>,
     vault_path: String,
@@ -374,6 +380,7 @@ impl DragonGlassApp {
                 items
             }
             SwitcherMode::PropertyInput => Vec::new(),
+            SwitcherMode::QueryInput => Vec::new(),
             SwitcherMode::CommandsMenu => vec![
                 command_item("Quick switcher", "ctrl+o", CommandId::QuickSwitch),
                 command_item("Search", "ctrl+shift+f", CommandId::Search),
@@ -388,6 +395,7 @@ impl DragonGlassApp {
                 command_item("Toggle theme", "ctrl+shift+l", CommandId::ToggleTheme),
                 command_item("Check for updates", "", CommandId::CheckUpdates),
                 command_item("Graph view", "ctrl+shift+g", CommandId::OpenGraph),
+                command_item("Run a query", "", CommandId::RunQuery),
             ],
         }
     }
@@ -443,6 +451,7 @@ impl DragonGlassApp {
         });
 
         self.show_graph = true;
+        self.show_query = false;
         window.focus(&view.focus_handle(cx));
         cx.notify();
     }
@@ -457,13 +466,25 @@ impl DragonGlassApp {
     }
 
     /// The centre pane: the graph when open, otherwise the editor.
-    fn center_view(&self) -> AnyElement {
+    fn center_view(&self, theme: Theme) -> AnyElement {
+        if self.show_query {
+            return query_view(&self.query_results, theme);
+        }
         if self.show_graph {
             if let Some(view) = &self.graph_view {
                 return view.clone().into_any_element();
             }
         }
         self.editor.clone().into_any_element()
+    }
+
+    fn close_query(&mut self, _: &CloseQuery, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.show_query {
+            return;
+        }
+        self.show_query = false;
+        window.focus(&self.editor.focus_handle(cx));
+        cx.notify();
     }
 
     fn toggle_theme(&mut self, _: &ToggleTheme, window: &mut Window, cx: &mut Context<Self>) {
@@ -630,6 +651,16 @@ impl DragonGlassApp {
                     return;
                 }
 
+                if panel.mode == SwitcherMode::QueryInput {
+                    let expression = panel.query.clone();
+                    self.query_results = query::run(&self.note_refs, &expression);
+                    self.show_query = true;
+                    self.show_graph = false;
+                    self.status_message = Some(format!("query: {} rows", self.query_results.len()));
+                    self.close_panel(window, cx);
+                    return;
+                }
+
                 if let Some(item) = panel.results.get(panel.selected) {
                     match &item.item {
                         Item::Note { relative } => {
@@ -736,6 +767,16 @@ impl DragonGlassApp {
                                 CommandId::ToggleTheme => self.toggle_theme_now(cx),
                                 CommandId::CheckUpdates => self.check_updates(),
                                 CommandId::OpenGraph => self.open_graph(window, cx),
+                                CommandId::RunQuery => {
+                                    panel.mode = SwitcherMode::QueryInput;
+                                    panel.query.clear();
+                                    panel.property_key = None;
+                                    panel.results.clear();
+                                    panel.selected = 0;
+                                    self.switcher = Some(panel);
+                                    cx.notify();
+                                    return;
+                                }
                                 _ => {}
                             }
                             self.close_panel(window, cx);
@@ -776,6 +817,63 @@ impl DragonGlassApp {
         self.switcher = Some(panel);
         cx.notify();
     }
+}
+
+fn query_view(rows: &[query::Row], theme: Theme) -> AnyElement {
+    let mut items: Vec<AnyElement> = Vec::with_capacity(rows.len() + 1);
+    items.push(
+        div()
+            .flex()
+            .flex_row()
+            .gap_4()
+            .px_3()
+            .py_1()
+            .text_xs()
+            .text_color(theme.muted)
+            .child(div().w(px(340.0)).child("note"))
+            .child("properties")
+            .into_any_element(),
+    );
+
+    for row in rows {
+        let properties = row
+            .values
+            .iter()
+            .map(|(key, value)| format!("{key}={value}"))
+            .collect::<Vec<_>>()
+            .join("  ");
+
+        items.push(
+            div()
+                .flex()
+                .flex_row()
+                .gap_4()
+                .px_3()
+                .py_1()
+                .text_sm()
+                .child(div().w(px(340.0)).child(row.relative.clone()))
+                .child(properties)
+                .into_any_element(),
+        );
+    }
+
+    div()
+        .id("query-scroll")
+        .flex()
+        .flex_col()
+        .size_full()
+        .overflow_y_scroll()
+        .py_2()
+        .child(
+            div()
+                .px_3()
+                .py_1()
+                .text_xs()
+                .text_color(theme.star)
+                .child(format!("{} rows", rows.len())),
+        )
+        .children(items)
+        .into_any_element()
 }
 
 fn git_item(label: &str, detail: &str, action: GitAction) -> SwitcherItem {
@@ -1042,6 +1140,7 @@ impl Render for DragonGlassApp {
                 SwitcherMode::PropertiesMenu => "properties:",
                 SwitcherMode::PropertyInput => "value:",
                 SwitcherMode::CommandsMenu => "command:",
+                SwitcherMode::QueryInput => "query:",
             };
             let rows = panel.results.iter().enumerate().map(|(i, item)| {
                 let mut row = div()
@@ -1097,6 +1196,7 @@ impl Render for DragonGlassApp {
             .on_action(cx.listener(Self::toggle_bookmark))
             .on_action(cx.listener(Self::open_commands))
             .on_action(cx.listener(Self::toggle_theme))
+            .on_action(cx.listener(Self::close_query))
             .child(
                 div()
                     .flex()
@@ -1134,7 +1234,7 @@ impl Render for DragonGlassApp {
                     .flex_1()
                     .min_h(px(0.0))
                     .child(sidebar)
-                    .child(div().flex_1().w_full().p_2().child(self.center_view()))
+                    .child(div().flex_1().w_full().p_2().child(self.center_view(theme)))
                     .children(outline),
             )
     }
@@ -1212,6 +1312,7 @@ fn main() {
             KeyBinding::new("cmd-shift-l", ToggleTheme, None),
             KeyBinding::new("ctrl-shift-g", OpenGraph, None),
             KeyBinding::new("cmd-shift-g", OpenGraph, None),
+            KeyBinding::new("escape", CloseQuery, None),
         ]);
         graph_view::init(cx);
 
@@ -1259,6 +1360,8 @@ fn main() {
             full_graph: initial_graph.clone(),
             graph_view: None,
             show_graph: false,
+            query_results: Vec::new(),
+            show_query: false,
             config: initial_config,
         });
 
