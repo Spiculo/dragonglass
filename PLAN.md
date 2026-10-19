@@ -245,11 +245,26 @@ reading mode, quick switcher, full-text search, tags, wikilinks/backlinks data, 
 daily notes + templates, properties display/edit, git sync, KaTeX/dialect still to expand.
 Remaining: word wrap, horizontal scroll, richer live preview.
 
-**Phase 2 — done except image capture.** Properties, daily/weekly/monthly notes, templates,
-outline, bookmarks, command palette, hotkey editor, theming (light/dark, user themes,
-snippets), embeds and attachments, file-recovery snapshots, graph view with filters, depth
-and folder grouping, external-change handling and the update prompt are all in. Remaining:
-pasting or dropping an image into the editor to file it in the attachments folder.
+**Phase 2 — complete.** Properties, daily/weekly/monthly notes, templates, outline,
+bookmarks, command palette, hotkey editor, theming (light/dark, user themes, snippets),
+embeds and attachments (images/PDF/audio, `![[note]]` transclusion, and pasting or pasting a
+path to an image to file it in the attachments folder), file-recovery snapshots, graph view
+with filters/depth/folder grouping, external-change handling and the update prompt are in.
+
+## 11. What is deliberately not done
+
+- **Phase 5 (macOS).** Not started, and not verifiable from this machine: it needs a Mac for
+  signing and notarization. The code is already cross-platform and CI builds the GPUI app on
+  Linux and Windows.
+- **Community/online theme and plugin store.** The locked decision is "no network by default";
+  the local store covers installation from a directory. A network store would contradict that.
+- **End-to-end-encrypted sync.** Listed conditionally ("if pursued") and not pursued; git sync
+  covers the sync requirement.
+- **Mobile.** Explicitly deferred by the locked decisions.
+- **Math typesetting.** `$…$` and `$$…$$` are shown as text. KaTeX is a JavaScript library and
+  has no native equivalent; a native typesetter is a project of its own.
+- **Mermaid diagrams.** Out of scope per the locked decisions.
+- **Horizontal scroll.** Moot now that the editor wraps.
 
 **Phase 3 — done except the online store.** Everything listed is in: command palette,
 CLI/headless mode, HTML export, query views, graph view, the WASM plugin host (with note
@@ -265,8 +280,7 @@ markdown, which drops straight into a vault).
 
 Word wrap landed (the editor wraps at spaces, and caret/selection/mouse/vertical movement
 follow visual rows). Comments, callouts and `==highlights==` are parsed; callouts and
-highlights render in the app and in exported HTML. Still open: math typesetting (KaTeX has no
-native equivalent — the syntax is currently shown as text), richer source/live-preview modes,
-and horizontal scroll (largely moot now that text wraps).
+highlights render in the app and in exported HTML. A live preview pane renders the reading
+view beside the editor. Open: math typesetting (see §11) and horizontal scroll (moot).
 
 **Phase 5 — not started.** macOS cross-compile, signing/notarization, platform polish.
