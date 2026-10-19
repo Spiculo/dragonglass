@@ -716,6 +716,7 @@ impl DragonGlassApp {
         let editor = cx.new(Editor::new);
         editor.update(cx, |editor, _cx| {
             editor.set_vault_root(&self.vault_root);
+            editor.set_attachments_folder(&self.config.attachments_folder);
             if let Some(active) = &self.active {
                 let _ = editor.load(&self.vault_root.join(active));
             }
@@ -1888,7 +1889,10 @@ fn main() {
             });
         }
         let initial_properties = editor.read(cx).properties();
-        editor.update(cx, |editor, _cx| editor.set_vault_root(&vault_root));
+        editor.update(cx, |editor, _cx| {
+            editor.set_vault_root(&vault_root);
+            editor.set_attachments_folder(&initial_config.attachments_folder);
+        });
         cx.set_global(initial_theme);
 
         let bounds = Bounds::centered(None, size(px(1000.0), px(640.0)), cx);

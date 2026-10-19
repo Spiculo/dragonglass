@@ -13,10 +13,10 @@ use dragonglass_core::frontmatter::{self, Property};
 use dragonglass_core::{history, storage, wrap, Buffer};
 use gpui::{
     actions, div, fill, point, prelude::*, px, relative, size, AnyElement, App, Bounds,
-    ClipboardItem, Context, CursorStyle, ElementId, ElementInputHandler, Entity,
-    EntityInputHandler, FocusHandle, Focusable, GlobalElementId, InspectorElementId, KeyBinding,
-    LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point,
-    Render, ShapedLine, SharedString, Style, TextRun, UTF16Selection, Window,
+    ClipboardEntry, ClipboardItem, Context, CursorStyle, ElementId, ElementInputHandler, Entity,
+    EntityInputHandler, FocusHandle, Focusable, GlobalElementId, ImageFormat, InspectorElementId,
+    KeyBinding, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad,
+    Pixels, Point, Render, ShapedLine, SharedString, Style, TextRun, UTF16Selection, Window,
 };
 
 use crate::theme::Theme;
@@ -94,6 +94,8 @@ pub struct Editor {
     font_size: Pixels,
     line_height: Pixels,
     marked_range: Option<Range<usize>>,
+    /// Folder (vault-relative) that pasted images are filed into.
+    attachments_folder: String,
     last_bounds: Option<Bounds<Pixels>>,
     /// Visual rows produced by the last paint, for hit-testing and IME.
     last_rows: Vec<RowMeta>,
@@ -124,6 +126,7 @@ impl Editor {
             last_bounds: None,
             last_rows: Vec::new(),
             last_shaped: Vec::new(),
+            attachments_folder: "attachments".to_string(),
         }
     }
 
@@ -215,6 +218,13 @@ impl Editor {
     /// Tell the editor where the vault lives, for resolving embeds.
     pub fn set_vault_root(&mut self, root: &Path) {
         self.vault_root = Some(root.to_path_buf());
+    }
+
+    /// Set the folder pasted images are filed into (vault-relative).
+    pub fn set_attachments_folder(&mut self, folder: &str) {
+        if !folder.trim().is_empty() {
+            self.attachments_folder = folder.trim().to_string();
+        }
     }
 
     /// Parsed frontmatter properties. Empty when absent or unsupported.
@@ -431,10 +441,103 @@ impl Editor {
     }
 
     fn paste(&mut self, _: &Paste, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.paste_clipboard_image(cx) {
+            cx.notify();
+            return;
+        }
+
         if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
+            if self.paste_image_path(&text) {
+                cx.notify();
+                return;
+            }
             self.insert_text(&text);
             cx.notify();
         }
+    }
+
+    /// If the clipboard holds an image, file it in the attachments folder and link it.
+    fn paste_clipboard_image(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(root) = self.vault_root.clone() else {
+            return false;
+        };
+        let Some(item) = cx.read_from_clipboard() else {
+            return false;
+        };
+
+        for entry in item.into_entries() {
+            let ClipboardEntry::Image(image) = entry else {
+                continue;
+            };
+            if image.bytes.is_empty() {
+                return false;
+            }
+
+            let extension = image_extension(image.format);
+            let relative = format!("{}/{}.{extension}", self.attachments_folder, stamp());
+            let target = root.join(&relative);
+
+            if let Some(parent) = target.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            if std::fs::write(&target, &image.bytes).is_err() {
+                return false;
+            }
+
+            self.insert_text(&format!("![[{relative}]]"));
+            return true;
+        }
+
+        false
+    }
+
+    /// If the pasted text is a path to an existing image, copy it in and link it.
+    fn paste_image_path(&mut self, text: &str) -> bool {
+        let trimmed = text.trim().trim_matches('"');
+        if trimmed.contains('\n') || trimmed.is_empty() {
+            return false;
+        }
+
+        let source = Path::new(trimmed);
+        let is_image = source
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .map(|extension| {
+                matches!(
+                    extension.to_ascii_lowercase().as_str(),
+                    "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "svg" | "avif"
+                )
+            })
+            .unwrap_or(false);
+        if !is_image || !source.is_file() {
+            return false;
+        }
+
+        let (Some(root), Some(stem), Some(extension)) = (
+            self.vault_root.clone(),
+            source.file_stem().and_then(|stem| stem.to_str()),
+            source.extension().and_then(|extension| extension.to_str()),
+        ) else {
+            return false;
+        };
+
+        let relative = format!(
+            "{}/{}-{}.{}",
+            self.attachments_folder,
+            sanitize(stem),
+            stamp(),
+            extension.to_ascii_lowercase()
+        );
+        let target = root.join(&relative);
+        if let Some(parent) = target.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if std::fs::copy(source, &target).is_err() {
+            return false;
+        }
+
+        self.insert_text(&format!("![[{relative}]]"));
+        true
     }
 
     fn on_save(&mut self, _: &Save, _window: &mut Window, cx: &mut Context<Self>) {
@@ -797,6 +900,37 @@ impl Editor {
     fn range_from_utf16(&self, range_utf16: Option<Range<usize>>) -> Option<Range<usize>> {
         range_utf16.map(|r| self.buffer.utf16_to_char(r.start)..self.buffer.utf16_to_char(r.end))
     }
+}
+
+/// Milliseconds since the epoch, for unique attachment names.
+fn stamp() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or(0)
+}
+
+fn image_extension(format: ImageFormat) -> &'static str {
+    match format {
+        ImageFormat::Png => "png",
+        ImageFormat::Jpeg => "jpg",
+        ImageFormat::Webp => "webp",
+        ImageFormat::Gif => "gif",
+        ImageFormat::Svg => "svg",
+        ImageFormat::Bmp => "bmp",
+        ImageFormat::Tiff => "tiff",
+    }
+}
+
+fn sanitize(name: &str) -> String {
+    name.chars()
+        .map(|ch| match ch {
+            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '-',
+            other => other,
+        })
+        .collect::<String>()
+        .trim()
+        .to_string()
 }
 
 struct EditorText {
