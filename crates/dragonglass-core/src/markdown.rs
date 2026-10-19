@@ -31,11 +31,64 @@ pub enum Block {
     Embed {
         target: String,
     },
+    /// An Obsidian callout: a blockquote starting with `[!kind] Title`.
+    Callout {
+        kind: String,
+        title: String,
+        text: String,
+    },
+}
+
+/// Remove `%%comment%%` spans, which may run across lines.
+pub fn strip_comments(src: &str) -> String {
+    let mut out = String::with_capacity(src.len());
+    let mut rest = src;
+
+    while let Some(start) = rest.find("%%") {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 2..];
+        match after.find("%%") {
+            Some(end) => rest = &after[end + 2..],
+            // Unterminated comment: drop everything to the end.
+            None => return out,
+        }
+    }
+
+    out.push_str(rest);
+    out
+}
+
+/// Split text into `(segment, is_highlight)` runs around `==highlight==` spans.
+pub fn split_highlights(text: &str) -> Vec<(String, bool)> {
+    let mut out = Vec::new();
+    let mut rest = text;
+    let mut highlighted = false;
+
+    loop {
+        match rest.find("==") {
+            Some(index) => {
+                if index > 0 {
+                    out.push((rest[..index].to_string(), highlighted));
+                }
+                rest = &rest[index + 2..];
+                highlighted = !highlighted;
+            }
+            None => {
+                if !rest.is_empty() {
+                    out.push((rest.to_string(), highlighted));
+                }
+                break;
+            }
+        }
+    }
+
+    out
 }
 
 /// Parse a document (frontmatter is skipped) into display blocks.
 pub fn parse_blocks(src: &str) -> Vec<Block> {
-    let body = frontmatter::split(src).body;
+    let cleaned = strip_comments(src);
+    let body = frontmatter::split(&cleaned).body;
     let lines: Vec<&str> = body.lines().collect();
 
     let mut blocks = Vec::new();
@@ -97,19 +150,21 @@ pub fn parse_blocks(src: &str) -> Vec<Block> {
         if trimmed.starts_with('>') {
             flush_paragraph(&mut paragraph, &mut blocks);
 
-            let mut quote = String::new();
+            let mut quoted: Vec<String> = Vec::new();
             while i < lines.len() {
                 let Some(rest) = lines[i].trim_start().strip_prefix('>') else {
                     break;
                 };
-                if !quote.is_empty() {
-                    quote.push('\n');
-                }
-                quote.push_str(rest.trim_start());
+                quoted.push(rest.trim_start().to_string());
                 i += 1;
             }
 
-            blocks.push(Block::Quote(quote));
+            // `> [!kind] Title` is a callout; everything else is a plain quote.
+            if let Some(callout) = parse_callout(&quoted) {
+                blocks.push(callout);
+            } else {
+                blocks.push(Block::Quote(quoted.join("\n")));
+            }
             continue;
         }
 
@@ -186,6 +241,31 @@ fn standalone_embed(line: &str) -> Option<String> {
 
 fn is_fence(trimmed: &str) -> bool {
     trimmed.starts_with("```") || trimmed.starts_with("~~~")
+}
+
+/// Recognise `[!kind] Title` at the start of a quoted block.
+fn parse_callout(quoted: &[String]) -> Option<Block> {
+    let first = quoted.first()?;
+    let rest = first.strip_prefix("[!")?;
+    let end = rest.find(']')?;
+
+    let kind = rest[..end].trim().to_lowercase();
+    if kind.is_empty() {
+        return None;
+    }
+
+    let title: String = rest[end + 1..].trim().to_string();
+    let title = if title.is_empty() {
+        kind.clone()
+    } else {
+        title
+    };
+
+    Some(Block::Callout {
+        kind,
+        title,
+        text: quoted[1..].join("\n"),
+    })
 }
 
 /// A heading and the 1-based source line it appears on.
@@ -436,6 +516,74 @@ mod tests {
                     line: 7
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn comments_are_stripped_before_parsing() {
+        let blocks = parse_blocks("%%hidden%%# Visible\n");
+        assert_eq!(
+            blocks,
+            vec![Block::Heading {
+                level: 1,
+                text: "Visible".into()
+            }]
+        );
+    }
+
+    #[test]
+    fn strip_comments_spans_lines_and_truncates_unterminated() {
+        assert_eq!(strip_comments("a %%x\ny%% b"), "a  b");
+        assert_eq!(strip_comments("a %%never closed"), "a ");
+    }
+
+    #[test]
+    fn callouts_are_parsed() {
+        let blocks = parse_blocks("> [!warning] Watch out\n> body line\n");
+        assert_eq!(
+            blocks,
+            vec![Block::Callout {
+                kind: "warning".into(),
+                title: "Watch out".into(),
+                text: "body line".into()
+            }]
+        );
+    }
+
+    #[test]
+    fn callouts_default_the_title_to_the_kind() {
+        let blocks = parse_blocks("> [!note]\n");
+        assert_eq!(
+            blocks,
+            vec![Block::Callout {
+                kind: "note".into(),
+                title: "note".into(),
+                text: String::new()
+            }]
+        );
+    }
+
+    #[test]
+    fn plain_quotes_stay_quotes() {
+        assert_eq!(
+            parse_blocks("> just a quote\n"),
+            vec![Block::Quote("just a quote".into())]
+        );
+    }
+
+    #[test]
+    fn highlights_split_into_runs() {
+        assert_eq!(
+            split_highlights("a ==b== c"),
+            vec![
+                ("a ".to_string(), false),
+                ("b".to_string(), true),
+                (" c".to_string(), false),
+            ]
+        );
+        assert_eq!(
+            split_highlights("plain"),
+            vec![("plain".to_string(), false)]
         );
     }
 

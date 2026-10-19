@@ -84,6 +84,33 @@ fn render_block(block: Block, vault_root: Option<&Path>, depth: usize, theme: Th
             .w_full()
             .bg(theme.border)
             .into_any_element(),
+        Block::Callout { kind, title, text } => {
+            let accent = match kind.as_str() {
+                "warning" | "caution" | "danger" | "error" => theme.warn,
+                "tip" | "success" => theme.code_text,
+                _ => theme.accent_text,
+            };
+
+            div()
+                .border_l_1()
+                .border_color(accent)
+                .bg(theme.chip)
+                .rounded_md()
+                .p_3()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(
+                    div()
+                        .font_weight(gpui::FontWeight::BOLD)
+                        .text_color(accent)
+                        .child(title),
+                )
+                .when(!text.trim().is_empty(), |d| {
+                    d.child(div().text_size(px(15.0)).child(text.replace('\n', " ")))
+                })
+                .into_any_element()
+        }
         Block::Embed { target } => render_embed(&target, vault_root, depth, theme),
     }
 }

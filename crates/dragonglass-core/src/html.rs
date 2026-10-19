@@ -64,6 +64,19 @@ fn render_block(block: Block) -> String {
             inline(&text.replace('\n', " "))
         ),
         Block::Rule => "<hr>".to_string(),
+        Block::Callout { kind, title, text } => {
+            let body = if text.trim().is_empty() {
+                String::new()
+            } else {
+                format!("<p>{}</p>", inline(&text.replace('\n', " ")))
+            };
+            format!(
+                "<blockquote class=\"callout callout-{}\"><p><strong>{}</strong></p>{}</blockquote>",
+                escape(&kind),
+                escape(&title),
+                body
+            )
+        }
         Block::Embed { target } => {
             if is_image(&target) {
                 format!(
@@ -177,6 +190,14 @@ mod tests {
     fn image_embed_becomes_img() {
         let html = render_body("![[shot.png]]\n");
         assert!(html.contains("<img src=\"shot.png\""));
+    }
+
+    #[test]
+    fn callouts_render_with_their_kind_and_title() {
+        let html = render_body("> [!warning] Careful\n> mind the gap\n");
+        assert!(html.contains("callout-warning"));
+        assert!(html.contains("<strong>Careful</strong>"));
+        assert!(html.contains("mind the gap"));
     }
 
     #[test]
