@@ -24,6 +24,7 @@ pub mod query;
 pub mod search;
 pub mod storage;
 pub mod store;
+pub mod syntax;
 pub mod tags;
 pub mod templates;
 pub mod tree;

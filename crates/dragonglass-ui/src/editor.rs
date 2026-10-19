@@ -10,7 +10,7 @@ use std::ops::Range;
 use std::path::{Path, PathBuf};
 
 use dragonglass_core::frontmatter::{self, Property};
-use dragonglass_core::{history, storage, wrap, Buffer};
+use dragonglass_core::{history, storage, syntax, wrap, Buffer};
 use gpui::{
     actions, div, fill, point, prelude::*, px, relative, size, AnyElement, App, Bounds,
     ClipboardEntry, ClipboardItem, Context, CursorStyle, ElementId, ElementInputHandler, Entity,
@@ -902,6 +902,57 @@ impl Editor {
     }
 }
 
+/// Build runs for a row, grouping consecutive characters of the same token kind.
+///
+/// `offsets` spans the row's characters plus one, so byte lengths are plain differences.
+fn runs_for(
+    kinds: &[syntax::TokenKind],
+    offsets: &[usize],
+    font: &gpui::Font,
+    base_color: gpui::Hsla,
+    theme: Theme,
+) -> Vec<TextRun> {
+    let mut runs: Vec<TextRun> = Vec::new();
+    let mut index = 0;
+
+    while index < kinds.len() {
+        let kind = kinds[index];
+        let mut end = index + 1;
+        while end < kinds.len() && kinds[end] == kind {
+            end += 1;
+        }
+
+        let len = offsets[end] - offsets[index];
+        if len > 0 {
+            runs.push(TextRun {
+                len,
+                font: font.clone(),
+                color: token_color(kind, base_color, theme),
+                background_color: None,
+                underline: None,
+                strikethrough: None,
+            });
+        }
+
+        index = end;
+    }
+
+    runs
+}
+
+fn token_color(kind: syntax::TokenKind, base: gpui::Hsla, theme: Theme) -> gpui::Hsla {
+    match kind {
+        syntax::TokenKind::Text => base,
+        syntax::TokenKind::Heading => theme.warn,
+        syntax::TokenKind::Emphasis => theme.text_dim,
+        syntax::TokenKind::Code | syntax::TokenKind::CodeBlock => theme.code_text,
+        syntax::TokenKind::Link => theme.accent_text,
+        syntax::TokenKind::Markup => theme.star,
+        syntax::TokenKind::Math => theme.code_text,
+        syntax::TokenKind::Comment => theme.muted,
+    }
+}
+
 /// Milliseconds since the epoch, for unique attachment names.
 fn stamp() -> u128 {
     std::time::SystemTime::now()
@@ -1003,19 +1054,11 @@ impl Element for EditorText {
         let line_height = editor.line_height;
         let available = f32::from(bounds.size.width).max(1.0);
 
-        let shape = |text: &str| {
-            let run = TextRun {
-                len: text.len(),
-                font: font.clone(),
-                color,
-                background_color: None,
-                underline: None,
-                strikethrough: None,
-            };
+        let shape = |text: &str, runs: &[TextRun]| {
             window.text_system().shape_line(
                 SharedString::from(text.to_string()),
                 font_size,
-                &[run],
+                runs,
                 None,
             )
         };
@@ -1024,7 +1067,18 @@ impl Element for EditorText {
         let mut rows: Vec<ShapedLine> = Vec::new();
         let mut metas: Vec<RowMeta> = Vec::new();
 
+        // Tokenize every line once, tracking fenced code blocks.
+        let mut line_tokens: Vec<Vec<syntax::TokenKind>> = Vec::with_capacity(count);
+        let mut in_code_block = false;
         for line_index in 0..count {
+            let text = editor.buffer.line(line_index);
+            line_tokens.push(syntax::line_tokens(&text, in_code_block));
+            if syntax::is_fence(&text) {
+                in_code_block = !in_code_block;
+            }
+        }
+
+        for (line_index, tokens) in line_tokens.iter().enumerate() {
             let text = editor.buffer.line(line_index);
             let chars: Vec<char> = text.chars().collect();
 
@@ -1040,7 +1094,15 @@ impl Element for EditorText {
             let ranges: Vec<(usize, usize)> = if chars.is_empty() {
                 vec![(0, 0)]
             } else {
-                let full = shape(&text);
+                let full_run = TextRun {
+                    len: text.len(),
+                    font: font.clone(),
+                    color,
+                    background_color: None,
+                    underline: None,
+                    strikethrough: None,
+                };
+                let full = shape(&text, &[full_run]);
                 let width_of = |from: usize, to: usize| -> f32 {
                     f32::from(full.x_for_index(offsets[to]))
                         - f32::from(full.x_for_index(offsets[from]))
@@ -1048,9 +1110,18 @@ impl Element for EditorText {
                 wrap::wrap(&chars, width_of, available)
             };
 
+            let tokens = tokens.as_slice();
+
             for (start, end) in ranges {
                 let segment: String = chars[start..end].iter().collect();
-                rows.push(shape(&segment));
+                let runs = runs_for(
+                    &tokens[start..end],
+                    &offsets[start..=end],
+                    &font,
+                    color,
+                    theme,
+                );
+                rows.push(shape(&segment, &runs));
                 metas.push(RowMeta {
                     line: line_index,
                     start,
