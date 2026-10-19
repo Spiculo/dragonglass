@@ -10,7 +10,7 @@ use std::ops::Range;
 use std::path::{Path, PathBuf};
 
 use dragonglass_core::frontmatter::{self, Property};
-use dragonglass_core::{history, storage, Buffer};
+use dragonglass_core::{history, storage, wrap, Buffer};
 use gpui::{
     actions, div, fill, point, prelude::*, px, relative, size, AnyElement, App, Bounds,
     ClipboardItem, Context, CursorStyle, ElementId, ElementInputHandler, Entity,
@@ -95,7 +95,17 @@ pub struct Editor {
     line_height: Pixels,
     marked_range: Option<Range<usize>>,
     last_bounds: Option<Bounds<Pixels>>,
-    last_lines: Vec<ShapedLine>,
+    /// Visual rows produced by the last paint, for hit-testing and IME.
+    last_rows: Vec<RowMeta>,
+    last_shaped: Vec<ShapedLine>,
+}
+
+/// A wrapped visual row: `[start, end)` character columns of logical line `line`.
+#[derive(Debug, Clone, Copy)]
+struct RowMeta {
+    line: usize,
+    start: usize,
+    end: usize,
 }
 
 impl Editor {
@@ -112,7 +122,8 @@ impl Editor {
             line_height: px(20.0),
             marked_range: None,
             last_bounds: None,
-            last_lines: Vec::new(),
+            last_rows: Vec::new(),
+            last_shaped: Vec::new(),
         }
     }
 
@@ -124,6 +135,8 @@ impl Editor {
         self.marked_range = None;
         self.anchor = None;
         self.selecting = false;
+        self.last_rows.clear();
+        self.last_shaped.clear();
         self.path = Some(path.to_path_buf());
         Ok(())
     }
@@ -167,6 +180,8 @@ impl Editor {
         self.buffer.mark_saved();
         self.anchor = None;
         self.marked_range = None;
+        self.last_rows.clear();
+        self.last_shaped.clear();
         Ok(())
     }
 
@@ -226,6 +241,39 @@ impl Editor {
         self.anchor = None;
     }
 
+    /// Move the caret one visual row up (`delta < 0`) or down, following wrapped rows.
+    fn move_vertical(&mut self, delta: isize) {
+        let (line, col) = self.buffer.line_col();
+
+        let Some(current) = self
+            .last_rows
+            .iter()
+            .rposition(|meta| meta.line == line && meta.start <= col)
+        else {
+            // No geometry yet: fall back to logical movement.
+            if delta < 0 {
+                self.buffer.move_up();
+            } else {
+                self.buffer.move_down();
+            }
+            return;
+        };
+
+        let target = current as isize + delta;
+        if target < 0 || target as usize >= self.last_rows.len() {
+            return;
+        }
+
+        let current_meta = self.last_rows[current];
+        let target_meta = self.last_rows[target as usize];
+        let offset = (col - current_meta.start).min(target_meta.end - target_meta.start);
+
+        self.buffer.set_cursor(
+            self.buffer
+                .char_index_at(target_meta.line, target_meta.start + offset),
+        );
+    }
+
     fn delete_selection(&mut self) -> bool {
         if let Some(selection) = self.selection() {
             self.buffer.delete_range(selection);
@@ -273,13 +321,13 @@ impl Editor {
 
     fn up(&mut self, _: &Up, _window: &mut Window, cx: &mut Context<Self>) {
         self.collapse_selection();
-        self.buffer.move_up();
+        self.move_vertical(-1);
         cx.notify();
     }
 
     fn down(&mut self, _: &Down, _window: &mut Window, cx: &mut Context<Self>) {
         self.collapse_selection();
-        self.buffer.move_down();
+        self.move_vertical(1);
         cx.notify();
     }
 
@@ -309,13 +357,13 @@ impl Editor {
 
     fn select_up(&mut self, _: &SelectUp, _window: &mut Window, cx: &mut Context<Self>) {
         self.begin_selection();
-        self.buffer.move_up();
+        self.move_vertical(-1);
         cx.notify();
     }
 
     fn select_down(&mut self, _: &SelectDown, _window: &mut Window, cx: &mut Context<Self>) {
         self.begin_selection();
-        self.buffer.move_down();
+        self.move_vertical(1);
         cx.notify();
     }
 
@@ -382,16 +430,26 @@ impl Editor {
         let bounds = self.last_bounds?;
         let local = bounds.localize(&position)?;
 
-        let line = (f32::from(local.y) / f32::from(self.line_height))
+        let row = (f32::from(local.y) / f32::from(self.line_height))
             .floor()
             .max(0.0) as usize;
-        let line = line.min(self.buffer.line_count().saturating_sub(1));
-        let shaped = self.last_lines.get(line)?;
+        let meta = *self.last_rows.get(row)?;
+        let shaped = self.last_shaped.get(row)?;
+
+        let row_text: String = self
+            .buffer
+            .line(meta.line)
+            .chars()
+            .skip(meta.start)
+            .take(meta.end.saturating_sub(meta.start))
+            .collect();
 
         let byte = shaped.closest_index_for_x(local.x);
-        let line_text = self.buffer.line(line);
-        let char_col = line_text[..byte.min(line_text.len())].chars().count();
-        Some(self.buffer.char_index_at(line, char_col))
+        let col_in_row = row_text[..byte.min(row_text.len())].chars().count();
+        Some(
+            self.buffer
+                .char_index_at(meta.line, meta.start + col_in_row),
+        )
     }
 
     fn on_mouse_down(
@@ -669,18 +727,24 @@ impl EntityInputHandler for Editor {
         _cx: &mut Context<Self>,
     ) -> Option<Bounds<Pixels>> {
         let start = self.buffer.utf16_to_char(range_utf16.start);
-        let end = self.buffer.utf16_to_char(range_utf16.end);
-        let (line, start_col) = self.buffer.line_col_at(start);
-        let (_, end_col) = self.buffer.line_col_at(end);
-        let shaped = self.last_lines.get(line)?;
+        let (line, col) = self.buffer.line_col_at(start);
 
-        let x0 = shaped.x_for_index(self.buffer.char_col_to_byte(line, start_col));
-        let x1 = shaped.x_for_index(self.buffer.char_col_to_byte(line, end_col));
-        let top = bounds.top() + self.line_height * line as f32;
+        let row = self
+            .last_rows
+            .iter()
+            .rposition(|meta| meta.line == line && meta.start <= col)?;
+        let meta = self.last_rows[row];
+        let shaped = self.last_shaped.get(row)?;
+
+        let col = col.min(meta.end);
+        let byte = self.buffer.char_col_to_byte(line, col)
+            - self.buffer.char_col_to_byte(line, meta.start);
+        let x = shaped.x_for_index(byte);
+        let top = bounds.top() + self.line_height * row as f32;
 
         Some(Bounds::from_corners(
-            point(bounds.left() + x0, top),
-            point(bounds.left() + x1, top + self.line_height),
+            point(bounds.left() + x, top),
+            point(bounds.left() + x, top + self.line_height),
         ))
     }
 
@@ -714,7 +778,8 @@ impl IntoElement for EditorText {
 }
 
 struct Prepaint {
-    lines: Vec<ShapedLine>,
+    rows: Vec<ShapedLine>,
+    metas: Vec<RowMeta>,
     selection: Vec<PaintQuad>,
     cursor: Option<PaintQuad>,
 }
@@ -741,8 +806,14 @@ impl Element for EditorText {
         let editor = self.editor.read(cx);
         let mut style = Style::default();
         style.size.width = relative(1.0).into();
-        let line_count = editor.buffer.line_count().max(1) as f32;
-        style.size.height = (editor.line_height * line_count).into();
+        // Before the first paint only the logical line count is known; afterwards the row
+        // count is exact, so the height settles after one frame.
+        let rows = if editor.last_rows.is_empty() {
+            editor.buffer.line_count()
+        } else {
+            editor.last_rows.len()
+        };
+        style.size.height = (editor.line_height * rows.max(1) as f32).into();
         (window.request_layout(style, [], cx), ())
     }
 
@@ -762,11 +833,9 @@ impl Element for EditorText {
         let color = text_style.color;
         let font_size = editor.font_size;
         let line_height = editor.line_height;
+        let available = f32::from(bounds.size.width).max(1.0);
 
-        let count = editor.buffer.line_count().max(1);
-        let mut lines = Vec::with_capacity(count);
-        for i in 0..count {
-            let text = editor.buffer.line(i);
+        let shape = |text: &str| {
             let run = TextRun {
                 len: text.len(),
                 font: font.clone(),
@@ -775,27 +844,76 @@ impl Element for EditorText {
                 underline: None,
                 strikethrough: None,
             };
-            let shaped =
-                window
-                    .text_system()
-                    .shape_line(SharedString::from(text), font_size, &[run], None);
-            lines.push(shaped);
+            window.text_system().shape_line(
+                SharedString::from(text.to_string()),
+                font_size,
+                &[run],
+                None,
+            )
+        };
+
+        let count = editor.buffer.line_count().max(1);
+        let mut rows: Vec<ShapedLine> = Vec::new();
+        let mut metas: Vec<RowMeta> = Vec::new();
+
+        for line_index in 0..count {
+            let text = editor.buffer.line(line_index);
+            let chars: Vec<char> = text.chars().collect();
+
+            // Byte offset of every character column, for measuring and slicing.
+            let mut offsets = Vec::with_capacity(chars.len() + 1);
+            let mut acc = 0usize;
+            for ch in &chars {
+                offsets.push(acc);
+                acc += ch.len_utf8();
+            }
+            offsets.push(acc);
+
+            let ranges: Vec<(usize, usize)> = if chars.is_empty() {
+                vec![(0, 0)]
+            } else {
+                let full = shape(&text);
+                let width_of = |from: usize, to: usize| -> f32 {
+                    f32::from(full.x_for_index(offsets[to]))
+                        - f32::from(full.x_for_index(offsets[from]))
+                };
+                wrap::wrap(&chars, width_of, available)
+            };
+
+            for (start, end) in ranges {
+                let segment: String = chars[start..end].iter().collect();
+                rows.push(shape(&segment));
+                metas.push(RowMeta {
+                    line: line_index,
+                    start,
+                    end,
+                });
+            }
         }
+
+        let row_byte = |line: usize, row_start: usize, col: usize| -> usize {
+            editor.buffer.char_col_to_byte(line, col)
+                - editor.buffer.char_col_to_byte(line, row_start)
+        };
 
         let mut selection_quads = Vec::new();
         if let Some(selection) = editor.selection() {
-            for (i, shaped) in lines.iter().enumerate() {
-                let line_start = editor.buffer.char_index_at(i, 0);
-                let line_end = line_start + editor.buffer.line_char_len(i);
-                let start = selection.start.max(line_start);
-                let end = selection.end.min(line_end);
+            for (row_index, meta) in metas.iter().enumerate() {
+                let line_start = editor.buffer.char_index_at(meta.line, 0);
+                let start = selection.start.max(line_start + meta.start);
+                let end = selection.end.min(line_start + meta.end);
                 if start >= end {
                     continue;
                 }
 
-                let x0 = shaped.x_for_index(editor.buffer.char_col_to_byte(i, start - line_start));
-                let x1 = shaped.x_for_index(editor.buffer.char_col_to_byte(i, end - line_start));
-                let top = bounds.top() + line_height * i as f32;
+                let x0 = rows[row_index].x_for_index(row_byte(
+                    meta.line,
+                    meta.start,
+                    start - line_start,
+                ));
+                let x1 =
+                    rows[row_index].x_for_index(row_byte(meta.line, meta.start, end - line_start));
+                let top = bounds.top() + line_height * row_index as f32;
                 selection_quads.push(fill(
                     Bounds::from_corners(
                         point(bounds.left() + x0, top),
@@ -807,26 +925,31 @@ impl Element for EditorText {
         }
 
         let (line_idx, col) = editor.buffer.line_col();
-        let cursor = match lines.get(line_idx) {
-            Some(shaped) => {
-                let byte = editor.buffer.char_col_to_byte(line_idx, col);
-                let x = shaped.x_for_index(byte);
-                Some(fill(
-                    Bounds::new(
-                        point(
-                            bounds.left() + x,
-                            bounds.top() + line_height * line_idx as f32,
-                        ),
-                        size(px(2.0), line_height),
-                    ),
-                    color,
-                ))
+        let mut cursor_row = None;
+        for (row_index, meta) in metas.iter().enumerate() {
+            if meta.line == line_idx && meta.start <= col {
+                cursor_row = Some(row_index);
             }
-            None => None,
-        };
+        }
+        let cursor = cursor_row.map(|row_index| {
+            let meta = metas[row_index];
+            let col = col.min(meta.end);
+            let x = rows[row_index].x_for_index(row_byte(meta.line, meta.start, col));
+            fill(
+                Bounds::new(
+                    point(
+                        bounds.left() + x,
+                        bounds.top() + line_height * row_index as f32,
+                    ),
+                    size(px(2.0), line_height),
+                ),
+                color,
+            )
+        });
 
         Prepaint {
-            lines,
+            rows,
+            metas,
             selection: selection_quads,
             cursor,
         }
@@ -855,9 +978,9 @@ impl Element for EditorText {
             window.paint_quad(quad);
         }
 
-        for (i, line) in prepaint.lines.iter().enumerate() {
+        for (i, row) in prepaint.rows.iter().enumerate() {
             let origin = point(bounds.left(), bounds.top() + line_height * i as f32);
-            let _ = line.paint(origin, line_height, window, cx);
+            let _ = row.paint(origin, line_height, window, cx);
         }
 
         if focus_handle.is_focused(window) {
@@ -866,10 +989,12 @@ impl Element for EditorText {
             }
         }
 
-        let lines = std::mem::take(&mut prepaint.lines);
+        let rows = std::mem::take(&mut prepaint.rows);
+        let metas = std::mem::take(&mut prepaint.metas);
         self.editor.update(cx, |editor, _cx| {
             editor.last_bounds = Some(bounds);
-            editor.last_lines = lines;
+            editor.last_rows = metas;
+            editor.last_shaped = rows;
         });
     }
 }
