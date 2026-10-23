@@ -25,6 +25,8 @@ pub struct Theme {
     pub code_bg: Hsla,
     pub code_text: Hsla,
     pub selection: Hsla,
+    /// Background of the line containing the caret.
+    pub current_line: Hsla,
 }
 
 fn h(hex: u32) -> Hsla {
@@ -52,6 +54,7 @@ impl Theme {
             code_bg: h(0x111111),
             code_text: h(0xb8d4b8),
             selection: h(0x3b82f6).opacity(0.3),
+            current_line: h(0x262626),
         }
     }
 
@@ -75,6 +78,7 @@ impl Theme {
             code_bg: h(0xf2f2f2),
             code_text: h(0x1f5f3f),
             selection: h(0x3b82f6).opacity(0.22),
+            current_line: h(0xf0f1f3),
         }
     }
 
@@ -120,6 +124,7 @@ impl Theme {
                 "code_bg" | "code-bg" => theme.code_bg = color,
                 "code_text" | "code-text" => theme.code_text = color,
                 "selection" => theme.selection = color,
+                "current_line" | "current-line" => theme.current_line = color,
                 _ => {}
             }
         }

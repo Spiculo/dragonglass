@@ -3,10 +3,10 @@
 
 use dragonglass_core::graph::{self, Graph};
 use gpui::{
-    actions, div, fill, point, prelude::*, px, relative, size, App, Bounds, Context, Element,
-    ElementId, Entity, FocusHandle, Focusable, GlobalElementId, InspectorElementId, KeyBinding,
-    LayoutId, MouseButton, MouseDownEvent, PaintQuad, PathBuilder, Pixels, Point, Render,
-    ShapedLine, SharedString, Style, TextRun, WeakEntity, Window,
+    div, fill, point, prelude::*, px, relative, size, App, Bounds, Context, Element, ElementId,
+    Entity, FocusHandle, Focusable, GlobalElementId, InspectorElementId, LayoutId, MouseButton,
+    MouseDownEvent, PaintQuad, PathBuilder, Pixels, Point, Render, ShapedLine, SharedString, Style,
+    TextRun, WeakEntity, Window,
 };
 
 use crate::theme::Theme;
@@ -16,13 +16,6 @@ const CANVAS: (f32, f32) = (1000.0, 600.0);
 /// How many hops of the active note to show.
 const DEPTH: usize = 1;
 const MAX_NODES: usize = 80;
-
-actions!(graph_view, [CloseGraph]);
-
-/// Bind Escape so a focused graph view closes.
-pub fn init(cx: &mut App) {
-    cx.bind_keys([KeyBinding::new("escape", CloseGraph, None)]);
-}
 
 pub struct GraphView {
     graph: Graph,
@@ -141,10 +134,6 @@ impl GraphView {
             cx.notify();
         }
     }
-
-    fn close(&mut self, _: &CloseGraph, window: &mut Window, cx: &mut Context<Self>) {
-        let _ = self.app.update(cx, |app, cx| app.close_graph(window, cx));
-    }
 }
 
 impl Focusable for GraphView {
@@ -162,7 +151,6 @@ impl Render for GraphView {
         div()
             .key_context("Graph")
             .track_focus(&self.focus_handle)
-            .on_action(cx.listener(Self::close))
             .flex()
             .flex_col()
             .size_full()

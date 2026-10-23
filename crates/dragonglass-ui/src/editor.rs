@@ -100,6 +100,9 @@ pub struct Editor {
     /// Visual rows produced by the last paint, for hit-testing and IME.
     last_rows: Vec<RowMeta>,
     last_shaped: Vec<ShapedLine>,
+    /// Cache key: the buffer revision and wrap width the shaped rows were built for.
+    cache_revision: u64,
+    cache_width: f32,
 }
 
 /// A wrapped visual row: `[start, end)` character columns of logical line `line`.
@@ -126,6 +129,8 @@ impl Editor {
             last_bounds: None,
             last_rows: Vec::new(),
             last_shaped: Vec::new(),
+            cache_revision: u64::MAX,
+            cache_width: 0.0,
             attachments_folder: "attachments".to_string(),
         }
     }
@@ -698,6 +703,8 @@ impl Render for Editor {
                 .flex_1()
                 .min_h(px(0.0))
                 .cursor(CursorStyle::IBeam)
+                .px_3()
+                .py_2()
                 .overflow_y_scroll()
                 .on_action(cx.listener(Self::backspace))
                 .on_action(cx.listener(Self::delete))
@@ -923,10 +930,19 @@ fn runs_for(
         }
 
         let len = offsets[end] - offsets[index];
+        let run_font = if kind == syntax::TokenKind::Heading {
+            gpui::Font {
+                weight: gpui::FontWeight::BOLD,
+                ..font.clone()
+            }
+        } else {
+            font.clone()
+        };
+
         if len > 0 {
             runs.push(TextRun {
                 len,
-                font: font.clone(),
+                font: run_font,
                 color: token_color(kind, base_color, theme),
                 background_color: None,
                 underline: None,
@@ -1000,7 +1016,11 @@ struct Prepaint {
     rows: Vec<ShapedLine>,
     metas: Vec<RowMeta>,
     selection: Vec<PaintQuad>,
+    current_line: Option<PaintQuad>,
     cursor: Option<PaintQuad>,
+    /// Cache key to record once painted.
+    revision: u64,
+    width: f32,
 }
 
 impl Element for EditorText {
@@ -1048,7 +1068,16 @@ impl Element for EditorText {
         let theme = *cx.global::<Theme>();
         let editor = self.editor.read(cx);
         let text_style = window.text_style();
-        let font = text_style.font();
+        let mut font = text_style.font();
+        // A monospace face for editing, with per-platform fallbacks.
+        font.family = "Cascadia Mono".into();
+        font.fallbacks = Some(gpui::FontFallbacks(std::sync::Arc::new(vec![
+            "Consolas".to_string(),
+            "DejaVu Sans Mono".to_string(),
+            "Liberation Mono".to_string(),
+            "Menlo".to_string(),
+            "monospace".to_string(),
+        ])));
         let color = text_style.color;
         let font_size = editor.font_size;
         let line_height = editor.line_height;
@@ -1064,71 +1093,84 @@ impl Element for EditorText {
         };
 
         let count = editor.buffer.line_count().max(1);
-        let mut rows: Vec<ShapedLine> = Vec::new();
-        let mut metas: Vec<RowMeta> = Vec::new();
+        let revision = editor.buffer.revision();
+        // Shaping is the expensive part, so reuse it across frames (scrolling, caret
+        // movement, selection) and only rebuild when the text or the width changes.
+        let cached = editor.cache_revision == revision
+            && (editor.cache_width - available).abs() < 0.5
+            && !editor.last_shaped.is_empty();
 
-        // Tokenize every line once, tracking fenced code blocks.
-        let mut line_tokens: Vec<Vec<syntax::TokenKind>> = Vec::with_capacity(count);
-        let mut in_code_block = false;
-        for line_index in 0..count {
-            let text = editor.buffer.line(line_index);
-            line_tokens.push(syntax::line_tokens(&text, in_code_block));
-            if syntax::is_fence(&text) {
-                in_code_block = !in_code_block;
+        let (rows, metas) = if cached {
+            (editor.last_shaped.clone(), editor.last_rows.clone())
+        } else {
+            let mut rows: Vec<ShapedLine> = Vec::new();
+            let mut metas: Vec<RowMeta> = Vec::new();
+
+            // Tokenize every line once, tracking fenced code blocks.
+            let mut line_tokens: Vec<Vec<syntax::TokenKind>> = Vec::with_capacity(count);
+            let mut in_code_block = false;
+            for line_index in 0..count {
+                let text = editor.buffer.line(line_index);
+                line_tokens.push(syntax::line_tokens(&text, in_code_block));
+                if syntax::is_fence(&text) {
+                    in_code_block = !in_code_block;
+                }
             }
-        }
 
-        for (line_index, tokens) in line_tokens.iter().enumerate() {
-            let text = editor.buffer.line(line_index);
-            let chars: Vec<char> = text.chars().collect();
+            for (line_index, tokens) in line_tokens.iter().enumerate() {
+                let text = editor.buffer.line(line_index);
+                let chars: Vec<char> = text.chars().collect();
 
-            // Byte offset of every character column, for measuring and slicing.
-            let mut offsets = Vec::with_capacity(chars.len() + 1);
-            let mut acc = 0usize;
-            for ch in &chars {
+                // Byte offset of every character column, for measuring and slicing.
+                let mut offsets = Vec::with_capacity(chars.len() + 1);
+                let mut acc = 0usize;
+                for ch in &chars {
+                    offsets.push(acc);
+                    acc += ch.len_utf8();
+                }
                 offsets.push(acc);
-                acc += ch.len_utf8();
-            }
-            offsets.push(acc);
 
-            let ranges: Vec<(usize, usize)> = if chars.is_empty() {
-                vec![(0, 0)]
-            } else {
-                let full_run = TextRun {
-                    len: text.len(),
-                    font: font.clone(),
-                    color,
-                    background_color: None,
-                    underline: None,
-                    strikethrough: None,
+                let ranges: Vec<(usize, usize)> = if chars.is_empty() {
+                    vec![(0, 0)]
+                } else {
+                    let full_run = TextRun {
+                        len: text.len(),
+                        font: font.clone(),
+                        color,
+                        background_color: None,
+                        underline: None,
+                        strikethrough: None,
+                    };
+                    let full = shape(&text, &[full_run]);
+                    let width_of = |from: usize, to: usize| -> f32 {
+                        f32::from(full.x_for_index(offsets[to]))
+                            - f32::from(full.x_for_index(offsets[from]))
+                    };
+                    wrap::wrap(&chars, width_of, available)
                 };
-                let full = shape(&text, &[full_run]);
-                let width_of = |from: usize, to: usize| -> f32 {
-                    f32::from(full.x_for_index(offsets[to]))
-                        - f32::from(full.x_for_index(offsets[from]))
-                };
-                wrap::wrap(&chars, width_of, available)
-            };
 
-            let tokens = tokens.as_slice();
+                let tokens = tokens.as_slice();
 
-            for (start, end) in ranges {
-                let segment: String = chars[start..end].iter().collect();
-                let runs = runs_for(
-                    &tokens[start..end],
-                    &offsets[start..=end],
-                    &font,
-                    color,
-                    theme,
-                );
-                rows.push(shape(&segment, &runs));
-                metas.push(RowMeta {
-                    line: line_index,
-                    start,
-                    end,
-                });
+                for (start, end) in ranges {
+                    let segment: String = chars[start..end].iter().collect();
+                    let runs = runs_for(
+                        &tokens[start..end],
+                        &offsets[start..=end],
+                        &font,
+                        color,
+                        theme,
+                    );
+                    rows.push(shape(&segment, &runs));
+                    metas.push(RowMeta {
+                        line: line_index,
+                        start,
+                        end,
+                    });
+                }
             }
-        }
+
+            (rows, metas)
+        };
 
         let row_byte = |line: usize, row_start: usize, col: usize| -> usize {
             editor.buffer.char_col_to_byte(line, col)
@@ -1186,11 +1228,24 @@ impl Element for EditorText {
             )
         });
 
+        let current_line = cursor_row.map(|row_index| {
+            fill(
+                Bounds::new(
+                    point(bounds.left(), bounds.top() + line_height * row_index as f32),
+                    size(bounds.size.width, line_height),
+                ),
+                theme.current_line,
+            )
+        });
+
         Prepaint {
             rows,
             metas,
             selection: selection_quads,
+            current_line,
             cursor,
+            revision,
+            width: available,
         }
     }
 
@@ -1213,6 +1268,10 @@ impl Element for EditorText {
 
         let line_height = self.editor.read(cx).line_height;
 
+        if let Some(quad) = prepaint.current_line.take() {
+            window.paint_quad(quad);
+        }
+
         for quad in prepaint.selection.drain(..) {
             window.paint_quad(quad);
         }
@@ -1230,10 +1289,15 @@ impl Element for EditorText {
 
         let rows = std::mem::take(&mut prepaint.rows);
         let metas = std::mem::take(&mut prepaint.metas);
+        let revision = prepaint.revision;
+        let width = prepaint.width;
+
         self.editor.update(cx, |editor, _cx| {
             editor.last_bounds = Some(bounds);
             editor.last_rows = metas;
             editor.last_shaped = rows;
+            editor.cache_revision = revision;
+            editor.cache_width = width;
         });
     }
 }

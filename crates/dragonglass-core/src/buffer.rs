@@ -31,6 +31,8 @@ pub struct Buffer {
     undo: Vec<Edit>,
     redo: Vec<Edit>,
     dirty: bool,
+    /// Bumped on every change, so the UI can cache derived layout.
+    revision: u64,
 }
 
 impl Buffer {
@@ -95,6 +97,11 @@ impl Buffer {
 
     pub fn is_dirty(&self) -> bool {
         self.dirty
+    }
+
+    /// Monotonic change counter, for cache invalidation.
+    pub fn revision(&self) -> u64 {
+        self.revision
     }
 
     pub fn mark_saved(&mut self) {
@@ -175,6 +182,7 @@ impl Buffer {
         });
         self.redo.clear();
         self.dirty = true;
+        self.revision = self.revision.wrapping_add(1);
     }
 
     /// Delete `range`, as a single undoable step.
@@ -236,6 +244,7 @@ impl Buffer {
 
         self.redo.clear();
         self.dirty = true;
+        self.revision = self.revision.wrapping_add(1);
     }
 
     /// Delete the character before the cursor. Returns whether anything was deleted.
@@ -262,6 +271,7 @@ impl Buffer {
 
         self.redo.clear();
         self.dirty = true;
+        self.revision = self.revision.wrapping_add(1);
         true
     }
 
@@ -276,6 +286,7 @@ impl Buffer {
         self.undo.push(Edit::Remove { at, text: removed });
         self.redo.clear();
         self.dirty = true;
+        self.revision = self.revision.wrapping_add(1);
         true
     }
 
@@ -333,6 +344,7 @@ impl Buffer {
         }
         self.redo.push(edit);
         self.dirty = true;
+        self.revision = self.revision.wrapping_add(1);
         true
     }
 
@@ -361,6 +373,7 @@ impl Buffer {
         }
         self.undo.push(edit);
         self.dirty = true;
+        self.revision = self.revision.wrapping_add(1);
         true
     }
 

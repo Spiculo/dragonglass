@@ -76,6 +76,7 @@ actions!(
         OpenWeekly,
         OpenMonthly,
         CloseQuery,
+        CloseOverlay,
         RunQuery,
         NewWindow
     ]
@@ -680,15 +681,6 @@ impl DragonGlassApp {
         cx.notify();
     }
 
-    fn close_graph(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.show_graph {
-            return;
-        }
-        self.show_graph = false;
-        window.focus(&self.editor.focus_handle(cx));
-        cx.notify();
-    }
-
     /// The centre pane: the graph, the query table, or the editor (optionally with a
     /// preview pane beside it).
     fn center_view(&self, theme: Theme, preview: Option<AnyElement>) -> AnyElement {
@@ -712,13 +704,25 @@ impl DragonGlassApp {
         }
     }
 
-    fn close_query(&mut self, _: &CloseQuery, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.show_query {
+    /// Escape closes whatever is on top: the panel, then the query view, then the graph.
+    fn close_overlay(&mut self, _: &CloseOverlay, window: &mut Window, cx: &mut Context<Self>) {
+        if self.switcher.is_some() {
+            self.close_panel(window, cx);
             return;
         }
-        self.show_query = false;
-        window.focus(&self.editor.focus_handle(cx));
-        cx.notify();
+
+        if self.show_query {
+            self.show_query = false;
+            window.focus(&self.editor.focus_handle(cx));
+            cx.notify();
+            return;
+        }
+
+        if self.show_graph {
+            self.show_graph = false;
+            window.focus(&self.editor.focus_handle(cx));
+            cx.notify();
+        }
     }
 
     fn new_window(&mut self, _: &NewWindow, window: &mut Window, cx: &mut Context<Self>) {
@@ -1775,7 +1779,7 @@ impl Render for DragonGlassApp {
             .on_action(cx.listener(Self::toggle_bookmark))
             .on_action(cx.listener(Self::open_commands))
             .on_action(cx.listener(Self::toggle_theme))
-            .on_action(cx.listener(Self::close_query))
+            .on_action(cx.listener(Self::close_overlay))
             .on_action(cx.listener(Self::new_window))
             .child(
                 div()
@@ -1931,11 +1935,10 @@ fn main() {
             KeyBinding::new("cmd-shift-l", ToggleTheme, None),
             KeyBinding::new("ctrl-shift-g", OpenGraph, None),
             KeyBinding::new("cmd-shift-g", OpenGraph, None),
-            KeyBinding::new("escape", CloseQuery, None),
+            KeyBinding::new("escape", CloseOverlay, None),
             KeyBinding::new("ctrl-n", NewWindow, None),
             KeyBinding::new("cmd-n", NewWindow, None),
         ]);
-        graph_view::init(cx);
 
         // Saved shortcut overrides win over the defaults registered above.
         for binding in &initial_bindings {
