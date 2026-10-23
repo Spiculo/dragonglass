@@ -6,6 +6,7 @@
 
 mod editor;
 mod graph_view;
+mod preview_window;
 mod reading;
 mod theme;
 
@@ -124,6 +125,7 @@ enum CommandId {
     GraphDepth,
     ToggleSnippets,
     TogglePreview,
+    DetachPreview,
     Plugin(usize),
 }
 
@@ -491,6 +493,7 @@ impl DragonGlassApp {
                 command_item("Graph: cycle depth", "", CommandId::GraphDepth),
                 command_item("Toggle snippets", "", CommandId::ToggleSnippets),
                 command_item("Toggle preview pane", "", CommandId::TogglePreview),
+                command_item("Pop preview out to a window", "", CommandId::DetachPreview),
                 command_item("Load workspace", "", CommandId::LoadWorkspace),
                 command_item("New window", "ctrl+n", CommandId::NewWindow),
             ]
@@ -1232,6 +1235,16 @@ impl DragonGlassApp {
                                         "preview pane: {}",
                                         if self.split_preview { "on" } else { "off" }
                                     ));
+                                    cx.notify();
+                                }
+                                CommandId::DetachPreview => {
+                                    preview_window::PreviewWindow::open(
+                                        self.editor.clone(),
+                                        self.vault_root.clone(),
+                                        cx,
+                                    );
+                                    self.status_message =
+                                        Some("preview opened in its own window".to_string());
                                     cx.notify();
                                 }
                                 CommandId::Hotkeys => {
