@@ -3,18 +3,34 @@
 //! A small block-level renderer rather than a full CommonMark engine: it mirrors the same
 //! block model the reading view uses, so exported output matches what the app shows.
 
+use crate::assets::Attachments;
+use crate::inline::{self, Inline};
 use crate::markdown::{self, Block};
-use crate::math::{self, Span};
-use crate::wikilink;
+use crate::math;
 
 /// Minimal CSS for exported pages.
 pub const STYLE: &str = "\
 body{font-family:system-ui,sans-serif;line-height:1.6;max-width:46rem;margin:2rem auto;padding:0 1rem;color:#1f1f1f}
-h1,h2,h3{line-height:1.25}
+h1,h2,h3,h4,h5,h6{line-height:1.25}
 pre{background:#f4f4f4;padding:.75rem;border-radius:6px;overflow:auto}
 blockquote{border-left:3px solid #d0d0d0;margin-left:0;padding-left:1rem;color:#555}
 hr{border:0;border-top:1px solid #d0d0d0}
 a{color:#1155cc}
+mark{background:#fff2a8;padding:0 .1em}
+code{background:#f4f4f4;padding:.1em .25em;border-radius:3px;font-size:.92em}
+del{opacity:.75}
+.math{background:#f4f4f4;padding:.1em .3em;border-radius:3px;font-family:ui-monospace,monospace}
+.math-inline{background:none;padding:0;font-family:inherit}
+.math-inline svg{vertical-align:middle}
+.math-display{background:none;padding:0;font-family:inherit;display:block;text-align:center;margin:1rem 0}
+.math-display svg{max-width:100%;height:auto}
+table{border-collapse:collapse;width:100%;margin:1rem 0}
+th,td{border:1px solid #d0d0d0;padding:.4rem .6rem;text-align:left}
+th{background:#f4f4f4}
+li.task{list-style:none;margin-left:-1.2em}
+img{max-width:100%;height:auto}
+.footnote{font-size:.9em;color:#555}
+.fn{color:#1155cc;font-weight:600}
 ";
 
 /// HTML-escape text.
@@ -35,42 +51,117 @@ pub fn escape(text: &str) -> String {
 
 /// Render the body of a document (no `<html>` wrapper).
 pub fn render_body(src: &str) -> String {
+    render_body_with(src, None, &mut Vec::new())
+}
+
+/// Render the body, resolving attachment embeds through `attachments`.
+///
+/// Vault-relative paths of the files the output points at are appended to `used`, so the
+/// caller can copy them next to the exported HTML.
+pub fn render_body_with(
+    src: &str,
+    attachments: Option<&Attachments>,
+    used: &mut Vec<String>,
+) -> String {
+    let blocks = markdown::parse_blocks(src);
     let mut out = String::new();
-    for block in markdown::parse_blocks(src) {
-        out.push_str(&render_block(block));
+    let mut index = 0;
+
+    while index < blocks.len() {
+        // Consecutive list items of the same kind share one list, the way the source wrote
+        // them.
+        if let Block::ListItem {
+            ordered: list_ordered,
+            ..
+        } = &blocks[index]
+        {
+            let list_ordered = *list_ordered;
+            let tag = if list_ordered { "ol" } else { "ul" };
+            out.push_str(&format!("<{tag}>\n"));
+
+            while index < blocks.len() {
+                let Block::ListItem {
+                    ordered,
+                    depth,
+                    marker: _,
+                    checked,
+                    text,
+                } = blocks[index].clone()
+                else {
+                    break;
+                };
+                if ordered != list_ordered {
+                    break;
+                }
+
+                let mut item = String::from("<li");
+                if checked.is_some() {
+                    item.push_str(" class=\"task\"");
+                }
+                if depth > 0 {
+                    item.push_str(&format!(" style=\"margin-left:{}rem\"", depth as f32 * 1.2));
+                }
+                item.push('>');
+                match checked {
+                    Some(true) => item.push_str("<input type=\"checkbox\" checked disabled> "),
+                    Some(false) => item.push_str("<input type=\"checkbox\" disabled> "),
+                    None => {}
+                }
+                item.push_str(&inline(&text));
+                item.push_str("</li>");
+                out.push_str(&item);
+                out.push('\n');
+                index += 1;
+            }
+
+            out.push_str(&format!("</{tag}>\n"));
+            continue;
+        }
+
+        out.push_str(&render_block(blocks[index].clone(), attachments, used));
         out.push('\n');
+        index += 1;
     }
+
     out
 }
 
-fn render_block(block: Block) -> String {
+fn render_block(block: Block, attachments: Option<&Attachments>, used: &mut Vec<String>) -> String {
     match block {
         Block::Heading { level, text } => {
             format!("<h{level}>{}</h{level}>", inline(&text))
         }
-        Block::Paragraph(text) => format!("<p>{}</p>", inline(&text.replace('\n', " "))),
+        Block::Paragraph(text) => format!("<p>{}</p>", inline(&text)),
         Block::ListItem {
             ordered,
             depth,
             marker: _,
+            checked,
             text,
         } => {
             let tag = if ordered { "ol" } else { "ul" };
             let _ = depth;
-            format!("<{tag}><li>{}</li></{tag}>", inline(&text))
+            let checkbox = match checked {
+                Some(true) => "<input type=\"checkbox\" checked disabled> ",
+                Some(false) => "<input type=\"checkbox\" disabled> ",
+                None => "",
+            };
+            format!("<{tag}><li>{checkbox}{}</li></{tag}>", inline(&text))
         }
         Block::Code { text, .. } => format!("<pre><code>{}</code></pre>", escape(&text)),
-        Block::Quote(text) => format!(
-            "<blockquote>{}</blockquote>",
-            inline(&text.replace('\n', " "))
-        ),
+        Block::Quote(text) => format!("<blockquote>{}</blockquote>", inline(&text)),
         Block::Rule => "<hr>".to_string(),
-        Block::Math { tex } => format!("<p class=\"math\">{}</p>", escape(&math::to_unicode(&tex))),
+        Block::Math { tex } => math_block_html(&tex),
+        Block::Footnote { id, text } => format!(
+            "<p class=\"footnote\"><sup>{}</sup> {}</p>",
+            escape(&id),
+            inline(&text)
+        ),
         Block::Callout { kind, title, text } => {
             let body = if text.trim().is_empty() {
                 String::new()
             } else {
-                format!("<p>{}</p>", inline(&text.replace('\n', " ")))
+                format!("<p>{}</p>", inline(&text))
             };
             format!(
                 "<blockquote class=\"callout callout-{}\"><p><strong>{}</strong></p>{}</blockquote>",
@@ -81,9 +172,14 @@ fn render_block(block: Block) -> String {
         }
         Block::Embed { target } => {
             if is_image(&target) {
+                let resolved = attachments.and_then(|index| index.resolve(&target));
+                let source = resolved.unwrap_or(target.as_str());
+                if resolved.is_some() && !used.iter().any(|file| file == source) {
+                    used.push(source.to_string());
+                }
                 format!(
                     "<p><img src=\"{}\" alt=\"{}\"></p>",
-                    escape(&target),
+                    escape(source),
                     escape(&target)
                 )
             } else {
@@ -94,58 +190,134 @@ fn render_block(block: Block) -> String {
                 )
             }
         }
-    }
-}
-
-/// Turn `[[wikilinks]]` into links, highlights into `<mark>`, math into spans, and escape
-/// everything else.
-fn inline(text: &str) -> String {
-    math::spans(text)
-        .into_iter()
-        .map(|span| match span {
-            Span::Text(text) => linked(&text),
-            Span::Highlight(text) => format!("<mark>{}</mark>", escape(&text)),
-            Span::Math(text) => format!("<span class=\"math\">{}</span>", escape(&text)),
-        })
-        .collect()
-}
-
-fn linked(text: &str) -> String {
-    if !text.contains("[[") {
-        return escape(text);
-    }
-
-    let mut out = String::new();
-    let mut last = 0;
-
-    for link in wikilink::parse(text) {
-        let Some(start) = text[last..].find("[[") else {
-            break;
-        };
-        let start = last + start;
-        let Some(end) = text[start..].find("]]") else {
-            break;
-        };
-        let end = start + end + 2;
-
-        out.push_str(&escape(&text[last..start]));
-
-        let label = link.alias.clone().unwrap_or_else(|| link.target.clone());
-        if link.target.is_empty() {
-            out.push_str(&escape(&format!("[[{}]]", label)));
-        } else {
-            out.push_str(&format!(
-                "<a href=\"{}.html\">{}</a>",
-                escape(&link.target),
-                escape(&label)
-            ));
+        Block::Table {
+            align,
+            headers,
+            rows,
+        } => {
+            let mut html = String::from("<table><thead><tr>");
+            for (index, header) in headers.iter().enumerate() {
+                let alignment = alignment_style(align.get(index));
+                html.push_str(&format!("<th{alignment}>{}</th>", inline(header)));
+            }
+            html.push_str("</tr></thead><tbody>");
+            for row in rows {
+                html.push_str("<tr>");
+                for (index, cell) in row.iter().enumerate() {
+                    let alignment = alignment_style(align.get(index));
+                    html.push_str(&format!("<td{alignment}>{}</td>", inline(cell)));
+                }
+                html.push_str("</tr>");
+            }
+            html.push_str("</tbody></table>");
+            html
         }
+    }
+}
 
-        last = end;
+fn alignment_style(align: Option<&markdown::Align>) -> &'static str {
+    match align {
+        Some(markdown::Align::Center) => " style=\"text-align:center\"",
+        Some(markdown::Align::Right) => " style=\"text-align:right\"",
+        _ => "",
+    }
+}
+
+/// Turn inline markdown into HTML: emphasis, code, links, highlights and math.
+fn inline(text: &str) -> String {
+    inline::parse(text).into_iter().map(render_span).collect()
+}
+
+/// Typeset `tex` and serialize it as a self-contained SVG (glyph outlines embedded).
+/// Returns the SVG and the formula's depth in em, which inline HTML needs for baseline
+/// alignment.
+fn math_svg(tex: &str, style: math::MathStyle) -> Option<(String, f64)> {
+    let scene = math::typeset(
+        tex,
+        &math::MathOptions {
+            style,
+            color: [0.0, 0.0, 0.0, 1.0],
+        },
+    )
+    .ok()?;
+
+    let options = ratex_svg::SvgOptions {
+        font_size: if style == math::MathStyle::Display {
+            18.0
+        } else {
+            16.0
+        },
+        padding: 0.0,
+        stroke_width: 1.0,
+        embed_glyphs: true,
+        font_dir: String::new(),
+    };
+
+    Some((
+        ratex_svg::render_to_svg(&scene.display, &options),
+        scene.depth(),
+    ))
+}
+
+fn math_block_html(tex: &str) -> String {
+    match math_svg(tex, math::MathStyle::Display) {
+        Some((svg, _)) => format!(
+            "<div class=\"math math-display\" data-tex=\"{}\">{svg}</div>",
+            escape(tex)
+        ),
+        None => format!("<p class=\"math\">{}</p>", escape(&math::to_unicode(tex))),
+    }
+}
+
+fn math_inline_html(tex: &str) -> Option<String> {
+    let (svg, depth) = math_svg(tex, math::MathStyle::Inline)?;
+    Some(format!(
+        "<span class=\"math math-inline\" data-tex=\"{}\" style=\"display:inline-block;vertical-align:-{depth:.3}em\">{svg}</span>",
+        escape(tex)
+    ))
+}
+
+fn render_span(span: Inline) -> String {
+    let style = span.style;
+    if style.footnote {
+        return format!("<sup class=\"fn\">{}</sup>", escape(&span.text));
+    }
+    let mut html = if style.code {
+        format!("<code>{}</code>", escape(&span.text))
+    } else if style.math {
+        match span.math.as_deref() {
+            Some(tex) => math_inline_html(tex)
+                .unwrap_or_else(|| format!("<span class=\"math\">{}</span>", escape(&span.text))),
+            None => format!("<span class=\"math\">{}</span>", escape(&span.text)),
+        }
+    } else {
+        escape(&span.text).replace('\n', "<br>")
+    };
+
+    if style.highlight {
+        html = format!("<mark>{html}</mark>");
+    }
+    if style.strikethrough {
+        html = format!("<del>{html}</del>");
+    }
+    if style.italic {
+        html = format!("<em>{html}</em>");
+    }
+    if style.bold {
+        html = format!("<strong>{html}</strong>");
+    }
+    if style.link {
+        if let Some(href) = span.href {
+            let href = if style.wiki {
+                format!("{href}.html")
+            } else {
+                href
+            };
+            html = format!("<a href=\"{}\">{html}</a>", escape(&href));
+        }
     }
 
-    out.push_str(&escape(&text[last..]));
-    out
+    html
 }
 
 fn is_image(target: &str) -> bool {
@@ -207,11 +379,96 @@ mod tests {
     }
 
     #[test]
+    fn bare_image_names_resolve_through_the_attachment_index() {
+        let index = Attachments::from_paths(["attachments/shot.png".to_string()]);
+        let mut used = Vec::new();
+        let html = render_body_with("![[shot.png]]\n", Some(&index), &mut used);
+        assert!(html.contains("<img src=\"attachments/shot.png\" alt=\"shot.png\">"));
+        assert_eq!(used, vec!["attachments/shot.png".to_string()]);
+    }
+
+    #[test]
+    fn unresolved_images_keep_their_target_and_are_not_collected() {
+        let index = Attachments::from_paths(["attachments/shot.png".to_string()]);
+        let mut used = Vec::new();
+        let html = render_body_with("![[gone.png]]\n", Some(&index), &mut used);
+        assert!(html.contains("<img src=\"gone.png\""));
+        assert!(used.is_empty());
+    }
+
+    #[test]
+    fn footnotes_render_as_superscripts_and_definitions() {
+        let html = render_body("Text[^1]\n\n[^1]: Note.\n");
+        assert!(html.contains("<sup class=\"fn\">1</sup>"));
+        assert!(html.contains("class=\"footnote\""));
+    }
+
+    #[test]
+    fn tables_render_with_headers_and_alignment() {
+        let html = render_body("| Name | Value |\n| :--- | ---: |\n| a | 1 |\n");
+        assert!(html.contains("<table>"));
+        assert!(html.contains("<th>Name</th>"));
+        assert!(html.contains("text-align:right"));
+        assert!(html.contains("<td>a</td>"));
+    }
+
+    #[test]
     fn callouts_render_with_their_kind_and_title() {
         let html = render_body("> [!warning] Careful\n> mind the gap\n");
         assert!(html.contains("callout-warning"));
         assert!(html.contains("<strong>Careful</strong>"));
         assert!(html.contains("mind the gap"));
+    }
+
+    #[test]
+    fn renders_inline_emphasis_code_and_strikethrough() {
+        let html = render_body("**bold** *italic* `code` ~~gone~~ ==mark==\n");
+        assert!(html.contains("<strong>bold</strong>"));
+        assert!(html.contains("<em>italic</em>"));
+        assert!(html.contains("<code>code</code>"));
+        assert!(html.contains("<del>gone</del>"));
+        assert!(html.contains("<mark>mark</mark>"));
+    }
+
+    #[test]
+    fn renders_inline_math_and_links() {
+        let html = render_body("see [docs](https://example.com) and $x^2$\n");
+        assert!(html.contains("<a href=\"https://example.com\">docs</a>"));
+        assert!(html.contains("class=\"math math-inline\""));
+        assert!(html.contains("<svg"));
+        assert!(!html.contains("x²"));
+    }
+
+    #[test]
+    fn task_lists_render_checkboxes_in_one_list() {
+        let html = render_body("- [ ] todo\n- [x] done\n");
+        assert_eq!(html.matches("<ul>").count(), 1);
+        assert!(html.contains("<input type=\"checkbox\" disabled> todo"));
+        assert!(html.contains("<input type=\"checkbox\" checked disabled> done"));
+    }
+
+    #[test]
+    fn ordered_and_unordered_lists_do_not_merge() {
+        let html = render_body("- one\n1. first\n");
+        assert!(html.contains("<ul>\n<li>one</li>\n</ul>"));
+        assert!(html.contains("<ol>\n<li>first</li>\n</ol>"));
+    }
+
+    #[test]
+    fn table_cells_render_inline_markup() {
+        let html = render_body("| **a** | $x^2$ |\n| --- | --- |\n| *b* | c |\n");
+        assert!(html.contains("<th><strong>a</strong></th>"));
+        assert!(html.contains("<th><span class=\"math math-inline\""));
+        assert!(html.contains("<svg"));
+        assert!(html.contains("<td><em>b</em></td>"));
+    }
+
+    #[test]
+    fn display_math_exports_as_standalone_svg() {
+        let html = render_body("$$\\frac{a}{b}$$\n");
+        assert!(html.contains("class=\"math math-display\""));
+        assert!(html.contains("data-tex=\"\\frac{a}{b}\""));
+        assert!(html.contains("<svg"));
     }
 
     #[test]

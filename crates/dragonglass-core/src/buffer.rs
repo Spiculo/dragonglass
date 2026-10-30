@@ -125,6 +125,24 @@ impl Buffer {
         self.rope.line(line).chars().take(n).collect()
     }
 
+    /// Whether `line`'s content equals `text`, ignoring the trailing newline.
+    ///
+    /// Lets the editor validate a cached line layout without allocating a copy of the
+    /// line, which matters on every frame of a long note.
+    pub fn line_eq(&self, line: usize, text: &str) -> bool {
+        if line >= self.rope.len_lines() {
+            return text.is_empty();
+        }
+        let n = self.line_content_len(line);
+        let mut chars = self.rope.line(line).chars().take(n);
+        for expected in text.chars() {
+            if chars.next() != Some(expected) {
+                return false;
+            }
+        }
+        chars.next().is_none()
+    }
+
     /// Number of characters in `line`, excluding the trailing newline (and `\r`).
     pub fn line_char_len(&self, line: usize) -> usize {
         if line >= self.rope.len_lines() {
@@ -201,19 +219,44 @@ impl Buffer {
     }
 
     /// Convert a character index to a UTF-16 offset (what the platform sends us).
+    ///
+    /// ASCII chunks are counted a chunk at a time; the platform asks for this on every
+    /// keystroke (and again for the IME candidate window), so it must stay cheap on large
+    /// notes.
     pub fn char_to_utf16(&self, char_idx: usize) -> usize {
         let n = char_idx.min(self.rope.len_chars());
-        self.rope.chars().take(n).map(char::len_utf16).sum()
+        let mut units = 0usize;
+        for chunk in self.rope.slice(0..n).chunks() {
+            if chunk.is_ascii() {
+                units += chunk.len();
+            } else {
+                units += chunk.chars().map(char::len_utf16).sum::<usize>();
+            }
+        }
+        units
     }
 
     /// Convert a UTF-16 offset to a character index.
     pub fn utf16_to_char(&self, utf16_idx: usize) -> usize {
         let mut units = 0usize;
-        for (i, c) in self.rope.chars().enumerate() {
-            if units >= utf16_idx {
-                return i;
+        let mut chars = 0usize;
+        for chunk in self.rope.chunks() {
+            if chunk.is_ascii() {
+                let len = chunk.len();
+                if units + len >= utf16_idx {
+                    return chars + utf16_idx.saturating_sub(units);
+                }
+                units += len;
+                chars += len;
+            } else {
+                for ch in chunk.chars() {
+                    if units >= utf16_idx {
+                        return chars;
+                    }
+                    units += ch.len_utf16();
+                    chars += 1;
+                }
             }
-            units += c.len_utf16();
         }
         self.rope.len_chars()
     }
@@ -317,6 +360,127 @@ impl Buffer {
         let target = line + 1;
         let start = self.rope.line_to_char(target);
         self.cursor = start + col.min(self.line_content_len(target));
+    }
+
+    /// Move to the start of the previous word (Ctrl+Left).
+    pub fn move_word_left(&mut self) {
+        self.cursor = self.word_left_from(self.cursor);
+    }
+
+    /// Move to the start of the next word (Ctrl+Right).
+    pub fn move_word_right(&mut self) {
+        self.cursor = self.word_right_from(self.cursor);
+    }
+
+    /// Start of the current paragraph, or of the previous one when already at the start
+    /// (Ctrl+Up).
+    pub fn move_paragraph_up(&mut self) {
+        let (line, _) = self.line_col();
+        let mut start = line;
+        while start > 0 && !self.line(start - 1).trim().is_empty() {
+            start -= 1;
+        }
+
+        if self.cursor != self.rope.line_to_char(start) {
+            self.cursor = self.rope.line_to_char(start);
+            return;
+        }
+
+        let mut previous = start.saturating_sub(1);
+        while previous > 0 && self.line(previous).trim().is_empty() {
+            previous -= 1;
+        }
+        while previous > 0 && !self.line(previous - 1).trim().is_empty() {
+            previous -= 1;
+        }
+        self.cursor = self.rope.line_to_char(previous);
+    }
+
+    /// End of the current paragraph, or of the next one when already at the end
+    /// (Ctrl+Down).
+    pub fn move_paragraph_down(&mut self) {
+        let (line, _) = self.line_col();
+        let last = self.rope.len_lines().saturating_sub(1);
+        let mut end = line;
+        while end < last && !self.line(end + 1).trim().is_empty() {
+            end += 1;
+        }
+
+        let end_index = self.rope.line_to_char(end) + self.line_content_len(end);
+        if self.cursor < end_index {
+            self.cursor = end_index;
+            return;
+        }
+
+        let mut next = (end + 1).min(last);
+        while next < last && self.line(next).trim().is_empty() {
+            next += 1;
+        }
+        while next < last && !self.line(next + 1).trim().is_empty() {
+            next += 1;
+        }
+        self.cursor = self.rope.line_to_char(next) + self.line_content_len(next);
+    }
+
+    /// Move to the very start of the document (Ctrl+Home).
+    pub fn move_document_start(&mut self) {
+        self.cursor = 0;
+    }
+
+    /// Move to the very end of the document (Ctrl+End).
+    pub fn move_document_end(&mut self) {
+        self.cursor = self.rope.len_chars();
+    }
+
+    /// Delete from the start of the previous word to the cursor (Ctrl+Backspace).
+    pub fn delete_word_left(&mut self) -> bool {
+        let start = self.word_left_from(self.cursor);
+        if start == self.cursor {
+            return false;
+        }
+        self.replace(start..self.cursor, "");
+        true
+    }
+
+    /// Delete from the cursor to the start of the next word (Ctrl+Delete).
+    pub fn delete_word_right(&mut self) -> bool {
+        let end = self.word_right_from(self.cursor);
+        if end == self.cursor {
+            return false;
+        }
+        self.replace(self.cursor..end, "");
+        true
+    }
+
+    fn char_at(&self, index: usize) -> Option<char> {
+        (index < self.rope.len_chars()).then(|| self.rope.char(index))
+    }
+
+    fn word_left_from(&self, from: usize) -> usize {
+        let mut index = from.min(self.rope.len_chars());
+        while index > 0 && self.char_at(index - 1).is_some_and(|ch| ch.is_whitespace()) {
+            index -= 1;
+        }
+        while index > 0
+            && self
+                .char_at(index - 1)
+                .is_some_and(|ch| !ch.is_whitespace())
+        {
+            index -= 1;
+        }
+        index
+    }
+
+    fn word_right_from(&self, from: usize) -> usize {
+        let len = self.rope.len_chars();
+        let mut index = from.min(len);
+        while index < len && self.char_at(index).is_some_and(|ch| ch.is_whitespace()) {
+            index += 1;
+        }
+        while index < len && self.char_at(index).is_some_and(|ch| !ch.is_whitespace()) {
+            index += 1;
+        }
+        index
     }
 
     pub fn undo(&mut self) -> bool {
@@ -537,6 +701,19 @@ mod tests {
     }
 
     #[test]
+    fn line_eq_ignores_the_newline() {
+        let b = Buffer::from_text("hello\nhi\r\nbye");
+        assert!(b.line_eq(0, "hello"));
+        assert!(b.line_eq(1, "hi"));
+        assert!(b.line_eq(2, "bye"));
+        assert!(b.line_eq(3, ""));
+        assert!(!b.line_eq(0, "hell"));
+        assert!(!b.line_eq(0, "helloo"));
+        assert!(!b.line_eq(0, "Hello"));
+        assert!(!b.line_eq(9, "anything"));
+    }
+
+    #[test]
     fn utf16_conversions_multibyte() {
         let b = Buffer::from_text("a\u{1F600}b");
         assert_eq!(b.len_chars(), 3);
@@ -565,5 +742,71 @@ mod tests {
         assert_eq!(b.line_col(), (1, 0));
         b.move_end();
         assert_eq!(b.line_col(), (1, 5));
+    }
+
+    #[test]
+    fn word_movement_skips_whitespace_and_words() {
+        let mut b = Buffer::from_text("one two  three");
+        b.set_cursor(0);
+        b.move_word_right();
+        assert_eq!(b.cursor(), 3);
+        b.move_word_right();
+        assert_eq!(b.cursor(), 7);
+        b.move_word_right();
+        assert_eq!(b.cursor(), 14);
+
+        b.move_word_left();
+        assert_eq!(b.cursor(), 9);
+        b.move_word_left();
+        assert_eq!(b.cursor(), 4);
+        b.move_word_left();
+        assert_eq!(b.cursor(), 0);
+    }
+
+    #[test]
+    fn word_movement_crosses_line_breaks() {
+        let mut b = Buffer::from_text("alpha\nbeta");
+        b.set_cursor(3);
+        b.move_word_right();
+        assert_eq!(b.cursor(), 5);
+        b.set_cursor(6);
+        b.move_word_left();
+        assert_eq!(b.cursor(), 0);
+    }
+
+    #[test]
+    fn paragraph_movement_stops_at_blank_lines() {
+        let mut b = Buffer::from_text("one line\ntwo line\n\nnext para\nstill next");
+        b.set_cursor(2);
+        b.move_paragraph_down();
+        assert_eq!(b.line_col(), (1, 8));
+        b.move_paragraph_down();
+        assert_eq!(b.line_col(), (4, 10));
+        b.move_paragraph_up();
+        assert_eq!(b.line_col(), (3, 0));
+        b.move_paragraph_up();
+        assert_eq!(b.line_col(), (0, 0));
+    }
+
+    #[test]
+    fn document_start_and_end() {
+        let mut b = Buffer::from_text("abc\ndef");
+        b.move_document_end();
+        assert_eq!(b.cursor(), 7);
+        b.move_document_start();
+        assert_eq!(b.cursor(), 0);
+    }
+
+    #[test]
+    fn word_deletion_removes_one_word_at_a_time() {
+        let mut b = Buffer::from_text("one two three");
+        b.set_cursor(13);
+        assert!(b.delete_word_left());
+        assert_eq!(b.text(), "one two ");
+        b.set_cursor(4);
+        assert!(b.delete_word_right());
+        assert_eq!(b.text(), "one  ");
+        b.move_document_end();
+        assert!(!b.delete_word_right());
     }
 }

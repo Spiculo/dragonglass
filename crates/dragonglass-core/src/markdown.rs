@@ -19,6 +19,8 @@ pub enum Block {
         depth: usize,
         /// Display marker: `•` for bullets, `1.` for ordered items.
         marker: String,
+        /// `Some(checked)` for a GFM task item (`- [ ]` / `- [x]`).
+        checked: Option<bool>,
         text: String,
     },
     Code {
@@ -41,9 +43,28 @@ pub enum Block {
     Math {
         tex: String,
     },
+    /// A footnote definition (`[^id]: text`), collected at the end of the document.
+    Footnote {
+        id: String,
+        text: String,
+    },
+    /// A GFM pipe table.
+    Table {
+        align: Vec<Align>,
+        headers: Vec<String>,
+        rows: Vec<Vec<String>>,
+    },
 }
 
-/// Remove `%%comment%%` spans, which may run across lines.
+/// Column alignment in a pipe table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Align {
+    Left,
+    Center,
+    Right,
+}
+
+/// Remove `%%comment%%` spans (which may run across lines) and `<!-- html comments -->`.
 pub fn strip_comments(src: &str) -> String {
     let mut out = String::with_capacity(src.len());
     let mut rest = src;
@@ -54,6 +75,23 @@ pub fn strip_comments(src: &str) -> String {
         match after.find("%%") {
             Some(end) => rest = &after[end + 2..],
             // Unterminated comment: drop everything to the end.
+            None => return out,
+        }
+    }
+
+    out.push_str(rest);
+    strip_html_comments(&out)
+}
+
+fn strip_html_comments(src: &str) -> String {
+    let mut out = String::with_capacity(src.len());
+    let mut rest = src;
+
+    while let Some(start) = rest.find("<!--") {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 4..];
+        match after.find("-->") {
+            Some(end) => rest = &after[end + 3..],
             None => return out,
         }
     }
@@ -96,6 +134,7 @@ pub fn parse_blocks(src: &str) -> Vec<Block> {
     let lines: Vec<&str> = body.lines().collect();
 
     let mut blocks = Vec::new();
+    let mut footnotes = Vec::new();
     let mut paragraph: Vec<&str> = Vec::new();
     let mut i = 0;
 
@@ -137,6 +176,13 @@ pub fn parse_blocks(src: &str) -> Vec<Block> {
             continue;
         }
 
+        if let Some((id, text)) = footnote_definition(trimmed) {
+            flush_paragraph(&mut paragraph, &mut blocks);
+            footnotes.push(Block::Footnote { id, text });
+            i += 1;
+            continue;
+        }
+
         if let Some(tex) = single_line_math(trimmed) {
             flush_paragraph(&mut paragraph, &mut blocks);
             blocks.push(Block::Math { tex });
@@ -164,11 +210,29 @@ pub fn parse_blocks(src: &str) -> Vec<Block> {
             continue;
         }
 
+        if let Some((table, consumed)) = table_at(&lines, i) {
+            flush_paragraph(&mut paragraph, &mut blocks);
+            blocks.push(table);
+            i += consumed;
+            continue;
+        }
+
         if let Some((level, text)) = heading(trimmed) {
             flush_paragraph(&mut paragraph, &mut blocks);
             blocks.push(Block::Heading { level, text });
             i += 1;
             continue;
+        }
+
+        // Setext headings: a paragraph line underlined with `===` or `---`.
+        if !paragraph.is_empty() {
+            if let Some(level) = setext_underline(trimmed) {
+                let text = paragraph.join(" ");
+                paragraph.clear();
+                blocks.push(Block::Heading { level, text });
+                i += 1;
+                continue;
+            }
         }
 
         if is_rule(trimmed) {
@@ -199,12 +263,13 @@ pub fn parse_blocks(src: &str) -> Vec<Block> {
             continue;
         }
 
-        if let Some((ordered, depth, marker, text)) = list_item(line) {
+        if let Some((ordered, depth, marker, checked, text)) = list_item(line) {
             flush_paragraph(&mut paragraph, &mut blocks);
             blocks.push(Block::ListItem {
                 ordered,
                 depth,
                 marker,
+                checked,
                 text,
             });
             i += 1;
@@ -216,7 +281,22 @@ pub fn parse_blocks(src: &str) -> Vec<Block> {
     }
 
     flush_paragraph(&mut paragraph, &mut blocks);
+    if !footnotes.is_empty() {
+        blocks.push(Block::Rule);
+        blocks.extend(footnotes);
+    }
     blocks
+}
+
+/// `[^id]: text` — a footnote definition.
+fn footnote_definition(line: &str) -> Option<(String, String)> {
+    let rest = line.strip_prefix("[^")?;
+    let close = rest.find("]:")?;
+    let id = rest[..close].trim();
+    if id.is_empty() {
+        return None;
+    }
+    Some((id.to_string(), rest[close + 2..].trim().to_string()))
 }
 
 fn flush_paragraph(paragraph: &mut Vec<&str>, blocks: &mut Vec<Block>) {
@@ -326,26 +406,62 @@ pub fn headings(src: &str) -> Vec<Heading> {
 
     let mut out = Vec::new();
     let mut in_fence = false;
+    // The last plain paragraph line, which a following `===`/`---` underlines.
+    let mut previous: Option<(usize, String)> = None;
 
     for (i, line) in body.lines().enumerate() {
         let trimmed = line.trim();
+
         if is_fence(trimmed) {
             in_fence = !in_fence;
+            previous = None;
             continue;
         }
         if in_fence {
             continue;
         }
+
+        if let Some(level) = setext_underline(trimmed) {
+            if let Some((line, text)) = previous.take() {
+                out.push(Heading {
+                    level,
+                    text: crate::inline::plain(&text),
+                    line: prefix_lines + line + 1,
+                });
+                continue;
+            }
+        }
+
         if let Some((level, text)) = heading(trimmed) {
             out.push(Heading {
                 level,
-                text,
+                // The outline shows the rendered text, not the markup.
+                text: crate::inline::plain(&text),
                 line: prefix_lines + i + 1,
             });
+            previous = None;
+            continue;
         }
+
+        if trimmed.is_empty() || starts_other_block(trimmed) {
+            previous = None;
+            continue;
+        }
+
+        previous = Some((i, trimmed.to_string()));
     }
 
     out
+}
+
+/// Lines that begin a block other than a paragraph, so a following `---` is a rule (or a
+/// list marker) rather than a setext underline.
+fn starts_other_block(trimmed: &str) -> bool {
+    trimmed.starts_with('>')
+        || trimmed.starts_with('|')
+        || is_rule(trimmed)
+        || matches!(trimmed.get(..2), Some("- ") | Some("* ") | Some("+ "))
+        || trimmed.chars().take_while(|ch| ch.is_ascii_digit()).count() > 0
 }
 
 fn heading(trimmed: &str) -> Option<(u8, String)> {
@@ -361,6 +477,114 @@ fn heading(trimmed: &str) -> Option<(u8, String)> {
     Some((level as u8, text))
 }
 
+/// A GFM pipe table: header row, delimiter row, then zero or more body rows.
+fn table_at(lines: &[&str], start: usize) -> Option<(Block, usize)> {
+    if start + 1 >= lines.len() {
+        return None;
+    }
+
+    let header = lines[start].trim();
+    let delimiter = lines[start + 1].trim();
+    if !header.contains('|') || !is_table_delimiter(delimiter) {
+        return None;
+    }
+
+    let align = table_align(delimiter);
+    if align.is_empty() {
+        return None;
+    }
+    let width = align.len();
+
+    let mut headers = split_row(header);
+    headers.truncate(width);
+    headers.resize(width, String::new());
+
+    let mut rows = Vec::new();
+    let mut index = start + 2;
+    while index < lines.len() {
+        let row = lines[index].trim();
+        if row.is_empty() || !row.contains('|') {
+            break;
+        }
+        let mut cells = split_row(row);
+        cells.truncate(width);
+        cells.resize(width, String::new());
+        rows.push(cells);
+        index += 1;
+    }
+
+    Some((
+        Block::Table {
+            align,
+            headers,
+            rows,
+        },
+        index - start,
+    ))
+}
+
+fn split_row(line: &str) -> Vec<String> {
+    let trimmed = line.trim();
+    let trimmed = trimmed.strip_prefix('|').unwrap_or(trimmed);
+    let trimmed = trimmed.strip_suffix('|').unwrap_or(trimmed);
+
+    // Split on unescaped pipes that are not inside an inline code span.
+    let mut cells: Vec<String> = Vec::new();
+    let mut cell = String::new();
+    let mut in_code = false;
+    let mut chars = trimmed.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\\' if chars.peek() == Some(&'|') => {
+                cell.push('|');
+                chars.next();
+            }
+            '`' => {
+                in_code = !in_code;
+                cell.push(ch);
+            }
+            '|' if !in_code => {
+                cells.push(cell.trim().to_string());
+                cell.clear();
+            }
+            _ => cell.push(ch),
+        }
+    }
+    cells.push(cell.trim().to_string());
+    cells
+}
+
+fn is_table_delimiter(line: &str) -> bool {
+    if !line.contains('|') {
+        return false;
+    }
+    !table_align(line).is_empty()
+}
+
+fn table_align(delimiter: &str) -> Vec<Align> {
+    let cells = split_row(delimiter);
+    if cells.is_empty() {
+        return Vec::new();
+    }
+
+    let mut align = Vec::with_capacity(cells.len());
+    for cell in cells {
+        let left = cell.starts_with(':');
+        let right = cell.ends_with(':');
+        let inner = cell.trim_matches(':').trim();
+        if inner.len() < 3 || !inner.chars().all(|ch| ch == '-') {
+            return Vec::new();
+        }
+        align.push(match (left, right) {
+            (true, true) => Align::Center,
+            (false, true) => Align::Right,
+            _ => Align::Left,
+        });
+    }
+    align
+}
+
 fn is_rule(trimmed: &str) -> bool {
     let compact: String = trimmed.chars().filter(|c| !c.is_whitespace()).collect();
     compact.len() >= 3
@@ -369,32 +593,63 @@ fn is_rule(trimmed: &str) -> bool {
             || compact.chars().all(|c| c == '_'))
 }
 
-fn list_item(line: &str) -> Option<(bool, usize, String, String)> {
+fn list_item(line: &str) -> Option<(bool, usize, String, Option<bool>, String)> {
     let indent = line.len() - line.trim_start().len();
     let depth = indent / 2;
     let trimmed = line.trim_start();
 
     for bullet in ["- ", "* ", "+ "] {
         if let Some(rest) = trimmed.strip_prefix(bullet) {
-            return Some((
-                false,
-                depth,
-                "\u{2022}".to_string(),
-                rest.trim().to_string(),
-            ));
+            let (checked, text) = task_marker(rest);
+            return Some((false, depth, "\u{2022}".to_string(), checked, text));
         }
     }
 
     let digits_len = trimmed.chars().take_while(|c| c.is_ascii_digit()).count();
     if digits_len > 0 {
         let rest = &trimmed[digits_len..];
-        if let Some(text) = rest.strip_prefix(". ") {
+        // Both `1.` and `1)` are valid ordered-list markers in GFM.
+        let rest = rest.strip_prefix(". ").or_else(|| rest.strip_prefix(") "));
+        if let Some(text) = rest {
             let number = &trimmed[..digits_len];
-            return Some((true, depth, format!("{number}."), text.trim().to_string()));
+            return Some((
+                true,
+                depth,
+                format!("{number}."),
+                None,
+                text.trim().to_string(),
+            ));
         }
     }
 
     None
+}
+
+/// Strip a GFM task-list checkbox from the start of a list item.
+fn task_marker(text: &str) -> (Option<bool>, String) {
+    let trimmed = text.trim_start();
+    for (marker, checked) in [("[ ] ", false), ("[x] ", true), ("[X] ", true)] {
+        if let Some(rest) = trimmed.strip_prefix(marker) {
+            return (Some(checked), rest.trim().to_string());
+        }
+    }
+    (None, text.trim().to_string())
+}
+
+/// `===` underlines a level-1 heading, `---` a level-2 heading.
+fn setext_underline(trimmed: &str) -> Option<u8> {
+    let first = trimmed.chars().next()?;
+    if first != '=' && first != '-' {
+        return None;
+    }
+    if !trimmed.chars().all(|ch| ch == first) {
+        return None;
+    }
+    // A single `-` is a list marker, not an underline.
+    if first == '-' && trimmed.len() < 2 {
+        return None;
+    }
+    Some(if first == '=' { 1 } else { 2 })
 }
 
 #[cfg(test)]
@@ -453,19 +708,72 @@ mod tests {
                     ordered: false,
                     depth: 0,
                     marker: "\u{2022}".into(),
+                    checked: None,
                     text: "a".into()
                 },
                 Block::ListItem {
                     ordered: false,
                     depth: 1,
                     marker: "\u{2022}".into(),
+                    checked: None,
                     text: "nested".into()
                 },
                 Block::ListItem {
                     ordered: true,
                     depth: 0,
                     marker: "1.".into(),
+                    checked: None,
                     text: "first".into()
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn task_list_items_carry_their_checkbox() {
+        let blocks = parse_blocks("- [ ] todo\n- [x] done\n- [X] also done\n- plain\n");
+        let states: Vec<Option<bool>> = blocks
+            .iter()
+            .map(|block| match block {
+                Block::ListItem { checked, .. } => *checked,
+                other => panic!("expected a list item, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(states, vec![Some(false), Some(true), Some(true), None]);
+    }
+
+    #[test]
+    fn footnote_definitions_move_to_the_end() {
+        let blocks = parse_blocks("Body[^a]\n\n[^a]: The note.\n");
+        assert!(matches!(&blocks[0], Block::Paragraph(text) if text == "Body[^a]"));
+        assert!(matches!(
+            blocks.last(),
+            Some(Block::Footnote { id, text }) if id == "a" && text == "The note."
+        ));
+    }
+
+    #[test]
+    fn ordered_lists_accept_paren_markers() {
+        let blocks = parse_blocks("1) first\n2) second\n");
+        assert_eq!(blocks.len(), 2);
+        assert!(matches!(
+            &blocks[0],
+            Block::ListItem { ordered: true, marker, .. } if marker == "1."
+        ));
+    }
+
+    #[test]
+    fn setext_headings() {
+        assert_eq!(
+            parse_blocks("Title\n=====\n\nSubtitle\n---\n"),
+            vec![
+                Block::Heading {
+                    level: 1,
+                    text: "Title".into()
+                },
+                Block::Heading {
+                    level: 2,
+                    text: "Subtitle".into()
                 },
             ]
         );
@@ -670,5 +978,107 @@ mod tests {
         assert_eq!(found.len(), 2);
         assert_eq!(found[0].text, "Real");
         assert_eq!(found[1].text, "Also");
+    }
+
+    #[test]
+    fn parses_gfm_tables() {
+        let src = "| Name | Value |\n| :--- | ---: |\n| alpha | 1 |\n| beta | 2 |\n\nafter\n";
+        let blocks = parse_blocks(src);
+        assert_eq!(
+            blocks,
+            vec![
+                Block::Table {
+                    align: vec![Align::Left, Align::Right],
+                    headers: vec!["Name".into(), "Value".into()],
+                    rows: vec![
+                        vec!["alpha".into(), "1".into()],
+                        vec!["beta".into(), "2".into()],
+                    ],
+                },
+                Block::Paragraph("after".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn table_rows_are_padded_and_truncated_to_the_header() {
+        let src = "a | b\n--- | ---\n| 1 |\n| 2 | 3 | 4 |\n";
+        let blocks = parse_blocks(src);
+        assert_eq!(
+            blocks,
+            vec![Block::Table {
+                align: vec![Align::Left, Align::Left],
+                headers: vec!["a".into(), "b".into()],
+                rows: vec![
+                    vec!["1".into(), String::new()],
+                    vec!["2".into(), "3".into()]
+                ],
+            }]
+        );
+    }
+
+    #[test]
+    fn a_horizontal_rule_is_not_a_table() {
+        assert_eq!(
+            parse_blocks("a | b\n\n---\n"),
+            vec![Block::Paragraph("a | b".into()), Block::Rule]
+        );
+    }
+
+    #[test]
+    fn table_cells_handle_escaped_pipes_and_code_spans() {
+        let blocks = parse_blocks("| a \\| b | `x | y` |\n| --- | --- |\n| 1 | 2 |\n");
+        let Block::Table { headers, .. } = &blocks[0] else {
+            panic!("expected table, got {blocks:?}");
+        };
+        assert_eq!(headers, &vec!["a | b".to_string(), "`x | y`".to_string()]);
+    }
+
+    #[test]
+    fn heading_outline_text_drops_inline_markup() {
+        let found = headings("# **Bold** $x^2$ [[Note|Alias]] `code`\n");
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].text, "Bold x² Alias code");
+    }
+
+    #[test]
+    fn outline_includes_setext_headings() {
+        let src = "Title\n=====\n\ntext\n\nSub\n---\n";
+        assert_eq!(
+            headings(src),
+            vec![
+                Heading {
+                    level: 1,
+                    text: "Title".into(),
+                    line: 1
+                },
+                Heading {
+                    level: 2,
+                    text: "Sub".into(),
+                    line: 6
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn html_comments_are_stripped() {
+        assert_eq!(strip_comments("a <!-- hidden\nstill hidden --> b"), "a  b");
+        assert_eq!(
+            parse_blocks("<!-- gone -->\n# Kept\n")[0],
+            Block::Heading {
+                level: 1,
+                text: "Kept".into()
+            }
+        );
+    }
+
+    #[test]
+    fn table_cells_keep_inline_markup_for_rendering() {
+        let blocks = parse_blocks("| $x^2$ | **bold** |\n| --- | --- |\n");
+        let Block::Table { headers, .. } = &blocks[0] else {
+            panic!("expected table");
+        };
+        assert_eq!(headers, &vec!["$x^2$".to_string(), "**bold**".to_string()]);
     }
 }

@@ -14,10 +14,27 @@ pub struct Node {
     pub links: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum EdgeKind {
+    /// A plain `[[wikilink]]`.
+    Link,
+    /// A `![[embed]]`.
+    Embed,
+    /// A frontmatter relation (`up`, `prev`, `related`, …), carrying its label.
+    Relation(&'static str),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Edge {
     pub from: usize,
     pub to: usize,
+    pub kind: EdgeKind,
+}
+
+impl Edge {
+    pub fn is_relation(self) -> bool {
+        matches!(self.kind, EdgeKind::Relation(_))
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -48,34 +65,9 @@ impl Graph {
     }
 }
 
-/// Build the graph, resolving `[[links]]` to notes by path or unique stem.
+/// Build the graph, resolving `[[links]]` to notes by path, stem, frontmatter name or alias.
 pub fn build(notes: &[NoteRef]) -> Graph {
-    let mut by_path: HashMap<String, usize> = HashMap::new();
-    let mut by_stem: HashMap<String, Vec<usize>> = HashMap::new();
-
-    for (id, note) in notes.iter().enumerate() {
-        by_path.insert(note.path_no_ext().to_lowercase(), id);
-        by_stem
-            .entry(note.stem().to_lowercase())
-            .or_default()
-            .push(id);
-    }
-
-    let resolve = |target: &str| -> Option<usize> {
-        let key = target.replace('\\', "/").to_lowercase();
-        if let Some(id) = by_path.get(&key) {
-            return Some(*id);
-        }
-        if let Some(ids) = by_stem.get(&key) {
-            if ids.len() == 1 {
-                return Some(ids[0]);
-            }
-        }
-        let stem = key.rsplit('/').next().unwrap_or(&key);
-        by_stem
-            .get(stem)
-            .and_then(|ids| if ids.len() == 1 { Some(ids[0]) } else { None })
-    };
+    let index = crate::resolve::NoteIndex::new(notes);
 
     let mut nodes: Vec<Node> = notes
         .iter()
@@ -98,11 +90,19 @@ pub fn build(notes: &[NoteRef]) -> Graph {
             if link.target.is_empty() {
                 continue;
             }
-            let Some(to) = resolve(&link.target) else {
+            let Some(to) = index.resolve(&link.target) else {
                 continue;
             };
             if seen.insert((from, to)) {
-                edges.push(Edge { from, to });
+                edges.push(Edge {
+                    from,
+                    to,
+                    kind: if link.embed {
+                        EdgeKind::Embed
+                    } else {
+                        EdgeKind::Link
+                    },
+                });
                 nodes[from].links += 1;
             }
         }
@@ -139,6 +139,7 @@ pub fn filter(graph: &Graph, query: &str) -> Graph {
             Some(Edge {
                 from: *remap.get(&edge.from)?,
                 to: *remap.get(&edge.to)?,
+                kind: edge.kind,
             })
         })
         .collect();
@@ -204,7 +205,11 @@ pub fn local(graph: &Graph, root: usize, depth: usize, max_nodes: usize) -> Grap
         .filter_map(|edge| {
             let from = *remap.get(&edge.from)?;
             let to = *remap.get(&edge.to)?;
-            Some(Edge { from, to })
+            Some(Edge {
+                from,
+                to,
+                kind: edge.kind,
+            })
         })
         .collect();
 
@@ -334,6 +339,30 @@ mod tests {
         assert_eq!(graph.edges.len(), 3);
         assert_eq!(graph.nodes[0].links, 2);
         assert_eq!(graph.neighbors(0), vec![1, 2]);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn edges_remember_whether_they_were_links_or_embeds() {
+        let dir = vault("kinds");
+        let notes = vec![
+            note(&dir, "a.md", "[[b]] and ![[c]]\n"),
+            note(&dir, "b.md", "b\n"),
+            note(&dir, "c.md", "c\n"),
+        ];
+
+        let graph = build(&notes);
+        assert_eq!(graph.edges[0].kind, EdgeKind::Link);
+        assert_eq!(graph.edges[1].kind, EdgeKind::Embed);
+        assert!(!graph.edges[0].is_relation());
+
+        let filtered = filter(&graph, "md");
+        assert_eq!(filtered.edges.len(), 2);
+        assert!(filtered
+            .edges
+            .iter()
+            .all(|edge| matches!(edge.kind, EdgeKind::Link | EdgeKind::Embed)));
 
         std::fs::remove_dir_all(&dir).unwrap();
     }

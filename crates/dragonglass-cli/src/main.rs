@@ -15,8 +15,8 @@ use std::process::ExitCode;
 
 use anyhow::{anyhow, bail, Context, Result};
 use dragonglass_core::{
-    api, git, graph, history, html, import, mcp, pdf, query, storage, store, update, uri, Note,
-    NoteRef, Vault,
+    api, assets, git, graph, history, html, import, mcp, pdf, query, resolve, shared, storage,
+    store, update, uri, Note, NoteRef, Vault,
 };
 use dragonglass_plugins as plugins;
 
@@ -83,11 +83,15 @@ fn run() -> Result<()> {
         }
     }
 
-    let resolver = Resolver::new(loaded.iter().map(|(r, _)| r));
+    let index = resolve::NoteIndex::new(
+        &loaded
+            .iter()
+            .map(|(note, _)| note.clone())
+            .collect::<Vec<_>>(),
+    );
 
     let mut total_links = 0usize;
     let mut broken = 0usize;
-    let mut ambiguous = 0usize;
     let mut attachments = 0usize;
     let mut unique_targets: HashMap<String, usize> = HashMap::new();
     let mut tags: BTreeMap<String, usize> = BTreeMap::new();
@@ -101,9 +105,8 @@ fn run() -> Result<()> {
                     .entry(link.target.to_lowercase())
                     .or_default() += 1;
             }
-            match resolver.resolve(&link.target) {
+            match classify(&index, &link.target) {
                 Resolution::Resolved | Resolution::SelfRef => {}
-                Resolution::Ambiguous => ambiguous += 1,
                 Resolution::Attachment => attachments += 1,
                 Resolution::Broken => {
                     broken += 1;
@@ -123,7 +126,6 @@ fn run() -> Result<()> {
         unique_targets.len()
     );
     println!("broken:     {broken}");
-    println!("ambiguous:  {ambiguous}");
     println!("attachments:{attachments}");
     println!("tags:       {}", tags.len());
     if read_errors > 0 {
@@ -392,6 +394,7 @@ fn pdf_cmd(args: Vec<String>) -> Result<()> {
         .map(|stem| stem.to_string_lossy().to_string())
         .unwrap_or_default();
 
+    let source = shared::expand(&source, &root);
     let document = pdf::from_markdown(&source, &title);
     storage::write_atomic(&out, &document)?;
 
@@ -715,6 +718,8 @@ fn export(args: Vec<String>) -> Result<()> {
     std::fs::create_dir_all(&out)?;
 
     let notes = vault.notes();
+    let attachments = assets::Attachments::index(&root);
+    let mut used: Vec<String> = Vec::new();
     let mut index = String::from("<h1>Index</h1>\n<ul>\n");
     let mut exported = 0usize;
 
@@ -724,7 +729,9 @@ fn export(args: Vec<String>) -> Result<()> {
         };
 
         let file_name = format!("{}.html", note_ref.path_no_ext().replace('/', "__"));
-        let document = html::document(note_ref.stem(), &html::render_body(&note.source));
+        let source = shared::expand(&note.source, &root);
+        let body = html::render_body_with(&source, Some(&attachments), &mut used);
+        let document = html::document(note_ref.stem(), &body);
         storage::write_atomic(&out.join(&file_name), &document)?;
 
         index.push_str(&format!(
@@ -738,7 +745,24 @@ fn export(args: Vec<String>) -> Result<()> {
     index.push_str("</ul>\n");
     storage::write_atomic(&out.join("index.html"), &html::document("Index", &index))?;
 
-    println!("exported {exported} notes to {}", display_path(&out));
+    // Attachments keep their vault-relative paths, so the `src` written into each page
+    // resolves without rewriting.
+    let mut copied = 0usize;
+    for relative in &used {
+        let from = root.join(relative);
+        let to = out.join(relative);
+        if let Some(parent) = to.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        if std::fs::copy(&from, &to).is_ok() {
+            copied += 1;
+        }
+    }
+
+    println!(
+        "exported {exported} notes and {copied} attachments to {}",
+        display_path(&out)
+    );
     Ok(())
 }
 
@@ -811,55 +835,26 @@ enum Resolution {
     Resolved,
     /// `[[#heading]]` — a link within the same file.
     SelfRef,
-    Ambiguous,
     /// Target names a non-markdown file (image, pdf, …).
     Attachment,
     Broken,
 }
 
-struct Resolver<'a> {
-    by_path: HashMap<String, &'a NoteRef>,
-    by_stem: HashMap<String, Vec<&'a NoteRef>>,
-}
-
-impl<'a> Resolver<'a> {
-    fn new(refs: impl Iterator<Item = &'a NoteRef>) -> Self {
-        let mut by_path = HashMap::new();
-        let mut by_stem: HashMap<String, Vec<&NoteRef>> = HashMap::new();
-        for r in refs {
-            by_path.insert(r.path_no_ext().to_lowercase(), r);
-            by_stem.entry(r.stem().to_lowercase()).or_default().push(r);
-        }
-        Self { by_path, by_stem }
+/// Classify a link target against the vault index (paths, stems, slugs and aliases).
+fn classify(index: &resolve::NoteIndex, target: &str) -> Resolution {
+    if target.is_empty() {
+        return Resolution::SelfRef;
     }
 
-    fn resolve(&self, target: &str) -> Resolution {
-        if target.is_empty() {
-            return Resolution::SelfRef;
-        }
+    if index.resolve(target).is_some() {
+        return Resolution::Resolved;
+    }
 
-        let key = target.replace('\\', "/").to_lowercase();
-
-        if self.by_path.contains_key(&key) {
-            return Resolution::Resolved;
-        }
-
-        if let Some(ext) = Path::new(&key).extension().and_then(|e| e.to_str()) {
-            if ext != "md" && ext != "markdown" {
-                return Resolution::Attachment;
-            }
-        }
-
-        match self.by_stem.get(&key) {
-            Some(v) if v.len() == 1 => Resolution::Resolved,
-            Some(_) => Resolution::Ambiguous,
-            None => {
-                let stem = key.rsplit('/').next().unwrap_or(&key);
-                match self.by_stem.get(stem) {
-                    Some(v) if !v.is_empty() => Resolution::Resolved,
-                    _ => Resolution::Broken,
-                }
-            }
+    if let Some(ext) = Path::new(target).extension().and_then(|e| e.to_str()) {
+        if !ext.eq_ignore_ascii_case("md") && !ext.eq_ignore_ascii_case("markdown") {
+            return Resolution::Attachment;
         }
     }
+
+    Resolution::Broken
 }

@@ -5,7 +5,7 @@
 
 use gpui::{rgb, Global, Hsla};
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Theme {
     pub dark: bool,
     pub bg: Hsla,
@@ -24,9 +24,14 @@ pub struct Theme {
     pub star: Hsla,
     pub code_bg: Hsla,
     pub code_text: Hsla,
+    pub code_keyword: Hsla,
+    pub code_string: Hsla,
+    pub code_function: Hsla,
     pub selection: Hsla,
     /// Background of the line containing the caret.
     pub current_line: Hsla,
+    /// Background of a hovered list row.
+    pub hover: Hsla,
 }
 
 fn h(hex: u32) -> Hsla {
@@ -53,8 +58,12 @@ impl Theme {
             star: h(0xffd479),
             code_bg: h(0x111111),
             code_text: h(0xb8d4b8),
+            code_keyword: h(0x569cd6),
+            code_string: h(0xce9178),
+            code_function: h(0xdcdcaa),
             selection: h(0x3b82f6).opacity(0.3),
             current_line: h(0x262626),
+            hover: h(0x242424),
         }
     }
 
@@ -77,8 +86,12 @@ impl Theme {
             star: h(0xb8860b),
             code_bg: h(0xf2f2f2),
             code_text: h(0x1f5f3f),
+            code_keyword: h(0x0000ff),
+            code_string: h(0xa31515),
+            code_function: h(0x795e26),
             selection: h(0x3b82f6).opacity(0.22),
             current_line: h(0xf0f1f3),
+            hover: h(0xe8e8e8),
         }
     }
 
@@ -95,6 +108,21 @@ impl Theme {
             "dark"
         } else {
             "light"
+        }
+    }
+
+    /// Colour for a code token, shared by the reading view and the editor.
+    pub fn code_color(&self, kind: dragonglass_core::syntax::CodeKind) -> Hsla {
+        use dragonglass_core::syntax::CodeKind;
+        match kind {
+            CodeKind::Text => self.code_text,
+            CodeKind::Keyword => self.code_keyword,
+            CodeKind::String => self.code_string,
+            CodeKind::Comment => self.muted,
+            CodeKind::Number => self.warn,
+            CodeKind::Function => self.code_function,
+            CodeKind::Type => self.text_dim,
+            CodeKind::Punctuation => self.muted,
         }
     }
 
@@ -123,8 +151,12 @@ impl Theme {
                 "star" => theme.star = color,
                 "code_bg" | "code-bg" => theme.code_bg = color,
                 "code_text" | "code-text" => theme.code_text = color,
+                "code_keyword" | "code-keyword" => theme.code_keyword = color,
+                "code_string" | "code-string" => theme.code_string = color,
+                "code_function" | "code-function" => theme.code_function = color,
                 "selection" => theme.selection = color,
                 "current_line" | "current-line" => theme.current_line = color,
+                "hover" => theme.hover = color,
                 _ => {}
             }
         }
@@ -158,6 +190,10 @@ impl Theme {
             ("star".into(), hex(base.star)),
             ("code_bg".into(), hex(base.code_bg)),
             ("code_text".into(), hex(base.code_text)),
+            ("code_keyword".into(), hex(base.code_keyword)),
+            ("code_string".into(), hex(base.code_string)),
+            ("code_function".into(), hex(base.code_function)),
+            ("hover".into(), hex(base.hover)),
         ];
 
         for (key, value) in colors {

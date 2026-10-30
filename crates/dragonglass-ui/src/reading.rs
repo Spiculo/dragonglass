@@ -1,50 +1,690 @@
 //! Reading mode: render parsed markdown blocks as styled GPUI elements, including
 //! embedded images and transcluded notes.
 //!
-//! Paragraph and list text goes through `StyledText` when it contains `==highlights==` or
-//! `$math$`, so those spans get a background while the text still wraps normally.
+//! Inline text goes through `dragonglass_core::inline`, so emphasis, code, links, math
+//! and highlights all render inside paragraphs, list items, headings and table cells.
 
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
+use std::ops::Range;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 
-use dragonglass_core::markdown::{self, Block};
-use dragonglass_core::math::{self, Span};
-use gpui::{div, img, prelude::*, px, relative, AnyElement, IntoElement, StyledText, TextRun};
+use dragonglass_core::assets::Attachments;
+use dragonglass_core::frontmatter::{self, Property};
+use dragonglass_core::inline;
+use dragonglass_core::markdown::{self, Align, Block};
+use dragonglass_core::math::{self, MathOptions, MathScene, MathStyle};
+use dragonglass_core::shared;
+use dragonglass_core::syntax;
 
+use gpui::{
+    div, fill, img, list, point, prelude::*, px, relative, AnyElement, App, Bounds, CursorStyle,
+    DispatchPhase, Element, ElementId, Entity, FontStyle, GlobalElementId, Hitbox, HitboxBehavior,
+    InspectorElementId, IntoElement, LayoutId, ListAlignment, ListState, MouseButton,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point, StrikethroughStyle,
+    StyledText, TextLayout, TextRun, UnderlineStyle, Window,
+};
+
+use crate::flow::{FlowContent, FlowKind, FlowPiece, FlowText};
+use crate::math_element::MathElement;
 use crate::theme::Theme;
 
-/// Guard against `![[a]]` → `a` → `![[a]]` cycles.
+/// Guard against `![[a]]` â†’ `a` â†’ `![[a]]` cycles.
 const MAX_EMBED_DEPTH: usize = 3;
 
-pub fn reading_view(
-    src: &str,
-    vault_root: Option<&Path>,
-    depth: usize,
-    theme: Theme,
-    template: &TextRun,
-) -> impl IntoElement {
-    let blocks = markdown::parse_blocks(src);
-    let template = template.clone();
+/// Called when a link in the reading view is clicked. The target is either a vault-relative
+/// note target or an `http(s)`/`mailto` URL; the app decides which.
+pub type LinkOpener = Rc<dyn Fn(&str, &mut Window, &mut App)>;
 
-    div()
-        .flex()
-        .flex_col()
-        .gap_3()
-        .p_4()
-        .text_color(theme.text)
-        .children(
-            blocks
-                .into_iter()
-                .map(move |block| render_block(block, vault_root, depth, theme, &template)),
-        )
+/// A point in the reading view: a block and a byte offset into its display text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ReadPoint {
+    pub block: usize,
+    pub offset: usize,
 }
 
-fn render_block(
-    block: Block,
-    vault_root: Option<&Path>,
+/// Character-level selection shared by every text piece in the reading view.
+#[derive(Debug, Default)]
+pub struct ReadSelection {
+    pub(crate) anchor: Option<ReadPoint>,
+    pub(crate) head: Option<ReadPoint>,
+    /// Where the drag started, so a slightly shaky click still counts as a click.
+    pub(crate) down: Option<Point<Pixels>>,
+    pub(crate) dragging: bool,
+    pub(crate) moved: bool,
+}
+
+impl ReadSelection {
+    pub(crate) fn clear(&mut self) {
+        self.anchor = None;
+        self.head = None;
+        self.down = None;
+        self.dragging = false;
+        self.moved = false;
+    }
+
+    /// The selection with its ends in document order.
+    pub(crate) fn ordered(&self) -> Option<(ReadPoint, ReadPoint)> {
+        let anchor = self.anchor?;
+        let head = self.head?;
+        if anchor == head {
+            return None;
+        }
+        Some(if anchor <= head {
+            (anchor, head)
+        } else {
+            (head, anchor)
+        })
+    }
+}
+
+/// Counts for the status bar while a reading-mode selection exists.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SelectionStats {
+    pub words: usize,
+    pub characters: usize,
+    pub lines: usize,
+}
+
+/// Everything a block needs to render, threaded through the recursive embed renderer.
+struct RenderCtx<'a> {
+    vault_root: Option<&'a Path>,
+    attachments: Option<&'a Attachments>,
+    selection: &'a Rc<RefCell<ReadSelection>>,
+    opener: Option<&'a LinkOpener>,
+    /// Display formulas, typeset once per document version.
+    math: &'a HashMap<(String, MathStyle), Rc<MathScene>>,
     depth: usize,
     theme: Theme,
-    template: &TextRun,
-) -> AnyElement {
+    template: &'a TextRun,
+}
+
+/// One place a footnote is referenced, used by the footnote picker.
+#[derive(Clone)]
+pub(crate) struct FootnoteRef {
+    pub block: usize,
+    pub snippet: String,
+}
+
+/// The small modal shown when a footnote marker is clicked: every reference to that footnote
+/// in the current note, plus a jump to the definition.
+pub(crate) struct FootnotePopup {
+    title: String,
+    refs: Rc<RefCell<HashMap<String, Vec<FootnoteRef>>>>,
+    defs: Rc<RefCell<HashMap<String, usize>>>,
+    list_state: ListState,
+    open: Option<(String, Vec<FootnoteRef>, Option<usize>)>,
+}
+
+impl FootnotePopup {
+    fn new(
+        refs: Rc<RefCell<HashMap<String, Vec<FootnoteRef>>>>,
+        defs: Rc<RefCell<HashMap<String, usize>>>,
+        list_state: ListState,
+    ) -> Self {
+        Self {
+            title: "This note".to_string(),
+            refs,
+            defs,
+            list_state,
+            open: None,
+        }
+    }
+
+    fn set_title(&mut self, title: String, cx: &mut Context<Self>) {
+        if self.title != title {
+            self.title = title;
+            if self.open.is_some() {
+                cx.notify();
+            }
+        }
+    }
+
+    fn show(&mut self, id: &str) {
+        let refs = self.refs.borrow().get(id).cloned().unwrap_or_default();
+        let definition = self.defs.borrow().get(id).copied();
+        self.open = Some((id.to_string(), refs, definition));
+    }
+
+    fn close(&mut self) {
+        self.open = None;
+    }
+}
+
+impl Render for FootnotePopup {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = *cx.global::<Theme>();
+        let Some((id, refs, definition)) = &self.open else {
+            return div().into_any_element();
+        };
+
+        let this = cx.entity().downgrade();
+        let close = this.clone();
+        let close_button = div()
+            .id("footnote-close")
+            .px_2()
+            .cursor_pointer()
+            .text_color(theme.muted)
+            .hover(move |style| style.bg(theme.hover))
+            .child("x")
+            .on_mouse_down(MouseButton::Left, move |_ev, window, cx| {
+                if let Some(this) = close.upgrade() {
+                    this.update(cx, |this, cx| {
+                        this.close();
+                        cx.notify();
+                    });
+                }
+                window.refresh();
+            });
+
+        let mut panel = div()
+            .id("footnote-popup")
+            .w(px(460.0))
+            .max_h(px(320.0))
+            .overflow_y_scroll()
+            .bg(theme.panel)
+            .border_1()
+            .border_color(theme.border)
+            .rounded_md()
+            .p_3()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .text_sm()
+            .text_color(theme.text)
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        div()
+                            .font_weight(gpui::FontWeight::BOLD)
+                            .child(format!("Footnote {id}")),
+                    )
+                    .child(close_button),
+            );
+
+        let title = self.title.clone();
+        for (index, reference) in refs.iter().enumerate() {
+            let block = reference.block;
+            let snippet = reference.snippet.clone();
+            let title = title.clone();
+            let state = this.clone();
+            let list_state = self.list_state.clone();
+            panel = panel.child(
+                div()
+                    .id(ElementId::Name(format!("footnote-ref-{index}").into()))
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .px_2()
+                    .py_1()
+                    .rounded_sm()
+                    .cursor_pointer()
+                    .hover(move |style| style.bg(theme.hover))
+                    .child(div().child(format!("Title: {title}")))
+                    .child(div().text_xs().text_color(theme.muted).child(snippet))
+                    .on_mouse_down(MouseButton::Left, move |_ev, window, cx| {
+                        list_state.scroll_to_reveal_item(block);
+                        if let Some(this) = state.upgrade() {
+                            this.update(cx, |this, cx| {
+                                this.close();
+                                cx.notify();
+                            });
+                        }
+                        window.refresh();
+                    }),
+            );
+        }
+
+        if let Some(block) = definition {
+            let block = *block;
+            let state = this.clone();
+            let list_state = self.list_state.clone();
+            panel = panel.child(
+                div()
+                    .id("footnote-definition")
+                    .px_2()
+                    .py_1()
+                    .rounded_sm()
+                    .cursor_pointer()
+                    .text_color(theme.accent_text)
+                    .hover(move |style| style.bg(theme.hover))
+                    .child("Go to footnote definition")
+                    .on_mouse_down(MouseButton::Left, move |_ev, window, cx| {
+                        list_state.scroll_to_reveal_item(block);
+                        if let Some(this) = state.upgrade() {
+                            this.update(cx, |this, cx| {
+                                this.close();
+                                cx.notify();
+                            });
+                        }
+                        window.refresh();
+                    }),
+            );
+        }
+
+        if refs.is_empty() && definition.is_none() {
+            panel = panel.child(
+                div()
+                    .text_xs()
+                    .text_color(theme.muted)
+                    .child("No references found in this note."),
+            );
+        }
+
+        panel.into_any_element()
+    }
+}
+
+/// A display title for the footnote picker: frontmatter title, first heading, or a fallback.
+fn note_title(properties: &[Property], blocks: &[Block]) -> String {
+    properties
+        .iter()
+        .find(|property| property.key.eq_ignore_ascii_case("title"))
+        .map(|property| property.value.display())
+        .filter(|title| !title.trim().is_empty())
+        .or_else(|| {
+            blocks.iter().find_map(|block| match block {
+                Block::Heading { text, .. } => Some(inline::plain(text)),
+                _ => None,
+            })
+        })
+        .unwrap_or_else(|| "This note".to_string())
+}
+
+/// The end of a paragraph, used as the context line in the footnote picker.
+fn snippet(text: &str) -> String {
+    let text = text.replace('\n', " ");
+    let text = text.trim();
+    let count = text.chars().count();
+    if count <= 120 {
+        text.to_string()
+    } else {
+        format!(
+            "\u{2026}{}",
+            text.chars().skip(count - 120).collect::<String>()
+        )
+    }
+}
+
+/// Parsed reading blocks plus the scroll state for a virtualized block list.
+///
+/// Blocks have different heights, so this uses GPUI's variable-height `List`: only the
+/// blocks around the viewport are turned into elements. The parse result is cached per
+/// document version, so scrolling never re-parses the note.
+pub struct ReadingCache {
+    version: (u64, u64),
+    blocks: Rc<Vec<Block>>,
+    list_state: ListState,
+    /// File index for the current vault, built on first use and reused afterwards.
+    attachments: Option<Rc<Attachments>>,
+    attachments_root: Option<PathBuf>,
+    /// Character-level selection, shared by every rendered text piece.
+    selection: Rc<RefCell<ReadSelection>>,
+    /// Frontmatter of the current document, shown above the reading view.
+    properties: Vec<Property>,
+    /// Display formulas, typeset when the document changes. Keyed by source and style: layout
+    /// is in em, so one scene serves every font size and zoom level. `Rc` so the virtualized
+    /// list closure can share it without cloning the map each frame.
+    math: Rc<HashMap<(String, MathStyle), Rc<MathScene>>>,
+    /// Collapsible metadata header; created on first render when an `App` is available.
+    metadata: Option<Entity<crate::editor::MetadataView>>,
+    /// Footnote references by id, for the marker picker.
+    footnote_refs: Rc<RefCell<HashMap<String, Vec<FootnoteRef>>>>,
+    /// Footnote definition blocks by id.
+    footnote_defs: Rc<RefCell<HashMap<String, usize>>>,
+    /// The picker overlay, created on first render.
+    footnote_popup: Option<Entity<FootnotePopup>>,
+}
+
+impl ReadingCache {
+    pub fn new() -> Self {
+        Self {
+            version: (u64::MAX, u64::MAX),
+            blocks: Rc::new(Vec::new()),
+            list_state: ListState::new(0, ListAlignment::Top, px(600.0)),
+            attachments: None,
+            attachments_root: None,
+            selection: Rc::new(RefCell::new(ReadSelection::default())),
+            properties: Vec::new(),
+            math: Rc::new(HashMap::new()),
+            metadata: None,
+            footnote_refs: Rc::new(RefCell::new(HashMap::new())),
+            footnote_defs: Rc::new(RefCell::new(HashMap::new())),
+            footnote_popup: None,
+        }
+    }
+
+    pub fn needs_update(&self, version: (u64, u64)) -> bool {
+        self.version != version
+    }
+
+    /// Drop the attachment index, so the next render re-walks the vault. Called after a
+    /// paste or drop files something new.
+    pub fn invalidate_attachments(&mut self) {
+        self.attachments = None;
+        self.attachments_root = None;
+    }
+
+    /// Re-parse only when the document changed. A new document resets the scroll
+    /// position; edits to the same document preserve it.
+    pub fn update(&mut self, version: (u64, u64), source: &str, root: Option<&Path>) {
+        if self.version == version {
+            return;
+        }
+
+        let source = match root {
+            Some(root) => shared::expand(source, root),
+            None => source.to_string(),
+        };
+        let blocks = markdown::parse_blocks(&source);
+        self.properties = frontmatter::display_properties(&source);
+
+        // Typeset every formula once per document version. Scenes are in em, so the painter
+        // can scale them to any font size without laying out again.
+        let mut math = HashMap::new();
+        for block in &blocks {
+            if let Block::Math { tex } = block {
+                typeset_into(&mut math, tex, MathStyle::Display);
+            }
+            for text in block_texts(block) {
+                for span in inline::parse(text) {
+                    if let Some(tex) = span.math {
+                        typeset_into(&mut math, &tex, MathStyle::Inline);
+                    }
+                }
+            }
+        }
+        self.math = Rc::new(math);
+
+        // Footnote occurrences for the marker picker: id → paragraphs that cite it, and
+        // id → definition block.
+        let mut footnote_refs: HashMap<String, Vec<FootnoteRef>> = HashMap::new();
+        let mut footnote_defs: HashMap<String, usize> = HashMap::new();
+        for (index, block) in blocks.iter().enumerate() {
+            if let Block::Footnote { id, .. } = block {
+                footnote_defs.insert(id.clone(), index);
+            }
+            let context = snippet(&block_display(block));
+            for text in block_texts(block) {
+                for span in inline::parse(text) {
+                    if !span.style.footnote {
+                        continue;
+                    }
+                    let id = span.text.trim().to_string();
+                    let entry = footnote_refs.entry(id).or_default();
+                    if !entry.iter().any(|reference| reference.block == index) {
+                        entry.push(FootnoteRef {
+                            block: index,
+                            snippet: context.clone(),
+                        });
+                    }
+                }
+            }
+        }
+        *self.footnote_refs.borrow_mut() = footnote_refs;
+        *self.footnote_defs.borrow_mut() = footnote_defs;
+
+        if self.version.0 != version.0 {
+            self.list_state.reset(blocks.len());
+        } else {
+            let old_count = self.blocks.len();
+            self.list_state.splice(0..old_count, blocks.len());
+        }
+
+        self.selection.borrow_mut().clear();
+        self.blocks = Rc::new(blocks);
+        self.version = version;
+    }
+
+    /// The selected reading text, with blocks joined by newlines.
+    pub fn selected_text(&self) -> Option<String> {
+        let (start, end) = self.selection.borrow().ordered()?;
+        let mut out = String::new();
+
+        for (index, block) in self.blocks.iter().enumerate() {
+            if index < start.block || index > end.block {
+                continue;
+            }
+            let text = block_display(block);
+            let from = if index == start.block {
+                start.offset.min(text.len())
+            } else {
+                0
+            };
+            let to = if index == end.block {
+                end.offset.min(text.len())
+            } else {
+                text.len()
+            };
+            if from < to {
+                out.push_str(&text[from..to]);
+            }
+            if index < end.block {
+                out.push('\n');
+            }
+        }
+
+        (!out.is_empty()).then_some(out)
+    }
+
+    /// Select the whole document, for Ctrl+A in reading mode.
+    pub fn select_all(&mut self) {
+        let Some(last) = self.blocks.len().checked_sub(1) else {
+            return;
+        };
+        let end = block_display(&self.blocks[last]).len();
+        let mut selection = self.selection.borrow_mut();
+        selection.anchor = Some(ReadPoint {
+            block: 0,
+            offset: 0,
+        });
+        selection.head = Some(ReadPoint {
+            block: last,
+            offset: end,
+        });
+        selection.dragging = false;
+        selection.moved = false;
+    }
+
+    pub fn selection_stats(&self) -> Option<SelectionStats> {
+        let text = self.selected_text()?;
+        Some(SelectionStats {
+            words: text.split_whitespace().count(),
+            characters: text.chars().count(),
+            lines: text.lines().count().max(1),
+        })
+    }
+
+    /// Test-only: install a selection from display-text offsets.
+    #[cfg(test)]
+    pub(crate) fn select_range(&mut self, anchor: ReadPoint, head: ReadPoint) {
+        let mut selection = self.selection.borrow_mut();
+        selection.anchor = Some(anchor);
+        selection.head = Some(head);
+        selection.dragging = false;
+        selection.moved = true;
+    }
+
+    /// Scroll the reading view so the heading with this text is visible.
+    pub fn scroll_to_heading(&self, text: &str) {
+        if let Some(index) = self.blocks.iter().position(
+            |block| matches!(block, Block::Heading { text: heading, .. } if heading == text),
+        ) {
+            self.list_state.scroll_to_reveal_item(index);
+        }
+    }
+
+    /// Scroll to the nth heading in the document. Heading order matches the table of
+    /// contents, so this works even when the heading text contains math or markup.
+    pub fn scroll_to_heading_index(&self, heading_index: usize) -> bool {
+        let Some((index, _)) = self
+            .blocks
+            .iter()
+            .enumerate()
+            .filter(|(_, block)| matches!(block, Block::Heading { .. }))
+            .nth(heading_index)
+        else {
+            return false;
+        };
+        self.list_state.scroll_to_reveal_item(index);
+        true
+    }
+
+    pub fn element(
+        &mut self,
+        vault_root: Option<PathBuf>,
+        theme: Theme,
+        template: TextRun,
+        opener: Option<LinkOpener>,
+        cx: &mut App,
+    ) -> impl IntoElement {
+        if vault_root.as_deref() != self.attachments_root.as_deref() {
+            self.attachments = vault_root
+                .as_deref()
+                .map(|root| Rc::new(Attachments::index(root)));
+            self.attachments_root = vault_root.clone();
+        }
+
+        if self.footnote_popup.is_none() {
+            let refs = self.footnote_refs.clone();
+            let defs = self.footnote_defs.clone();
+            let list_state = self.list_state.clone();
+            self.footnote_popup = Some(cx.new(move |_| FootnotePopup::new(refs, defs, list_state)));
+        }
+        let title = note_title(&self.properties, self.blocks.as_slice());
+        if let Some(popup) = &self.footnote_popup {
+            popup.update(cx, |popup, cx| popup.set_title(title, cx));
+        }
+
+        // Footnote markers share the link path: `#fn:<id>` opens the picker, everything else
+        // goes to the app's normal note/URL opener.
+        let popup_for_links = self.footnote_popup.clone();
+        let app_opener = opener.clone();
+        let opener: Option<LinkOpener> = Some(Rc::new(move |target, window, cx| {
+            if let Some(id) = target.strip_prefix("#fn:") {
+                if let Some(popup) = &popup_for_links {
+                    let id = id.to_string();
+                    popup.update(cx, |popup, cx| {
+                        popup.show(&id);
+                        cx.notify();
+                    });
+                }
+                window.refresh();
+                return;
+            }
+            if let Some(opener) = &app_opener {
+                opener(target, window, cx);
+            }
+        }));
+
+        if self.metadata.is_none() {
+            self.metadata = Some(cx.new(crate::editor::MetadataView::new));
+        }
+        let metadata = self.metadata.clone();
+        if let Some(view) = &metadata {
+            view.update(cx, |view, cx| {
+                view.set(self.properties.clone(), theme, opener.clone(), cx);
+            });
+        }
+
+        let footnote_popup = self.footnote_popup.clone();
+        let blocks = self.blocks.clone();
+        let attachments = self.attachments.clone();
+        let selection = self.selection.clone();
+        let math = self.math.clone();
+        div()
+            .relative()
+            .size_full()
+            .flex()
+            .flex_col()
+            .px_8()
+            .py_6()
+            .text_color(theme.text)
+            .children(metadata)
+            .child(
+                div().flex_1().min_h(px(0.0)).child(
+                    list(self.list_state.clone(), move |index, _window, _cx| {
+                        let Some(block) = blocks.get(index).cloned() else {
+                            return div().into_any_element();
+                        };
+
+                        let ctx = RenderCtx {
+                            vault_root: vault_root.as_deref(),
+                            attachments: attachments.as_deref(),
+                            selection: &selection,
+                            opener: opener.as_ref(),
+                            math: &math,
+                            depth: 0,
+                            theme,
+                            template: &template,
+                        };
+
+                        let mut item = div().w_full().max_w(px(780.0)).mx_auto().px_2().pb_3();
+                        // Display math is centred by the item itself: the list gives each
+                        // item the full column width, but a shrink-to-fit child would
+                        // otherwise sit at the left edge.
+                        if matches!(block, Block::Math { .. }) {
+                            item = item.flex().justify_center().py_3();
+                        }
+                        item.child(render_block(block, Some(index), &ctx))
+                            .into_any_element()
+                    })
+                    .size_full(),
+                ),
+            )
+            .children(footnote_popup.map(|popup| {
+                div()
+                    .absolute()
+                    .top(px(96.0))
+                    .left(px(24.0))
+                    .child(popup)
+                    .into_any_element()
+            }))
+    }
+}
+
+impl Default for ReadingCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// A non-virtualized column, used for nested `![[note]]` embeds where a second scroll
+/// container would be wrong.
+fn reading_column(src: &str, ctx: &RenderCtx) -> impl IntoElement {
+    let source = match ctx.vault_root {
+        Some(root) => shared::expand(src, root),
+        None => src.to_string(),
+    };
+    let blocks = markdown::parse_blocks(&source);
+    let template = ctx.template.clone();
+    let nested = RenderCtx {
+        vault_root: ctx.vault_root,
+        attachments: ctx.attachments,
+        selection: ctx.selection,
+        opener: ctx.opener,
+        math: ctx.math,
+        depth: ctx.depth + 1,
+        theme: ctx.theme,
+        template: &template,
+    };
+
+    div().flex().flex_col().gap_3().children(
+        blocks
+            .into_iter()
+            .map(move |block| render_block(block, None, &nested)),
+    )
+}
+
+fn render_block(block: Block, block_index: Option<usize>, ctx: &RenderCtx) -> AnyElement {
+    let theme = ctx.theme;
+    let template = ctx.template;
     match block {
         Block::Heading { level, text } => {
             let size = match level {
@@ -54,60 +694,125 @@ fn render_block(
                 _ => 17.0,
             };
             div()
-                .text_size(px(size))
-                .font_weight(gpui::FontWeight::BOLD)
-                .child(text)
+                .pb_1()
+                .child(rich_text_styled(
+                    &text,
+                    size,
+                    block_index,
+                    0,
+                    ctx,
+                    gpui::FontWeight::BOLD,
+                    1.25,
+                ))
                 .into_any_element()
         }
-        Block::Paragraph(text) => rich_text(&text.replace('\n', " "), 15.0, theme, template),
+        Block::Paragraph(text) => rich_text(&text, 15.0, block_index, 0, ctx),
         Block::ListItem {
             depth,
             marker,
+            checked,
             text,
             ..
-        } => div()
-            .flex()
-            .flex_row()
-            .gap_2()
-            .pl(px(8.0 + depth as f32 * 16.0))
-            .child(div().text_color(theme.muted).child(marker))
-            .child(rich_text(&text, 15.0, theme, template))
-            .into_any_element(),
-        Block::Code { text, .. } => div()
-            .bg(theme.code_bg)
-            .p_3()
-            .rounded_md()
-            .text_size(px(13.0))
-            .text_color(theme.code_text)
-            .child(text)
-            .into_any_element(),
-        Block::Quote(text) => div()
-            .border_l_1()
-            .border_color(theme.border)
-            .pl_3()
-            .text_color(theme.muted)
-            .child(text.replace('\n', " "))
-            .into_any_element(),
+        } => {
+            let (marker, marker_color) = match checked {
+                Some(true) => ("\u{2611}".to_string(), theme.code_text),
+                Some(false) => ("\u{2610}".to_string(), theme.muted),
+                None => (marker, theme.muted),
+            };
+            div()
+                .flex()
+                .flex_row()
+                .items_start()
+                // An explicit spacer instead of padding: padding on a flex row is added
+                // outside the column width here, which pushed deep items past the wrap edge.
+                .child(
+                    div()
+                        .w(px(8.0 + depth.min(8) as f32 * 16.0))
+                        .flex_shrink_0(),
+                )
+                .child(
+                    div()
+                        .w(px(24.0))
+                        .flex_shrink_0()
+                        .text_color(marker_color)
+                        .child(marker),
+                )
+                // The text must be the one flexible child: without `flex_1` its
+                // max-content width becomes the row's width, the row outgrows the
+                // reading column, and every later block loses the column's alignment.
+                .child(div().flex_1().min_w(px(0.0)).child(rich_text(
+                    &text,
+                    15.0,
+                    block_index,
+                    0,
+                    ctx,
+                )))
+                .into_any_element()
+        }
+        Block::Code { text, language } => code_block(&text, &language, block_index, ctx),
+        Block::Quote(text) => {
+            let mut muted = template.clone();
+            muted.color = theme.muted;
+            let muted_ctx = ctx.with_template(&muted);
+            div()
+                .border_l_1()
+                .border_color(theme.border)
+                .pl_3()
+                .child(rich_text(&text, 15.0, block_index, 0, &muted_ctx))
+                .into_any_element()
+        }
         Block::Rule => div()
             .h(px(1.0))
             .w_full()
             .bg(theme.border)
             .into_any_element(),
-        Block::Math { tex } => div()
-            .bg(theme.chip)
-            .rounded_md()
-            .px_3()
-            .py_2()
-            .text_size(px(15.0))
-            .text_color(theme.text)
-            .child(math::to_unicode(&tex))
-            .into_any_element(),
+        Block::Math { tex } => render_math(&tex, ctx),
+        Block::Footnote { id, text } => {
+            // `[id] text` is the display form; selection offsets start after the marker.
+            let base = id.len() + 3;
+            let target = format!("#fn:{id}");
+            let opener = ctx.opener.cloned();
+            div()
+                .flex()
+                .flex_row()
+                .items_start()
+                .gap_2()
+                .pt_1()
+                .text_sm()
+                .text_color(theme.muted)
+                .child(
+                    div()
+                        .flex_shrink_0()
+                        .font_weight(gpui::FontWeight::BOLD)
+                        .text_color(theme.accent_text)
+                        .cursor_pointer()
+                        .child(format!("[{id}]"))
+                        .on_mouse_down(MouseButton::Left, move |_ev, window, cx| {
+                            if let Some(opener) = &opener {
+                                opener(&target, window, cx);
+                            }
+                        }),
+                )
+                .child(div().flex_1().min_w(px(0.0)).child(rich_text(
+                    &text,
+                    13.0,
+                    block_index,
+                    base,
+                    ctx,
+                )))
+                .into_any_element()
+        }
         Block::Callout { kind, title, text } => {
             let accent = match kind.as_str() {
                 "warning" | "caution" | "danger" | "error" => theme.warn,
                 "tip" | "success" => theme.code_text,
                 _ => theme.accent_text,
             };
+
+            let mut title_template = template.clone();
+            title_template.color = accent;
+            let title_ctx = ctx.with_template(&title_template);
+            let body_base = inline_display(&title).len() + 1;
 
             div()
                 .border_l_1()
@@ -118,97 +823,678 @@ fn render_block(
                 .flex()
                 .flex_col()
                 .gap_1()
-                .child(
-                    div()
-                        .font_weight(gpui::FontWeight::BOLD)
-                        .text_color(accent)
-                        .child(title),
-                )
+                .child(rich_text_styled(
+                    &title,
+                    15.0,
+                    block_index,
+                    0,
+                    &title_ctx,
+                    gpui::FontWeight::BOLD,
+                    1.3,
+                ))
                 .when(!text.trim().is_empty(), |d| {
-                    d.child(rich_text(&text.replace('\n', " "), 15.0, theme, template))
+                    d.child(rich_text(&text, 15.0, block_index, body_base, ctx))
                 })
                 .into_any_element()
         }
-        Block::Embed { target } => render_embed(&target, vault_root, depth, theme, template),
+        Block::Table {
+            align,
+            headers,
+            rows,
+        } => render_table(&align, &headers, &rows, block_index, ctx),
+        Block::Embed { target } => render_embed(&target, ctx),
     }
 }
 
-/// Plain text, unless it contains `==highlights==` or `$math$`.
-fn rich_text(text: &str, size: f32, theme: Theme, template: &TextRun) -> AnyElement {
-    let parts = math::spans(text);
-    let container = div().text_size(px(size)).line_height(relative(1.5));
-
-    if parts.iter().all(|span| matches!(span, Span::Text(_))) {
-        let plain: String = parts.iter().map(span_text).collect();
-        return container.child(plain).into_any_element();
+impl<'a> RenderCtx<'a> {
+    fn with_template<'b>(&'b self, template: &'b TextRun) -> RenderCtx<'b> {
+        RenderCtx {
+            vault_root: self.vault_root,
+            attachments: self.attachments,
+            selection: self.selection,
+            opener: self.opener,
+            math: self.math,
+            depth: self.depth,
+            theme: self.theme,
+            template,
+        }
     }
+}
 
-    // Delimiters are dropped, so render the rebuilt string.
-    let display: String = parts.iter().map(span_text).collect();
-    let runs: Vec<TextRun> = parts
-        .iter()
-        .filter(|span| !span_text(span).is_empty())
-        .map(|span| TextRun {
-            len: span_text(span).len(),
-            font: template.font.clone(),
-            color: template.color,
-            background_color: match span {
-                Span::Highlight(_) => Some(theme.star),
-                Span::Math(_) => Some(theme.chip),
-                Span::Text(_) => None,
-            },
-            underline: None,
-            strikethrough: None,
-        })
-        .collect();
+/// Typeset one formula into the cache, unless it is already there.
+fn typeset_into(
+    cache: &mut HashMap<(String, MathStyle), Rc<MathScene>>,
+    tex: &str,
+    style: MathStyle,
+) {
+    let key = (tex.to_string(), style);
+    if cache.contains_key(&key) {
+        return;
+    }
+    let options = MathOptions {
+        style,
+        color: [0.0, 0.0, 0.0, 1.0],
+    };
+    if let Ok(scene) = math::typeset(tex, &options) {
+        cache.insert(key, Rc::new(scene));
+    }
+}
 
-    container
-        .child(StyledText::new(display).with_runs(runs))
+/// The text-bearing parts of a block, so inline formulas can be typeset up front.
+fn block_texts(block: &Block) -> Vec<&str> {
+    match block {
+        Block::Heading { text, .. } | Block::Paragraph(text) => vec![text],
+        Block::ListItem { text, .. } => vec![text],
+        Block::Quote(text) => vec![text],
+        Block::Footnote { text, .. } => vec![text],
+        Block::Callout { title, text, .. } => vec![title, text],
+        Block::Table { headers, rows, .. } => {
+            let mut out: Vec<&str> = headers.iter().map(String::as_str).collect();
+            for row in rows {
+                out.extend(row.iter().map(String::as_str));
+            }
+            out
+        }
+        Block::Code { .. } | Block::Rule | Block::Math { .. } | Block::Embed { .. } => Vec::new(),
+    }
+}
+
+/// A display formula, centred and scaled down when it is wider than the reading column.
+fn render_math(tex: &str, ctx: &RenderCtx) -> AnyElement {
+    const FONT_SIZE: f32 = 17.0;
+    /// Usable width inside the reading column (780 max width, 8 px padding each side).
+    const MAX_WIDTH: f32 = 736.0;
+
+    let Some(scene) = ctx
+        .math
+        .get(&(tex.to_string(), MathStyle::Display))
+        .cloned()
+    else {
+        return math_error(tex, ctx.theme);
+    };
+
+    let width = scene.width() as f32 * FONT_SIZE;
+    let scale = if width > MAX_WIDTH {
+        (MAX_WIDTH / width).max(0.6)
+    } else {
+        1.0
+    };
+
+    MathElement::new(scene, FONT_SIZE * scale, ctx.theme.text).into_any_element()
+}
+
+/// Unsupported or malformed TeX: show the source, never a silent blank.
+fn math_error(tex: &str, theme: Theme) -> AnyElement {
+    div()
+        .w_full()
+        .flex()
+        .justify_center()
+        .py_2()
+        .child(
+            div()
+                .px_2()
+                .py_1()
+                .rounded_md()
+                .bg(theme.chip)
+                .text_color(theme.warn)
+                .text_sm()
+                .child(format!("math: {tex}")),
+        )
         .into_any_element()
 }
 
-fn span_text(span: &Span) -> &str {
-    match span {
-        Span::Text(text) | Span::Highlight(text) | Span::Math(text) => text,
+/// Plain text, at the body weight and line height.
+fn rich_text(
+    text: &str,
+    size: f32,
+    block: Option<usize>,
+    base: usize,
+    ctx: &RenderCtx,
+) -> AnyElement {
+    rich_text_styled(text, size, block, base, ctx, gpui::FontWeight::NORMAL, 1.5)
+}
+
+/// Inline text â€” emphasis, code, links, math, highlights â€” at a given size, weight and
+/// line height.
+#[allow(clippy::too_many_arguments)]
+fn rich_text_styled(
+    text: &str,
+    size: f32,
+    block: Option<usize>,
+    base: usize,
+    ctx: &RenderCtx,
+    weight: gpui::FontWeight,
+    line_height: f32,
+) -> AnyElement {
+    let theme = ctx.theme;
+    let template = ctx.template;
+    let spans = inline::parse(text);
+    let container = div().text_size(px(size)).line_height(relative(line_height));
+
+    // Inline math cannot live inside one StyledText run, so paragraphs that contain it use a
+    // wrapping row of word-sized text pieces and math boxes instead. Everything else keeps
+    // the faster single-run path below.
+    if spans
+        .iter()
+        .any(|span| span.style.math && span.math.is_some())
+    {
+        let len = spans
+            .iter()
+            .map(|span| {
+                span.math
+                    .as_ref()
+                    .map(|tex| tex.len() + 2)
+                    .unwrap_or(span.text.len())
+            })
+            .sum();
+        let content = flow_content(&spans, size, weight, line_height, ctx);
+        return FlowText::new(
+            content,
+            block,
+            base,
+            len,
+            ctx.selection.clone(),
+            ctx.opener.cloned(),
+            ctx.theme,
+        )
+        .into_any_element();
+    }
+
+    let plain = spans
+        .iter()
+        .all(|span| span.style == inline::Style::default() && span.href.is_none());
+    if plain && block.is_none() {
+        let text: String = spans.iter().map(|span| span.text.as_str()).collect();
+        return container.font_weight(weight).child(text).into_any_element();
+    }
+
+    let display: String = spans.iter().map(|span| span.text.as_str()).collect();
+    let mut links: Vec<(Range<usize>, String)> = Vec::new();
+    let mut offset = 0usize;
+    let mut runs: Vec<TextRun> = Vec::with_capacity(spans.len());
+
+    for span in &spans {
+        let style = span.style;
+        let mut font = if style.code {
+            code_font(&template.font)
+        } else {
+            template.font.clone()
+        };
+        font.weight = if style.bold || style.footnote {
+            gpui::FontWeight::BOLD
+        } else {
+            weight
+        };
+        if style.italic {
+            font.style = FontStyle::Italic;
+        }
+
+        let color = if style.link || style.footnote {
+            theme.accent_text
+        } else if style.code || style.math {
+            theme.code_text
+        } else {
+            template.color
+        };
+
+        if let Some(href) = &span.href {
+            let end = offset + span.text.len();
+            if end > offset {
+                links.push((offset..end, href.clone()));
+            }
+        } else if style.footnote {
+            let end = offset + span.text.len();
+            if end > offset {
+                links.push((offset..end, format!("#fn:{}", span.text.trim())));
+            }
+        }
+        offset += span.text.len();
+
+        if span.text.is_empty() {
+            continue;
+        }
+        runs.push(TextRun {
+            len: span.text.len(),
+            font,
+            color,
+            background_color: if style.highlight {
+                Some(theme.star)
+            } else if style.code {
+                Some(theme.code_bg)
+            } else if style.math {
+                Some(theme.chip)
+            } else {
+                None
+            },
+            underline: style.link.then_some(UnderlineStyle {
+                thickness: px(1.0),
+                color: Some(theme.accent_text),
+                wavy: false,
+            }),
+            strikethrough: style.strikethrough.then_some(StrikethroughStyle {
+                thickness: px(1.0),
+                color: None,
+            }),
+        });
+    }
+
+    let styled = StyledText::new(display.clone()).with_runs(runs);
+
+    match block {
+        Some(block) => container
+            .child(SelectableText {
+                text: styled,
+                block,
+                base,
+                len: display.len(),
+                selection: ctx.selection.clone(),
+                links,
+                opener: ctx.opener.cloned(),
+            })
+            .into_any_element(),
+        None => container.child(styled).into_any_element(),
     }
 }
 
-fn render_embed(
-    target: &str,
-    vault_root: Option<&Path>,
-    depth: usize,
-    theme: Theme,
-    template: &TextRun,
-) -> AnyElement {
-    let Some(root) = vault_root else {
-        return placeholder(target, "no vault root", theme);
+/// Turn inline spans into measured flow pieces. Math spans become atomic boxes; the rest is
+/// split at spaces so the flow layout can break lines between words.
+fn flow_content(
+    spans: &[inline::Inline],
+    size: f32,
+    weight: gpui::FontWeight,
+    line_height: f32,
+    ctx: &RenderCtx,
+) -> Rc<FlowContent> {
+    let theme = ctx.theme;
+    let mut pieces = Vec::new();
+    let mut offset = 0usize;
+
+    for span in spans {
+        if span.style.math {
+            if let Some(tex) = &span.math {
+                if let Some(scene) = ctx.math.get(&(tex.clone(), MathStyle::Inline)).cloned() {
+                    // `block_display` copies math as `$tex$`; keep the piece range in sync.
+                    let display_len = tex.len() + 2;
+                    pieces.push(FlowPiece {
+                        kind: FlowKind::Math {
+                            scene,
+                            color: theme.text,
+                        },
+                        offset,
+                        len: display_len,
+                    });
+                    offset += display_len;
+                    continue;
+                }
+
+                // Unsupported formula: show its source rather than a silent gap, and keep the
+                // same copy length.
+                let display = format!("${tex}$");
+                pieces.push(FlowPiece {
+                    kind: FlowKind::Text {
+                        text: display.clone().into(),
+                        font: ctx.template.font.clone(),
+                        color: theme.warn,
+                        background: Some(theme.chip),
+                        underline: false,
+                        strike: false,
+                        href: None,
+                    },
+                    offset,
+                    len: display.len(),
+                });
+                offset += display.len();
+                continue;
+            }
+        }
+
+        for chunk in span.text.split_inclusive(' ') {
+            if chunk.is_empty() {
+                continue;
+            }
+            let mut font = if span.style.code {
+                code_font(&ctx.template.font)
+            } else {
+                ctx.template.font.clone()
+            };
+            font.weight = if span.style.bold || span.style.footnote {
+                gpui::FontWeight::BOLD
+            } else {
+                weight
+            };
+            if span.style.italic {
+                font.style = FontStyle::Italic;
+            }
+            let color = if span.style.link || span.style.footnote {
+                theme.accent_text
+            } else if span.style.code || span.style.math {
+                theme.code_text
+            } else {
+                ctx.template.color
+            };
+            let background = if span.style.highlight {
+                Some(theme.star)
+            } else if span.style.code {
+                Some(theme.code_bg)
+            } else {
+                None
+            };
+            let href = if span.style.footnote {
+                Some(format!("#fn:{}", span.text.trim()))
+            } else {
+                span.href.clone()
+            };
+            pieces.push(FlowPiece {
+                kind: FlowKind::Text {
+                    text: chunk.to_string().into(),
+                    font,
+                    color,
+                    background,
+                    underline: span.style.link,
+                    strike: span.style.strikethrough,
+                    href,
+                },
+                offset,
+                len: chunk.len(),
+            });
+            offset += chunk.len();
+        }
+    }
+
+    Rc::new(FlowContent {
+        pieces,
+        font_size: size,
+        line_height,
+        link_color: theme.accent_text,
+    })
+}
+
+/// A fenced code block, coloured by the small language lexer in `syntax`, with its
+/// language shown above the code.
+fn code_block(text: &str, language: &str, block: Option<usize>, ctx: &RenderCtx) -> AnyElement {
+    let theme = ctx.theme;
+    let font = code_font(&ctx.template.font);
+    let content = text.strip_suffix('\n').unwrap_or(text);
+    let lines: Vec<&str> = if content.is_empty() {
+        vec![""]
+    } else {
+        content.split('\n').collect()
     };
 
+    let mut rendered: Vec<AnyElement> = Vec::with_capacity(lines.len());
+    let mut base = 0usize;
+    for line in &lines {
+        let spans = syntax::code_spans(line, language);
+        let display: String = if spans.is_empty() {
+            (*line).to_string()
+        } else {
+            spans.iter().map(|span| span.text.as_str()).collect()
+        };
+
+        let runs: Vec<TextRun> = if spans.is_empty() {
+            vec![TextRun {
+                len: display.len(),
+                font: font.clone(),
+                color: theme.code_text,
+                background_color: None,
+                underline: None,
+                strikethrough: None,
+            }]
+        } else {
+            spans
+                .iter()
+                .map(|span| TextRun {
+                    len: span.text.len(),
+                    font: font.clone(),
+                    color: theme.code_color(span.kind),
+                    background_color: None,
+                    underline: None,
+                    strikethrough: None,
+                })
+                .collect()
+        };
+
+        let styled = StyledText::new(display.clone()).with_runs(runs);
+        let piece: AnyElement = match block {
+            Some(block) => SelectableText {
+                text: styled,
+                block,
+                base,
+                len: display.len(),
+                selection: ctx.selection.clone(),
+                links: Vec::new(),
+                opener: ctx.opener.cloned(),
+            }
+            .into_any_element(),
+            None => div().whitespace_nowrap().child(styled).into_any_element(),
+        };
+
+        rendered.push(div().whitespace_nowrap().child(piece).into_any_element());
+        base += display.len() + 1;
+    }
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    text.hash(&mut hasher);
+    language.hash(&mut hasher);
+    let id = format!("reading-code-{:x}", hasher.finish());
+
+    let language = language.trim();
+    div()
+        .id(ElementId::Name(id.clone().into()))
+        .w_full()
+        .bg(theme.code_bg)
+        .border_1()
+        .border_color(theme.border)
+        .rounded_md()
+        .p_3()
+        .text_size(px(13.0))
+        .line_height(relative(1.45))
+        .text_color(theme.code_text)
+        .flex()
+        .flex_col()
+        .when(!language.is_empty(), |d| {
+            d.child(
+                div()
+                    .flex()
+                    .justify_between()
+                    .pb_2()
+                    .text_xs()
+                    .text_color(theme.muted)
+                    .child(language.to_string())
+                    .child(format!("{} lines", lines.len())),
+            )
+        })
+        .child(
+            div()
+                .id(ElementId::Name(format!("{id}-scroll").into()))
+                .flex()
+                .flex_col()
+                .overflow_x_scroll()
+                .children(rendered),
+        )
+        .into_any_element()
+}
+
+fn code_font(base: &gpui::Font) -> gpui::Font {
+    let mut font = base.clone();
+    font.family = "Cascadia Mono".into();
+    font.fallbacks = Some(gpui::FontFallbacks(std::sync::Arc::new(vec![
+        "Consolas".to_string(),
+        "DejaVu Sans Mono".to_string(),
+        "Liberation Mono".to_string(),
+        "Menlo".to_string(),
+        "monospace".to_string(),
+    ])));
+    font
+}
+
+/// A GFM pipe table, with the same inline math/highlight treatment as prose.
+fn render_table(
+    align: &[Align],
+    headers: &[String],
+    rows: &[Vec<String>],
+    block: Option<usize>,
+    ctx: &RenderCtx,
+) -> AnyElement {
+    let theme = ctx.theme;
+
+    // Cell bases mirror `block_display`: cells joined by tabs, rows by newlines.
+    let mut bases: Vec<Vec<usize>> = Vec::new();
+    let mut offset = 0usize;
+    for row in std::iter::once(headers).chain(rows.iter().map(Vec::as_slice)) {
+        let mut row_bases = Vec::with_capacity(row.len());
+        for (index, cell) in row.iter().enumerate() {
+            row_bases.push(offset);
+            offset += inline_display(cell).len();
+            if index + 1 < row.len() {
+                offset += 1;
+            }
+        }
+        offset += 1;
+        bases.push(row_bases);
+    }
+
+    let empty: Vec<usize> = Vec::new();
+    let header = table_row(
+        headers,
+        align,
+        block,
+        bases.first().unwrap_or(&empty),
+        ctx,
+        true,
+    );
+    let body: Vec<AnyElement> = rows
+        .iter()
+        .enumerate()
+        .map(|(index, row)| {
+            table_row(
+                row,
+                align,
+                block,
+                bases.get(index + 1).unwrap_or(&empty),
+                ctx,
+                false,
+            )
+        })
+        .collect();
+
+    div()
+        .w_full()
+        .border_1()
+        .border_color(theme.border)
+        .rounded_md()
+        .overflow_hidden()
+        .flex()
+        .flex_col()
+        .child(header)
+        .children(body)
+        .into_any_element()
+}
+
+fn table_row(
+    cells: &[String],
+    align: &[Align],
+    block: Option<usize>,
+    bases: &[usize],
+    ctx: &RenderCtx,
+    header: bool,
+) -> AnyElement {
+    let theme = ctx.theme;
+    let mut row = div()
+        .w_full()
+        .flex()
+        .flex_row()
+        .border_b_1()
+        .border_color(theme.border);
+    if header {
+        row = row.bg(theme.panel_alt);
+    }
+
+    let rendered: Vec<AnyElement> = cells
+        .iter()
+        .enumerate()
+        .map(|(index, cell)| {
+            let mut cell_element = div()
+                .flex_1()
+                .min_w(px(0.0))
+                .px_3()
+                .py_2()
+                .border_r_1()
+                .border_color(theme.border);
+            cell_element = match align.get(index) {
+                Some(Align::Center) => cell_element.text_center(),
+                Some(Align::Right) => cell_element.text_right(),
+                _ => cell_element.text_left(),
+            };
+            cell_element
+                .child(rich_text_styled(
+                    cell,
+                    14.0,
+                    block,
+                    bases.get(index).copied().unwrap_or(0),
+                    ctx,
+                    if header {
+                        gpui::FontWeight::BOLD
+                    } else {
+                        gpui::FontWeight::NORMAL
+                    },
+                    1.4,
+                ))
+                .into_any_element()
+        })
+        .collect();
+
+    row.children(rendered).into_any_element()
+}
+
+fn render_embed(target: &str, ctx: &RenderCtx) -> AnyElement {
+    let theme = ctx.theme;
+    let Some(root) = ctx.vault_root else {
+        return placeholder(target, "no vault root", theme);
+    };
+    let attachments = ctx.attachments;
+
     if is_image(target) {
-        let path = root.join(target);
-        return if path.exists() {
-            img(path)
+        return match resolve_file(root, attachments, target) {
+            Some(path) => img(path)
                 .max_w(px(480.0))
                 .max_h(px(360.0))
-                .into_any_element()
-        } else {
-            placeholder(target, "image not found", theme)
+                .into_any_element(),
+            None => placeholder(target, "image not found", theme),
         };
     }
 
-    if depth >= MAX_EMBED_DEPTH {
+    if is_attachment(target) {
+        return match resolve_file(root, attachments, target) {
+            Some(_) => placeholder(target, "attachment â€” not previewed", theme),
+            None => placeholder(target, "attachment not found", theme),
+        };
+    }
+
+    if ctx.depth >= MAX_EMBED_DEPTH {
         return placeholder(target, "embed depth limit", theme);
     }
 
-    match std::fs::read_to_string(resolve_note(root, target)) {
+    match std::fs::read_to_string(resolve_note(root, attachments, target)) {
         Ok(text) => div()
             .border_l_1()
             .border_color(theme.border)
             .pl_3()
-            .child(reading_view(&text, Some(root), depth + 1, theme, template))
+            .child(reading_column(&text, ctx))
             .into_any_element(),
         Err(_) => placeholder(target, "note not found", theme),
     }
+}
+
+/// Resolve a link target to a file: the direct path first, then the vault-wide name index.
+fn resolve_file(root: &Path, attachments: Option<&Attachments>, target: &str) -> Option<PathBuf> {
+    let direct = root.join(target);
+    if direct.is_file() {
+        return Some(direct);
+    }
+    let resolved = attachments?.resolve(target)?;
+    let path = root.join(resolved);
+    path.is_file().then_some(path)
 }
 
 fn is_image(target: &str) -> bool {
@@ -222,13 +1508,27 @@ fn is_image(target: &str) -> bool {
     )
 }
 
-fn resolve_note(root: &Path, target: &str) -> PathBuf {
-    let candidate = root.join(target);
-    if candidate.extension().is_some() {
-        candidate
-    } else {
-        root.join(format!("{target}.md"))
+/// A non-note, non-image file: PDF, audio, video.
+fn is_attachment(target: &str) -> bool {
+    matches!(
+        Path::new(target)
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase())
+            .as_deref(),
+        Some("pdf" | "mp3" | "wav" | "ogg" | "flac" | "mp4" | "webm" | "mov" | "m4a")
+    )
+}
+
+fn resolve_note(root: &Path, attachments: Option<&Attachments>, target: &str) -> PathBuf {
+    if let Some(path) = resolve_file(root, attachments, target) {
+        return path;
     }
+    let with_ext = format!("{target}.md");
+    if let Some(path) = resolve_file(root, attachments, &with_ext) {
+        return path;
+    }
+    root.join(with_ext)
 }
 
 fn placeholder(target: &str, reason: &str, theme: Theme) -> AnyElement {
@@ -241,4 +1541,453 @@ fn placeholder(target: &str, reason: &str, theme: Theme) -> AnyElement {
         .text_color(theme.muted)
         .child(format!("embed: {target} ({reason})"))
         .into_any_element()
+}
+
+/// The text a block contributes to a reading-mode selection.
+fn block_display(block: &Block) -> String {
+    match block {
+        Block::Heading { text, .. }
+        | Block::Paragraph(text)
+        | Block::Quote(text)
+        | Block::ListItem { text, .. } => inline_display(text),
+        Block::Code { text, .. } => text.strip_suffix('\n').unwrap_or(text).to_string(),
+        Block::Math { tex } => format!("$${tex}$$"),
+        Block::Callout { title, text, .. } => {
+            let mut out = inline_display(title);
+            if !text.trim().is_empty() {
+                out.push('\n');
+                out.push_str(&inline_display(text));
+            }
+            out
+        }
+        Block::Table { headers, rows, .. } => {
+            let mut out = String::new();
+            let mut first_row = true;
+            for row in std::iter::once(headers).chain(rows.iter()) {
+                if !first_row {
+                    out.push('\n');
+                }
+                first_row = false;
+                for (index, cell) in row.iter().enumerate() {
+                    if index > 0 {
+                        out.push('\t');
+                    }
+                    out.push_str(&inline_display(cell));
+                }
+            }
+            out
+        }
+        Block::Footnote { id, text } => format!("[{id}] {text}"),
+        Block::Rule | Block::Embed { .. } => String::new(),
+    }
+}
+
+/// The text `inline::parse` shows, with markdown removed. Math keeps its TeX source so
+/// copying a selection preserves `$…$` for pasting back into a note.
+fn inline_display(text: &str) -> String {
+    inline::parse(text)
+        .into_iter()
+        .map(|span| match span.math {
+            Some(tex) => format!("${tex}$"),
+            None => span.text,
+        })
+        .collect()
+}
+
+/// A `StyledText` that can be drag-selected and whose links are clickable.
+///
+/// Reading blocks are laid out as separate elements, so each text piece reports its own
+/// slice of a document-wide [`ReadSelection`]; `base` is the piece's byte offset within
+/// its block, which lets a selection run across wrapped code lines and callout titles.
+struct SelectableText {
+    text: StyledText,
+    block: usize,
+    base: usize,
+    len: usize,
+    selection: Rc<RefCell<ReadSelection>>,
+    links: Vec<(Range<usize>, String)>,
+    opener: Option<LinkOpener>,
+}
+
+impl IntoElement for SelectableText {
+    type Element = Self;
+
+    fn into_element(self) -> Self::Element {
+        self
+    }
+}
+
+impl Element for SelectableText {
+    type RequestLayoutState = ();
+    type PrepaintState = Hitbox;
+
+    fn id(&self) -> Option<ElementId> {
+        None
+    }
+
+    fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        id: Option<&GlobalElementId>,
+        inspector_id: Option<&InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (LayoutId, ()) {
+        self.text.request_layout(id, inspector_id, window, cx)
+    }
+
+    fn prepaint(
+        &mut self,
+        id: Option<&GlobalElementId>,
+        inspector_id: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        state: &mut (),
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Hitbox {
+        self.text
+            .prepaint(id, inspector_id, bounds, state, window, cx);
+        window.insert_hitbox(bounds, HitboxBehavior::Normal)
+    }
+
+    fn paint(
+        &mut self,
+        id: Option<&GlobalElementId>,
+        inspector_id: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        state: &mut (),
+        hitbox: &mut Hitbox,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let theme = *cx.global::<Theme>();
+        let layout = self.text.layout().clone();
+        let (block, base, len) = (self.block, self.base, self.len);
+
+        // Mouse listeners must be registered during paint, not prepaint.
+        let down_selection = self.selection.clone();
+        let down_layout = layout.clone();
+        window.on_mouse_event(
+            move |event: &MouseDownEvent, phase, window: &mut Window, _cx: &mut App| {
+                if phase != DispatchPhase::Bubble || event.button != MouseButton::Left {
+                    return;
+                }
+                if !bounds.contains(&event.position) {
+                    return;
+                }
+                let Ok(index) = down_layout.index_for_position(event.position) else {
+                    return;
+                };
+                let point = ReadPoint {
+                    block,
+                    offset: base + index.min(len),
+                };
+                let mut selection = down_selection.borrow_mut();
+                selection.anchor = Some(point);
+                selection.head = Some(point);
+                selection.down = Some(event.position);
+                selection.dragging = true;
+                selection.moved = false;
+                drop(selection);
+                window.refresh();
+            },
+        );
+
+        let move_selection = self.selection.clone();
+        let move_layout = layout.clone();
+        window.on_mouse_event(
+            move |event: &MouseMoveEvent, phase, window: &mut Window, _cx: &mut App| {
+                if phase != DispatchPhase::Bubble {
+                    return;
+                }
+                let mut selection = move_selection.borrow_mut();
+                if !selection.dragging {
+                    return;
+                }
+                // Vertical hit-testing only: dragging past the end of a line still
+                // extends the selection to that line's end.
+                if event.position.y < bounds.top() - px(2.0)
+                    || event.position.y > bounds.bottom() + px(2.0)
+                {
+                    return;
+                }
+                let index = match move_layout.index_for_position(event.position) {
+                    Ok(index) | Err(index) => index,
+                };
+                let point = ReadPoint {
+                    block,
+                    offset: base + index.min(len),
+                };
+                if selection.head != Some(point) {
+                    selection.head = Some(point);
+                    selection.moved = true;
+                    drop(selection);
+                    window.refresh();
+                }
+            },
+        );
+
+        let up_selection = self.selection.clone();
+        let up_links = self.links.clone();
+        let up_opener = self.opener.clone();
+        window.on_mouse_event(
+            move |event: &MouseUpEvent, phase, window: &mut Window, cx: &mut App| {
+                if phase != DispatchPhase::Bubble {
+                    return;
+                }
+                let mut selection = up_selection.borrow_mut();
+                if !selection.dragging {
+                    return;
+                }
+                selection.dragging = false;
+                // A click with a little jitter is still a click on the link under it.
+                let clicked = match selection.down {
+                    Some(down) => (event.position - down).magnitude() < 4.0,
+                    None => !selection.moved,
+                };
+                let head = selection.head;
+                if clicked {
+                    selection.clear();
+                }
+                drop(selection);
+
+                if clicked {
+                    if let Some(head) = head {
+                        let local = head.offset.saturating_sub(base);
+                        if let Some((_, target)) =
+                            up_links.iter().find(|(range, _)| range.contains(&local))
+                        {
+                            if let Some(opener) = &up_opener {
+                                opener(target, window, cx);
+                            }
+                        }
+                    }
+                }
+                window.refresh();
+            },
+        );
+
+        if let Some((start, end)) = self.selection.borrow().ordered() {
+            for quad in selection_quads(
+                &layout,
+                self.block,
+                self.base,
+                self.len,
+                start,
+                end,
+                theme.selection,
+            ) {
+                window.paint_quad(quad);
+            }
+        }
+
+        if !self.links.is_empty() {
+            if let Ok(index) = layout.index_for_position(window.mouse_position()) {
+                if self.links.iter().any(|(range, _)| range.contains(&index)) {
+                    window.set_cursor_style(CursorStyle::PointingHand, hitbox);
+                }
+            }
+        }
+
+        let mut prepaint = ();
+        self.text
+            .paint(id, inspector_id, bounds, state, &mut prepaint, window, cx)
+    }
+}
+
+/// Highlight quads for the part of `[start, end)` that falls inside this text piece.
+fn selection_quads(
+    layout: &TextLayout,
+    block: usize,
+    base: usize,
+    len: usize,
+    start: ReadPoint,
+    end: ReadPoint,
+    color: gpui::Hsla,
+) -> Vec<PaintQuad> {
+    if start == end || end.block < block || start.block > block {
+        return Vec::new();
+    }
+
+    let piece_end = base + len;
+    let from = if start.block == block {
+        start.offset.max(base)
+    } else {
+        base
+    };
+    let to = if end.block == block {
+        end.offset.min(piece_end)
+    } else {
+        piece_end
+    };
+    if from >= to {
+        return Vec::new();
+    }
+
+    let (Some(p0), Some(p1)) = (
+        layout.position_for_index(from - base),
+        layout.position_for_index(to - base),
+    ) else {
+        return Vec::new();
+    };
+
+    let height = layout.line_height();
+    let bounds = layout.bounds();
+    let mut quads = Vec::new();
+
+    if f32::from(p0.y - p1.y).abs() < 0.5 {
+        quads.push(fill(
+            Bounds::from_corners(point(p0.x, p0.y), point(p1.x, p1.y + height)),
+            color,
+        ));
+    } else {
+        quads.push(fill(
+            Bounds::from_corners(point(p0.x, p0.y), point(bounds.right(), p0.y + height)),
+            color,
+        ));
+        let mut y = p0.y + height;
+        while y + px(0.5) < p1.y {
+            quads.push(fill(
+                Bounds::from_corners(point(bounds.left(), y), point(bounds.right(), y + height)),
+                color,
+            ));
+            y += height;
+        }
+        if p1.x > bounds.left() + px(0.5) {
+            quads.push(fill(
+                Bounds::from_corners(point(bounds.left(), p1.y), point(p1.x, p1.y + height)),
+                color,
+            ));
+        }
+    }
+
+    quads
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reading_cache_reparses_only_when_the_version_changes() {
+        let mut cache = ReadingCache::new();
+        assert!(cache.needs_update((1, 0)));
+
+        cache.update((1, 0), "# Title\n\nBody", None);
+        assert!(!cache.needs_update((1, 0)));
+        assert!(cache.blocks.len() >= 2);
+        assert_eq!(cache.list_state.item_count(), cache.blocks.len());
+
+        let before = cache.blocks.len();
+        cache.update((1, 1), "# Title\n\nBody\n\nMore", None);
+        assert!(cache.blocks.len() > before);
+        assert_eq!(cache.list_state.item_count(), cache.blocks.len());
+    }
+
+    #[test]
+    fn reading_cache_resets_for_a_new_document() {
+        let mut cache = ReadingCache::new();
+        cache.update((1, 4), "# Title\n\nBody", None);
+        assert!(!cache.blocks.is_empty());
+
+        cache.update((2, 0), "", None);
+        assert!(cache.blocks.is_empty());
+        assert_eq!(cache.list_state.item_count(), 0);
+    }
+
+    #[test]
+    fn selection_spans_blocks_and_ignores_markup() {
+        let mut cache = ReadingCache::new();
+        cache.update((1, 0), "One **two**\n\n`Three` four\n", None);
+        cache.select_all();
+
+        assert_eq!(
+            cache.selected_text().as_deref(),
+            Some("One two\nThree four")
+        );
+        let stats = cache.selection_stats().unwrap();
+        assert_eq!(stats.words, 4);
+        assert_eq!(stats.lines, 2);
+    }
+
+    #[test]
+    fn footnote_references_are_grouped_for_the_picker() {
+        let mut cache = ReadingCache::new();
+        cache.update((1, 0), "One[^1].\n\nTwo[^1].\n\n[^1]: the note\n", None);
+
+        let refs = cache.footnote_refs.borrow();
+        let one = refs.get("1").expect("footnote 1 references");
+        assert_eq!(one.len(), 2, "both paragraphs cite the same footnote");
+        assert!(one[0].snippet.contains("One"));
+        assert!(one[1].snippet.contains("Two"));
+
+        let defs = cache.footnote_defs.borrow();
+        assert!(defs.contains_key("1"));
+
+        let mut popup = FootnotePopup::new(
+            cache.footnote_refs.clone(),
+            cache.footnote_defs.clone(),
+            ListState::new(0, ListAlignment::Top, px(600.0)),
+        );
+        popup.show("1");
+        let (id, options, definition) = popup.open.as_ref().expect("picker opened");
+        assert_eq!(id, "1");
+        assert_eq!(options.len(), 2);
+        assert!(definition.is_some());
+    }
+
+    #[test]
+    fn copying_preserves_tex_source() {
+        let mut cache = ReadingCache::new();
+        cache.update(
+            (1, 0),
+            "Energy $E = mc^2$ and $\\frac{a}{b}$.\n\n$$\\int_0^1 x\\,dx$$\n",
+            None,
+        );
+        cache.select_all();
+
+        let text = cache.selected_text().unwrap();
+        assert!(text.contains("$E = mc^2$"), "got {text:?}");
+        assert!(text.contains("$\\frac{a}{b}$"), "got {text:?}");
+        assert!(text.contains("$$\\int_0^1 x\\,dx$$"), "got {text:?}");
+        assert!(
+            !text.contains("mc²"),
+            "copy must not use the transliteration"
+        );
+    }
+
+    #[test]
+    fn inline_display_keeps_math_delimiters() {
+        assert_eq!(inline_display("a $x^2$ b"), "a $x^2$ b");
+    }
+
+    #[test]
+    fn selection_clears_when_the_document_changes() {
+        let mut cache = ReadingCache::new();
+        cache.update((1, 0), "Body\n", None);
+        cache.select_all();
+        assert!(cache.selected_text().is_some());
+
+        cache.update((1, 1), "Body\n\nMore\n", None);
+        assert_eq!(cache.selected_text(), None);
+    }
+
+    #[test]
+    fn block_text_is_the_display_text() {
+        let block = Block::Paragraph("**bold** and `code`".to_string());
+        assert_eq!(block_display(&block), "bold and code");
+    }
+
+    #[test]
+    fn table_text_joins_cells_with_tabs() {
+        let block = Block::Table {
+            align: Vec::new(),
+            headers: vec!["a".to_string(), "b".to_string()],
+            rows: vec![vec!["1".to_string(), "2".to_string()]],
+        };
+        assert_eq!(block_display(&block), "a\tb\n1\t2");
+    }
 }

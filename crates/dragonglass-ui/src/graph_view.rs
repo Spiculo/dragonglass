@@ -130,7 +130,9 @@ impl GraphView {
 
         if let Some((id, _)) = best {
             let relative = self.graph.nodes[id].relative.clone();
-            let _ = self.app.update(cx, |app, cx| app.open_note(&relative, cx));
+            let _ = self
+                .app
+                .update(cx, |app, cx| app.open_note(&relative, window, cx));
             cx.notify();
         }
     }
@@ -169,7 +171,7 @@ impl Render for GraphView {
                         "graph: {count} notes / {edges} links · depth {}",
                         self.depth
                     ))
-                    .child("click a node to open · Esc to close · colours group by folder"),
+                    .child("click a node to open · Esc to close · dashed = relations · colours group by folder"),
             )
             .child(
                 div()
@@ -267,25 +269,39 @@ impl Element for GraphCanvas {
             )
         };
 
-        // Edges first, so nodes sit on top.
-        let mut edges = PathBuilder::stroke(px(1.0));
-        let mut drew_edge = false;
+        // Edges first, so nodes sit on top. Plain links are solid; frontmatter relations are
+        // dashed and tinted, so the relation graph reads differently from the link graph.
+        let mut links = PathBuilder::stroke(px(1.0));
+        let mut relations = PathBuilder::stroke(px(1.0)).dash_array(&[px(4.0), px(3.0)]);
+        let mut drew_link = false;
+        let mut drew_relation = false;
         for edge in &graph_edges {
             let (ax, ay) = canvas_position(edge.from);
             let (bx, by) = canvas_position(edge.to);
             let a = to_screen(ax, ay);
             let b = to_screen(bx, by);
-            if !drew_edge {
-                edges.move_to(a);
-                drew_edge = true;
+
+            let (path, drew) = if edge.is_relation() {
+                (&mut relations, &mut drew_relation)
             } else {
-                edges.line_to(a);
+                (&mut links, &mut drew_link)
+            };
+            if !*drew {
+                path.move_to(a);
+                *drew = true;
+            } else {
+                path.line_to(a);
             }
-            edges.line_to(b);
+            path.line_to(b);
         }
-        if drew_edge {
-            if let Ok(path) = edges.build() {
+        if drew_link {
+            if let Ok(path) = links.build() {
                 window.paint_path(path, theme.border);
+            }
+        }
+        if drew_relation {
+            if let Ok(path) = relations.build() {
+                window.paint_path(path, theme.accent_text);
             }
         }
 

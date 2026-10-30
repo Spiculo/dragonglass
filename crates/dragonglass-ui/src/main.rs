@@ -4,18 +4,29 @@
 //! provides a quick switcher (Ctrl+O), full-text search (Ctrl+Shift+F) and a git menu
 //! (Ctrl+G).
 
+// Release builds are a normal GUI app on Windows: no console window behind the editor.
+#![cfg_attr(
+    all(not(debug_assertions), target_os = "windows"),
+    windows_subsystem = "windows"
+)]
+
 mod editor;
+mod flow;
 mod graph_view;
+mod math_element;
 mod preview_window;
 mod reading;
 mod theme;
+mod vault_picker;
 
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 
 use dragonglass_core::frontmatter::{Property, PropertyValue};
 use dragonglass_core::{
-    bookmarks, config, conflict, git, graph, keymap, markdown, query, search, storage, store,
-    templates, update, uri, workspace, NodeKind, Note, NoteRef, TreeNode, Vault,
+    bookmarks, config, conflict, diff, git, graph, keymap, lint, markdown, query, relations,
+    resolve, search, session, shared, stats, storage, store, templates, tree, update, uri, vaults,
+    versions, workspace, NodeKind, Note, NoteRef, TreeNode, Vault,
 };
 
 /// Actions the hotkey editor can rebind: `(action, default key, label)`.
@@ -24,6 +35,7 @@ const HOTKEYS: &[(&str, &str, &str)] = &[
     ("OpenSwitcher", "ctrl+o", "Quick switcher"),
     ("OpenSearch", "ctrl+shift+f", "Search"),
     ("OpenGraph", "ctrl+shift+g", "Graph view"),
+    ("OpenRelations", "ctrl+shift+r", "Document relations"),
     ("OpenDaily", "ctrl+shift+d", "Daily note"),
     ("OpenWeekly", "ctrl+shift+w", "Weekly note"),
     ("OpenMonthly", "ctrl+shift+m", "Monthly note"),
@@ -32,6 +44,16 @@ const HOTKEYS: &[(&str, &str, &str)] = &[
     ("OpenGit", "ctrl+g", "Git"),
     ("ToggleTheme", "ctrl+shift+l", "Toggle theme"),
     ("NewWindow", "ctrl+n", "New window"),
+    ("ToggleSideBySide", "ctrl-alt+1", "Read/write side by side"),
+    ("DetachTab", "ctrl-alt+n", "Move tab to new window"),
+    (
+        "ToggleSplitEditor",
+        "ctrl-alt+2",
+        "Two editors side by side",
+    ),
+    ("CloseTab", "ctrl+w", "Close tab"),
+    ("NextTab", "ctrl-tab", "Next tab"),
+    ("PrevTab", "ctrl-shift-tab", "Previous tab"),
 ];
 
 /// Bind a saved override by action name.
@@ -41,6 +63,7 @@ fn bind_named(cx: &mut App, key: &str, action: &str) {
         "OpenSwitcher" => cx.bind_keys([KeyBinding::new(key, OpenSwitcher, None)]),
         "OpenSearch" => cx.bind_keys([KeyBinding::new(key, OpenSearch, None)]),
         "OpenGraph" => cx.bind_keys([KeyBinding::new(key, OpenGraph, None)]),
+        "OpenRelations" => cx.bind_keys([KeyBinding::new(key, OpenRelations, None)]),
         "OpenDaily" => cx.bind_keys([KeyBinding::new(key, OpenDaily, None)]),
         "OpenWeekly" => cx.bind_keys([KeyBinding::new(key, OpenWeekly, None)]),
         "OpenMonthly" => cx.bind_keys([KeyBinding::new(key, OpenMonthly, None)]),
@@ -49,17 +72,25 @@ fn bind_named(cx: &mut App, key: &str, action: &str) {
         "OpenGit" => cx.bind_keys([KeyBinding::new(key, OpenGit, None)]),
         "ToggleTheme" => cx.bind_keys([KeyBinding::new(key, ToggleTheme, None)]),
         "NewWindow" => cx.bind_keys([KeyBinding::new(key, NewWindow, None)]),
+        "DetachTab" => cx.bind_keys([KeyBinding::new(key, DetachTab, None)]),
+        "ToggleSideBySide" => cx.bind_keys([KeyBinding::new(key, ToggleSideBySide, None)]),
+        "ToggleSplitEditor" => cx.bind_keys([KeyBinding::new(key, ToggleSplitEditor, None)]),
+        "CloseTab" => cx.bind_keys([KeyBinding::new(key, CloseTab, None)]),
+        "NextTab" => cx.bind_keys([KeyBinding::new(key, NextTab, None)]),
+        "PrevTab" => cx.bind_keys([KeyBinding::new(key, PrevTab, None)]),
         _ => {}
     }
 }
 use dragonglass_plugins as plugins;
 use editor::Editor;
 use gpui::{
-    actions, div, prelude::*, px, size, AnyElement, App, Application, Bounds, Context, ElementId,
-    FocusHandle, Focusable, KeyBinding, KeyDownEvent, MouseButton, Render, Window, WindowBounds,
-    WindowOptions,
+    actions, div, prelude::*, px, size, uniform_list, AnyElement, App, Application, Bounds,
+    Context, CursorStyle, ElementId, Entity, FocusHandle, Focusable, KeyBinding, KeyDownEvent,
+    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Render, WeakEntity, Window,
+    WindowBounds, WindowOptions,
 };
 use graph_view::GraphView;
+use reading::ReadingCache;
 use theme::Theme;
 
 actions!(
@@ -74,12 +105,19 @@ actions!(
         OpenCommands,
         ToggleTheme,
         OpenGraph,
+        OpenRelations,
         OpenWeekly,
         OpenMonthly,
         CloseQuery,
         CloseOverlay,
         RunQuery,
-        NewWindow
+        NewWindow,
+        ToggleSideBySide,
+        DetachTab,
+        ToggleSplitEditor,
+        CloseTab,
+        NextTab,
+        PrevTab
     ]
 );
 
@@ -98,6 +136,15 @@ enum SwitcherMode {
     HotkeyMenu,
     HotkeyCapture,
     GraphFilterInput,
+    VersionMenu,
+    TemplateMenu,
+    TemplateNewMenu,
+    SharedMenu,
+    SharedEditMenu,
+    ReviewMenu,
+    NewNoteName,
+    SharedName,
+    RelationInput,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -120,6 +167,7 @@ enum CommandId {
     LoadWorkspace,
     UserTheme(usize),
     NewWindow,
+    OpenVault,
     Hotkeys,
     GraphFilter,
     GraphDepth,
@@ -127,6 +175,28 @@ enum CommandId {
     TogglePreview,
     DetachPreview,
     Plugin(usize),
+    CloseTab,
+    NextTab,
+    PrevTab,
+    Versions,
+    SaveVersionA,
+    SaveVersionB,
+    InsertTemplate,
+    NewFromTemplate,
+    InsertShared,
+    EditShared,
+    ExtractShared,
+    ReloadNote,
+    ReviewDocument,
+    Relations,
+    RelationGraph,
+    MoveBlockUp,
+    MoveBlockDown,
+    DuplicateBlock,
+    DeleteBlock,
+    AddRelation,
+    ToggleSplitEditor,
+    DetachTab,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -146,6 +216,15 @@ enum Item {
     Command(CommandId),
     Workspace(String),
     Hotkey(String),
+    VersionSave(String),
+    VersionCompare { left: Option<String>, right: String },
+    VersionPromote(String),
+    VersionDelete(String),
+    Template(String),
+    TemplateNew(String),
+    Shared(String),
+    SharedEdit(String),
+    Issue(usize),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -171,12 +250,175 @@ struct Switcher {
     capture_action: Option<String>,
 }
 
+/// One open note. Each tab owns its editor, so cursor, scroll and unsaved edits are
+/// preserved when switching between notes.
+struct Tab {
+    relative: Option<String>,
+    editor: Entity<Editor>,
+    title: String,
+    /// Whether the file changed on disk while this tab has unsaved edits.
+    conflict: bool,
+}
+
+/// The value carried while dragging a tab between the tab bar, editor panes and windows.
+#[derive(Clone)]
+struct TabDrag {
+    source: WeakEntity<DragonGlassApp>,
+    index: usize,
+    title: String,
+}
+
+/// A small floating tab rendered under the cursor during a drag.
+struct DragGhost {
+    title: String,
+}
+
+impl Render for DragGhost {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = *cx.global::<Theme>();
+        div()
+            .px_3()
+            .py_1()
+            .rounded_md()
+            .bg(theme.header)
+            .border_1()
+            .border_color(theme.border)
+            .text_sm()
+            .text_color(theme.text)
+            .child(self.title.clone())
+    }
+}
+
+/// Where a dragged tab was released.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TabDrop {
+    Merge,
+    Split(SplitSide),
+    Detach,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SplitSide {
+    Left,
+    Right,
+    Above,
+    Below,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SplitAxis {
+    Horizontal,
+    Vertical,
+}
+
+/// Which side panel a splitter drag is resizing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResizePanel {
+    Sidebar,
+    Outline,
+    Relations,
+}
+
+/// An in-progress splitter drag.
+#[derive(Clone, Copy)]
+struct ResizeDrag {
+    panel: ResizePanel,
+    start_x: f32,
+    start_width: f32,
+    last_width: f32,
+    last_tick: std::time::Instant,
+}
+
+/// A draggable splitter between a side panel and the editor.
+fn resize_handle(panel: ResizePanel, theme: Theme, cx: &mut Context<DragonGlassApp>) -> AnyElement {
+    div()
+        .id(ElementId::Name(format!("resize-{panel:?}").into()))
+        .w(px(5.0))
+        .h_full()
+        .flex_shrink_0()
+        .cursor(CursorStyle::ResizeLeftRight)
+        .hover(move |style| style.bg(theme.accent))
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |this, event: &MouseDownEvent, _window, cx| {
+                let start_width = match panel {
+                    ResizePanel::Sidebar => this.sidebar_width,
+                    ResizePanel::Outline => this.outline_width,
+                    ResizePanel::Relations => this.relations_width,
+                };
+                this.resize = Some(ResizeDrag {
+                    panel,
+                    start_x: f32::from(event.position.x),
+                    start_width,
+                    last_width: start_width,
+                    last_tick: std::time::Instant::now(),
+                });
+                this.set_editors_resizing(true, cx);
+                cx.notify();
+            }),
+        )
+        .into_any_element()
+}
+
+/// Sanitize a vault-relative path for a newly created note.
+fn sanitize_relative(path: &str) -> String {
+    path.split('/')
+        .filter(|segment| !segment.is_empty() && *segment != "." && *segment != "..")
+        .map(|segment| {
+            segment
+                .chars()
+                .map(|ch| match ch {
+                    ':' | '*' | '?' | '"' | '<' | '>' | '|' | '\\' => '-',
+                    other => other,
+                })
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+fn tab_title(relative: &str) -> String {
+    relative
+        .rsplit('/')
+        .next()
+        .unwrap_or(relative)
+        .trim_end_matches(".md")
+        .trim_end_matches(".markdown")
+        .to_string()
+}
+
 struct DragonGlassApp {
     editor: gpui::Entity<Editor>,
+    /// All open notes; `editor` is always the active tab's editor.
+    tabs: Vec<Tab>,
+    active_tab: usize,
+    /// Additional tabs shown beside the active editor, in layout order.
+    split_tabs: Vec<usize>,
+    /// Whether the split panes are side-by-side or stacked.
+    split_axis: SplitAxis,
+    /// A detached window that shows only its editor, with none of the app chrome.
+    minimal: bool,
+    /// Set when a minimal window has given its last tab away; it closes on the next frame.
+    close_requested: bool,
+    /// The tab currently being dragged, if any.
+    dragging: Option<TabDrag>,
+    /// Bumped when the active editor changes so document-derived caches invalidate even
+    /// when two editors share the same buffer revision.
+    cache_epoch: u64,
     vault_root: PathBuf,
     tree: TreeNode,
+    /// Flattened tree rows for the sidebar. Rebuilt when the vault changes, never in
+    /// `render`, so scrolling does not recursively walk the tree each frame.
+    file_rows: Rc<Vec<Row>>,
     note_refs: Vec<NoteRef>,
+    /// Link resolution for the whole vault: paths, stems, frontmatter names and aliases.
+    note_index: resolve::NoteIndex,
     properties: Vec<Property>,
+    /// Outline headings, cached per document version so scrolling never re-parses the note.
+    headings: Rc<Vec<markdown::Heading>>,
+    headings_version: (u64, u64),
+    /// Virtualized split-preview content.
+    preview_content: ReadingCache,
     bookmarks: Vec<String>,
     theme: Theme,
     conflict: bool,
@@ -186,7 +428,23 @@ struct DragonGlassApp {
     full_graph: graph::Graph,
     graph_view: Option<gpui::Entity<GraphView>>,
     show_graph: bool,
-    query_results: Vec<query::Row>,
+    relations: Vec<relations::NoteRelations>,
+    show_relations: bool,
+    /// Panel widths in pixels, adjustable by dragging the splitters.
+    sidebar_width: f32,
+    outline_width: f32,
+    relations_width: f32,
+    resize: Option<ResizeDrag>,
+    show_diff: bool,
+    diff_title: String,
+    diff_summary: String,
+    diff_rows: Rc<Vec<diff::Line>>,
+    review_issues: Vec<lint::Issue>,
+    pending_shared: Option<String>,
+    pending_template: Option<templates::TemplateFile>,
+    stats: stats::Stats,
+    stats_version: (u64, u64),
+    query_results: Rc<Vec<query::Row>>,
     show_query: bool,
     /// Show the reading view beside the editor.
     split_preview: bool,
@@ -212,69 +470,457 @@ struct DragonGlassApp {
 }
 
 impl DragonGlassApp {
-    fn open_note(&mut self, relative: &str, cx: &mut Context<Self>) {
-        let path = self.vault_root.join(relative);
-        self.editor.update(cx, |editor, cx| {
-            // Don't lose edits when switching notes.
-            if editor.is_dirty() {
-                let _ = editor.save();
+    /// Build the callback reading views use to open clicked links.
+    fn link_opener(&self, cx: &mut Context<Self>) -> reading::LinkOpener {
+        let weak = cx.entity().downgrade();
+        Rc::new(move |target: &str, window: &mut Window, cx: &mut App| {
+            let _ = weak.update(cx, |app, cx| app.open_target(target, window, cx));
+        })
+    }
+
+    /// Open a link target: a note (by path, stem, slug or alias) or an external URL.
+    fn open_target(&mut self, target: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if target.starts_with("http://")
+            || target.starts_with("https://")
+            || target.starts_with("mailto:")
+        {
+            cx.open_url(target);
+            return;
+        }
+
+        let target = target.split('#').next().unwrap_or(target).trim();
+        if target.is_empty() {
+            return;
+        }
+
+        match self.note_index.resolve_relative(target) {
+            Some(relative) => {
+                let relative = relative.to_string();
+                self.open_note(&relative, window, cx);
             }
-            if editor.load(&path).is_ok() {
+            None => {
+                // An unresolved wikilink creates the note, the way Obsidian does.
+                let is_asset = Path::new(target)
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                    .map(|ext| {
+                        !ext.eq_ignore_ascii_case("md") && !ext.eq_ignore_ascii_case("markdown")
+                    })
+                    .unwrap_or(false);
+                if is_asset {
+                    self.status_message = Some(format!("unresolved link: {target}"));
+                    cx.notify();
+                    return;
+                }
+                self.create_linked_note(target, window, cx);
+            }
+        }
+    }
+
+    /// Create and open a note for an unresolved wikilink.
+    fn create_linked_note(&mut self, target: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let cleaned = target.trim().trim_matches('/');
+        if cleaned.is_empty() {
+            return;
+        }
+
+        let file = if cleaned.to_ascii_lowercase().ends_with(".md") {
+            cleaned.to_string()
+        } else {
+            format!("{cleaned}.md")
+        };
+
+        // A bare name goes next to the current note; a path is vault-relative.
+        let relative = if file.contains('/') {
+            file
+        } else {
+            match self
+                .active
+                .as_deref()
+                .and_then(|active| active.rsplit_once('/'))
+            {
+                Some((dir, _)) if !dir.is_empty() => format!("{dir}/{file}"),
+                _ => file,
+            }
+        };
+        let relative = sanitize_relative(&relative);
+        if relative.is_empty() {
+            return;
+        }
+
+        let path = self.vault_root.join(&relative);
+        if path.exists() {
+            // Indexed copies can lag behind the disk; never overwrite a real note.
+            self.refresh_vault(cx);
+            self.open_note(&relative, window, cx);
+            return;
+        }
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+
+        let title = relative
+            .rsplit('/')
+            .next()
+            .unwrap_or(&relative)
+            .trim_end_matches(".md");
+        let content = format!("# {title}\n\n");
+
+        match storage::write_atomic(&path, &content) {
+            Ok(()) => {
+                self.refresh_vault(cx);
+                self.status_message = Some(format!("created note: {relative}"));
+                self.open_note(&relative, window, cx);
+            }
+            Err(error) => {
+                self.status_message = Some(format!("could not create note: {error}"));
                 cx.notify();
             }
+        }
+    }
+
+    /// Resize a side panel while its splitter is being dragged.
+    ///
+    /// A full app repaint is expensive, so movement is applied at most once per frame
+    /// (16 ms) and only when the width actually changed by a visible amount.
+    fn apply_resize_x(&mut self, x: f32, force: bool, cx: &mut Context<Self>) {
+        let Some(drag) = self.resize else {
+            return;
+        };
+
+        let dx = x - drag.start_x;
+        let width = match drag.panel {
+            ResizePanel::Sidebar => drag.start_width + dx,
+            ResizePanel::Outline | ResizePanel::Relations => drag.start_width - dx,
+        };
+        let width = width.clamp(140.0, 560.0).round();
+
+        let now = std::time::Instant::now();
+        if !force {
+            if (width - drag.last_width).abs() < 1.0 {
+                return;
+            }
+            if now.duration_since(drag.last_tick) < std::time::Duration::from_millis(16)
+                && (width - drag.last_width).abs() < 8.0
+            {
+                return;
+            }
+        }
+
+        self.resize = Some(ResizeDrag {
+            last_width: width,
+            last_tick: now,
+            ..drag
         });
-        self.active = Some(relative.to_string());
-        self.conflict = false;
-        self.refresh_properties(cx);
+
+        match drag.panel {
+            ResizePanel::Sidebar => self.sidebar_width = width,
+            ResizePanel::Outline => self.outline_width = width,
+            ResizePanel::Relations => self.relations_width = width,
+        }
         cx.notify();
+    }
+
+    fn apply_resize(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) {
+        self.apply_resize_x(f32::from(event.position.x), false, cx);
+    }
+
+    /// Freeze or resume editor wrapping for every open tab while a splitter moves.
+    fn set_editors_resizing(&mut self, resizing: bool, cx: &mut Context<Self>) {
+        let editors: Vec<Entity<Editor>> = self.tabs.iter().map(|tab| tab.editor.clone()).collect();
+        for editor in editors {
+            editor.update(cx, |editor, _| editor.set_resizing(resizing));
+        }
+    }
+
+    /// End a splitter drag when the mouse button is released.
+    fn finish_resize(
+        &mut self,
+        event: &MouseUpEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.resize.is_some() {
+            self.apply_resize_x(f32::from(event.position.x), true, cx);
+            self.resize = None;
+            self.set_editors_resizing(false, cx);
+            cx.notify();
+        }
+    }
+
+    /// Create an editor pointed at this vault.
+    fn new_editor(&self, cx: &mut Context<Self>) -> Entity<Editor> {
+        let editor = cx.new(Editor::new);
+        let root = self.vault_root.clone();
+        let folder = self.config.attachments_folder.clone();
+        let opener = self.link_opener(cx);
+        editor.update(cx, |editor, _cx| {
+            editor.set_vault_root(&root);
+            editor.set_attachments_folder(&folder);
+            editor.set_link_opener(opener);
+        });
+        editor
+    }
+
+    /// Load `relative` into an existing editor. Returns false if the file could not be read.
+    fn load_into(&self, editor: &Entity<Editor>, relative: &str, cx: &mut Context<Self>) -> bool {
+        let root = self.vault_root.clone();
+        let folder = self.config.attachments_folder.clone();
+        let path = root.join(relative);
+        editor.update(cx, |editor, cx| {
+            editor.set_vault_root(&root);
+            editor.set_attachments_folder(&folder);
+            match editor.load(&path) {
+                Ok(()) => {
+                    cx.notify();
+                    true
+                }
+                Err(_) => false,
+            }
+        })
+    }
+
+    /// Save the active note and reading mode, so the next launch reopens them.
+    fn remember_session(&self, cx: &Context<Self>) {
+        let saved = session::Session {
+            note: self.active.clone(),
+            reading: self.editor.read(cx).is_reading(),
+        };
+        let _ = session::save(&self.vault_root, &saved);
+    }
+
+    /// Switch the active tab, syncing the editor, outline and properties.
+    fn activate_tab(&mut self, index: usize, cx: &mut Context<Self>) {
+        if index >= self.tabs.len() {
+            return;
+        }
+
+        self.active_tab = index;
+        self.editor = self.tabs[index].editor.clone();
+        self.active = self.tabs[index].relative.clone();
+        self.conflict = self.tabs[index].conflict;
+        self.cache_epoch = self.cache_epoch.wrapping_add(1);
+        self.show_graph = false;
+        self.show_query = false;
+        self.show_diff = false;
+        self.normalize_splits();
+        self.refresh_properties(cx);
+        if self.show_relations {
+            self.relations = relations::build(&self.note_refs);
+        }
+        self.remember_session(cx);
+        cx.notify();
+    }
+
+    fn normalize_splits(&mut self) {
+        let len = self.tabs.len();
+        let active = self.active_tab;
+        self.split_tabs
+            .retain(|index| *index < len && *index != active);
+        self.split_tabs.sort_unstable();
+        self.split_tabs.dedup();
+    }
+
+    fn reindex_splits_after_remove(&mut self, removed: usize) {
+        self.split_tabs = self
+            .split_tabs
+            .iter()
+            .filter_map(|index| match index.cmp(&removed) {
+                std::cmp::Ordering::Equal => None,
+                std::cmp::Ordering::Greater => Some(index - 1),
+                std::cmp::Ordering::Less => Some(*index),
+            })
+            .collect();
+    }
+
+    fn open_note(&mut self, relative: &str, window: &mut Window, cx: &mut Context<Self>) {
+        // Already open: just focus it.
+        if let Some(index) = self
+            .tabs
+            .iter()
+            .position(|tab| tab.relative.as_deref() == Some(relative))
+        {
+            self.activate_tab(index, cx);
+            window.focus(&self.editor.focus_handle(cx));
+            return;
+        }
+
+        // Reuse a clean, empty tab when there is one.
+        let empty = self.tabs.iter().enumerate().find_map(|(index, tab)| {
+            (tab.relative.is_none() && !tab.editor.read(cx).is_dirty()).then_some(index)
+        });
+
+        let title = tab_title(relative);
+        if let Some(index) = empty {
+            let editor = self.tabs[index].editor.clone();
+            if !self.load_into(&editor, relative, cx) {
+                self.status_message = Some(format!("could not open {relative}"));
+                cx.notify();
+                return;
+            }
+            self.tabs[index].relative = Some(relative.to_string());
+            self.tabs[index].title = title;
+            self.tabs[index].conflict = false;
+            self.activate_tab(index, cx);
+        } else {
+            let editor = self.new_editor(cx);
+            if !self.load_into(&editor, relative, cx) {
+                self.status_message = Some(format!("could not open {relative}"));
+                cx.notify();
+                return;
+            }
+            self.tabs.push(Tab {
+                relative: Some(relative.to_string()),
+                editor: editor.clone(),
+                title,
+                conflict: false,
+            });
+            self.active_tab = self.tabs.len() - 1;
+            self.editor = editor;
+            self.active = Some(relative.to_string());
+            self.conflict = false;
+            self.cache_epoch = self.cache_epoch.wrapping_add(1);
+            self.show_graph = false;
+            self.show_query = false;
+            self.show_diff = false;
+            self.normalize_splits();
+            self.refresh_properties(cx);
+            if self.show_relations {
+                self.relations = relations::build(&self.note_refs);
+            }
+            self.remember_session(cx);
+            cx.notify();
+        }
+
+        window.focus(&self.editor.focus_handle(cx));
+    }
+
+    /// Close a tab. Dirty notes are saved first so closing never loses edits.
+    fn close_tab(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if index >= self.tabs.len() {
+            return;
+        }
+
+        let save_result = self.tabs[index].editor.update(cx, |editor, _cx| {
+            if editor.is_dirty() {
+                editor.save()
+            } else {
+                Ok(())
+            }
+        });
+        if let Err(error) = save_result {
+            self.status_message = Some(format!("could not save before closing: {error}"));
+            cx.notify();
+            return;
+        }
+
+        let was_active = index == self.active_tab;
+        let title = self.tabs[index].title.clone();
+        self.tabs.remove(index);
+        self.reindex_splits_after_remove(index);
+
+        if self.tabs.is_empty() {
+            let editor = self.new_editor(cx);
+            self.tabs.push(Tab {
+                relative: None,
+                editor,
+                title: "Untitled".to_string(),
+                conflict: false,
+            });
+            self.activate_tab(0, cx);
+        } else if was_active {
+            let next = index.min(self.tabs.len() - 1);
+            self.activate_tab(next, cx);
+        } else if index < self.active_tab {
+            self.active_tab -= 1;
+        }
+
+        self.normalize_splits();
+        self.status_message = Some(format!("closed {title}"));
+        window.focus(&self.editor.focus_handle(cx));
+        cx.notify();
+    }
+
+    fn cycle_tab(&mut self, delta: isize, window: &mut Window, cx: &mut Context<Self>) {
+        if self.tabs.len() < 2 {
+            return;
+        }
+        let count = self.tabs.len() as isize;
+        let next = (self.active_tab as isize + delta).rem_euclid(count) as usize;
+        self.activate_tab(next, cx);
+        window.focus(&self.editor.focus_handle(cx));
     }
 
     /// React to a note changing on disk while it is open.
     fn on_external_change(&mut self, changed: &str, cx: &mut Context<Self>) {
-        let Some(active) = self.active.clone() else {
-            return;
-        };
-        let active_path = self.vault_root.join(&active);
+        let changed_path = Path::new(changed);
+        let mut matched = false;
+        let mut active_matched = false;
+        let mut reloaded = false;
+        let mut conflicted = false;
 
-        let same_file = match (
-            active_path.canonicalize(),
-            Path::new(changed).canonicalize(),
-        ) {
-            (Ok(a), Ok(b)) => a == b,
-            _ => active_path.to_string_lossy() == changed,
-        };
-        if !same_file {
+        for index in 0..self.tabs.len() {
+            let Some(relative) = self.tabs[index].relative.clone() else {
+                continue;
+            };
+            let path = self.vault_root.join(&relative);
+            let same_file = match (path.canonicalize(), changed_path.canonicalize()) {
+                (Ok(a), Ok(b)) => a == b,
+                _ => path.to_string_lossy() == changed,
+            };
+            if !same_file {
+                continue;
+            }
+
+            matched = true;
+            active_matched |= index == self.active_tab;
+            eprintln!("[dragon-glass] external change: {changed}");
+
+            let Ok(disk) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let editor = self.tabs[index].editor.clone();
+            let (buffer, dirty) = {
+                let editor = editor.read(cx);
+                (editor.text(), editor.is_dirty())
+            };
+
+            match conflict::classify(&buffer, dirty, &disk) {
+                conflict::Resolution::Ignore => {}
+                conflict::Resolution::Reload => {
+                    editor.update(cx, |editor, cx| {
+                        let _ = editor.reload();
+                        cx.notify();
+                    });
+                    self.tabs[index].conflict = false;
+                    reloaded = true;
+                }
+                conflict::Resolution::Conflict => {
+                    self.tabs[index].conflict = true;
+                    conflicted = true;
+                }
+            }
+        }
+
+        if !matched {
             return;
         }
 
-        eprintln!("[dragon-glass] external change to open note: {changed}");
-
-        let Ok(disk) = std::fs::read_to_string(&active_path) else {
-            return;
-        };
-        let (buffer, dirty) = {
-            let editor = self.editor.read(cx);
-            (editor.text(), editor.is_dirty())
-        };
-
-        match conflict::classify(&buffer, dirty, &disk) {
-            conflict::Resolution::Ignore => {}
-            conflict::Resolution::Reload => {
-                self.editor.update(cx, |editor, cx| {
-                    let _ = editor.reload();
-                    cx.notify();
-                });
-                self.conflict = false;
-                self.status_message = Some("reloaded from disk (changed externally)".to_string());
-                cx.notify();
-            }
-            conflict::Resolution::Conflict => {
-                self.conflict = true;
+        if active_matched {
+            self.conflict = self.tabs[self.active_tab].conflict;
+            self.cache_epoch = self.cache_epoch.wrapping_add(1);
+            self.refresh_properties(cx);
+            if self.conflict {
                 self.status_message =
-                    Some("changed on disk — saving will overwrite the file".to_string());
-                cx.notify();
+                    Some("changed on disk - saving will overwrite the file".to_string());
+            } else if reloaded {
+                self.status_message = Some("reloaded from disk (changed externally)".to_string());
             }
+        } else if conflicted {
+            self.status_message = Some("a note changed on disk in another tab".to_string());
         }
+
+        cx.notify();
     }
 
     fn refresh_git(&mut self) {
@@ -286,12 +932,23 @@ impl DragonGlassApp {
     }
 
     /// Re-scan the vault after files are created or removed.
-    fn refresh_vault(&mut self) {
+    fn refresh_vault(&mut self, cx: &mut Context<Self>) {
         if let Ok(vault) = Vault::open(&self.vault_root) {
             self.note_refs = vault.notes();
-            self.tree = vault.tree();
+            self.note_index = resolve::NoteIndex::new(&self.note_refs);
+            self.tree = tree::build(&self.note_refs);
             self.notes = self.note_refs.len();
+            self.full_graph = graph::build(&self.note_refs);
+            if self.show_relations {
+                self.relations = relations::build(&self.note_refs);
+            }
         }
+        // A rescan is also when attachments may have appeared or disappeared.
+        self.editor
+            .update(cx, |editor, _| editor.invalidate_attachments());
+        let mut rows = Vec::new();
+        flatten(&self.tree, 0, &mut rows);
+        self.file_rows = Rc::new(rows);
         self.refresh_git();
     }
 
@@ -364,10 +1021,10 @@ impl DragonGlassApp {
                 cx.notify();
                 return;
             }
-            self.refresh_vault();
+            self.refresh_vault(cx);
         }
 
-        self.open_note(&relative, cx);
+        self.open_note(&relative, window, cx);
         window.focus(&self.editor.focus_handle(cx));
         cx.notify();
     }
@@ -472,6 +1129,103 @@ impl DragonGlassApp {
                 .collect(),
             SwitcherMode::HotkeyCapture => Vec::new(),
             SwitcherMode::GraphFilterInput => Vec::new(),
+            SwitcherMode::NewNoteName => Vec::new(),
+            SwitcherMode::SharedName => Vec::new(),
+            SwitcherMode::RelationInput => Vec::new(),
+            SwitcherMode::VersionMenu => {
+                let Some(relative) = self.active.clone() else {
+                    return Vec::new();
+                };
+                let mut items = vec![
+                    SwitcherItem {
+                        label: "Save current as version A".to_string(),
+                        detail: "a/b versions".to_string(),
+                        item: Item::VersionSave("A".to_string()),
+                    },
+                    SwitcherItem {
+                        label: "Save current as version B".to_string(),
+                        detail: "a/b versions".to_string(),
+                        item: Item::VersionSave("B".to_string()),
+                    },
+                ];
+
+                let versions = versions::list(&self.vault_root, &relative);
+                for version in &versions {
+                    let label = version.display_label();
+                    items.push(SwitcherItem {
+                        label: format!("Compare current with {label}"),
+                        detail: version.id.clone(),
+                        item: Item::VersionCompare {
+                            left: None,
+                            right: version.id.clone(),
+                        },
+                    });
+                    items.push(SwitcherItem {
+                        label: format!("Promote {label} to the note"),
+                        detail: "snapshots the current note first".to_string(),
+                        item: Item::VersionPromote(version.id.clone()),
+                    });
+                    items.push(SwitcherItem {
+                        label: format!("Delete {label}"),
+                        detail: String::new(),
+                        item: Item::VersionDelete(version.id.clone()),
+                    });
+                }
+                if versions.len() >= 2 {
+                    items.push(SwitcherItem {
+                        label: format!(
+                            "Compare {} with {}",
+                            versions[0].display_label(),
+                            versions[1].display_label()
+                        ),
+                        detail: String::new(),
+                        item: Item::VersionCompare {
+                            left: Some(versions[0].id.clone()),
+                            right: versions[1].id.clone(),
+                        },
+                    });
+                }
+                items
+            }
+            SwitcherMode::TemplateMenu | SwitcherMode::TemplateNewMenu => {
+                let new_note = mode == SwitcherMode::TemplateNewMenu;
+                templates::list(&self.vault_root, &self.config.templates_folder)
+                    .into_iter()
+                    .map(|template| SwitcherItem {
+                        label: template.name.clone(),
+                        detail: template.relative.clone(),
+                        item: if new_note {
+                            Item::TemplateNew(template.relative.clone())
+                        } else {
+                            Item::Template(template.relative.clone())
+                        },
+                    })
+                    .collect()
+            }
+            SwitcherMode::SharedMenu | SwitcherMode::SharedEditMenu => {
+                let edit = mode == SwitcherMode::SharedEditMenu;
+                shared::list(&self.vault_root)
+                    .into_iter()
+                    .map(|block| SwitcherItem {
+                        label: block.title.clone(),
+                        detail: format!("{{{{shared:{}}}}}", block.slug),
+                        item: if edit {
+                            Item::SharedEdit(block.slug.clone())
+                        } else {
+                            Item::Shared(block.slug.clone())
+                        },
+                    })
+                    .collect()
+            }
+            SwitcherMode::ReviewMenu => self
+                .review_issues
+                .iter()
+                .map(|issue| SwitcherItem {
+                    label: format!("{} · {}", issue.severity.label(), issue.rule),
+                    detail: format!("line {}: {}", issue.line, issue.message),
+                    item: Item::Issue(issue.line),
+                })
+                .collect(),
             SwitcherMode::CommandsMenu => vec![
                 command_item("Quick switcher", "ctrl+o", CommandId::QuickSwitch),
                 command_item("Search", "ctrl+shift+f", CommandId::Search),
@@ -486,16 +1240,55 @@ impl DragonGlassApp {
                 command_item("Toggle theme", "ctrl+shift+l", CommandId::ToggleTheme),
                 command_item("Check for updates", "", CommandId::CheckUpdates),
                 command_item("Graph view", "ctrl+shift+g", CommandId::OpenGraph),
+                command_item("Document relations", "ctrl+shift+r", CommandId::Relations),
+                command_item("Relation graph", "", CommandId::RelationGraph),
+                command_item("A/B versions", "", CommandId::Versions),
+                command_item("Save as version A", "", CommandId::SaveVersionA),
+                command_item("Save as version B", "", CommandId::SaveVersionB),
+                command_item("Insert template", "", CommandId::InsertTemplate),
+                command_item("New note from template", "", CommandId::NewFromTemplate),
+                command_item("Insert shared block", "", CommandId::InsertShared),
+                command_item("Edit shared block", "", CommandId::EditShared),
+                command_item(
+                    "Extract selection as shared block",
+                    "",
+                    CommandId::ExtractShared,
+                ),
+                command_item("Reload note from disk", "", CommandId::ReloadNote),
+                command_item("Review document", "", CommandId::ReviewDocument),
+                command_item("Move block up", "ctrl+shift+up", CommandId::MoveBlockUp),
+                command_item(
+                    "Move block down",
+                    "ctrl+shift+down",
+                    CommandId::MoveBlockDown,
+                ),
+                command_item("Duplicate block", "", CommandId::DuplicateBlock),
+                command_item("Delete block", "", CommandId::DeleteBlock),
+                command_item("Add related note", "", CommandId::AddRelation),
                 command_item("Run a query", "", CommandId::RunQuery),
                 command_item("Save workspace", "", CommandId::SaveWorkspace),
                 command_item("Keyboard shortcuts", "", CommandId::Hotkeys),
                 command_item("Graph: filter", "", CommandId::GraphFilter),
                 command_item("Graph: cycle depth", "", CommandId::GraphDepth),
                 command_item("Toggle snippets", "", CommandId::ToggleSnippets),
-                command_item("Toggle preview pane", "", CommandId::TogglePreview),
+                command_item(
+                    "Read and write side by side",
+                    "ctrl-alt+1",
+                    CommandId::TogglePreview,
+                ),
                 command_item("Pop preview out to a window", "", CommandId::DetachPreview),
                 command_item("Load workspace", "", CommandId::LoadWorkspace),
+                command_item("Open vault", "", CommandId::OpenVault),
                 command_item("New window", "ctrl+n", CommandId::NewWindow),
+                command_item("Move tab to new window", "ctrl-alt+n", CommandId::DetachTab),
+                command_item(
+                    "Two editors side by side",
+                    "ctrl-alt+2",
+                    CommandId::ToggleSplitEditor,
+                ),
+                command_item("Close tab", "ctrl+w", CommandId::CloseTab),
+                command_item("Next tab", "ctrl+tab", CommandId::NextTab),
+                command_item("Previous tab", "ctrl+shift+tab", CommandId::PrevTab),
             ]
             .into_iter()
             .chain(
@@ -590,7 +1383,7 @@ impl DragonGlassApp {
 
         self.show_query = false;
         if let Some(note) = &workspace.note {
-            self.open_note(note, cx);
+            self.open_note(note, window, cx);
         }
 
         self.editor.update(cx, |editor, cx| {
@@ -680,20 +1473,369 @@ impl DragonGlassApp {
 
         self.show_graph = true;
         self.show_query = false;
+        self.show_diff = false;
         window.focus(&view.focus_handle(cx));
         cx.notify();
     }
 
-    /// The centre pane: the graph, the query table, or the editor (optionally with a
-    /// preview pane beside it).
+    /// Toggle the editorial relations panel, rebuilding it from disk each time it opens.
+    fn open_relations(&mut self, _: &OpenRelations, _window: &mut Window, cx: &mut Context<Self>) {
+        self.show_relations = !self.show_relations;
+        if self.show_relations {
+            self.relations = relations::build(&self.note_refs);
+            self.status_message = Some("document relations".to_string());
+        }
+        cx.notify();
+    }
+
+    /// A link graph that also includes frontmatter relationships.
+    fn open_relation_graph(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(view) = self.graph_view.clone() else {
+            return;
+        };
+        let enriched = relations::graph(&self.note_refs);
+        view.update(cx, |view, cx| {
+            view.set_graph(enriched.clone());
+            cx.notify();
+        });
+        self.show_graph = true;
+        self.show_query = false;
+        self.show_diff = false;
+        let relations = enriched
+            .edges
+            .iter()
+            .filter(|edge| edge.is_relation())
+            .count();
+        self.status_message = Some(format!(
+            "relation graph: {} notes / {} relations",
+            enriched.nodes.len(),
+            relations
+        ));
+        window.focus(&view.focus_handle(cx));
+        cx.notify();
+    }
+
+    fn save_version(&mut self, label: &str, cx: &mut Context<Self>) {
+        let Some(relative) = self.active.clone() else {
+            self.status_message = Some("open a note before saving a version".to_string());
+            cx.notify();
+            return;
+        };
+
+        let content = self.editor.read(cx).text();
+        self.status_message = Some(
+            match versions::save(&self.vault_root, &relative, label, &content) {
+                Ok(version) => format!(
+                    "saved version {} ({} bytes)",
+                    version.display_label(),
+                    version.bytes
+                ),
+                Err(error) => format!("could not save version: {error}"),
+            },
+        );
+        cx.notify();
+    }
+
+    fn compare_version(&mut self, left: Option<String>, right: String, cx: &mut Context<Self>) {
+        let Some(relative) = self.active.clone() else {
+            self.status_message = Some("open a note before comparing versions".to_string());
+            cx.notify();
+            return;
+        };
+
+        let compared = match &left {
+            Some(left) => versions::compare(&self.vault_root, &relative, left, &right),
+            None => versions::compare_with_note(&self.vault_root, &relative, &right),
+        };
+
+        let diff = match compared {
+            Ok(diff) => diff,
+            Err(error) => {
+                self.status_message = Some(format!("could not compare versions: {error}"));
+                cx.notify();
+                return;
+            }
+        };
+
+        let label_of = |id: &str| {
+            versions::list(&self.vault_root, &relative)
+                .into_iter()
+                .find(|version| version.id == id)
+                .map(|version| version.display_label())
+                .unwrap_or_else(|| id.to_string())
+        };
+
+        self.diff_title = match &left {
+            Some(left) => format!("{} ↔ {}", label_of(left), label_of(&right)),
+            None => format!("current ↔ {}", label_of(&right)),
+        };
+        self.diff_summary = diff.summary();
+        self.diff_rows = Rc::new(diff.lines);
+        self.show_diff = true;
+        self.show_graph = false;
+        self.show_query = false;
+        self.status_message = Some(format!("version diff: {}", self.diff_summary));
+        cx.notify();
+    }
+
+    fn promote_version(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(relative) = self.active.clone() else {
+            return;
+        };
+
+        // Promoting replaces the note on disk; never discard unsaved edits doing it.
+        self.editor.update(cx, |editor, _cx| {
+            if editor.is_dirty() {
+                let _ = editor.save();
+            }
+        });
+
+        self.status_message = Some(match versions::promote(&self.vault_root, &relative, id) {
+            Ok(_) => {
+                self.editor.update(cx, |editor, cx| {
+                    let _ = editor.reload();
+                    cx.notify();
+                });
+                self.cache_epoch = self.cache_epoch.wrapping_add(1);
+                self.refresh_properties(cx);
+                if self.show_relations {
+                    self.relations = relations::build(&self.note_refs);
+                }
+                format!("promoted version {id} to {relative}")
+            }
+            Err(error) => format!("could not promote version: {error}"),
+        });
+        window.focus(&self.editor.focus_handle(cx));
+        cx.notify();
+    }
+
+    fn delete_version(&mut self, id: &str, cx: &mut Context<Self>) {
+        let Some(relative) = self.active.clone() else {
+            return;
+        };
+        self.status_message = Some(match versions::remove(&self.vault_root, &relative, id) {
+            Ok(()) => format!("deleted version {id}"),
+            Err(error) => format!("could not delete version: {error}"),
+        });
+        cx.notify();
+    }
+
+    fn insert_template(&mut self, relative: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let path = self.vault_root.join(relative);
+        let template = match std::fs::read_to_string(&path) {
+            Ok(template) => template,
+            Err(error) => {
+                self.status_message = Some(format!("could not read template: {error}"));
+                cx.notify();
+                return;
+            }
+        };
+
+        let title = self
+            .active
+            .as_deref()
+            .map(tab_title)
+            .unwrap_or_else(|| "Untitled".to_string());
+        let rendered = render_template(&template, &self.vault_root, self.active.as_deref(), &title);
+
+        self.editor.update(cx, |editor, cx| {
+            editor.insert_template(&rendered);
+            cx.notify();
+        });
+        window.focus(&self.editor.focus_handle(cx));
+        self.status_message = Some(format!("inserted template {relative}"));
+        cx.notify();
+    }
+
+    fn create_from_template(
+        &mut self,
+        name: &str,
+        template: &templates::TemplateFile,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let name = name.trim();
+        if name.is_empty() {
+            self.status_message = Some("a note needs a name".to_string());
+            cx.notify();
+            return;
+        }
+
+        let folder = self
+            .active
+            .as_deref()
+            .and_then(|active| active.rsplit_once('/'))
+            .map(|(folder, _)| folder.to_string())
+            .unwrap_or_default();
+        let file_name = format!("{}.md", sanitize_filename(name));
+        let relative = if folder.is_empty() {
+            file_name
+        } else {
+            format!("{folder}/{file_name}")
+        };
+        let path = self.vault_root.join(&relative);
+        if path.exists() {
+            self.status_message = Some(format!("{relative} already exists"));
+            cx.notify();
+            return;
+        }
+
+        let template_text = match std::fs::read_to_string(&template.path) {
+            Ok(text) => text,
+            Err(error) => {
+                self.status_message = Some(format!("could not read template: {error}"));
+                cx.notify();
+                return;
+            }
+        };
+        let rendered = render_template(&template_text, &self.vault_root, Some(&relative), name);
+
+        if let Err(error) = storage::write_atomic(&path, &rendered) {
+            self.status_message = Some(format!("could not create note: {error}"));
+            cx.notify();
+            return;
+        }
+
+        self.refresh_vault(cx);
+        self.open_note(&relative, window, cx);
+        self.status_message = Some(format!("created {relative} from {}", template.name));
+        cx.notify();
+    }
+
+    fn insert_shared(&mut self, slug: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let reference = format!("{{{{shared:{}}}}}", shared::sanitize(slug));
+        self.editor.update(cx, |editor, cx| {
+            editor.replace_selection_or_insert(&reference);
+            cx.notify();
+        });
+        window.focus(&self.editor.focus_handle(cx));
+        self.status_message = Some(format!("inserted shared block {slug}"));
+        cx.notify();
+    }
+
+    fn extract_shared(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let editor = self.editor.clone();
+        let text = editor
+            .read(cx)
+            .selection_text()
+            .or_else(|| editor.read(cx).current_block_text());
+
+        let Some(text) = text else {
+            self.status_message =
+                Some("select text or place the caret in a block first".to_string());
+            cx.notify();
+            return;
+        };
+        if text.trim().is_empty() {
+            self.status_message = Some("nothing to extract".to_string());
+            cx.notify();
+            return;
+        }
+
+        self.pending_shared = Some(text);
+        self.open_panel(SwitcherMode::SharedName, window, cx);
+        self.status_message = Some("name the shared block".to_string());
+    }
+
+    fn review_document(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let text = self.editor.read(cx).text();
+        self.review_issues = lint::review_with(&text, &self.note_index);
+        if self.review_issues.is_empty() {
+            self.status_message = Some("review: no issues found".to_string());
+            cx.notify();
+            return;
+        }
+
+        self.status_message = Some(format!("review: {} issue(s)", self.review_issues.len()));
+        self.open_panel(SwitcherMode::ReviewMenu, window, cx);
+    }
+
+    fn add_relation(&mut self, target: &str, cx: &mut Context<Self>) {
+        let target = target.trim();
+        if target.is_empty() {
+            return;
+        }
+
+        let mut properties = self.properties.clone();
+        match properties
+            .iter_mut()
+            .find(|property| property.key == "related")
+        {
+            Some(property) => match &mut property.value {
+                PropertyValue::List(items) => {
+                    if !items.iter().any(|item| item == target) {
+                        items.push(target.to_string());
+                    }
+                }
+                PropertyValue::Scalar(value) => {
+                    let existing = value.clone();
+                    property.value = PropertyValue::List(vec![existing, target.to_string()]);
+                }
+                PropertyValue::Raw(_) => {}
+            },
+            None => properties.push(Property {
+                key: "related".to_string(),
+                value: PropertyValue::List(vec![target.to_string()]),
+            }),
+        }
+
+        self.apply_properties(&properties, cx);
+        self.relations = relations::build(&self.note_refs);
+        self.status_message = Some(format!("related: {target}"));
+    }
+
+    /// The centre pane: the graph, the query table, a diff, or the editor (optionally with
+    /// a preview pane beside it).
     fn center_view(&self, theme: Theme, preview: Option<AnyElement>) -> AnyElement {
+        if self.show_diff {
+            return diff_view(
+                self.diff_title.clone(),
+                self.diff_summary.clone(),
+                self.diff_rows.clone(),
+                theme,
+            );
+        }
         if self.show_query {
-            return query_view(&self.query_results, theme);
+            return query_view(self.query_results.clone(), theme);
         }
         if self.show_graph {
             if let Some(view) = &self.graph_view {
                 return view.clone().into_any_element();
             }
+        }
+        if !self.split_tabs.is_empty() {
+            return match self.split_axis {
+                SplitAxis::Horizontal => {
+                    let mut row = div()
+                        .flex()
+                        .flex_row()
+                        .size_full()
+                        .child(div().flex_1().min_w(px(0.0)).child(self.editor.clone()));
+                    for index in &self.split_tabs {
+                        if let Some(tab) = self.tabs.get(*index) {
+                            row = row
+                                .child(div().w(px(1.0)).h_full().bg(theme.border).flex_shrink_0())
+                                .child(div().flex_1().min_w(px(0.0)).child(tab.editor.clone()));
+                        }
+                    }
+                    row.into_any_element()
+                }
+                SplitAxis::Vertical => {
+                    let mut column = div()
+                        .flex()
+                        .flex_col()
+                        .size_full()
+                        .child(div().flex_1().min_h(px(0.0)).child(self.editor.clone()));
+                    for index in &self.split_tabs {
+                        if let Some(tab) = self.tabs.get(*index) {
+                            column = column
+                                .child(div().h(px(1.0)).w_full().bg(theme.border).flex_shrink_0())
+                                .child(div().flex_1().min_h(px(0.0)).child(tab.editor.clone()));
+                        }
+                    }
+                    column.into_any_element()
+                }
+            };
         }
         match preview {
             Some(preview) => div()
@@ -714,6 +1856,13 @@ impl DragonGlassApp {
             return;
         }
 
+        if self.show_diff {
+            self.show_diff = false;
+            window.focus(&self.editor.focus_handle(cx));
+            cx.notify();
+            return;
+        }
+
         if self.show_query {
             self.show_query = false;
             window.focus(&self.editor.focus_handle(cx));
@@ -725,11 +1874,36 @@ impl DragonGlassApp {
             self.show_graph = false;
             window.focus(&self.editor.focus_handle(cx));
             cx.notify();
+            return;
+        }
+
+        if self.show_relations {
+            self.show_relations = false;
+            window.focus(&self.editor.focus_handle(cx));
+            cx.notify();
         }
     }
 
     fn new_window(&mut self, _: &NewWindow, window: &mut Window, cx: &mut Context<Self>) {
         self.open_new_window(window, cx);
+    }
+
+    fn close_tab_action(&mut self, _: &CloseTab, window: &mut Window, cx: &mut Context<Self>) {
+        if self.switcher.is_none() {
+            self.close_tab(self.active_tab, window, cx);
+        }
+    }
+
+    fn next_tab(&mut self, _: &NextTab, window: &mut Window, cx: &mut Context<Self>) {
+        if self.switcher.is_none() {
+            self.cycle_tab(1, window, cx);
+        }
+    }
+
+    fn prev_tab(&mut self, _: &PrevTab, window: &mut Window, cx: &mut Context<Self>) {
+        if self.switcher.is_none() {
+            self.cycle_tab(-1, window, cx);
+        }
     }
 
     /// Open another window on the same vault, with its own editor and panes.
@@ -743,15 +1917,406 @@ impl DragonGlassApp {
             }
         });
 
+        let sibling_tab = Tab {
+            relative: self.active.clone(),
+            editor,
+            title: self
+                .active
+                .as_deref()
+                .map(tab_title)
+                .unwrap_or_else(|| "Untitled".to_string()),
+            conflict: false,
+        };
+        self.spawn_window_with_tabs(vec![sibling_tab], 0, false, cx);
+    }
+
+    /// Remove a tab from this window, keeping its editor alive, and repair the active and
+    /// secondary indices. Used both by tear-out and by cross-window drag and drop.
+    fn take_tab(&mut self, index: usize, cx: &mut Context<Self>) -> Option<Tab> {
+        if index >= self.tabs.len() {
+            return None;
+        }
+
+        self.dragging = None;
+        let was_last = self.tabs.len() == 1;
+        let old_active = self.active_tab;
+        let tab = self.tabs.remove(index);
+        self.reindex_splits_after_remove(index);
+        if was_last && self.minimal {
+            self.close_requested = true;
+        }
+
+        if self.tabs.is_empty() {
+            if self.minimal {
+                // A popped-out window giving away its last tab has nothing left to show;
+                // it closes on its next frame instead of opening an empty document.
+                self.active_tab = 0;
+                self.split_tabs.clear();
+                self.close_requested = true;
+                return Some(tab);
+            }
+            let editor = self.new_editor(cx);
+            self.tabs.push(Tab {
+                relative: None,
+                editor,
+                title: "Untitled".to_string(),
+                conflict: false,
+            });
+            self.active_tab = 0;
+            self.split_tabs.clear();
+        } else {
+            self.active_tab = if old_active == index {
+                index.min(self.tabs.len() - 1)
+            } else if old_active > index {
+                old_active - 1
+            } else {
+                old_active
+            };
+        }
+
+        self.activate_tab(self.active_tab, cx);
+        Some(tab)
+    }
+
+    /// Move one tab into a real OS window, preserving its editor and unsaved state.
+    fn detach_tab(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(tab) = self.take_tab(index, cx) else {
+            return;
+        };
+        let title = tab.title.clone();
+        window.focus(&self.editor.focus_handle(cx));
+        self.status_message = Some(format!("moved {title} to its own window"));
+        cx.notify();
+        self.spawn_window_with_tabs(vec![tab], 0, true, cx);
+    }
+
+    /// Remove every tab without creating a replacement, used when a popped-out window
+    /// hands its contents back to its parent.
+    fn take_all_tabs(&mut self) -> Vec<Tab> {
+        self.dragging = None;
+        self.split_tabs.clear();
+        self.active_tab = 0;
+        std::mem::take(&mut self.tabs)
+    }
+
+    /// Append tabs moved in from another window and focus the first of them.
+    fn adopt_tabs(&mut self, tabs: Vec<Tab>, cx: &mut Context<Self>) {
+        if tabs.is_empty() {
+            return;
+        }
+
+        let first = self.tabs.len();
+        self.tabs.extend(tabs);
+        self.activate_tab(first, cx);
+        self.status_message = Some(format!("returned {}", self.tabs[first].title));
+        cx.notify();
+    }
+
+    /// Move a dragged tab into this window and place it according to where it was dropped.
+    fn accept_tab(
+        &mut self,
+        drag: &TabDrag,
+        drop: TabDrop,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.dragging = None;
+        let same_window = drag.source.entity_id() == cx.entity().entity_id();
+        let target = if same_window {
+            if drag.index >= self.tabs.len() {
+                return;
+            }
+            drag.index
+        } else {
+            let taken = drag
+                .source
+                .update(cx, |source, cx| source.take_tab(drag.index, cx));
+            let Ok(Some(tab)) = taken else {
+                return;
+            };
+            self.tabs.push(tab);
+            self.tabs.len() - 1
+        };
+
+        match drop {
+            TabDrop::Merge => {
+                self.activate_tab(target, cx);
+                self.status_message = Some(self.tabs[target].title.clone());
+            }
+            TabDrop::Split(side) => {
+                let axis = match side {
+                    SplitSide::Left | SplitSide::Right => SplitAxis::Horizontal,
+                    SplitSide::Above | SplitSide::Below => SplitAxis::Vertical,
+                };
+
+                if target == self.active_tab {
+                    if self.split_tabs.is_empty() {
+                        return;
+                    }
+                    self.split_axis = axis;
+                } else {
+                    if !self.split_tabs.contains(&target) && self.split_tabs.len() >= 3 {
+                        self.status_message = Some("at most four editor panes".to_string());
+                        return;
+                    }
+
+                    self.split_axis = axis;
+                    match side {
+                        SplitSide::Left | SplitSide::Above => {
+                            let previous = self.active_tab;
+                            self.activate_tab(target, cx);
+                            self.split_tabs.retain(|index| *index != target);
+                            if previous != target && !self.split_tabs.contains(&previous) {
+                                self.split_tabs.insert(0, previous);
+                            }
+                        }
+                        SplitSide::Right | SplitSide::Below => {
+                            if !self.split_tabs.contains(&target) {
+                                self.split_tabs.push(target);
+                            }
+                        }
+                    }
+                }
+
+                self.split_preview = false;
+                let axis_name = match self.split_axis {
+                    SplitAxis::Horizontal => "horizontal",
+                    SplitAxis::Vertical => "vertical",
+                };
+                self.status_message = Some(format!(
+                    "{axis_name} split: {} panes",
+                    self.split_tabs.len() + 1
+                ));
+            }
+            TabDrop::Detach => {
+                if same_window {
+                    self.detach_tab(target, window, cx);
+                    return;
+                }
+                self.activate_tab(target, cx);
+                self.status_message = Some(self.tabs[target].title.clone());
+            }
+        }
+
+        self.normalize_splits();
+        window.focus(&self.editor.focus_handle(cx));
+        cx.notify();
+    }
+
+    fn drop_on_tab_bar(&mut self, drag: &TabDrag, window: &mut Window, cx: &mut Context<Self>) {
+        self.accept_tab(drag, TabDrop::Merge, window, cx);
+    }
+
+    fn drop_on_window(&mut self, drag: &TabDrag, window: &mut Window, cx: &mut Context<Self>) {
+        let same_window = drag.source.entity_id() == cx.entity().entity_id();
+        self.accept_tab(
+            drag,
+            if same_window {
+                TabDrop::Detach
+            } else {
+                TabDrop::Merge
+            },
+            window,
+            cx,
+        );
+    }
+
+    /// While a tab is dragged, the editor area exposes four edges: left/right split the
+    /// editors horizontally, top/bottom stack them vertically.
+    fn tab_drop_overlay(&self, theme: Theme, cx: &mut Context<Self>) -> AnyElement {
+        let edge = px(84.0);
+        let edge_tint = theme.accent.opacity(0.16);
+        let center_tint = theme.accent.opacity(0.06);
+        let center_side = match self.split_axis {
+            SplitAxis::Horizontal => SplitSide::Right,
+            SplitAxis::Vertical => SplitSide::Below,
+        };
+
+        div()
+            .id("tab-drop-overlay")
+            .absolute()
+            .top_0()
+            .left_0()
+            .right_0()
+            .bottom_0()
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .h(edge)
+                    .w_full()
+                    .bg(edge_tint)
+                    .drag_over::<TabDrag>(move |style, _drag, _window, _cx| {
+                        style.bg(theme.accent.opacity(0.35))
+                    })
+                    .on_drop::<TabDrag>(cx.listener(|this, drag: &TabDrag, window, cx| {
+                        this.accept_tab(drag, TabDrop::Split(SplitSide::Above), window, cx);
+                    })),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .flex()
+                    .flex_row()
+                    .child(
+                        div()
+                            .w(edge)
+                            .h_full()
+                            .bg(edge_tint)
+                            .drag_over::<TabDrag>(move |style, _drag, _window, _cx| {
+                                style.bg(theme.accent.opacity(0.35))
+                            })
+                            .on_drop::<TabDrag>(cx.listener(|this, drag: &TabDrag, window, cx| {
+                                this.accept_tab(drag, TabDrop::Split(SplitSide::Left), window, cx);
+                            })),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .h_full()
+                            .bg(center_tint)
+                            .drag_over::<TabDrag>(move |style, _drag, _window, _cx| {
+                                style.bg(theme.accent.opacity(0.3))
+                            })
+                            .on_drop::<TabDrag>(cx.listener(
+                                move |this, drag: &TabDrag, window, cx| {
+                                    this.accept_tab(drag, TabDrop::Split(center_side), window, cx);
+                                },
+                            )),
+                    )
+                    .child(
+                        div()
+                            .w(edge)
+                            .h_full()
+                            .bg(edge_tint)
+                            .drag_over::<TabDrag>(move |style, _drag, _window, _cx| {
+                                style.bg(theme.accent.opacity(0.35))
+                            })
+                            .on_drop::<TabDrag>(cx.listener(|this, drag: &TabDrag, window, cx| {
+                                this.accept_tab(drag, TabDrop::Split(SplitSide::Right), window, cx);
+                            })),
+                    ),
+            )
+            .child(
+                div()
+                    .h(edge)
+                    .w_full()
+                    .bg(edge_tint)
+                    .drag_over::<TabDrag>(move |style, _drag, _window, _cx| {
+                        style.bg(theme.accent.opacity(0.35))
+                    })
+                    .on_drop::<TabDrag>(cx.listener(|this, drag: &TabDrag, window, cx| {
+                        this.accept_tab(drag, TabDrop::Split(SplitSide::Below), window, cx);
+                    })),
+            )
+            .into_any_element()
+    }
+
+    /// A tab dragged outside every drop zone pops out into its own window.
+    fn on_drag_release_out(
+        &mut self,
+        _: &gpui::MouseUpEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.resize = None;
+        if let Some(drag) = self.dragging.take() {
+            if cx.has_active_drag() {
+                cx.stop_active_drag(window);
+                self.detach_tab(drag.index, window, cx);
+            }
+        }
+    }
+
+    /// If a drag ended outside the window, the platform may not deliver the mouse-up.
+    /// The next button-less mouse movement releases the stale drag so it cannot keep
+    /// covering the editor.
+    fn clear_stuck_drag_move(
+        &mut self,
+        event: &gpui::MouseMoveEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.resize.is_some() {
+            if event.pressed_button.is_none() {
+                self.resize = None;
+                self.set_editors_resizing(false, cx);
+                cx.notify();
+            } else {
+                self.apply_resize(event, cx);
+            }
+        }
+
+        if event.pressed_button.is_none() && cx.has_active_drag() {
+            cx.stop_active_drag(window);
+            self.dragging = None;
+            cx.notify();
+        }
+
+        // A tab dragged in from another window is a global active drag; repaint so this
+        // window's drop zones light up and its hit-testing stays current.
+        if cx.has_active_drag() && self.dragging.is_none() {
+            cx.notify();
+        }
+    }
+
+    fn clear_stuck_drag_down(
+        &mut self,
+        _: &gpui::MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if cx.has_active_drag() {
+            cx.stop_active_drag(window);
+            self.dragging = None;
+            cx.notify();
+        }
+    }
+
+    /// Build a new Dragon Glass window around the supplied tabs, sharing this app's vault
+    /// configuration, theme and workspace list.
+    fn spawn_window_with_tabs(
+        &mut self,
+        tabs: Vec<Tab>,
+        active_tab: usize,
+        minimal: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let active_tab = active_tab.min(tabs.len().saturating_sub(1));
+        let Some(active_tab_ref) = tabs.get(active_tab) else {
+            return;
+        };
+        let editor = active_tab_ref.editor.clone();
+        let active = active_tab_ref.relative.clone();
+        let title = match (minimal, active.as_deref().map(tab_title)) {
+            (true, Some(title)) => title,
+            (false, Some(title)) => format!("Dragon Glass — {title}"),
+            (_, None) => "Dragon Glass".to_string(),
+        };
+
+        let parent_for_close = cx.entity().downgrade();
         let sibling = cx.new(|cx| DragonGlassApp {
             editor: editor.clone(),
+            tabs,
+            active_tab,
+            split_tabs: Vec::new(),
+            split_axis: SplitAxis::Horizontal,
+            minimal,
+            close_requested: false,
+            dragging: None,
+            cache_epoch: 1,
             vault_root: self.vault_root.clone(),
             tree: self.tree.clone(),
+            file_rows: self.file_rows.clone(),
             note_refs: self.note_refs.clone(),
+            note_index: self.note_index.clone(),
             properties: Vec::new(),
+            headings: Rc::new(Vec::new()),
+            headings_version: (u64::MAX, u64::MAX),
+            preview_content: ReadingCache::new(),
             bookmarks: self.bookmarks.clone(),
             theme: self.theme,
-            active: self.active.clone(),
+            active,
             vault_path: self.vault_path.clone(),
             notes: self.notes,
             links: self.links,
@@ -767,9 +2332,24 @@ impl DragonGlassApp {
             full_graph: self.full_graph.clone(),
             graph_view: None,
             show_graph: false,
-            query_results: Vec::new(),
+            relations: self.relations.clone(),
+            show_relations: self.show_relations && !minimal,
+            sidebar_width: self.sidebar_width,
+            outline_width: self.outline_width,
+            relations_width: self.relations_width,
+            resize: None,
+            show_diff: false,
+            diff_title: String::new(),
+            diff_summary: String::new(),
+            diff_rows: Rc::new(Vec::new()),
+            review_issues: Vec::new(),
+            pending_shared: None,
+            pending_template: None,
+            stats: self.stats,
+            stats_version: (u64::MAX, u64::MAX),
+            query_results: Rc::new(Vec::new()),
             show_query: false,
-            split_preview: self.split_preview,
+            split_preview: self.split_preview && !minimal,
             plugins: self.plugins.clone(),
             plugin_commands: self.plugin_commands.clone(),
             workspaces: self.workspaces.clone(),
@@ -781,22 +2361,138 @@ impl DragonGlassApp {
         });
 
         let graph_view = cx.new(|cx| GraphView::new(sibling.downgrade(), cx));
-        sibling.update(cx, |app, _cx| {
+        sibling.update(cx, |app, cx| {
             app.graph_view = Some(graph_view);
+            app.watch_vault(cx);
         });
 
         let bounds = Bounds::centered(None, size(px(1000.0), px(640.0)), cx);
         let options = WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(bounds)),
             titlebar: Some(gpui::TitlebarOptions {
-                title: Some("Dragon Glass".into()),
+                title: Some(title.into()),
                 ..Default::default()
             }),
             ..Default::default()
         };
 
         let view = sibling.clone();
-        let _ = cx.open_window(options, move |_window, _cx| view.clone());
+        let returns = sibling.downgrade();
+        let _ = cx.open_window(options, move |window, cx| {
+            // Closing a popped-out window returns its tabs to the window it came from, so
+            // closing the window is the merge gesture: no separate button is needed.
+            let child = returns.clone();
+            let target = parent_for_close.clone();
+            window.on_window_should_close(cx, move |_window, cx| {
+                let mut tabs = Vec::new();
+                if let Some(child) = child.upgrade() {
+                    tabs = child.update(cx, |app, _cx| app.take_all_tabs());
+                }
+                if !tabs.is_empty() {
+                    if let Some(target) = target.upgrade() {
+                        let _ = target.update(cx, |app, cx| app.adopt_tabs(tabs, cx));
+                    }
+                }
+                true
+            });
+            view.clone()
+        });
+    }
+
+    /// Watch the vault for external edits. Event-driven: the watcher thread blocks, so idle
+    /// CPU stays at zero. Each window gets its own watcher so detached tabs still reconcile.
+    fn watch_vault(&mut self, cx: &mut Context<Self>) {
+        let (change_tx, change_rx) = smol::channel::unbounded::<String>();
+        let watcher =
+            match notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
+                if let Ok(event) = event {
+                    for path in event.paths {
+                        if path
+                            .extension()
+                            .map(|extension| extension.eq_ignore_ascii_case("md"))
+                            .unwrap_or(false)
+                        {
+                            let _ = change_tx.send_blocking(path.to_string_lossy().to_string());
+                        }
+                    }
+                }
+            }) {
+                Ok(mut watcher) => {
+                    use notify::Watcher as _;
+                    let _ = watcher.watch(&self.vault_root, notify::RecursiveMode::Recursive);
+                    Some(watcher)
+                }
+                Err(_) => None,
+            };
+
+        self.watcher = watcher;
+        cx.spawn(async move |this, cx| {
+            while let Ok(changed) = change_rx.recv().await {
+                let alive = this
+                    .update(cx, |app, cx| app.on_external_change(&changed, cx))
+                    .is_ok();
+                if !alive {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    fn detach_tab_action(&mut self, _: &DetachTab, window: &mut Window, cx: &mut Context<Self>) {
+        self.detach_tab(self.active_tab, window, cx);
+    }
+
+    fn toggle_split_editor(&mut self, cx: &mut Context<Self>) {
+        if !self.split_tabs.is_empty() {
+            self.split_tabs.clear();
+            self.status_message = Some("single editor".to_string());
+        } else if self.tabs.len() < 2 {
+            self.status_message = Some("open another note to use split editing".to_string());
+        } else {
+            let next = (self.active_tab + 1) % self.tabs.len();
+            self.split_tabs.push(next);
+            self.split_axis = SplitAxis::Horizontal;
+            self.split_preview = false;
+            self.status_message = Some(format!("two editors: {}", self.tabs[next].title));
+        }
+        cx.notify();
+    }
+
+    fn toggle_split_preview(&mut self, cx: &mut Context<Self>) {
+        self.split_preview = !self.split_preview;
+        if self.split_preview {
+            self.split_tabs.clear();
+            self.editor.update(cx, |editor, cx| {
+                if editor.is_reading() {
+                    editor.set_reading_mode(false);
+                    cx.notify();
+                }
+            });
+        }
+        self.status_message = Some(format!(
+            "preview pane: {}",
+            if self.split_preview { "on" } else { "off" }
+        ));
+        cx.notify();
+    }
+
+    fn toggle_split_editor_action(
+        &mut self,
+        _: &ToggleSplitEditor,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.toggle_split_editor(cx);
+    }
+
+    fn toggle_side_by_side_action(
+        &mut self,
+        _: &ToggleSideBySide,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.toggle_split_preview(cx);
     }
 
     /// The theme with snippets layered on, if enabled.
@@ -813,6 +2509,12 @@ impl DragonGlassApp {
         let theme = self.effective_theme();
         self.theme = theme;
         cx.set_global(theme);
+        // Token colours are baked into the shaped rows, so every open editor must
+        // re-shape before the next frame.
+        for tab in &self.tabs {
+            tab.editor
+                .update(cx, |editor, _| editor.invalidate_layout());
+        }
         self.editor.update(cx, |_, cx| cx.notify());
         cx.notify();
     }
@@ -882,7 +2584,7 @@ impl DragonGlassApp {
     }
 
     fn refresh_properties(&mut self, cx: &mut Context<Self>) {
-        self.properties = self.editor.read(cx).properties();
+        self.properties = self.editor.update(cx, |editor, _cx| editor.properties());
     }
 
     fn toggle_bookmark(
@@ -923,6 +2625,7 @@ impl DragonGlassApp {
         match result {
             Ok(()) => {
                 self.properties = properties.to_vec();
+                self.cache_epoch = self.cache_epoch.wrapping_add(1);
                 self.status_message = Some("properties updated".to_string());
             }
             Err(e) => self.status_message = Some(format!("could not save properties: {e}")),
@@ -1041,9 +2744,10 @@ impl DragonGlassApp {
 
                 if panel.mode == SwitcherMode::QueryInput {
                     let expression = panel.query.clone();
-                    self.query_results = query::run(&self.note_refs, &expression);
+                    self.query_results = Rc::new(query::run(&self.note_refs, &expression));
                     self.show_query = true;
                     self.show_graph = false;
+                    self.show_diff = false;
                     self.status_message = Some(format!("query: {} rows", self.query_results.len()));
                     self.close_panel(window, cx);
                     return;
@@ -1070,11 +2774,54 @@ impl DragonGlassApp {
                     return;
                 }
 
+                if panel.mode == SwitcherMode::SharedName {
+                    let slug = panel.query.clone();
+                    let content = self.pending_shared.take();
+                    self.close_panel(window, cx);
+                    if let Some(content) = content {
+                        match shared::save(&self.vault_root, &slug, &content) {
+                            Ok(block) => {
+                                let reference = format!("{{{{shared:{}}}}}", block.slug);
+                                self.editor.update(cx, |editor, cx| {
+                                    editor.replace_selection_or_insert(&reference);
+                                    cx.notify();
+                                });
+                                window.focus(&self.editor.focus_handle(cx));
+                                self.status_message =
+                                    Some(format!("shared block created: {}", block.slug));
+                            }
+                            Err(error) => {
+                                self.status_message =
+                                    Some(format!("could not save shared block: {error}"));
+                            }
+                        }
+                    }
+                    cx.notify();
+                    return;
+                }
+
+                if panel.mode == SwitcherMode::NewNoteName {
+                    let name = panel.query.clone();
+                    let template = self.pending_template.take();
+                    self.close_panel(window, cx);
+                    if let Some(template) = template {
+                        self.create_from_template(&name, &template, window, cx);
+                    }
+                    return;
+                }
+
+                if panel.mode == SwitcherMode::RelationInput {
+                    let target = panel.query.clone();
+                    self.close_panel(window, cx);
+                    self.add_relation(&target, cx);
+                    return;
+                }
+
                 if let Some(item) = panel.results.get(panel.selected) {
                     match &item.item {
                         Item::Note { relative } => {
                             let relative = relative.clone();
-                            self.open_note(&relative, cx);
+                            self.open_note(&relative, window, cx);
                             self.close_panel(window, cx);
                             return;
                         }
@@ -1142,6 +2889,77 @@ impl DragonGlassApp {
                             self.close_panel(window, cx);
                             return;
                         }
+                        Item::VersionSave(label) => {
+                            let label = label.clone();
+                            self.close_panel(window, cx);
+                            self.save_version(&label, cx);
+                            return;
+                        }
+                        Item::VersionCompare { left, right } => {
+                            let left = left.clone();
+                            let right = right.clone();
+                            self.close_panel(window, cx);
+                            self.compare_version(left, right, cx);
+                            return;
+                        }
+                        Item::VersionPromote(id) => {
+                            let id = id.clone();
+                            self.close_panel(window, cx);
+                            self.promote_version(&id, window, cx);
+                            return;
+                        }
+                        Item::VersionDelete(id) => {
+                            let id = id.clone();
+                            self.close_panel(window, cx);
+                            self.delete_version(&id, cx);
+                            return;
+                        }
+                        Item::Template(relative) => {
+                            let relative = relative.clone();
+                            self.close_panel(window, cx);
+                            self.insert_template(&relative, window, cx);
+                            return;
+                        }
+                        Item::TemplateNew(relative) => {
+                            let relative = relative.clone();
+                            let template =
+                                templates::list(&self.vault_root, &self.config.templates_folder)
+                                    .into_iter()
+                                    .find(|template| template.relative == relative);
+                            if let Some(template) = template {
+                                self.pending_template = Some(template);
+                                panel.mode = SwitcherMode::NewNoteName;
+                                panel.query.clear();
+                                panel.results.clear();
+                                panel.selected = 0;
+                                self.switcher = Some(panel);
+                                cx.notify();
+                            }
+                            return;
+                        }
+                        Item::Shared(slug) => {
+                            let slug = slug.clone();
+                            self.close_panel(window, cx);
+                            self.insert_shared(&slug, window, cx);
+                            return;
+                        }
+                        Item::SharedEdit(slug) => {
+                            let relative =
+                                format!(".dragon-glass/shared/{}.md", shared::sanitize(slug));
+                            self.open_note(&relative, window, cx);
+                            self.close_panel(window, cx);
+                            return;
+                        }
+                        Item::Issue(line) => {
+                            let line = *line;
+                            self.close_panel(window, cx);
+                            self.editor.update(cx, |editor, cx| {
+                                editor.jump_to_line(line.saturating_sub(1));
+                                cx.notify();
+                            });
+                            window.focus(&self.editor.focus_handle(cx));
+                            return;
+                        }
                         Item::Command(command) => {
                             let command = *command;
 
@@ -1181,10 +2999,13 @@ impl DragonGlassApp {
                                     self.create_periodic(Periodic::Monthly, window, cx)
                                 }
                                 CommandId::Bookmark => self.toggle_bookmark_now(cx),
-                                CommandId::ToggleReading => self.editor.update(cx, |editor, cx| {
-                                    editor.toggle_reading_mode();
-                                    cx.notify();
-                                }),
+                                CommandId::ToggleReading => {
+                                    self.editor.update(cx, |editor, cx| {
+                                        editor.toggle_reading_mode();
+                                        cx.notify();
+                                    });
+                                    self.remember_session(cx);
+                                }
                                 CommandId::Save => self.editor.update(cx, |editor, cx| {
                                     let _ = editor.save();
                                     cx.notify();
@@ -1205,6 +3026,40 @@ impl DragonGlassApp {
                                 CommandId::Plugin(index) => self.run_plugin_command(index, cx),
                                 CommandId::UserTheme(index) => self.apply_user_theme(index, cx),
                                 CommandId::NewWindow => self.open_new_window(window, cx),
+                                CommandId::OpenVault => {
+                                    self.close_panel(window, cx);
+                                    vault_picker::VaultPicker::open(
+                                        cx,
+                                        None,
+                                        Rc::new(open_vault_in_new_process),
+                                    );
+                                    return;
+                                }
+                                CommandId::DetachTab => {
+                                    self.detach_tab(self.active_tab, window, cx);
+                                    self.close_panel(window, cx);
+                                    return;
+                                }
+                                CommandId::ToggleSplitEditor => {
+                                    self.toggle_split_editor(cx);
+                                    self.close_panel(window, cx);
+                                    return;
+                                }
+                                CommandId::CloseTab => {
+                                    self.close_tab(self.active_tab, window, cx);
+                                    self.close_panel(window, cx);
+                                    return;
+                                }
+                                CommandId::NextTab => {
+                                    self.cycle_tab(1, window, cx);
+                                    self.close_panel(window, cx);
+                                    return;
+                                }
+                                CommandId::PrevTab => {
+                                    self.cycle_tab(-1, window, cx);
+                                    self.close_panel(window, cx);
+                                    return;
+                                }
                                 CommandId::GraphFilter => {
                                     panel.mode = SwitcherMode::GraphFilterInput;
                                     panel.query.clear();
@@ -1229,18 +3084,13 @@ impl DragonGlassApp {
                                     return;
                                 }
                                 CommandId::ToggleSnippets => self.toggle_snippets(cx),
-                                CommandId::TogglePreview => {
-                                    self.split_preview = !self.split_preview;
-                                    self.status_message = Some(format!(
-                                        "preview pane: {}",
-                                        if self.split_preview { "on" } else { "off" }
-                                    ));
-                                    cx.notify();
-                                }
+                                CommandId::TogglePreview => self.toggle_split_preview(cx),
                                 CommandId::DetachPreview => {
+                                    let opener = self.link_opener(cx);
                                     preview_window::PreviewWindow::open(
                                         self.editor.clone(),
                                         self.vault_root.clone(),
+                                        opener,
                                         cx,
                                     );
                                     self.status_message =
@@ -1274,6 +3124,169 @@ impl DragonGlassApp {
                                     panel.property_key = None;
                                     panel.results =
                                         self.compute_results(SwitcherMode::WorkspaceMenu, "");
+                                    panel.selected = 0;
+                                    self.switcher = Some(panel);
+                                    cx.notify();
+                                    return;
+                                }
+                                CommandId::Versions => {
+                                    panel.mode = SwitcherMode::VersionMenu;
+                                    panel.query.clear();
+                                    panel.property_key = None;
+                                    panel.results =
+                                        self.compute_results(SwitcherMode::VersionMenu, "");
+                                    panel.selected = 0;
+                                    self.switcher = Some(panel);
+                                    cx.notify();
+                                    return;
+                                }
+                                CommandId::SaveVersionA | CommandId::SaveVersionB => {
+                                    let label = if command == CommandId::SaveVersionA {
+                                        "A"
+                                    } else {
+                                        "B"
+                                    };
+                                    self.close_panel(window, cx);
+                                    self.save_version(label, cx);
+                                    return;
+                                }
+                                CommandId::InsertTemplate => {
+                                    panel.mode = SwitcherMode::TemplateMenu;
+                                    panel.query.clear();
+                                    panel.property_key = None;
+                                    panel.results =
+                                        self.compute_results(SwitcherMode::TemplateMenu, "");
+                                    panel.selected = 0;
+                                    self.switcher = Some(panel);
+                                    cx.notify();
+                                    return;
+                                }
+                                CommandId::NewFromTemplate => {
+                                    panel.mode = SwitcherMode::TemplateNewMenu;
+                                    panel.query.clear();
+                                    panel.property_key = None;
+                                    panel.results =
+                                        self.compute_results(SwitcherMode::TemplateNewMenu, "");
+                                    panel.selected = 0;
+                                    self.switcher = Some(panel);
+                                    cx.notify();
+                                    return;
+                                }
+                                CommandId::InsertShared => {
+                                    panel.mode = SwitcherMode::SharedMenu;
+                                    panel.query.clear();
+                                    panel.property_key = None;
+                                    panel.results =
+                                        self.compute_results(SwitcherMode::SharedMenu, "");
+                                    panel.selected = 0;
+                                    self.switcher = Some(panel);
+                                    cx.notify();
+                                    return;
+                                }
+                                CommandId::EditShared => {
+                                    panel.mode = SwitcherMode::SharedEditMenu;
+                                    panel.query.clear();
+                                    panel.property_key = None;
+                                    panel.results =
+                                        self.compute_results(SwitcherMode::SharedEditMenu, "");
+                                    panel.selected = 0;
+                                    self.switcher = Some(panel);
+                                    cx.notify();
+                                    return;
+                                }
+                                CommandId::ExtractShared => {
+                                    self.extract_shared(window, cx);
+                                    return;
+                                }
+                                CommandId::ReloadNote => {
+                                    self.editor.update(cx, |editor, cx| {
+                                        let _ = editor.reload();
+                                        cx.notify();
+                                    });
+                                    self.cache_epoch = self.cache_epoch.wrapping_add(1);
+                                    self.refresh_properties(cx);
+                                    self.close_panel(window, cx);
+                                    self.status_message = Some("reloaded from disk".to_string());
+                                    return;
+                                }
+                                CommandId::ReviewDocument => {
+                                    self.review_document(window, cx);
+                                    return;
+                                }
+                                CommandId::Relations => {
+                                    self.close_panel(window, cx);
+                                    self.relations = relations::build(&self.note_refs);
+                                    self.show_relations = true;
+                                    self.status_message = Some("document relations".to_string());
+                                    cx.notify();
+                                    return;
+                                }
+                                CommandId::RelationGraph => {
+                                    self.close_panel(window, cx);
+                                    self.open_relation_graph(window, cx);
+                                    return;
+                                }
+                                CommandId::MoveBlockUp => {
+                                    let moved = self.editor.update(cx, |editor, cx| {
+                                        let moved = editor.move_block_up();
+                                        cx.notify();
+                                        moved
+                                    });
+                                    self.close_panel(window, cx);
+                                    self.status_message = Some(if moved {
+                                        "block moved up".to_string()
+                                    } else {
+                                        "nothing to move up".to_string()
+                                    });
+                                    return;
+                                }
+                                CommandId::MoveBlockDown => {
+                                    let moved = self.editor.update(cx, |editor, cx| {
+                                        let moved = editor.move_block_down();
+                                        cx.notify();
+                                        moved
+                                    });
+                                    self.close_panel(window, cx);
+                                    self.status_message = Some(if moved {
+                                        "block moved down".to_string()
+                                    } else {
+                                        "nothing to move down".to_string()
+                                    });
+                                    return;
+                                }
+                                CommandId::DuplicateBlock => {
+                                    let changed = self.editor.update(cx, |editor, cx| {
+                                        let changed = editor.duplicate_block();
+                                        cx.notify();
+                                        changed
+                                    });
+                                    self.close_panel(window, cx);
+                                    self.status_message = Some(if changed {
+                                        "block duplicated".to_string()
+                                    } else {
+                                        "no block here".to_string()
+                                    });
+                                    return;
+                                }
+                                CommandId::DeleteBlock => {
+                                    let changed = self.editor.update(cx, |editor, cx| {
+                                        let changed = editor.delete_block();
+                                        cx.notify();
+                                        changed
+                                    });
+                                    self.close_panel(window, cx);
+                                    self.status_message = Some(if changed {
+                                        "block deleted".to_string()
+                                    } else {
+                                        "no block here".to_string()
+                                    });
+                                    return;
+                                }
+                                CommandId::AddRelation => {
+                                    panel.mode = SwitcherMode::RelationInput;
+                                    panel.query.clear();
+                                    panel.property_key = None;
+                                    panel.results.clear();
                                     panel.selected = 0;
                                     self.switcher = Some(panel);
                                     cx.notify();
@@ -1321,61 +3334,183 @@ impl DragonGlassApp {
     }
 }
 
-fn query_view(rows: &[query::Row], theme: Theme) -> AnyElement {
-    let mut items: Vec<AnyElement> = Vec::with_capacity(rows.len() + 1);
-    items.push(
-        div()
-            .flex()
-            .flex_row()
-            .gap_4()
-            .px_3()
-            .py_1()
-            .text_xs()
-            .text_color(theme.muted)
-            .child(div().w(px(340.0)).child("note"))
-            .child("properties")
-            .into_any_element(),
-    );
+fn query_view(rows: Rc<Vec<query::Row>>, theme: Theme) -> AnyElement {
+    let count = rows.len();
+    let list = uniform_list("query-rows", count, move |range, _window, _cx| {
+        range
+            .filter_map(|i| rows.get(i).map(|row| (i, row)))
+            .map(|(i, row)| {
+                let properties = row
+                    .values
+                    .iter()
+                    .map(|(key, value)| format!("{key}={value}"))
+                    .collect::<Vec<_>>()
+                    .join("  ");
 
-    for row in rows {
-        let properties = row
-            .values
-            .iter()
-            .map(|(key, value)| format!("{key}={value}"))
-            .collect::<Vec<_>>()
-            .join("  ");
+                div()
+                    .id(ElementId::Name(format!("query-row-{i}").into()))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .h(px(24.0))
+                    .gap_4()
+                    .px_3()
+                    .text_sm()
+                    .child(div().w(px(340.0)).child(row.relative.clone()))
+                    .child(properties)
+                    .into_any_element()
+            })
+            .collect::<Vec<AnyElement>>()
+    })
+    .flex_1()
+    .min_h(px(0.0));
 
-        items.push(
+    div()
+        .flex()
+        .flex_col()
+        .size_full()
+        .py_2()
+        .child(
             div()
                 .flex()
                 .flex_row()
                 .gap_4()
                 .px_3()
                 .py_1()
-                .text_sm()
-                .child(div().w(px(340.0)).child(row.relative.clone()))
-                .child(properties)
-                .into_any_element(),
-        );
-    }
+                .text_xs()
+                .text_color(theme.muted)
+                .child(
+                    div()
+                        .w(px(340.0))
+                        .text_color(theme.star)
+                        .child(format!("{count} rows")),
+                )
+                .child("note  /  properties"),
+        )
+        .child(list)
+        .into_any_element()
+}
+
+fn diff_view(
+    title: String,
+    summary: String,
+    rows: Rc<Vec<diff::Line>>,
+    theme: Theme,
+) -> AnyElement {
+    let count = rows.len();
+    let list = uniform_list("diff-rows", count, move |range, _window, _cx| {
+        range
+            .filter_map(|i| rows.get(i).map(|row| (i, row)))
+            .map(|(i, row)| {
+                let color = match row.kind {
+                    diff::LineKind::Added => theme.code_text,
+                    diff::LineKind::Removed => theme.warn,
+                    diff::LineKind::Context => theme.text_dim,
+                };
+                let marker = row.kind.marker().to_string();
+                let numbers = format!(
+                    "{:>4} {:>4}",
+                    row.old_line.unwrap_or(0),
+                    row.new_line.unwrap_or(0)
+                );
+
+                div()
+                    .id(ElementId::Name(format!("diff-row-{i}").into()))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .h(px(20.0))
+                    .px_3()
+                    .text_sm()
+                    .child(div().w(px(76.0)).text_color(theme.muted).child(numbers))
+                    .child(div().w(px(16.0)).text_color(color).child(marker))
+                    .child(div().flex_1().text_color(color).child(row.text.clone()))
+                    .into_any_element()
+            })
+            .collect::<Vec<AnyElement>>()
+    })
+    .flex_1()
+    .min_h(px(0.0));
 
     div()
-        .id("query-scroll")
         .flex()
         .flex_col()
         .size_full()
-        .overflow_y_scroll()
         .py_2()
         .child(
             div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_4()
                 .px_3()
                 .py_1()
                 .text_xs()
-                .text_color(theme.star)
-                .child(format!("{} rows", rows.len())),
+                .text_color(theme.muted)
+                .child(div().text_color(theme.star).child(title))
+                .child(summary)
+                .child(div().flex_1())
+                .child("Esc to close"),
         )
-        .children(items)
+        .child(list)
         .into_any_element()
+}
+
+/// Fill the standard template variables for a note.
+fn render_template(template: &str, root: &Path, relative: Option<&str>, title: &str) -> String {
+    let now = chrono::Local::now();
+    let date = now.format("%Y-%m-%d").to_string();
+    let time = now.format("%H:%M").to_string();
+    let weekday = now.format("%A").to_string();
+    let vault = root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("vault")
+        .to_string();
+    let folder = relative
+        .and_then(|relative| relative.rsplit_once('/'))
+        .map(|(folder, _)| folder)
+        .unwrap_or("")
+        .to_string();
+
+    templates::render(
+        template,
+        &[
+            ("title", title),
+            ("date", &date),
+            ("time", &time),
+            ("weekday", &weekday),
+            ("vault", &vault),
+            ("folder", &folder),
+        ],
+    )
+}
+
+fn note_display(relative: &str) -> String {
+    relative
+        .rsplit('/')
+        .next()
+        .unwrap_or(relative)
+        .trim_end_matches(".md")
+        .trim_end_matches(".markdown")
+        .to_string()
+}
+
+fn sanitize_filename(name: &str) -> String {
+    let mut out: String = name
+        .trim()
+        .chars()
+        .map(|ch| match ch {
+            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '-',
+            other => other,
+        })
+        .collect();
+    out = out.trim().trim_end_matches('.').to_string();
+    if out.is_empty() {
+        "Untitled".to_string()
+    } else {
+        out
+    }
 }
 
 fn describe_workspace(workspace: &workspace::Workspace) -> String {
@@ -1533,52 +3668,142 @@ fn git_label(status: &Option<git::Status>) -> String {
 
 impl Render for DragonGlassApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.close_requested {
+            window.remove_window();
+            return div();
+        }
+
         let theme = *cx.global::<Theme>();
 
-        // A preview pane beside the editor, sharing the same document text.
-        let preview: Option<AnyElement> =
-            if self.split_preview && !self.show_graph && !self.show_query {
-                let style = window.text_style();
-                let template = gpui::TextRun {
-                    len: 0,
-                    font: style.font(),
-                    color: style.color,
-                    background_color: None,
-                    underline: None,
-                    strikethrough: None,
-                };
-                let text = self.editor.read(cx).text();
+        // Stats and the outline both need the document text. Fetch it once per change
+        // rather than once per consumer: copying a large note is not free on every
+        // keystroke.
+        let stats_version = self.editor.read(cx).document_version();
+        let headings_version = (self.cache_epoch, stats_version.1);
+        let stats_stale = stats_version != self.stats_version;
+        let headings_stale = headings_version != self.headings_version;
+        if stats_stale || headings_stale {
+            let text = self.editor.read(cx).text();
+            if stats_stale {
+                self.stats = stats::compute(&text);
+                self.stats_version = stats_version;
+            }
+            if headings_stale {
+                self.headings = Rc::new(markdown::headings(&text));
+                self.headings_version = headings_version;
+            }
+        }
 
-                Some(
-                    div()
-                        .id("preview-scroll")
-                        .flex_1()
-                        .min_w(px(0.0))
-                        .overflow_y_scroll()
-                        .border_l_1()
-                        .border_color(theme.border)
-                        .child(crate::reading::reading_view(
-                            &text,
-                            Some(&self.vault_root),
-                            0,
-                            theme,
-                            &template,
-                        ))
-                        .into_any_element(),
-                )
-            } else {
-                None
+        // A preview pane beside the editor, sharing the same document text.
+        let preview: Option<AnyElement> = if self.split_preview
+            && self.split_tabs.is_empty()
+            && !self.show_graph
+            && !self.show_diff
+            && !self.show_query
+            && !self.editor.read(cx).is_reading()
+        {
+            let version = (self.cache_epoch, self.editor.read(cx).document_version().1);
+            if self.preview_content.needs_update(version) {
+                let text = self.editor.read(cx).text();
+                let root = self.vault_root.clone();
+                self.preview_content.update(version, &text, Some(&root));
+            }
+
+            let style = window.text_style();
+            let template = gpui::TextRun {
+                len: 0,
+                font: style.font(),
+                color: style.color,
+                background_color: None,
+                underline: None,
+                strikethrough: None,
             };
+
+            let opener = self.link_opener(cx);
+            Some(
+                div()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .border_l_1()
+                    .border_color(theme.border)
+                    .child(self.preview_content.element(
+                        Some(self.vault_root.clone()),
+                        theme,
+                        template,
+                        Some(opener),
+                        cx,
+                    ))
+                    .into_any_element(),
+            )
+        } else {
+            None
+        };
 
         // A conflict is resolved once the editor is clean again (saved or reloaded).
         if self.conflict && !self.editor.read(cx).is_dirty() {
             self.conflict = false;
         }
 
-        let mut rows = Vec::new();
-        flatten(&self.tree, 0, &mut rows);
+        let rows = self.file_rows.clone();
+        let file_count = rows.len();
+        let me_for_list = cx.entity();
+        let active_for_list = self.active.clone();
+        let file_list = uniform_list("file-list", file_count, move |range, _window, _cx| {
+            range
+                .filter_map(|i| rows.get(i).map(|row| (i, row)))
+                .map(|(i, row)| {
+                    let indent = px(8.0 + row.depth as f32 * 12.0);
+                    let is_active =
+                        !row.is_dir && row.path.as_deref() == active_for_list.as_deref();
+                    let color = if row.is_dir {
+                        theme.text_dim
+                    } else if is_active {
+                        theme.accent_text
+                    } else {
+                        theme.text
+                    };
+
+                    let mut base = div()
+                        .id(ElementId::Name(format!("row-{i}").into()))
+                        .flex()
+                        .items_center()
+                        .h(px(24.0))
+                        .w_full()
+                        .min_w(px(0.0))
+                        .overflow_hidden()
+                        .rounded_sm()
+                        .pl(indent)
+                        .pr_2()
+                        .text_sm()
+                        .cursor_pointer()
+                        .text_color(color)
+                        .child(row.name.clone());
+
+                    if is_active {
+                        base = base.bg(theme.accent);
+                    }
+
+                    match &row.path {
+                        Some(path) => {
+                            let path = path.clone();
+                            let me = me_for_list.clone();
+                            base.hover(move |style| style.bg(theme.hover))
+                                .on_mouse_down(MouseButton::Left, move |_ev, window, cx| {
+                                    me.update(cx, |this, cx| {
+                                        this.open_note(&path, window, cx);
+                                    });
+                                })
+                                .into_any_element()
+                        }
+                        None => base.font_weight(gpui::FontWeight::BOLD).into_any_element(),
+                    }
+                })
+                .collect::<Vec<AnyElement>>()
+        })
+        .flex_1()
+        .min_h(px(0.0));
+
         let me = cx.entity();
-        let active = self.active.clone();
 
         let bookmark_rows: Vec<AnyElement> = self
             .bookmarks
@@ -1595,16 +3820,23 @@ impl Render for DragonGlassApp {
                     .to_string();
                 div()
                     .id(ElementId::Name(format!("bookmark-{i}").into()))
+                    .flex()
+                    .items_center()
+                    .h(px(24.0))
+                    .w_full()
+                    .min_w(px(0.0))
+                    .overflow_hidden()
+                    .rounded_sm()
                     .pl(px(16.0))
                     .pr_2()
-                    .py_1()
                     .text_sm()
                     .cursor_pointer()
                     .text_color(theme.star)
+                    .hover(move |style| style.bg(theme.hover))
                     .child(format!("\u{2605} {name}"))
-                    .on_mouse_down(MouseButton::Left, move |_ev, _window, cx| {
+                    .on_mouse_down(MouseButton::Left, move |_ev, window, cx| {
                         me.update(cx, |this, cx| {
-                            this.open_note(&relative, cx);
+                            this.open_note(&relative, window, cx);
                         });
                     })
                     .into_any_element()
@@ -1613,10 +3845,17 @@ impl Render for DragonGlassApp {
 
         let sidebar = div()
             .id("sidebar")
-            .w(px(240.0))
+            .on_drop::<TabDrag>(cx.listener(Self::drop_on_window))
+            .drag_over::<TabDrag>(move |style, _drag, _window, _cx| {
+                style.bg(theme.accent.opacity(0.25))
+            })
+            .flex()
+            .flex_col()
+            .w(px(self.sidebar_width))
             .h_full()
-            .overflow_y_scroll()
             .bg(theme.panel)
+            .border_r_1()
+            .border_color(theme.border)
             .py_2()
             .when(!bookmark_rows.is_empty(), move |d| {
                 d.child(
@@ -1631,95 +3870,273 @@ impl Render for DragonGlassApp {
             })
             .child(
                 div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
                     .px_2()
-                    .py_1()
+                    .pt_2()
+                    .pb_1()
                     .text_xs()
                     .text_color(theme.muted)
-                    .child("FILES"),
+                    .child("FILES")
+                    .child(format!("{}", self.notes)),
             )
-            .children(rows.into_iter().enumerate().map(move |(i, row)| {
-                let indent = px(8.0 + row.depth as f32 * 12.0);
-                let is_active = !row.is_dir && row.path.as_deref() == active.as_deref();
-                let color = if row.is_dir {
-                    theme.muted
-                } else if is_active {
-                    theme.accent_text
-                } else {
-                    theme.text
-                };
+            .child(file_list);
 
-                let mut base = div()
-                    .id(ElementId::Name(format!("row-{i}").into()))
-                    .pl(indent)
-                    .pr_2()
-                    .py_1()
-                    .text_sm()
-                    .cursor_pointer()
-                    .text_color(color)
-                    .child(row.name.clone());
-
-                if is_active {
-                    base = base.bg(theme.accent);
-                }
-
-                match row.path {
-                    Some(path) => {
-                        let me = me.clone();
-                        base.on_mouse_down(MouseButton::Left, move |_ev, _window, cx| {
-                            me.update(cx, |this, cx| {
-                                this.open_note(&path, cx);
-                            });
-                        })
-                    }
-                    None => base,
-                }
-            }));
-
-        let headings = {
-            let editor = self.editor.read(cx);
-            markdown::headings(&editor.text())
-        };
+        let headings = self.headings.clone();
 
         let outline: Option<AnyElement> = if headings.is_empty() {
             None
         } else {
             let me = cx.entity();
-            let rows = headings.iter().enumerate().map(|(i, heading)| {
-                let indent = px(8.0 + heading.level.saturating_sub(1) as f32 * 10.0);
-                let line = heading.line;
-                let me = me.clone();
-                div()
-                    .id(ElementId::Name(format!("outline-{i}").into()))
-                    .pl(indent)
-                    .pr_2()
-                    .py_1()
-                    .text_sm()
-                    .cursor_pointer()
-                    .text_color(theme.text)
-                    .child(heading.text.clone())
-                    .on_mouse_down(MouseButton::Left, move |_ev, window, cx| {
-                        me.update(cx, |this, cx| {
-                            this.editor.update(cx, |editor, cx| {
-                                editor.jump_to_line(line.saturating_sub(1));
-                                cx.notify();
-                            });
-                            window.focus(&this.editor.focus_handle(cx));
-                            cx.notify();
-                        });
+            let heading_count = headings.len();
+            let rows = uniform_list("outline-list", heading_count, move |range, _window, _cx| {
+                range
+                    .filter_map(|i| headings.get(i).map(|heading| (i, heading)))
+                    .map(|(i, heading)| {
+                        let indent = px(8.0 + heading.level.saturating_sub(1) as f32 * 10.0);
+                        let line = heading.line;
+                        let heading_text = heading.text.clone();
+                        let me = me.clone();
+                        div()
+                            .id(ElementId::Name(format!("outline-{i}").into()))
+                            .flex()
+                            .items_center()
+                            .h(px(24.0))
+                            .mx_1()
+                            .rounded_sm()
+                            .pl(indent)
+                            .pr_2()
+                            .text_sm()
+                            .cursor_pointer()
+                            .text_color(theme.text)
+                            .hover(move |style| style.bg(theme.hover))
+                            .child(heading.text.clone())
+                            .on_mouse_down(MouseButton::Left, move |_ev, window, cx| {
+                                me.update(cx, |this, cx| {
+                                    this.editor.update(cx, |editor, cx| {
+                                        editor.jump_to_heading(
+                                            line.saturating_sub(1),
+                                            &heading_text,
+                                            i,
+                                        );
+                                        cx.notify();
+                                    });
+                                    window.focus(&this.editor.focus_handle(cx));
+                                    cx.notify();
+                                });
+                            })
+                            .into_any_element()
                     })
-            });
+                    .collect::<Vec<AnyElement>>()
+            })
+            .flex_1()
+            .min_h(px(0.0));
 
             Some(
                 div()
                     .id("outline")
-                    .w(px(200.0))
+                    .on_drop::<TabDrag>(cx.listener(Self::drop_on_window))
+                    .flex()
+                    .flex_col()
+                    .w(px(self.outline_width))
                     .h_full()
-                    .overflow_y_scroll()
                     .bg(theme.panel)
+                    .border_l_1()
+                    .border_color(theme.border)
                     .py_2()
+                    .child(
+                        div()
+                            .px_2()
+                            .py_1()
+                            .text_xs()
+                            .text_color(theme.muted)
+                            .child("TABLE OF CONTENTS"),
+                    )
+                    .child(rows)
+                    .into_any_element(),
+            )
+        };
+
+        let relations_panel: Option<AnyElement> = if self.show_relations {
+            let me = cx.entity();
+            let active = self.active.clone();
+            let entries = active
+                .as_deref()
+                .and_then(|relative| relations::for_note(&self.relations, relative));
+
+            let mut rows: Vec<AnyElement> = Vec::new();
+            let section = |title: &str, rows: &mut Vec<AnyElement>| {
+                rows.push(
+                    div()
+                        .px_2()
+                        .pt_2()
+                        .pb_1()
+                        .text_xs()
+                        .text_color(theme.muted)
+                        .child(title.to_uppercase())
+                        .into_any_element(),
+                );
+            };
+
+            if let Some(entries) = entries {
+                if !entries.outgoing.is_empty() {
+                    section("Relations", &mut rows);
+                    for relation in entries.outgoing.iter().take(30) {
+                        let target = relation.target.clone();
+                        let me = me.clone();
+                        let label = note_display(&target);
+                        let detail = match &relation.label {
+                            Some(label) => format!("{} · {label}", relation.kind.label()),
+                            None => relation.kind.label().to_string(),
+                        };
+                        rows.push(
+                            div()
+                                .id(ElementId::Name(
+                                    format!("relation-{}-{}", relation.kind.label(), target).into(),
+                                ))
+                                .flex()
+                                .items_center()
+                                .justify_between()
+                                .gap_2()
+                                .h(px(24.0))
+                                .mx_1()
+                                .rounded_sm()
+                                .pl(px(14.0))
+                                .pr_2()
+                                .text_sm()
+                                .cursor_pointer()
+                                .text_color(theme.text)
+                                .hover(move |style| style.bg(theme.hover))
+                                .child(div().child(label))
+                                .child(div().text_xs().text_color(theme.muted).child(detail))
+                                .on_mouse_down(MouseButton::Left, move |_ev, window, cx| {
+                                    me.update(cx, |this, cx| {
+                                        this.open_note(&target, window, cx);
+                                    });
+                                })
+                                .into_any_element(),
+                        );
+                    }
+                }
+
+                if !entries.incoming.is_empty() {
+                    section("Backlinks", &mut rows);
+                    for relation in entries.incoming.iter().take(30) {
+                        let target = relation.target.clone();
+                        let me = me.clone();
+                        let label = note_display(&target);
+                        let detail = relation.kind.label();
+                        rows.push(
+                            div()
+                                .id(ElementId::Name(
+                                    format!("backlink-{}-{}", relation.kind.label(), target).into(),
+                                ))
+                                .flex()
+                                .items_center()
+                                .justify_between()
+                                .gap_2()
+                                .h(px(24.0))
+                                .mx_1()
+                                .rounded_sm()
+                                .pl(px(14.0))
+                                .pr_2()
+                                .text_sm()
+                                .cursor_pointer()
+                                .text_color(theme.text)
+                                .hover(move |style| style.bg(theme.hover))
+                                .child(div().child(label))
+                                .child(div().text_xs().text_color(theme.muted).child(detail))
+                                .on_mouse_down(MouseButton::Left, move |_ev, window, cx| {
+                                    me.update(cx, |this, cx| {
+                                        this.open_note(&target, window, cx);
+                                    });
+                                })
+                                .into_any_element(),
+                        );
+                    }
+                }
+
+                if !entries.shared_tags.is_empty() {
+                    section("Shared tags", &mut rows);
+                    for (tag, notes) in entries.shared_tags.iter().take(20) {
+                        let others: Vec<String> = notes
+                            .iter()
+                            .take(3)
+                            .map(|note| note_display(note))
+                            .collect();
+                        rows.push(
+                            div()
+                                .flex()
+                                .items_center()
+                                .justify_between()
+                                .gap_2()
+                                .h(px(24.0))
+                                .mx_1()
+                                .rounded_sm()
+                                .pl(px(14.0))
+                                .pr_2()
+                                .text_sm()
+                                .text_color(theme.text_dim)
+                                .child(format!("#{tag}"))
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(theme.muted)
+                                        .child(others.join(", ")),
+                                )
+                                .into_any_element(),
+                        );
+                    }
+                }
+            }
+
+            if rows.is_empty() {
+                rows.push(
+                    div()
+                        .px_3()
+                        .py_2()
+                        .text_sm()
+                        .text_color(theme.muted)
+                        .child(if active.is_some() {
+                            "no relations yet"
+                        } else {
+                            "no note open"
+                        })
+                        .into_any_element(),
+                );
+            }
+
+            Some(
+                div()
+                    .id("relations")
+                    .on_drop::<TabDrag>(cx.listener(Self::drop_on_window))
+                    .flex()
+                    .flex_col()
+                    .w(px(self.relations_width))
+                    .h_full()
+                    .bg(theme.panel)
+                    .border_l_1()
+                    .border_color(theme.border)
+                    .py_2()
+                    .overflow_y_scroll()
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .px_2()
+                            .pb_1()
+                            .text_xs()
+                            .text_color(theme.muted)
+                            .child("DOCUMENT RELATIONS")
+                            .child("esc"),
+                    )
                     .children(rows)
                     .into_any_element(),
             )
+        } else {
+            None
         };
 
         let panel: Option<AnyElement> = self.switcher.as_ref().map(|panel| {
@@ -1737,19 +4154,31 @@ impl Render for DragonGlassApp {
                 SwitcherMode::HotkeyMenu => "shortcut:",
                 SwitcherMode::HotkeyCapture => "press a key:",
                 SwitcherMode::GraphFilterInput => "graph filter:",
+                SwitcherMode::VersionMenu => "versions:",
+                SwitcherMode::TemplateMenu => "template:",
+                SwitcherMode::TemplateNewMenu => "new note template:",
+                SwitcherMode::SharedMenu => "shared block:",
+                SwitcherMode::SharedEditMenu => "edit shared block:",
+                SwitcherMode::ReviewMenu => "review:",
+                SwitcherMode::NewNoteName => "note name:",
+                SwitcherMode::SharedName => "shared block name:",
+                SwitcherMode::RelationInput => "related note:",
             };
             let rows = panel.results.iter().enumerate().map(|(i, item)| {
                 let mut row = div()
                     .flex()
                     .flex_row()
+                    .items_center()
                     .gap_3()
+                    .h(px(28.0))
                     .px_3()
-                    .py_1()
                     .text_sm()
                     .child(item.label.clone())
                     .child(div().text_color(theme.muted).child(item.detail.clone()));
                 if i == panel.selected {
                     row = row.bg(theme.accent);
+                } else {
+                    row = row.hover(move |style| style.bg(theme.hover));
                 }
                 row
             });
@@ -1765,10 +4194,13 @@ impl Render for DragonGlassApp {
                 .border_b_1()
                 .border_color(theme.border)
                 .max_h(px(320.0))
+                .overflow_y_scroll()
                 .child(
                     div()
                         .px_3()
                         .py_2()
+                        .border_b_1()
+                        .border_color(theme.border)
                         .text_color(theme.text)
                         .child(format!("{prefix} {}", panel.query)),
                 )
@@ -1776,15 +4208,216 @@ impl Render for DragonGlassApp {
                 .into_any_element()
         });
 
+        let tab_host = cx.entity();
+        let drop_overlay = if cx.has_active_drag() {
+            Some(self.tab_drop_overlay(theme, cx))
+        } else {
+            None
+        };
+        let center = div()
+            .flex_1()
+            // `flex_1` alone lets the outline panel keep its width; `w_full` would make
+            // this pane claim the whole row and push the outline off-screen.
+            .min_w(px(0.0))
+            .relative()
+            .child(self.center_view(theme, preview))
+            .children(drop_overlay);
+
+        if self.minimal {
+            let minimal_title = self
+                .tabs
+                .get(self.active_tab)
+                .map(|tab| tab.title.clone())
+                .unwrap_or_default();
+
+            return div()
+                .flex()
+                .flex_col()
+                .size_full()
+                .bg(theme.bg)
+                .text_color(theme.text)
+                .on_drop::<TabDrag>(cx.listener(Self::drop_on_window))
+                .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_drag_release_out))
+                .on_mouse_move(cx.listener(Self::clear_stuck_drag_move))
+                .on_mouse_down(MouseButton::Left, cx.listener(Self::clear_stuck_drag_down))
+                .on_action(cx.listener(Self::open_switcher))
+                .on_action(cx.listener(Self::open_search))
+                .on_action(cx.listener(Self::open_git))
+                .on_action(cx.listener(Self::open_relations))
+                .on_action(cx.listener(Self::open_daily))
+                .on_action(cx.listener(Self::open_weekly))
+                .on_action(cx.listener(Self::open_monthly))
+                .on_action(cx.listener(Self::open_properties))
+                .on_action(cx.listener(Self::toggle_bookmark))
+                .on_action(cx.listener(Self::open_commands))
+                .on_action(cx.listener(Self::toggle_theme))
+                .on_action(cx.listener(Self::close_overlay))
+                .on_action(cx.listener(Self::new_window))
+                .on_action(cx.listener(Self::toggle_side_by_side_action))
+                .on_action(cx.listener(Self::detach_tab_action))
+                .on_action(cx.listener(Self::toggle_split_editor_action))
+                .on_action(cx.listener(Self::close_tab_action))
+                .on_action(cx.listener(Self::next_tab))
+                .on_action(cx.listener(Self::prev_tab))
+                .children(panel)
+                .child(
+                    div()
+                        .id("minimal-tab")
+                        .flex()
+                        .items_center()
+                        .h(px(28.0))
+                        .px_3()
+                        .bg(theme.header)
+                        .border_b_1()
+                        .border_color(theme.border)
+                        .text_sm()
+                        .text_color(theme.muted)
+                        .child(minimal_title.clone())
+                        .child(div().flex_1())
+                        .on_drag(
+                            TabDrag {
+                                source: cx.entity().downgrade(),
+                                index: self.active_tab,
+                                title: minimal_title.clone(),
+                            },
+                            |drag, _offset, _window, cx| {
+                                let _ = drag.source.update(cx, |app, cx| {
+                                    app.dragging = Some(drag.clone());
+                                    cx.notify();
+                                });
+                                cx.new(|_| DragGhost {
+                                    title: drag.title.clone(),
+                                })
+                            },
+                        ),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .flex_1()
+                        .min_h(px(0.0))
+                        .child(center),
+                );
+        }
+
+        let tab_bar = div()
+            .id("tab-bar")
+            .on_drop::<TabDrag>(cx.listener(Self::drop_on_tab_bar))
+            .drag_over::<TabDrag>(move |style, _drag, _window, _cx| style.bg(theme.accent))
+            .flex()
+            .flex_row()
+            .items_center()
+            .h(px(34.0))
+            .bg(theme.header)
+            .border_b_1()
+            .border_color(theme.border)
+            .overflow_x_scroll()
+            .children(self.tabs.iter().enumerate().map(|(index, tab)| {
+                let is_active = index == self.active_tab;
+                let is_secondary = self.split_tabs.contains(&index);
+                let dirty = tab.editor.read(cx).is_dirty();
+                let title = tab.title.clone();
+                let activate = tab_host.clone();
+                let close = tab_host.clone();
+                let middle = tab_host.clone();
+
+                div()
+                    .id(ElementId::Name(format!("tab-{index}").into()))
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .h(px(34.0))
+                    .pl_3()
+                    .pr_1()
+                    .cursor_pointer()
+                    .border_r_1()
+                    .border_color(theme.border)
+                    .text_sm()
+                    .bg(if is_active {
+                        theme.bg
+                    } else if is_secondary {
+                        theme.chip
+                    } else {
+                        theme.header
+                    })
+                    .text_color(if is_active {
+                        theme.text
+                    } else if is_secondary {
+                        theme.star
+                    } else {
+                        theme.muted
+                    })
+                    .when(!is_active, move |d| {
+                        d.hover(move |style| style.bg(theme.hover).text_color(theme.text))
+                    })
+                    .child(title.clone())
+                    .when(dirty, |d| {
+                        d.child(div().text_color(theme.warn).child("\u{25CF}"))
+                    })
+                    .on_drag(
+                        TabDrag {
+                            source: cx.entity().downgrade(),
+                            index,
+                            title: title.clone(),
+                        },
+                        |drag, _offset, _window, cx| {
+                            let _ = drag.source.update(cx, |app, cx| {
+                                app.dragging = Some(drag.clone());
+                                cx.notify();
+                            });
+                            cx.new(|_| DragGhost {
+                                title: drag.title.clone(),
+                            })
+                        },
+                    )
+                    .child(
+                        div()
+                            .id(ElementId::Name(format!("tab-close-{index}").into()))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .w(px(18.0))
+                            .h(px(18.0))
+                            .rounded_sm()
+                            .text_color(theme.muted)
+                            .hover(move |style| style.bg(theme.hover).text_color(theme.warn))
+                            .child("\u{00D7}")
+                            .on_mouse_down(MouseButton::Left, move |_ev, window, cx| {
+                                cx.stop_propagation();
+                                close.update(cx, |this, cx| this.close_tab(index, window, cx));
+                            })
+                            .on_click(move |_ev, _window, cx| cx.stop_propagation()),
+                    )
+                    .on_click(move |_ev, window, cx| {
+                        activate.update(cx, |this, cx| {
+                            this.activate_tab(index, cx);
+                            let handle = this.editor.focus_handle(cx);
+                            window.focus(&handle);
+                        });
+                    })
+                    .on_mouse_down(MouseButton::Middle, move |_ev, window, cx| {
+                        cx.stop_propagation();
+                        middle.update(cx, |this, cx| this.close_tab(index, window, cx));
+                    })
+                    .into_any_element()
+            }));
+
         div()
             .flex()
             .flex_col()
             .size_full()
             .bg(theme.bg)
             .text_color(theme.text)
+            .on_drop::<TabDrag>(cx.listener(Self::drop_on_window))
+            .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_drag_release_out))
+            .on_mouse_up(MouseButton::Left, cx.listener(Self::finish_resize))
+            .on_mouse_move(cx.listener(Self::clear_stuck_drag_move))
+            .on_mouse_down(MouseButton::Left, cx.listener(Self::clear_stuck_drag_down))
             .on_action(cx.listener(Self::open_switcher))
             .on_action(cx.listener(Self::open_search))
             .on_action(cx.listener(Self::open_git))
+            .on_action(cx.listener(Self::open_relations))
             .on_action(cx.listener(Self::open_daily))
             .on_action(cx.listener(Self::open_weekly))
             .on_action(cx.listener(Self::open_monthly))
@@ -1794,19 +4427,50 @@ impl Render for DragonGlassApp {
             .on_action(cx.listener(Self::toggle_theme))
             .on_action(cx.listener(Self::close_overlay))
             .on_action(cx.listener(Self::new_window))
+            .on_action(cx.listener(Self::toggle_side_by_side_action))
+            .on_action(cx.listener(Self::detach_tab_action))
+            .on_action(cx.listener(Self::toggle_split_editor_action))
+            .on_action(cx.listener(Self::close_tab_action))
+            .on_action(cx.listener(Self::next_tab))
+            .on_action(cx.listener(Self::prev_tab))
             .child(
                 div()
                     .flex()
                     .flex_row()
-                    .gap_4()
+                    .items_center()
+                    .gap_3()
+                    .h(px(40.0))
                     .px_4()
-                    .py_2()
                     .bg(theme.header)
+                    .border_b_1()
+                    .border_color(theme.border)
                     .text_sm()
-                    .child("Dragon Glass")
-                    .child(self.vault_path.clone())
-                    .child(git_label(&self.git_status))
-                    .child(format!("{} notes / {} links", self.notes, self.links))
+                    .child(
+                        div()
+                            .font_weight(gpui::FontWeight::BOLD)
+                            .text_color(theme.text)
+                            .child("Dragon Glass"),
+                    )
+                    .child(div().text_color(theme.muted).child(self.vault_path.clone()))
+                    .child(
+                        div()
+                            .text_color(theme.text_dim)
+                            .child(git_label(&self.git_status)),
+                    )
+                    .child(
+                        div()
+                            .text_color(theme.muted)
+                            .child(format!("{} notes", self.notes)),
+                    )
+                    .child(
+                        div()
+                            .text_color(theme.muted)
+                            .child(format!("{} links", self.links)),
+                    )
+                    .child(div().text_color(theme.muted).child(format!(
+                        "{} words · {} min",
+                        self.stats.words, self.stats.reading_minutes
+                    )))
                     .when(self.conflict, |d| {
                         d.child(div().text_color(theme.warn).child("changed on disk"))
                     })
@@ -1817,6 +4481,7 @@ impl Render for DragonGlassApp {
                                 .child(format!("update available: {latest}")),
                         )
                     })
+                    .child(div().flex_1())
                     .child(
                         div()
                             .text_color(theme.muted)
@@ -1824,6 +4489,7 @@ impl Render for DragonGlassApp {
                     ),
             )
             .children(panel)
+            .child(tab_bar)
             .child(
                 div()
                     .flex()
@@ -1831,50 +4497,159 @@ impl Render for DragonGlassApp {
                     .flex_1()
                     .min_h(px(0.0))
                     .child(sidebar)
-                    .child(
+                    .child(resize_handle(ResizePanel::Sidebar, theme, cx))
+                    .child(center)
+                    .children(outline.map(|panel| {
+                        let handle = resize_handle(ResizePanel::Outline, theme, cx);
                         div()
-                            .flex_1()
-                            .w_full()
-                            .p_2()
-                            .child(self.center_view(theme, preview)),
-                    )
-                    .children(outline),
+                            .flex()
+                            .flex_row()
+                            .h_full()
+                            .child(handle)
+                            .child(panel)
+                            .into_any_element()
+                    }))
+                    .children(relations_panel.map(|panel| {
+                        let handle = resize_handle(ResizePanel::Relations, theme, cx);
+                        div()
+                            .flex()
+                            .flex_row()
+                            .h_full()
+                            .child(handle)
+                            .child(panel)
+                            .into_any_element()
+                    })),
             )
     }
 }
 
 fn main() {
     // The first argument may be a vault path or a `dragonglass://` URI, so the app can be
-    // registered as the OS handler for the scheme.
-    let argument = std::env::args()
+    // registered as the OS handler for the scheme. Without one, reopen the last vault; on
+    // a first run, ask which folder to open.
+    let requested = std::env::args()
         .nth(1)
-        .unwrap_or_else(|| "test-vault".to_string());
-    let (vault_path, uri_note) = match uri::parse(&argument) {
-        Some(parsed) => (
-            parsed.vault.clone().unwrap_or_else(|| ".".to_string()),
-            parsed.note.clone(),
-        ),
-        None => (argument, None),
+        .or_else(|| std::env::var("DRAGON_GLASS_VAULT").ok())
+        .filter(|argument| !argument.trim().is_empty());
+
+    let (requested_vault, uri_note) = match requested {
+        Some(argument) => match uri::parse(&argument) {
+            Some(parsed) => (parsed.vault.map(PathBuf::from), parsed.note),
+            None => (Some(PathBuf::from(argument)), None),
+        },
+        None => (None, None),
     };
 
+    Application::new().run(move |cx: &mut App| {
+        // An explicit path (a shortcut, the file manager, or a `dragonglass://` URI) wins.
+        // If it cannot be opened, fall back to the chooser rather than exiting silently.
+        if let Some(vault_path) = requested_vault.clone() {
+            if !open_vault_window(vault_path.clone(), uri_note.clone(), cx) {
+                vault_picker::VaultPicker::open(
+                    cx,
+                    Some(format!("Could not open {}.", vault_path.display())),
+                    Rc::new(open_vault_at_startup),
+                );
+            }
+            return;
+        }
+
+        // Otherwise reopen the last vault. A URI that names no vault still supplies a note.
+        let last = vaults::Registry::load().last().map(Path::to_path_buf);
+        match last {
+            Some(last) if last.is_dir() => {
+                if !open_vault_window(last.clone(), uri_note.clone(), cx) {
+                    vault_picker::VaultPicker::open(
+                        cx,
+                        Some(format!("Could not open {}.", last.display())),
+                        Rc::new(open_vault_at_startup),
+                    );
+                }
+            }
+            Some(last) => vault_picker::VaultPicker::open(
+                cx,
+                Some(format!(
+                    "The last vault, {}, is no longer available.",
+                    last.display()
+                )),
+                Rc::new(open_vault_at_startup),
+            ),
+            None => vault_picker::VaultPicker::open(cx, None, Rc::new(open_vault_at_startup)),
+        }
+    });
+}
+
+/// Open a vault chosen in the startup picker, falling back to the picker on failure.
+fn open_vault_at_startup(vault_path: PathBuf, cx: &mut App) {
+    if !open_vault_window(vault_path.clone(), None, cx) {
+        vault_picker::VaultPicker::open(
+            cx,
+            Some(format!("Could not open {}.", vault_path.display())),
+            Rc::new(open_vault_at_startup),
+        );
+    }
+}
+
+/// Open a vault chosen while the app is running in a second process.
+///
+/// Each window owns its vault, theme and keymap, so switching vaults is a fresh launch
+/// rather than a reset of the current window. The current vault stays open beside it.
+fn open_vault_in_new_process(vault_path: PathBuf, cx: &mut App) {
+    let spawned = std::env::current_exe().and_then(|exe| {
+        std::process::Command::new(exe)
+            .arg(&vault_path)
+            .spawn()
+            .map(|_| ())
+    });
+
+    if let Err(error) = spawned {
+        vault_picker::VaultPicker::open(
+            cx,
+            Some(format!("Could not open {}: {error}", vault_path.display())),
+            Rc::new(open_vault_in_new_process),
+        );
+    }
+}
+
+/// Build the main window for `vault_path`. Returns false when the vault cannot be opened.
+fn open_vault_window(vault_path: PathBuf, uri_note: Option<String>, cx: &mut App) -> bool {
     let vault = match Vault::open(&vault_path) {
         Ok(v) => v,
         Err(e) => {
-            eprintln!("could not open vault {vault_path:?}: {e}");
-            std::process::exit(1);
+            eprintln!("could not open vault {}: {e}", vault_path.display());
+            return false;
         }
     };
 
+    // Remember it before doing any other work, so a crash later still leaves the vault
+    // at the top of the list next time.
+    let mut registry = vaults::Registry::load();
+    let _ = registry.record(vault.root());
+
     let note_refs = vault.notes();
     let note_count = note_refs.len();
-    let link_count: usize = note_refs
-        .iter()
-        .filter_map(|r| Note::load(&r.path).ok())
-        .map(|n| n.links().len())
-        .sum();
 
-    let tree = vault.tree();
+    // One pass over the notes for both the link count and the "most linked note" pick.
+    let mut link_count = 0usize;
+    let mut best_links = 0usize;
+    let mut first: Option<&NoteRef> = None;
+    for note_ref in &note_refs {
+        if let Ok(note) = Note::load(&note_ref.path) {
+            let links = note.links().len();
+            link_count += links;
+            if links >= best_links {
+                best_links = links;
+                first = Some(note_ref);
+            }
+        }
+    }
+
+    let tree = tree::build(&note_refs);
+    let mut initial_rows = Vec::new();
+    flatten(&tree, 0, &mut initial_rows);
+    let file_rows = Rc::new(initial_rows);
     let vault_root = vault.root().to_path_buf();
+    let initial_session = session::load(&vault_root);
     let initial_bookmarks = bookmarks::load(&vault_root);
     let initial_user_themes = load_user_themes(&vault_root);
     let initial_theme = load_theme(&vault_root, &initial_user_themes);
@@ -1906,175 +4681,207 @@ fn main() {
     } else {
         None
     };
-    let display_path = vault_path.clone();
+    let display_path = vaults::canonical(&vault_path).to_string_lossy().to_string();
 
-    // Open the note with the most links, so there is something worth looking at.
-    let first = note_refs
-        .iter()
-        .max_by_key(|r| Note::load(&r.path).map(|n| n.links().len()).unwrap_or(0));
-
-    // A URI note wins over the default; otherwise open the note with the most links.
+    // A URI note wins, then the note that was open last time, then the most linked note.
     let first_rel = uri_note
         .filter(|note| {
             note_refs
                 .iter()
                 .any(|candidate| &candidate.relative == note)
         })
+        .or_else(|| {
+            initial_session.note.clone().filter(|note| {
+                note_refs
+                    .iter()
+                    .any(|candidate| &candidate.relative == note)
+            })
+        })
         .or_else(|| first.map(|r| r.relative.clone()));
     let first_path = first_rel.as_ref().map(|relative| vault_root.join(relative));
 
-    Application::new().run(move |cx: &mut App| {
-        editor::init(cx);
-        cx.bind_keys([
-            KeyBinding::new("ctrl-o", OpenSwitcher, None),
-            KeyBinding::new("cmd-o", OpenSwitcher, None),
-            KeyBinding::new("ctrl-shift-f", OpenSearch, None),
-            KeyBinding::new("cmd-shift-f", OpenSearch, None),
-            KeyBinding::new("ctrl-g", OpenGit, None),
-            KeyBinding::new("cmd-g", OpenGit, None),
-            KeyBinding::new("ctrl-shift-d", OpenDaily, None),
-            KeyBinding::new("cmd-shift-d", OpenDaily, None),
-            KeyBinding::new("ctrl-shift-w", OpenWeekly, None),
-            KeyBinding::new("cmd-shift-w", OpenWeekly, None),
-            KeyBinding::new("ctrl-shift-m", OpenMonthly, None),
-            KeyBinding::new("cmd-shift-m", OpenMonthly, None),
-            KeyBinding::new("ctrl-shift-p", OpenProperties, None),
-            KeyBinding::new("cmd-shift-p", OpenProperties, None),
-            KeyBinding::new("ctrl-shift-b", ToggleBookmark, None),
-            KeyBinding::new("cmd-shift-b", ToggleBookmark, None),
-            KeyBinding::new("ctrl-p", OpenCommands, None),
-            KeyBinding::new("cmd-p", OpenCommands, None),
-            KeyBinding::new("ctrl-shift-l", ToggleTheme, None),
-            KeyBinding::new("cmd-shift-l", ToggleTheme, None),
-            KeyBinding::new("ctrl-shift-g", OpenGraph, None),
-            KeyBinding::new("cmd-shift-g", OpenGraph, None),
-            KeyBinding::new("escape", CloseOverlay, None),
-            KeyBinding::new("ctrl-n", NewWindow, None),
-            KeyBinding::new("cmd-n", NewWindow, None),
-        ]);
+    editor::init(cx);
+    cx.bind_keys([
+        KeyBinding::new("ctrl-o", OpenSwitcher, None),
+        KeyBinding::new("cmd-o", OpenSwitcher, None),
+        KeyBinding::new("ctrl-shift-f", OpenSearch, None),
+        KeyBinding::new("cmd-shift-f", OpenSearch, None),
+        KeyBinding::new("ctrl-g", OpenGit, None),
+        KeyBinding::new("cmd-g", OpenGit, None),
+        KeyBinding::new("ctrl-shift-d", OpenDaily, None),
+        KeyBinding::new("cmd-shift-d", OpenDaily, None),
+        KeyBinding::new("ctrl-shift-w", OpenWeekly, None),
+        KeyBinding::new("cmd-shift-w", OpenWeekly, None),
+        KeyBinding::new("ctrl-shift-m", OpenMonthly, None),
+        KeyBinding::new("cmd-shift-m", OpenMonthly, None),
+        KeyBinding::new("ctrl-shift-p", OpenProperties, None),
+        KeyBinding::new("cmd-shift-p", OpenProperties, None),
+        KeyBinding::new("ctrl-shift-b", ToggleBookmark, None),
+        KeyBinding::new("cmd-shift-b", ToggleBookmark, None),
+        KeyBinding::new("ctrl-p", OpenCommands, None),
+        KeyBinding::new("cmd-p", OpenCommands, None),
+        KeyBinding::new("ctrl-shift-l", ToggleTheme, None),
+        KeyBinding::new("cmd-shift-l", ToggleTheme, None),
+        KeyBinding::new("ctrl-shift-g", OpenGraph, None),
+        KeyBinding::new("cmd-shift-g", OpenGraph, None),
+        KeyBinding::new("ctrl-shift-r", OpenRelations, None),
+        KeyBinding::new("cmd-shift-r", OpenRelations, None),
+        KeyBinding::new("escape", CloseOverlay, None),
+        KeyBinding::new("ctrl-n", NewWindow, None),
+        KeyBinding::new("cmd-n", NewWindow, None),
+        KeyBinding::new("ctrl-alt-n", DetachTab, None),
+        KeyBinding::new("ctrl-alt-1", ToggleSideBySide, None),
+        KeyBinding::new("ctrl-alt-2", ToggleSplitEditor, None),
+        KeyBinding::new("ctrl-w", CloseTab, None),
+        KeyBinding::new("cmd-w", CloseTab, None),
+        KeyBinding::new("ctrl-tab", NextTab, None),
+        KeyBinding::new("ctrl-shift-tab", PrevTab, None),
+        KeyBinding::new("ctrl-pagedown", NextTab, None),
+        KeyBinding::new("ctrl-pageup", PrevTab, None),
+    ]);
 
-        // Saved shortcut overrides win over the defaults registered above.
-        for binding in &initial_bindings {
-            bind_named(cx, &binding.key, &binding.action);
-        }
+    // Saved shortcut overrides win over the defaults registered above.
+    for binding in &initial_bindings {
+        bind_named(cx, &binding.key, &binding.action);
+    }
 
-        let editor = cx.new(Editor::new);
-        if let Some(path) = &first_path {
-            editor.update(cx, |editor, _cx| {
-                let _ = editor.load(path);
-                // Handy for screenshots and for exercising the reading view.
-                if std::env::var("DRAGON_GLASS_READING").is_ok() {
-                    editor.set_reading_mode(true);
-                }
-            });
-        }
-        let initial_properties = editor.read(cx).properties();
+    let editor = cx.new(Editor::new);
+    if let Some(path) = &first_path {
         editor.update(cx, |editor, _cx| {
-            editor.set_vault_root(&vault_root);
-            editor.set_attachments_folder(&initial_config.attachments_folder);
+            let _ = editor.load(path);
+            // Handy for screenshots and for exercising the reading view.
+            let reading = std::env::var("DRAGON_GLASS_READING").is_ok() || initial_session.reading;
+            if reading {
+                editor.set_reading_mode(true);
+            }
         });
-        cx.set_global(initial_theme);
-
-        let bounds = Bounds::centered(None, size(px(1000.0), px(640.0)), cx);
-        let options = WindowOptions {
-            window_bounds: Some(WindowBounds::Windowed(bounds)),
-            titlebar: Some(gpui::TitlebarOptions {
-                title: Some("Dragon Glass".into()),
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-
-        let app_view = cx.new(|cx| DragonGlassApp {
-            editor: editor.clone(),
-            vault_root: vault_root.clone(),
-            tree: tree.clone(),
-            note_refs: note_refs.clone(),
-            properties: initial_properties,
-            bookmarks: initial_bookmarks,
-            theme: initial_theme,
-            active: first_rel.clone(),
-            vault_path: display_path.clone(),
-            notes: note_count,
-            links: link_count,
-            git_status: initial_git.clone(),
-            status_message: None,
-            switcher: None,
-            switcher_focus: cx.focus_handle(),
-            focus_handle: cx.focus_handle(),
-            conflict: false,
-            watcher: None,
-            update_source,
-            update_available,
-            full_graph: initial_graph.clone(),
-            graph_view: None,
-            show_graph: false,
-            query_results: Vec::new(),
-            show_query: false,
-            split_preview: std::env::var("DRAGON_GLASS_PREVIEW").is_ok(),
-            plugins: initial_plugins,
-            plugin_commands: initial_plugin_commands,
-            workspaces: initial_workspaces,
-            user_themes: initial_user_themes,
-            bindings: initial_bindings,
-            base_theme: initial_theme,
-            snippet_overrides: initial_snippets,
-            config: initial_config,
-        });
-
-        let graph_view_entity = cx.new(|cx| GraphView::new(app_view.downgrade(), cx));
-        app_view.update(cx, |app, _cx| {
-            app.graph_view = Some(graph_view_entity.clone());
-        });
-
-        // Watch the vault so external edits to the open note are noticed. This is
-        // event-driven: the watcher thread blocks, so idle CPU stays at zero.
-        let (change_tx, change_rx) = smol::channel::unbounded::<String>();
-        let watcher =
-            match notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
-                if let Ok(event) = event {
-                    for path in event.paths {
-                        if path
-                            .extension()
-                            .map(|e| e.eq_ignore_ascii_case("md"))
-                            .unwrap_or(false)
-                        {
-                            let _ = change_tx.send_blocking(path.to_string_lossy().to_string());
-                        }
-                    }
-                }
-            }) {
-                Ok(mut watcher) => {
-                    use notify::Watcher as _;
-                    let _ = watcher.watch(&vault_root, notify::RecursiveMode::Recursive);
-                    Some(watcher)
-                }
-                Err(_) => None,
-            };
-
-        app_view.update(cx, |this, cx| {
-            this.watcher = watcher;
-            cx.spawn(async move |this, cx| {
-                while let Ok(changed) = change_rx.recv().await {
-                    let alive = this
-                        .update(cx, |app, cx| app.on_external_change(&changed, cx))
-                        .is_ok();
-                    if !alive {
-                        break;
-                    }
-                }
-            })
-            .detach();
-        });
-
-        let view_for_window = app_view.clone();
-        let window = cx
-            .open_window(options, move |_window, _cx| view_for_window.clone())
-            .expect("failed to open window");
-
-        let _ = window.update(cx, |view, window, cx| {
-            window.focus(&view.editor.focus_handle(cx));
-            cx.activate(true);
-        });
+    }
+    let initial_properties = editor.update(cx, |editor, _cx| editor.properties());
+    let initial_cache_epoch = 1u64;
+    let initial_headings_version = (initial_cache_epoch, editor.read(cx).document_version().1);
+    let initial_text = editor.read(cx).text();
+    let initial_headings = Rc::new(markdown::headings(&initial_text));
+    let initial_stats = stats::compute(&initial_text);
+    editor.update(cx, |editor, _cx| {
+        editor.set_vault_root(&vault_root);
+        editor.set_attachments_folder(&initial_config.attachments_folder);
     });
+    let initial_tabs = vec![Tab {
+        relative: first_rel.clone(),
+        editor: editor.clone(),
+        title: first_rel
+            .as_deref()
+            .map(tab_title)
+            .unwrap_or_else(|| "Untitled".to_string()),
+        conflict: false,
+    }];
+    let note_index = resolve::NoteIndex::new(&note_refs);
+    cx.set_global(initial_theme);
+
+    let bounds = Bounds::centered(None, size(px(1000.0), px(640.0)), cx);
+    let options = WindowOptions {
+        window_bounds: Some(WindowBounds::Windowed(bounds)),
+        titlebar: Some(gpui::TitlebarOptions {
+            title: Some("Dragon Glass".into()),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+
+    let app_view = cx.new(|cx| DragonGlassApp {
+        editor: editor.clone(),
+        tabs: initial_tabs,
+        active_tab: 0,
+        split_tabs: Vec::new(),
+        split_axis: SplitAxis::Horizontal,
+        minimal: false,
+        close_requested: false,
+        dragging: None,
+        cache_epoch: initial_cache_epoch,
+        vault_root: vault_root.clone(),
+        tree: tree.clone(),
+        file_rows: file_rows.clone(),
+        note_refs: note_refs.clone(),
+        note_index,
+        properties: initial_properties,
+        headings: initial_headings,
+        headings_version: initial_headings_version,
+        preview_content: ReadingCache::new(),
+        bookmarks: initial_bookmarks,
+        theme: initial_theme,
+        active: first_rel.clone(),
+        vault_path: display_path.clone(),
+        notes: note_count,
+        links: link_count,
+        git_status: initial_git.clone(),
+        status_message: None,
+        switcher: None,
+        switcher_focus: cx.focus_handle(),
+        focus_handle: cx.focus_handle(),
+        conflict: false,
+        watcher: None,
+        update_source,
+        update_available,
+        full_graph: initial_graph.clone(),
+        graph_view: None,
+        show_graph: false,
+        relations: Vec::new(),
+        show_relations: false,
+        sidebar_width: 240.0,
+        outline_width: 200.0,
+        relations_width: 240.0,
+        resize: None,
+        show_diff: false,
+        diff_title: String::new(),
+        diff_summary: String::new(),
+        diff_rows: Rc::new(Vec::new()),
+        review_issues: Vec::new(),
+        pending_shared: None,
+        pending_template: None,
+        stats: initial_stats,
+        stats_version: initial_headings_version,
+        query_results: Rc::new(Vec::new()),
+        show_query: false,
+        split_preview: std::env::var("DRAGON_GLASS_PREVIEW").is_ok(),
+        plugins: initial_plugins,
+        plugin_commands: initial_plugin_commands,
+        workspaces: initial_workspaces,
+        user_themes: initial_user_themes,
+        bindings: initial_bindings,
+        base_theme: initial_theme,
+        snippet_overrides: initial_snippets,
+        config: initial_config,
+    });
+
+    let graph_view_entity = cx.new(|cx| GraphView::new(app_view.downgrade(), cx));
+    app_view.update(cx, |app, cx| {
+        app.graph_view = Some(graph_view_entity.clone());
+        let opener = app.link_opener(cx);
+        let editor = app.editor.clone();
+        editor.update(cx, |editor, _| editor.set_link_opener(opener));
+    });
+
+    app_view.update(cx, |this, cx| this.watch_vault(cx));
+    // Pin the note we opened, so the next launch reopens the same one.
+    app_view.update(cx, |this, cx| this.remember_session(cx));
+
+    let view_for_window = app_view.clone();
+    let window = cx
+        .open_window(options, move |window, cx| {
+            // Persist the reading mode too, including changes made with Ctrl+E, which
+            // the editor handles without telling the app.
+            let saver = view_for_window.clone();
+            window.on_window_should_close(cx, move |_window, cx| {
+                saver.update(cx, |app, cx| app.remember_session(cx));
+                true
+            });
+            view_for_window
+        })
+        .expect("failed to open window");
+
+    let _ = window.update(cx, |view, window, cx| {
+        window.focus(&view.editor.focus_handle(cx));
+        cx.activate(true);
+    });
+    true
 }

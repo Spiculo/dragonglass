@@ -64,6 +64,9 @@ pub struct Property {
 pub enum PropertyValue {
     Scalar(String),
     List(Vec<String>),
+    /// An unsupported/nested YAML block kept verbatim for display. Never produced by the
+    /// strict parser, so it cannot be written back accidentally.
+    Raw(String),
 }
 
 impl PropertyValue {
@@ -72,6 +75,7 @@ impl PropertyValue {
         match self {
             PropertyValue::Scalar(value) => value.clone(),
             PropertyValue::List(items) => items.join(", "),
+            PropertyValue::Raw(raw) => raw.clone(),
         }
     }
 
@@ -79,6 +83,11 @@ impl PropertyValue {
     /// anything else a scalar.
     pub fn from_input(input: &str) -> Self {
         let input = input.trim();
+        // `[[Note]]` is an Obsidian wikilink, not an inline YAML list. Treating it as a list
+        // strips the brackets and splits on commas, which breaks the link.
+        if input.starts_with("[[") && input.ends_with("]]") {
+            return PropertyValue::Scalar(unquote(input));
+        }
         if input.starts_with('[') && input.ends_with(']') {
             let inner = &input[1..input.len() - 1];
             let items = inner
@@ -165,6 +174,102 @@ pub fn properties(src: &str) -> Result<Vec<Property>> {
     Ok(properties)
 }
 
+/// Frontmatter properties for display only.
+///
+/// Real vaults contain YAML shapes the editor deliberately refuses to rewrite (nested
+/// mappings such as a bibliography list). `properties` fails on those so a save can never
+/// mangle them; this lenient variant keeps the block verbatim as [`PropertyValue::Raw`] so
+/// the metadata panel can show it. Never feed these back into `with_properties`.
+pub fn display_properties(src: &str) -> Vec<Property> {
+    let Some(frontmatter) = split(src).frontmatter else {
+        return Vec::new();
+    };
+
+    let mut properties: Vec<Property> = Vec::new();
+    // Index of the key whose block we are reading, plus the lines collected so far and whether
+    // the block is a nested mapping that cannot be represented as a simple list.
+    let mut block: Option<usize> = None;
+    let mut raw_lines: Vec<String> = Vec::new();
+    let mut nested = false;
+
+    for raw in frontmatter.lines() {
+        let line = raw.trim_end();
+        let trimmed = line.trim_start();
+
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+
+        if let Some(index) = block {
+            let top_level_item = line.len() == trimmed.len() && trimmed.starts_with("- ");
+            let new_key = line.len() == trimmed.len() && !top_level_item;
+
+            if !new_key {
+                raw_lines.push(trimmed.to_string());
+                if let Some(item) = trimmed.strip_prefix("- ") {
+                    if item.contains(':') || item.ends_with(':') {
+                        nested = true;
+                    } else if !nested {
+                        if let Some(Property {
+                            value: PropertyValue::List(items),
+                            ..
+                        }) = properties.get_mut(index)
+                        {
+                            items.push(unquote(item.trim()));
+                        }
+                    }
+                } else {
+                    // Indented continuation under a list item: a nested mapping.
+                    nested = true;
+                }
+                continue;
+            }
+
+            if nested {
+                if let Some(property) = properties.get_mut(index) {
+                    property.value = PropertyValue::Raw(raw_lines.join("\n"));
+                }
+            }
+            block = None;
+            raw_lines.clear();
+            nested = false;
+        }
+
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+
+        let key = key.trim();
+        if key.is_empty() {
+            continue;
+        }
+
+        let value = value.trim();
+        if value.is_empty() {
+            properties.push(Property {
+                key: key.to_string(),
+                value: PropertyValue::List(Vec::new()),
+            });
+            block = Some(properties.len() - 1);
+        } else {
+            properties.push(Property {
+                key: key.to_string(),
+                value: PropertyValue::from_input(value),
+            });
+        }
+    }
+
+    if nested {
+        if let Some(index) = block {
+            if let Some(property) = properties.get_mut(index) {
+                property.value = PropertyValue::Raw(raw_lines.join("\n"));
+            }
+        }
+    }
+
+    properties
+}
+
 /// Rewrite the document with `properties` as its frontmatter, keeping the body.
 pub fn with_properties(src: &str, properties: &[Property]) -> String {
     let body = split(src).body;
@@ -192,6 +297,13 @@ pub fn with_properties(src: &str, properties: &[Property]) -> String {
                     out.push_str(&items.join(", "));
                     out.push_str("]\n");
                 }
+            }
+            // Display-only data should never reach a rewrite; emit it verbatim if it does.
+            PropertyValue::Raw(raw) => {
+                out.push_str(&property.key);
+                out.push_str(":\n");
+                out.push_str(raw);
+                out.push('\n');
             }
         }
     }
@@ -306,5 +418,52 @@ mod tests {
     #[test]
     fn removing_all_properties_keeps_body() {
         assert_eq!(with_properties("---\na: b\n---\nbody", &[]), "body");
+    }
+
+    #[test]
+    fn display_keeps_nested_blocks_as_raw() {
+        let src = "---\nTitle: Hello\nTags:\n  - a\n  - b\nBibliography:\n  - title: \"Paper\"\n    url: https://example.com\nSeries: [[Math]]\n---\nbody\n";
+        assert!(properties(src).is_err());
+
+        let found = display_properties(src);
+        let keys: Vec<&str> = found.iter().map(|p| p.key.as_str()).collect();
+        assert_eq!(keys, vec!["Title", "Tags", "Bibliography", "Series"]);
+        assert_eq!(
+            found[1].value,
+            PropertyValue::List(vec!["a".into(), "b".into()])
+        );
+        match &found[2].value {
+            PropertyValue::Raw(raw) => {
+                assert!(raw.contains("- title: \"Paper\""), "got {raw:?}");
+                assert!(raw.contains("url: https://example.com"), "got {raw:?}");
+            }
+            other => panic!("expected raw bibliography, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn wikilink_values_stay_scalars() {
+        assert_eq!(
+            PropertyValue::from_input("[[Algorithms, Models and Proofs]]"),
+            PropertyValue::Scalar("[[Algorithms, Models and Proofs]]".into())
+        );
+        assert_eq!(
+            PropertyValue::from_input("[a, b]"),
+            PropertyValue::List(vec!["a".into(), "b".into()])
+        );
+    }
+
+    #[test]
+    fn display_handles_top_level_list_items() {
+        let src =
+            "---\nTags:\n- Chess\n- Math\nBibliography:\n- title: Paper\n  url: x\nTitle: T\n---\n";
+        let found = display_properties(src);
+        let keys: Vec<&str> = found.iter().map(|p| p.key.as_str()).collect();
+        assert_eq!(keys, vec!["Tags", "Bibliography", "Title"]);
+        assert_eq!(
+            found[0].value,
+            PropertyValue::List(vec!["Chess".into(), "Math".into()])
+        );
+        assert!(matches!(found[1].value, PropertyValue::Raw(_)));
     }
 }

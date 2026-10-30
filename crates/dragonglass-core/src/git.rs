@@ -80,6 +80,50 @@ pub fn status(root: &Path) -> Result<Status> {
     Ok(status)
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DiffStat {
+    pub added: usize,
+    pub removed: usize,
+}
+
+/// Lines added and removed in one file, relative to `HEAD`.
+///
+/// Untracked files count every line as added; a tracked, unchanged file is `0 / 0`.
+pub fn file_diff(root: &Path, relative: &str) -> Result<DiffStat> {
+    let path = relative.replace('\\', "/");
+
+    if let Ok(output) = run(root, &["diff", "--numstat", "HEAD", "--", &path]) {
+        if let Some(stat) = parse_numstat(&output) {
+            return Ok(stat);
+        }
+    }
+
+    // Repositories with no commits yet have no `HEAD`.
+    if let Ok(output) = run(root, &["diff", "--numstat", "--", &path]) {
+        if let Some(stat) = parse_numstat(&output) {
+            return Ok(stat);
+        }
+    }
+
+    if run(root, &["ls-files", "--error-unmatch", "--", &path]).is_ok() {
+        return Ok(DiffStat::default());
+    }
+
+    let text = std::fs::read_to_string(root.join(&path))?;
+    Ok(DiffStat {
+        added: text.lines().count(),
+        removed: 0,
+    })
+}
+
+fn parse_numstat(output: &str) -> Option<DiffStat> {
+    let line = output.lines().find(|line| !line.trim().is_empty())?;
+    let mut parts = line.split('\t');
+    let added = parts.next()?.trim().parse().ok()?;
+    let removed = parts.next()?.trim().parse().ok()?;
+    Some(DiffStat { added, removed })
+}
+
 /// Stage everything and commit. Returns `false` when there was nothing to commit.
 pub fn commit_all(root: &Path, message: &str) -> Result<bool> {
     run(root, &["add", "-A"])?;
@@ -251,6 +295,34 @@ mod tests {
 
         // Nothing changed: no empty commit.
         assert!(!commit_all(&dir, "second").unwrap());
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn file_diff_counts_added_and_removed_lines() {
+        let dir = temp_repo("diffstat");
+        init(&dir).unwrap();
+        std::fs::write(dir.join("note.md"), "one\ntwo\n").unwrap();
+        assert_eq!(
+            file_diff(&dir, "note.md").unwrap(),
+            DiffStat {
+                added: 2,
+                removed: 0
+            }
+        );
+
+        commit_all(&dir, "first").unwrap();
+        assert_eq!(file_diff(&dir, "note.md").unwrap(), DiffStat::default());
+
+        std::fs::write(dir.join("note.md"), "one\nthree\nfour\n").unwrap();
+        assert_eq!(
+            file_diff(&dir, "note.md").unwrap(),
+            DiffStat {
+                added: 2,
+                removed: 1
+            }
+        );
 
         std::fs::remove_dir_all(&dir).unwrap();
     }
