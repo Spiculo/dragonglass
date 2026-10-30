@@ -1,0 +1,93 @@
+name: Bug report
+description: Something is broken or behaves unexpectedly.
+title: "[Bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report. Please **do not paste private note contents** — a small,
+        synthetic note that reproduces the problem is enough. Security issues must go through
+        [SECURITY.md](https://github.com/Spiculo/dragonglass/blob/main/SECURITY.md), not a public issue.
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: A clear and concise description of the bug.
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Open a vault containing ...
+        2. Press ...
+        3. See ...
+      render: markdown
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      description: What did you expect instead?
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: Dragon Glass version
+      description: The release tag or commit, and whether this is a packaged, release or debug build.
+      placeholder: "v0.0.1, debug build"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options:
+        - Windows 11
+        - Windows 10
+        - Linux (X11)
+        - Linux (Wayland)
+        - macOS
+        - Other
+    validations:
+      required: true
+
+  - type: dropdown
+    id: install
+    attributes:
+      label: How did you install it?
+      options:
+        - Built from source (cargo)
+        - Windows installer (Inno Setup / winget)
+        - Linux package (.deb / AppImage / Flatpak)
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs or console output
+      description: Paste any error output. Remove anything private.
+      render: shell
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checklist
+      options:
+        - label: I searched existing issues and this is not a duplicate.
+          required: true
+        - label: This is not a security vulnerability (those go through SECURITY.md).
+          required: true

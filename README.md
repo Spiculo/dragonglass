@@ -1,0 +1,176 @@
+# Dragon Glass
+
+[![CI](https://github.com/Spiculo/dragonglass/actions/workflows/ci.yml/badge.svg)](https://github.com/Spiculo/dragonglass/actions/workflows/ci.yml)
+[![License: GPL-3.0-or-later](https://img.shields.io/badge/license-GPL--3.0--or--later-blue.svg)](LICENSE)
+
+A fast, native, local-first knowledge base for a folder of markdown notes, built in Rust
+with [GPUI](https://github.com/zed-industries/zed/tree/main/crates/gpui). No Electron, no
+webview, no account.
+
+Point Dragon Glass at an existing Obsidian vault. It reads and writes plain `.md`, preserves
+YAML frontmatter, and leaves `.obsidian/` alone. There is no import step.
+
+> **Status: v0.0.1, early.** Windows and Linux are the target platforms; macOS is not built
+> yet. Keep backups (git is a good one) and expect rough edges.
+
+## Why another notes app?
+
+Obsidian is Electron: hundreds of megabytes of RAM idle, slow cold starts, and a browser
+engine between you and your text. Dragon Glass keeps the same job — a plain-text,
+local-first vault — in a native window. The goals are low memory, a cold start under 200 ms,
+and effectively zero idle CPU: work happens on filesystem events and input, not on timers
+or polling.
+
+The other half is compatibility. A vault is just a directory, so migrating should be as
+simple as opening it. Dragon Glass reads and writes the same files Obsidian does. (It does
+not run Obsidian's JavaScript plugins; its own plugin model is a WASM sandbox.)
+
+## Features
+
+A lot already works. This is a working application, not a mockup — but it is early.
+
+**Editing**
+- Source editor with a rope buffer, undo/redo, IME, word wrap and a line-number gutter
+- Reading view and a live-preview pane beside the editor
+- Syntax highlighting, code fences, tables, task lists, footnotes, callouts and
+  `==highlights==`
+- KaTeX-compatible math (`$…$` / `$$…$$`) via [RaTeX](https://github.com/erweixin/RaTeX),
+  rendered natively and exported as vector SVG
+- Tabs, split panes, detached windows, multiple windows per vault
+- Find and replace, command palette, configurable hotkeys, light/dark themes and snippets
+
+**Vault and knowledge**
+- File tree, quick switcher, full-text search
+- Wikilinks, backlinks, tags, outline, document relations and a graph view
+- Daily/weekly/monthly notes, templates, properties, bookmarks
+- Embeds and attachments (images, PDF, audio), transclusion, shared blocks
+- A/B versions with a line diff, document review, block move/duplicate/delete/extract
+
+**Around the editor**
+- Git sync by driving your own `git` binary (your credentials, SSH config and hooks)
+- HTML and PDF export
+- Read-only local HTTP API and an MCP server over stdio for AI tooling
+- Importers for Evernote (`.enex`) and Roam exports
+- A local package store for themes and WASM plugins
+- A vault picker that remembers recent vaults and reopens the note you were last in
+
+**Not there yet:** macOS, Mermaid diagrams, a community (online) theme/plugin store,
+end-to-end-encrypted sync, and mobile. See [`PLAN.md`](PLAN.md) for the full roadmap and
+the decisions behind it.
+
+## Build from source
+
+Requirements: Rust **1.85+** (stable) and `git`.
+
+On Windows, install the MSVC toolchain and Visual Studio Build Tools with the "Desktop
+development with C++" workload. No other system libraries are needed.
+
+On Linux, install the build and GPU/windowing dependencies:
+
+```bash
+sudo apt-get update
+sudo apt-get install -y --no-install-recommends \
+  build-essential pkg-config cmake clang libclang-dev libssl-dev \
+  libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libx11-dev \
+  libx11-xcb-dev libxcb1-dev libxcb-render0-dev libxcb-shape0-dev \
+  libxcb-xfixes0-dev libvulkan-dev libfontconfig1-dev libfreetype-dev \
+  libasound2-dev
+```
+
+Then:
+
+```bash
+git clone https://github.com/Spiculo/dragonglass.git
+cd dragonglass
+cargo build --release -p dragonglass-ui -p dragonglass-cli
+```
+
+`target/release/dragon-glass-app` is the app; `target/release/dragon-glass` is the CLI.
+The UI crate pulls in GPUI, so the workspace's default build (`cargo build`) deliberately
+skips it — build it explicitly with `-p dragonglass-ui`.
+
+## Run
+
+```bash
+# Open a specific vault
+dragon-glass-app /path/to/vault
+
+# Or no argument: reopen the last vault, or show the vault picker on a first run
+dragon-glass-app
+```
+
+`dragonglass://` URIs (for example from a shortcut or automation) are also accepted:
+
+```text
+dragonglass://open?vault=/path/to/vault&note=notes/Index.md
+```
+
+### Vaults
+
+The app remembers the vaults you open, outside any vault, in
+`%APPDATA%\DragonGlass\vaults.txt` on Windows or `~/.config/dragon-glass/vaults.txt`
+elsewhere (`$XDG_CONFIG_HOME` is respected, and `DRAGON_GLASS_CONFIG_DIR` overrides both).
+On launch it reopens the last vault and the note you were last in — stored per vault in
+`.dragon-glass/session.txt`. Use **Open vault** in the command palette (`Ctrl+P`) to open
+another vault in its own window, or remove stale entries in the picker.
+
+## CLI
+
+`dragon-glass` is the headless companion: useful for scripting, CI and cron.
+
+```bash
+dragon-glass stats   /path/to/vault          # counts, words, tags, links
+dragon-glass broken  /path/to/vault          # unresolved [[links]]
+dragon-glass export  /path/to/vault out/     # static HTML
+dragon-glass query   /path/to/vault 'tag:#project'
+dragon-glass pdf     /path/to/vault notes/Index.md Index.pdf
+dragon-glass git-pull /path/to/vault
+dragon-glass --help
+```
+
+## Development
+
+```bash
+cargo run -p dragonglass-ui -- /path/to/vault   # debug build
+DRAGON_GLASS_VAULT=/path/to/vault cargo run -p dragonglass-ui
+
+cargo test                                      # core, CLI and plugin crates
+cargo fmt --all -- --check
+cargo clippy --all-targets --all-features
+```
+
+CI runs exactly those checks on Windows and Linux, and builds the GPUI app on both.
+See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the ground rules, and
+[`PLAN.md`](PLAN.md) for architecture, phases and settled design decisions.
+
+## Project layout
+
+| Path | What lives there |
+|---|---|
+| `crates/dragonglass-core` | Headless engine: vault/FS, parser, index, search, graph, math, export |
+| `crates/dragonglass-ui` | The GPUI desktop application |
+| `crates/dragonglass-cli` | `dragon-glass`, the headless CLI |
+| `crates/dragonglass-plugins` | WASM plugin host (experimental) |
+| `docs/` | Design notes, such as the math/typesetting spec |
+| `packaging/` | Windows (Inno Setup, winget) and Linux (deb, AppImage, Flatpak) recipes |
+
+## Design principles
+
+- **Plain text, no lock-in.** Everything is `.md` plus small, diffable config files.
+- **Local-first.** No network by default, no telemetry, no account.
+- **Data safety.** Atomic writes, backups and snapshots; the app never silently loses edits.
+- **Idle means idle.** No polling, no background timers; filesystem events and input only.
+- **Obsidian compatibility, not ABI compatibility.** Vaults and file formats yes; running
+  Obsidian's JS plugins no.
+- **Native, not a web page in a frame.** GPUI renders GPU-side and ships as a single binary.
+
+## Contributing
+
+Issues and pull requests are welcome. Read [`CONTRIBUTING.md`](CONTRIBUTING.md) first, and
+please follow the [Code of Conduct](CODE_OF_CONDUCT.md). Security issues should go through
+[`SECURITY.md`](SECURITY.md), not a public issue.
+
+## License
+
+Dragon Glass is free software under the **GNU General Public License v3.0 or later**
+(`GPL-3.0-or-later`). See [`LICENSE`](LICENSE).

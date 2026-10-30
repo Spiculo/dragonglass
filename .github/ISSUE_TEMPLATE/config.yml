@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Roadmap, scope and design decisions
+    url: https://github.com/Spiculo/dragonglass/blob/main/PLAN.md
+    about: Read this before proposing a feature or asking why something is out of scope.
+  - name: Contributing guide
+    url: https://github.com/Spiculo/dragonglass/blob/main/CONTRIBUTING.md
+    about: Build instructions, checks to run, and code guidelines.

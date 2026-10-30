@@ -1,0 +1,66 @@
+name: Feature request
+description: Suggest a capability or an improvement.
+title: "[Feature] "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Before proposing a feature, check [`PLAN.md`](https://github.com/Spiculo/dragonglass/blob/main/PLAN.md).
+        It records the scope and a set of **locked design decisions**, so proposals that
+        reopen those (for example, a webview-based UI or an online plugin store) are unlikely
+        to be accepted.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem does this solve?
+      description: Describe the workflow or limitation, not just the UI you have in mind.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: What would you like Dragon Glass to do?
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Existing workarounds, Obsidian behavior, or other tools.
+    validations:
+      required: false
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - Editor
+        - Reading view / rendering
+        - Vault and files
+        - Search
+        - Links, tags and graph
+        - Math
+        - Export
+        - Git sync
+        - Plugins / themes
+        - CLI / automation
+        - Packaging / platforms
+        - Other
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checklist
+      options:
+        - label: I searched existing issues and PLAN.md first.
+          required: true
+        - label: This is compatible with the project's local-first, no-network-by-default design.
+          required: true
