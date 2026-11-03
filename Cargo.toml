@@ -5,6 +5,8 @@ members = [
     "crates/dragonglass-cli",
     "crates/dragonglass-ui",
     "crates/dragonglass-plugins",
+    "crates/dragonglass-ffi",
+    "crates/dragonglass-ffi-bindgen",
 ]
 # Keep the default build fast: the UI crate pulls in GPUI, which is a heavy dependency.
 # Build it explicitly with `cargo build -p dragonglass-ui`.

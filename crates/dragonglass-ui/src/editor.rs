@@ -4,28 +4,34 @@
 //! line of a `dragonglass_core::Buffer`, paints a caret and selection, and routes keyboard
 //! input and platform IME text through `EntityInputHandler`.
 //!
-//! Still missing (tracked): word wrap, horizontal scroll, multi-cursor.
+//! The editor also owns the in-note find/replace bar, optional Vim mode, and multi-cursor
+//! state. Selections and extra carets live here; the buffer only stores the primary caret.
 
+use std::collections::HashSet;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
+use dragonglass_core::find as find_engine;
+use dragonglass_core::format as text_format;
 use dragonglass_core::frontmatter::{self, Property, PropertyValue};
 use dragonglass_core::inline;
+use dragonglass_core::markdown;
 use dragonglass_core::math::{self, MathOptions, MathStyle};
 use dragonglass_core::{blocks, git, history, stats, storage, syntax, templates, wrap, Buffer};
 use gpui::{
     actions, div, fill, point, prelude::*, px, relative, size, AnyElement, App, Bounds,
     ClipboardEntry, ClipboardItem, Context, CursorStyle, ElementId, ElementInputHandler, Entity,
     EntityInputHandler, ExternalPaths, FocusHandle, Focusable, GlobalElementId, ImageFormat,
-    InspectorElementId, KeyBinding, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, PaintQuad, Pixels, Point, Render, ScrollHandle, ShapedLine, SharedString, Style,
-    TextRun, UTF16Selection, Window,
+    InspectorElementId, KeyBinding, KeyDownEvent, LayoutId, MouseButton, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point, Render, ScrollHandle, ShapedLine,
+    SharedString, Style, TextRun, UTF16Selection, Window,
 };
 
 use crate::math_element::MathElement;
 use crate::reading::{LinkOpener, ReadingCache};
 use crate::theme::Theme;
+use crate::vim::{Mode as VimMode, Vim};
 
 /// How many leading lines are inspected for YAML frontmatter. Real frontmatter is a few
 /// lines; the cap keeps property refresh from copying a large note.
@@ -70,7 +76,27 @@ actions!(
         Undo,
         Redo,
         MoveBlockUp,
-        MoveBlockDown
+        MoveBlockDown,
+        ToggleFold,
+        OpenFind,
+        OpenFindReplace,
+        FindNext,
+        FindPrev,
+        FindReplaceOne,
+        FindReplaceAll,
+        FindToggleRegex,
+        FindToggleCase,
+        FindToggleWord,
+        SelectNextOccurrence,
+        AddCursorAbove,
+        AddCursorBelow,
+        ToggleBold,
+        ToggleItalic,
+        ToggleStrikethrough,
+        ToggleHighlight,
+        ToggleInlineCode,
+        ToggleComment,
+        InsertWikilink
     ]
 );
 
@@ -129,8 +155,90 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("cmd-e", ToggleReading, None),
         KeyBinding::new("ctrl-shift-up", MoveBlockUp, None),
         KeyBinding::new("ctrl-shift-down", MoveBlockDown, None),
+        // Fold or unfold the heading at the caret.
+        KeyBinding::new("ctrl-shift-[", ToggleFold, None),
+        KeyBinding::new("cmd-shift-[", ToggleFold, None),
+        // In-note search/replace and multi-cursor editing.
+        KeyBinding::new("ctrl-f", OpenFind, None),
+        KeyBinding::new("cmd-f", OpenFind, None),
+        KeyBinding::new("ctrl-h", OpenFindReplace, None),
+        KeyBinding::new("cmd-alt-f", OpenFindReplace, None),
+        KeyBinding::new("f3", FindNext, None),
+        KeyBinding::new("shift-f3", FindPrev, None),
+        KeyBinding::new("ctrl-d", SelectNextOccurrence, None),
+        KeyBinding::new("cmd-d", SelectNextOccurrence, None),
+        KeyBinding::new("ctrl-alt-up", AddCursorAbove, None),
+        KeyBinding::new("ctrl-alt-down", AddCursorBelow, None),
+        KeyBinding::new("cmd-alt-up", AddCursorAbove, None),
+        KeyBinding::new("cmd-alt-down", AddCursorBelow, None),
+        // Inline formatting, selected text only.
+        KeyBinding::new("ctrl-b", ToggleBold, None),
+        KeyBinding::new("cmd-b", ToggleBold, None),
+        KeyBinding::new("ctrl-i", ToggleItalic, None),
+        KeyBinding::new("cmd-i", ToggleItalic, None),
+        KeyBinding::new("ctrl-shift-x", ToggleStrikethrough, None),
+        KeyBinding::new("cmd-shift-x", ToggleStrikethrough, None),
+        KeyBinding::new("ctrl-shift-h", ToggleHighlight, None),
+        KeyBinding::new("cmd-shift-h", ToggleHighlight, None),
+        KeyBinding::new("ctrl-shift-c", ToggleInlineCode, None),
+        KeyBinding::new("cmd-shift-c", ToggleInlineCode, None),
+        // Start a wikilink from the caret, or from the selected text.
+        KeyBinding::new("ctrl-k", InsertWikilink, None),
+        KeyBinding::new("cmd-k", InsertWikilink, None),
     ]);
 }
+
+/// Slash commands: `(inserted text, description)`. Typing `/desc` narrows the list.
+/// Flatten a selection into something valid inside `[[target|alias]]`.
+fn clean_link_alias(text: &str) -> String {
+    let mut out = String::new();
+    for word in text.split_whitespace() {
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        for ch in word.chars() {
+            match ch {
+                '|' => out.push('-'),
+                '[' | ']' => {}
+                other => out.push(other),
+            }
+        }
+    }
+    out
+}
+
+/// Wrap selected text as a self-contained wikilink, e.g. `My Note` → `[[My Note]]`.
+fn wikilink_for_selection(text: &str) -> Option<String> {
+    let target = clean_link_alias(text);
+    (!target.is_empty()).then(|| format!("[[{target}]]"))
+}
+
+/// Build the wikilink text for a suggestion, using the captured selection as an alias.
+fn link_text(target: &str, label: &str, alias: Option<&str>) -> String {
+    match alias
+        .map(str::trim)
+        .filter(|alias| !alias.is_empty() && !alias.eq_ignore_ascii_case(label))
+    {
+        Some(alias) => format!("[[{target}|{alias}]]"),
+        None => format!("[[{target}]]"),
+    }
+}
+
+const SLASH_COMMANDS: &[(&str, &str)] = &[
+    ("# ", "h1 heading"),
+    ("## ", "h2 heading"),
+    ("### ", "h3 heading"),
+    ("- ", "bullet list"),
+    ("- [ ] ", "task todo"),
+    ("1. ", "numbered list"),
+    ("> ", "quote"),
+    ("> [!note]\n> ", "callout note"),
+    ("---\n", "divider rule"),
+    ("```\n\n```", "code block fence"),
+    ("$$\n\n$$", "math latex block"),
+    ("| A | B |\n| --- | --- |\n|  |  |\n", "table"),
+    ("[[]]", "wikilink"),
+];
 
 pub struct Editor {
     buffer: Buffer,
@@ -184,6 +292,132 @@ pub struct Editor {
     /// Git added/removed lines for the file, refreshed when the saved buffer changes.
     git_stat: Option<git::DiffStat>,
     git_stat_key: Option<(u64, bool)>,
+    /// Extra carets/selections created with Ctrl+D or Ctrl+Alt+Up/Down.
+    extra_cursors: Vec<CursorState>,
+    /// The in-note find/replace bar.
+    find: FindState,
+    /// Optional Vim-style modal editing.
+    vim: Vim,
+    /// Heading indices whose sections are folded in the text view.
+    folded: HashSet<usize>,
+    /// Headings for the current document revision, used to compute fold ranges.
+    heading_cache: (u64, u64, Rc<Vec<markdown::Heading>>),
+    /// Bumped when `folded` changes so `lay_out` reflows.
+    fold_revision: u64,
+    /// The fold revision the current layout was built for.
+    layout_fold_revision: u64,
+    /// Per source line: 0 = no marker, 1 = expandable heading, 2 = folded heading.
+    fold_markers: Rc<Vec<u8>>,
+    /// Wikilink, tag and slash-command suggestions while typing.
+    autocomplete: Autocomplete,
+    /// `(insertion text, label)` for every note in the vault.
+    note_suggestions: Rc<Vec<(String, String)>>,
+    /// Every tag used in the vault.
+    tag_suggestions: Rc<Vec<String>>,
+    /// Selected text captured when a wikilink was started, used as the link alias.
+    pending_link_alias: Option<String>,
+    /// A `[` was pressed with a selection; the next text input wraps it as a wikilink.
+    pending_link_start: bool,
+    /// The selection to wrap, kept separately because the text-input handler can run
+    /// after the platform has already collapsed the selection.
+    pending_link_selection: Option<Range<usize>>,
+    /// After auto-inserting `[[…]]`, ignore the second `[` the user was about to type.
+    swallow_bracket: bool,
+}
+
+/// A caret plus its selection anchor. The primary caret lives in the buffer; extras live
+/// here so the buffer's undo and text APIs stay simple.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CursorState {
+    cursor: usize,
+    anchor: Option<usize>,
+}
+
+/// One replacement to perform at a caret. `primary` keeps the primary caret identifiable
+/// after edits shift every position.
+#[derive(Debug, Clone)]
+struct EditTarget {
+    range: Range<usize>,
+    text: String,
+    primary: bool,
+}
+
+/// The next occurrence of `needle` at or after `from` (in characters).
+fn literal_after(text: &str, needle: &str, from: usize) -> Option<usize> {
+    if needle.is_empty() {
+        return None;
+    }
+    for (char_index, (byte, _)) in text.char_indices().enumerate() {
+        if char_index < from {
+            continue;
+        }
+        if text[byte..].starts_with(needle) {
+            return Some(char_index);
+        }
+    }
+    None
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum FindField {
+    #[default]
+    Pattern,
+    Replacement,
+}
+
+#[derive(Debug, Clone, Default)]
+struct FindState {
+    open: bool,
+    replace: bool,
+    pattern: String,
+    replacement: String,
+    field: FindField,
+    regex: bool,
+    case_sensitive: bool,
+    whole_word: bool,
+    error: Option<String>,
+    /// Character ranges of every match in the current buffer.
+    matches: Vec<Range<usize>>,
+    current: usize,
+    message: Option<String>,
+}
+
+impl FindState {
+    fn options(&self) -> find_engine::Options {
+        find_engine::Options {
+            regex: self.regex,
+            case_sensitive: self.case_sensitive,
+            whole_word: self.whole_word,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SuggestionKind {
+    Link,
+    Tag,
+    Slash,
+}
+
+#[derive(Debug, Clone)]
+struct Suggestion {
+    /// Primary text shown in the popup.
+    label: String,
+    /// Secondary text shown to the right of the name.
+    detail: String,
+    /// Text that replaces the trigger plus query.
+    insert: String,
+}
+
+#[derive(Debug, Clone, Default)]
+struct Autocomplete {
+    open: bool,
+    kind: Option<SuggestionKind>,
+    /// Character offset where the replaced range starts (before `[[`, `#` or `/`).
+    start: usize,
+    query: String,
+    items: Vec<Suggestion>,
+    selected: usize,
 }
 
 /// A wrapped visual row: `[start, end)` character columns of logical line `line`.
@@ -245,7 +479,289 @@ impl Editor {
             stats_cache: (u64::MAX, stats::Stats::default()),
             git_stat: None,
             git_stat_key: None,
+            extra_cursors: Vec::new(),
+            find: FindState::default(),
+            vim: Vim::new(),
+            folded: HashSet::new(),
+            heading_cache: (u64::MAX, u64::MAX, Rc::new(Vec::new())),
+            fold_revision: 0,
+            layout_fold_revision: u64::MAX,
+            fold_markers: Rc::new(Vec::new()),
+            autocomplete: Autocomplete::default(),
+            note_suggestions: Rc::new(Vec::new()),
+            tag_suggestions: Rc::new(Vec::new()),
+            pending_link_alias: None,
+            pending_link_start: false,
+            pending_link_selection: None,
+            swallow_bracket: false,
         }
+    }
+
+    /// Replace the vault-wide suggestion lists used while typing.
+    pub fn set_suggestions(&mut self, notes: Vec<(String, String)>, tags: Vec<String>) {
+        self.note_suggestions = Rc::new(notes);
+        self.tag_suggestions = Rc::new(tags);
+    }
+
+    /// Wrap or unwrap the current selection (or insert a marker pair at the caret).
+    fn apply_style(&mut self, style: text_format::Style) {
+        if self.reading || self.find.open {
+            return;
+        }
+        let range = self
+            .selection()
+            .unwrap_or_else(|| self.buffer.cursor()..self.buffer.cursor());
+        let text = self.buffer.text();
+        let edit = text_format::toggle(&text, range, style);
+        let base = edit.range.start;
+        self.buffer.replace(edit.range, &edit.text);
+
+        let start = base + edit.selection.start;
+        let end = base + edit.selection.end;
+        if start == end {
+            self.anchor = None;
+            self.buffer.set_cursor(start);
+        } else {
+            self.anchor = Some(start);
+            self.buffer.set_cursor(end);
+        }
+        self.autocomplete = Autocomplete::default();
+        self.pending_link_alias = None;
+        self.pending_link_start = false;
+        self.swallow_bracket = false;
+    }
+
+    /// Wrap the pending selection as `[[selected text]]`. Returns false when the selection
+    /// was empty, in which case the caller opens the note picker instead.
+    fn wrap_selection_as_wikilink(&mut self, swallow_second_bracket: bool) -> bool {
+        let range = self
+            .pending_link_selection
+            .take()
+            .or_else(|| self.selection());
+        let Some(range) = range else {
+            return false;
+        };
+        let target = clean_link_alias(&self.buffer.slice(range.clone()));
+        let target = if target.is_empty() {
+            self.pending_link_alias.clone().unwrap_or_default()
+        } else {
+            target
+        };
+        let Some(link) = wikilink_for_selection(&target) else {
+            return false;
+        };
+
+        self.buffer.replace(range, &link);
+        self.anchor = None;
+        self.autocomplete = Autocomplete::default();
+        self.pending_link_alias = None;
+        self.pending_link_start = false;
+        self.pending_link_selection = None;
+        self.swallow_bracket = swallow_second_bracket;
+        self.refresh_autocomplete();
+        true
+    }
+
+    /// Start a wikilink at the caret, or from the selected text as an alias.
+    fn start_wikilink(&mut self) {
+        if self.reading || self.find.open {
+            return;
+        }
+        self.autocomplete = Autocomplete::default();
+        self.pending_link_start = false;
+        self.pending_link_selection = None;
+        self.swallow_bracket = false;
+        if let Some(range) = self.selection() {
+            let alias = clean_link_alias(&self.buffer.slice(range.clone()));
+            self.pending_link_alias = (!alias.is_empty()).then_some(alias);
+            self.buffer.replace(range, "[[");
+            self.anchor = None;
+        } else {
+            self.pending_link_alias = None;
+            self.buffer.insert("[[");
+        }
+        self.refresh_autocomplete();
+    }
+
+    /// Remember a selection when the user starts typing `[[` over it, so the picker can
+    /// offer `[[target|selection]]`.
+    fn capture_link_alias(&mut self, typed: &str) {
+        if typed == "[" || typed == "[[" {
+            if let Some(range) = self.selection() {
+                let alias = clean_link_alias(&self.buffer.slice(range.clone()));
+                self.pending_link_alias = (!alias.is_empty()).then_some(alias);
+                self.pending_link_selection = Some(range);
+            }
+        }
+    }
+
+    fn dismiss_autocomplete(&mut self) {
+        self.autocomplete = Autocomplete::default();
+        self.pending_link_alias = None;
+        self.pending_link_start = false;
+        self.pending_link_selection = None;
+        self.swallow_bracket = false;
+    }
+
+    /// Recompute the popup from the text before the caret.
+    fn refresh_autocomplete(&mut self) {
+        if self.reading || self.find.open {
+            self.autocomplete = Autocomplete::default();
+            self.pending_link_alias = None;
+            return;
+        }
+
+        let (line, col) = self.buffer.line_col();
+        let text = self.buffer.line(line);
+        let head: String = text.chars().take(col).collect();
+
+        // Slash commands: the line starts with `/` and the caret is inside the first word.
+        let trimmed = head.trim_start();
+        if trimmed.starts_with('/') && !trimmed.chars().any(char::is_whitespace) {
+            let start_col = col.saturating_sub(trimmed.chars().count());
+            let start = self.buffer.char_index_at(line, start_col);
+            let query = trimmed.trim_start_matches('/').to_string();
+            self.pending_link_alias = None;
+            self.show_suggestions(SuggestionKind::Slash, start, query);
+            return;
+        }
+
+        // Wikilinks: the most recent `[[` is still open.
+        if let Some(byte) = head.rfind("[[") {
+            let after = &head[byte + 2..];
+            if !after.contains("]]") && !after.contains('\n') {
+                let start_col = col.saturating_sub(head[byte..].chars().count());
+                let start = self.buffer.char_index_at(line, start_col);
+                self.show_suggestions(SuggestionKind::Link, start, after.to_string());
+                return;
+            }
+        }
+
+        // Tags: `#` at a word boundary and no whitespace after it.
+        if let Some(byte) = head.rfind('#') {
+            let before = head[..byte].chars().next_back();
+            let boundary = before.map(|ch| !ch.is_alphanumeric()).unwrap_or(true);
+            let after = &head[byte + 1..];
+            if boundary && !after.is_empty() && !after.chars().any(char::is_whitespace) {
+                let start_col = col.saturating_sub(head[byte..].chars().count());
+                let start = self.buffer.char_index_at(line, start_col);
+                self.pending_link_alias = None;
+                self.show_suggestions(SuggestionKind::Tag, start, after.to_string());
+                return;
+            }
+        }
+
+        // Keep an alias only while the user is between the two opening brackets.
+        if !head.ends_with('[') {
+            self.pending_link_alias = None;
+        }
+        self.autocomplete = Autocomplete::default();
+    }
+
+    fn show_suggestions(&mut self, kind: SuggestionKind, start: usize, query: String) {
+        let needle = query.to_lowercase();
+        let mut items = Vec::new();
+
+        match kind {
+            SuggestionKind::Link => {
+                let alias = self.pending_link_alias.clone();
+                for (target, label) in self.note_suggestions.iter() {
+                    if needle.is_empty()
+                        || label.to_lowercase().contains(&needle)
+                        || target.to_lowercase().contains(&needle)
+                    {
+                        items.push(Suggestion {
+                            label: label.clone(),
+                            detail: target.clone(),
+                            insert: link_text(target, label, alias.as_deref()),
+                        });
+                        if items.len() == 8 {
+                            break;
+                        }
+                    }
+                }
+            }
+            SuggestionKind::Tag => {
+                for tag in self.tag_suggestions.iter() {
+                    if needle.is_empty() || tag.to_lowercase().contains(&needle) {
+                        items.push(Suggestion {
+                            label: format!("#{tag}"),
+                            detail: "tag".to_string(),
+                            insert: format!("#{tag}"),
+                        });
+                        if items.len() == 8 {
+                            break;
+                        }
+                    }
+                }
+            }
+            SuggestionKind::Slash => {
+                for (insert, description) in SLASH_COMMANDS {
+                    if needle.is_empty() || description.contains(&needle) {
+                        items.push(Suggestion {
+                            label: (*description).to_string(),
+                            detail: (*insert).replace('\n', "\\n"),
+                            insert: (*insert).to_string(),
+                        });
+                        if items.len() == 8 {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        if items.is_empty() {
+            self.autocomplete = Autocomplete::default();
+            if kind == SuggestionKind::Link {
+                self.pending_link_alias = None;
+            }
+            return;
+        }
+
+        self.autocomplete = Autocomplete {
+            open: true,
+            kind: Some(kind),
+            start,
+            query,
+            items,
+            selected: 0,
+        };
+    }
+
+    /// Insert the highlighted suggestion. Returns true when one was accepted.
+    fn accept_autocomplete(&mut self) -> bool {
+        if !self.autocomplete.open {
+            return false;
+        }
+        let Some(item) = self
+            .autocomplete
+            .items
+            .get(self.autocomplete.selected)
+            .cloned()
+        else {
+            self.autocomplete = Autocomplete::default();
+            self.pending_link_alias = None;
+            return false;
+        };
+        let cursor = self.buffer.cursor();
+        let start = self.autocomplete.start.min(cursor);
+        self.buffer.replace(start..cursor, &item.insert);
+        self.anchor = None;
+        self.autocomplete = Autocomplete::default();
+        self.pending_link_alias = None;
+        self.pending_link_start = false;
+        self.swallow_bracket = false;
+        true
+    }
+
+    fn move_autocomplete(&mut self, delta: isize) {
+        if !self.autocomplete.open || self.autocomplete.items.is_empty() {
+            return;
+        }
+        let count = self.autocomplete.items.len() as isize;
+        let selected = (self.autocomplete.selected as isize + delta).rem_euclid(count);
+        self.autocomplete.selected = selected as usize;
     }
 
     /// Load a note from disk, replacing the buffer.
@@ -256,6 +772,13 @@ impl Editor {
         self.marked_range = None;
         self.anchor = None;
         self.selecting = false;
+        self.extra_cursors.clear();
+        self.find.open = false;
+        self.find.matches.clear();
+        self.find.error = None;
+        self.find.message = None;
+        self.autocomplete = Autocomplete::default();
+        self.vim.reset();
         self.reset_layout_cache();
         self.scroll_handle = ScrollHandle::new();
         self.properties_revision = u64::MAX;
@@ -267,7 +790,10 @@ impl Editor {
     /// Write the buffer back to its file, atomically.
     pub fn save(&mut self) -> std::io::Result<()> {
         let Some(path) = self.path.clone() else {
-            return Ok(());
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "note has no file name yet (use Save note as)",
+            ));
         };
 
         let new_content = self.buffer.text();
@@ -291,6 +817,11 @@ impl Editor {
 
     pub fn is_dirty(&self) -> bool {
         self.buffer.is_dirty()
+    }
+
+    /// Whether this editor is backed by a file (false for an untitled buffer).
+    pub fn has_path(&self) -> bool {
+        self.path.is_some()
     }
 
     /// Re-read the note from disk, discarding in-memory edits.
@@ -325,6 +856,9 @@ impl Editor {
     /// Toggle between edit and reading mode (used by the command palette).
     pub fn toggle_reading_mode(&mut self) {
         self.reading = !self.reading;
+        if self.reading {
+            self.find.open = false;
+        }
     }
 
     /// Whether the editor is currently in reading mode.
@@ -335,6 +869,9 @@ impl Editor {
     /// Set reading mode explicitly (used when restoring a workspace).
     pub fn set_reading_mode(&mut self, reading: bool) {
         self.reading = reading;
+        if reading {
+            self.find.open = false;
+        }
     }
 
     /// Insert text at the caret (used by plugins).
@@ -457,6 +994,9 @@ impl Editor {
         self.last_shaped = Rc::new(Vec::new());
         self.cache_revision = u64::MAX;
         self.caret_follow = None;
+        // Folds are keyed by heading index, which a replaced document invalidates.
+        self.folded.clear();
+        self.fold_revision = self.fold_revision.wrapping_add(1);
     }
 
     /// Force the shaped-line cache to rebuild on the next frame, keeping hit-testing
@@ -468,6 +1008,23 @@ impl Editor {
 
     /// Freeze text wrapping while a splitter drag changes the editor width, then reflow
     /// once when it ends. Re-shaping the whole note on every mouse tick made resizing crawl.
+    /// Change the editor text size. Re-shapes on the next frame.
+    pub fn set_font_size(&mut self, size: Pixels) {
+        if self.font_size == size {
+            return;
+        }
+        self.font_size = size;
+        self.line_height = size * 1.4286;
+        self.invalidate_layout();
+    }
+
+    /// Point this editor at a moved/renamed file without discarding the buffer.
+    pub fn set_path(&mut self, path: Option<PathBuf>) {
+        self.path = path;
+        self.git_stat = None;
+        self.git_stat_key = None;
+    }
+
     pub fn set_resizing(&mut self, resizing: bool) {
         if self.resizing == resizing {
             return;
@@ -475,6 +1032,165 @@ impl Editor {
         self.resizing = resizing;
         if !resizing {
             self.cache_width = 0.0;
+        }
+    }
+
+    /// Headings for the current document, cached by document identity and revision.
+    fn document_headings(&mut self) -> Rc<Vec<markdown::Heading>> {
+        let key = (self.doc_generation, self.buffer.revision());
+        if self.heading_cache.0 != key.0 || self.heading_cache.1 != key.1 {
+            let text = self.buffer.text();
+            self.heading_cache = (key.0, key.1, Rc::new(markdown::headings(&text)));
+        }
+        self.heading_cache.2.clone()
+    }
+
+    /// Whether a heading has at least one heading nested under it.
+    fn heading_has_children(headings: &[markdown::Heading], index: usize) -> bool {
+        headings
+            .get(index + 1)
+            .is_some_and(|next| next.level > headings[index].level)
+    }
+
+    /// The 0-based line where the section under `index` stops (exclusive).
+    fn fold_end(headings: &[markdown::Heading], index: usize, line_count: usize) -> usize {
+        headings[index + 1..]
+            .iter()
+            .find(|next| next.level <= headings[index].level)
+            .map(|next| next.line.saturating_sub(1))
+            .unwrap_or(line_count)
+            .min(line_count)
+    }
+
+    /// Whether a line is the underline of a setext heading (`===` or `---`).
+    fn is_setext_underline(text: &str) -> bool {
+        let trimmed = text.trim();
+        !trimmed.is_empty()
+            && (trimmed.chars().all(|ch| ch == '=') || trimmed.chars().all(|ch| ch == '-'))
+    }
+
+    /// Mark the source lines hidden by folded headings.
+    fn hidden_lines(
+        headings: &[markdown::Heading],
+        folded: &HashSet<usize>,
+        line_count: usize,
+    ) -> Vec<bool> {
+        let mut hidden = vec![false; line_count];
+        for (index, heading) in headings.iter().enumerate() {
+            if !folded.contains(&index) {
+                continue;
+            }
+            let start = heading.line.saturating_sub(1);
+            if start >= line_count {
+                continue;
+            }
+            let end = Self::fold_end(headings, index, line_count);
+            for line in (start + 1)..end {
+                hidden[line] = true;
+            }
+        }
+        hidden
+    }
+
+    /// Per-line gutter markers: 1 for an expandable heading, 2 for a folded one.
+    fn fold_markers(
+        headings: &[markdown::Heading],
+        folded: &HashSet<usize>,
+        line_count: usize,
+    ) -> Vec<u8> {
+        let mut markers = vec![0u8; line_count];
+        for (index, heading) in headings.iter().enumerate() {
+            if !Self::heading_has_children(headings, index) {
+                continue;
+            }
+            let line = heading.line.saturating_sub(1);
+            if line < line_count {
+                markers[line] = if folded.contains(&index) { 2 } else { 1 };
+            }
+        }
+        markers
+    }
+
+    /// Fold or unfold a heading's section. Returns false when there is nothing to fold.
+    fn toggle_fold_index(&mut self, index: usize) -> bool {
+        let headings = self.document_headings();
+        if index >= headings.len() || !Self::heading_has_children(&headings, index) {
+            return false;
+        }
+
+        if !self.folded.remove(&index) {
+            self.folded.insert(index);
+        }
+        self.fold_revision = self.fold_revision.wrapping_add(1);
+
+        // A caret inside a section that just closed would be invisible: move it to the
+        // heading so typing continues somewhere the user can see.
+        if self.folded.contains(&index) {
+            let start = headings[index].line.saturating_sub(1);
+            let end = Self::fold_end(&headings, index, self.buffer.line_count());
+            let (line, _) = self.buffer.line_col();
+            if line > start && line < end {
+                let col = self.buffer.line(start).chars().count();
+                self.buffer
+                    .set_cursor(self.buffer.char_index_at(start, col));
+                self.anchor = None;
+            }
+        }
+        true
+    }
+
+    /// Fold or unfold the heading containing the caret.
+    pub fn toggle_fold_at_cursor(&mut self) -> bool {
+        let headings = self.document_headings();
+        let (line, _) = self.buffer.line_col();
+        let index = headings
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|(_, heading)| heading.line.saturating_sub(1) <= line)
+            .map(|(index, _)| index);
+        index.is_some_and(|index| self.toggle_fold_index(index))
+    }
+
+    /// Fold or unfold the heading containing the caret.
+    fn toggle_fold(&mut self, _: &ToggleFold, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.toggle_fold_at_cursor() {
+            cx.notify();
+        }
+    }
+
+    /// Fold or unfold the heading that starts on `line` (0-based).
+    fn toggle_fold_line(&mut self, line: usize) -> bool {
+        let headings = self.document_headings();
+        let index = headings.iter().enumerate().find_map(|(index, heading)| {
+            (heading.line.saturating_sub(1) == line && Self::heading_has_children(&headings, index))
+                .then_some(index)
+        });
+        index.is_some_and(|index| self.toggle_fold_index(index))
+    }
+
+    /// Unfold any section that hides the caret, so keyboard jumps cannot leave it invisible.
+    fn unfold_cursor_section(&mut self) {
+        if self.folded.is_empty() {
+            return;
+        }
+        let (line, _) = self.buffer.line_col();
+        let headings = self.document_headings();
+        let line_count = self.buffer.line_count();
+        let mut changed = false;
+        for (index, heading) in headings.iter().enumerate() {
+            if !self.folded.contains(&index) {
+                continue;
+            }
+            let start = heading.line.saturating_sub(1);
+            let end = Self::fold_end(&headings, index, line_count);
+            if line > start && line < end {
+                self.folded.remove(&index);
+                changed = true;
+            }
+        }
+        if changed {
+            self.fold_revision = self.fold_revision.wrapping_add(1);
         }
     }
 
@@ -492,7 +1208,12 @@ impl Editor {
         };
         let revision = self.buffer.revision();
         let width_changed = (self.cache_width - width).abs() >= 0.5;
-        if !width_changed && self.cache_revision == revision && !self.last_shaped.is_empty() {
+        let folds_changed = self.layout_fold_revision != self.fold_revision;
+        if !width_changed
+            && self.cache_revision == revision
+            && !folds_changed
+            && !self.last_shaped.is_empty()
+        {
             return;
         }
         if width_changed {
@@ -515,12 +1236,36 @@ impl Editor {
         let count = self.buffer.line_count().max(1);
         self.align_line_cache(count);
 
+        // Headings drive both the fold ranges and the gutter markers, so they are parsed
+        // once per document revision even when nothing is folded.
+        let headings = self.document_headings();
+        let mut hidden = Self::hidden_lines(&headings, &self.folded, count);
+        // A setext heading's underline is part of the heading, not its body.
+        for (index, heading) in headings.iter().enumerate() {
+            if !self.folded.contains(&index) {
+                continue;
+            }
+            let start = heading.line.saturating_sub(1);
+            if start + 1 >= count || hidden[start] {
+                continue;
+            }
+            if !self.buffer.line(start).trim_start().starts_with('#')
+                && Self::is_setext_underline(&self.buffer.line(start + 1))
+            {
+                hidden[start + 1] = false;
+            }
+        }
+        let markers = Self::fold_markers(&headings, &self.folded, count);
+
         let mut in_code = false;
         let mut language = String::new();
         let mut rows: Vec<Rc<ShapedLine>> = Vec::new();
         let mut metas: Vec<RowMeta> = Vec::new();
 
         for line_index in 0..count {
+            if hidden[line_index] {
+                continue;
+            }
             let reused = match self.line_cache.get(line_index).and_then(Option::as_ref) {
                 Some(cached)
                     if cached.in_code == in_code
@@ -573,6 +1318,8 @@ impl Editor {
         self.last_shaped = Rc::new(rows);
         self.cache_revision = revision;
         self.cache_width = width;
+        self.fold_markers = Rc::new(markers);
+        self.layout_fold_revision = self.fold_revision;
     }
 
     /// Shift the per-line cache to match whole lines that were inserted or removed.
@@ -716,6 +1463,9 @@ impl Editor {
     }
 
     fn begin_selection(&mut self) {
+        if !self.extra_cursors.is_empty() {
+            self.extra_cursors.clear();
+        }
         if self.anchor.is_none() {
             self.anchor = Some(self.buffer.cursor());
         }
@@ -723,6 +1473,339 @@ impl Editor {
 
     fn collapse_selection(&mut self) {
         self.anchor = None;
+    }
+
+    /// Every caret, primary first.
+    fn all_cursor_states(&self) -> Vec<CursorState> {
+        let mut states = Vec::with_capacity(self.extra_cursors.len() + 1);
+        states.push(CursorState {
+            cursor: self.buffer.cursor(),
+            anchor: self.anchor,
+        });
+        states.extend(self.extra_cursors.iter().copied());
+        states
+    }
+
+    /// Replace the caret set. The first entry becomes the primary caret.
+    fn set_cursor_states(&mut self, states: Vec<CursorState>) {
+        let mut unique = Vec::with_capacity(states.len());
+        for state in states {
+            if !unique.contains(&state) {
+                unique.push(state);
+            }
+        }
+        let Some(primary) = unique.first().copied() else {
+            return;
+        };
+        self.buffer.set_cursor(primary.cursor);
+        self.anchor = primary.anchor;
+        self.extra_cursors = unique.into_iter().skip(1).collect();
+    }
+
+    /// Selected ranges for every caret, primary first. Empty selections are carets.
+    fn selection_ranges(&self) -> Vec<Range<usize>> {
+        self.all_cursor_states()
+            .into_iter()
+            .filter_map(|state| match state.anchor {
+                Some(anchor) if anchor != state.cursor => {
+                    Some(anchor.min(state.cursor)..anchor.max(state.cursor))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Apply one edit per caret as a single undo step. `text` is inserted at each caret or
+    /// replaces each selection. Returns the number of carets that produced an edit.
+    fn apply_cursor_edits(&mut self, text: &str) -> usize {
+        let states = self.all_cursor_states();
+        let mut targets: Vec<EditTarget> = Vec::with_capacity(states.len());
+        for (index, state) in states.into_iter().enumerate() {
+            let range = match state.anchor {
+                Some(anchor) if anchor != state.cursor => {
+                    anchor.min(state.cursor)..anchor.max(state.cursor)
+                }
+                _ => state.cursor..state.cursor,
+            };
+            targets.push(EditTarget {
+                range,
+                text: text.to_string(),
+                primary: index == 0,
+            });
+        }
+        self.apply_edit_targets(targets)
+    }
+
+    /// Apply arbitrary ranges/replacements as one undo step and rebuild all carets.
+    fn apply_edit_targets(&mut self, mut targets: Vec<EditTarget>) -> usize {
+        if targets.is_empty() {
+            return 0;
+        }
+
+        // Keep exactly one caret per location. The primary range wins over extras that
+        // overlap it; overlapping extras are dropped.
+        let primary_range = targets
+            .iter()
+            .find(|target| target.primary)
+            .map(|target| target.range.clone());
+        if let Some(primary) = &primary_range {
+            let primary_empty = primary.start == primary.end;
+            targets.retain(|target| {
+                target.primary
+                    || target.range.end <= primary.start
+                    || if primary_empty {
+                        target.range.start > primary.start
+                    } else {
+                        target.range.start >= primary.end
+                    }
+            });
+        }
+
+        targets.sort_by_key(|target| (target.range.start, target.range.end));
+        let mut kept: Vec<EditTarget> = Vec::with_capacity(targets.len());
+        let mut last_end = 0usize;
+        let mut seen: Vec<(usize, usize)> = Vec::new();
+        for target in targets {
+            if target.range.start < last_end {
+                continue;
+            }
+            if seen.contains(&(target.range.start, target.range.end)) {
+                continue;
+            }
+            let empty = target.range.start == target.range.end && target.text.is_empty();
+            if empty {
+                continue;
+            }
+            seen.push((target.range.start, target.range.end));
+            last_end = target.range.end.max(target.range.start);
+            kept.push(target);
+        }
+        if kept.is_empty() {
+            return 0;
+        }
+
+        // New caret after each edit, in document order. `delta` is the shift caused by
+        // edits earlier in the document.
+        let mut positions = Vec::with_capacity(kept.len());
+        let mut primary_slot = 0usize;
+        let mut delta: isize = 0;
+        for (index, target) in kept.iter().enumerate() {
+            let inserted = target.text.chars().count();
+            let start = (target.range.start as isize + delta).max(0) as usize;
+            positions.push(start + inserted);
+            if target.primary {
+                primary_slot = index;
+            }
+            delta += inserted as isize - (target.range.end - target.range.start) as isize;
+        }
+
+        let edits = kept
+            .iter()
+            .map(|target| (target.range.clone(), target.text.clone()))
+            .collect();
+        self.buffer.replace_many(edits);
+        self.buffer.set_cursor(positions[primary_slot]);
+        self.anchor = None;
+        self.extra_cursors = positions
+            .into_iter()
+            .enumerate()
+            .filter(|(index, _)| *index != primary_slot)
+            .map(|(_, cursor)| CursorState {
+                cursor,
+                anchor: None,
+            })
+            .collect();
+        kept.len()
+    }
+
+    /// Delete every selection, leaving bare carets alone.
+    fn delete_selections(&mut self) -> usize {
+        let states = self.all_cursor_states();
+        let mut targets = Vec::new();
+        for (index, state) in states.into_iter().enumerate() {
+            if let Some(anchor) = state.anchor {
+                if anchor != state.cursor {
+                    targets.push(EditTarget {
+                        range: anchor.min(state.cursor)..anchor.max(state.cursor),
+                        text: String::new(),
+                        primary: index == 0,
+                    });
+                }
+            }
+        }
+        self.apply_edit_targets(targets)
+    }
+
+    /// Delete every selection, or one character on each side of each caret.
+    fn delete_at_cursors(&mut self, backwards: bool) -> usize {
+        let states = self.all_cursor_states();
+        let mut targets = Vec::new();
+        for (index, state) in states.into_iter().enumerate() {
+            let range = match state.anchor {
+                Some(anchor) if anchor != state.cursor => {
+                    anchor.min(state.cursor)..anchor.max(state.cursor)
+                }
+                _ if backwards => {
+                    if state.cursor == 0 {
+                        continue;
+                    }
+                    state.cursor - 1..state.cursor
+                }
+                _ => {
+                    if state.cursor >= self.buffer.len_chars() {
+                        continue;
+                    }
+                    state.cursor..state.cursor + 1
+                }
+            };
+            targets.push(EditTarget {
+                range,
+                text: String::new(),
+                primary: index == 0,
+            });
+        }
+        self.apply_edit_targets(targets)
+    }
+
+    fn select_word_at_cursor(&mut self) {
+        let text = self.buffer.text();
+        let chars: Vec<char> = text.chars().collect();
+        let cursor = self.buffer.cursor().min(chars.len());
+        if chars.is_empty() {
+            return;
+        }
+        let word = |ch: char| ch.is_alphanumeric() || ch == '_';
+        let mut start = cursor;
+        let mut end = cursor;
+        if start < chars.len() && word(chars[start]) {
+            while start > 0 && word(chars[start - 1]) {
+                start -= 1;
+            }
+            while end < chars.len() && word(chars[end]) {
+                end += 1;
+            }
+        } else {
+            while start > 0 && chars[start - 1].is_whitespace() {
+                start -= 1;
+            }
+            while start > 0 && word(chars[start - 1]) {
+                start -= 1;
+            }
+            end = start;
+            while end < chars.len() && word(chars[end]) {
+                end += 1;
+            }
+            if end == start && cursor < chars.len() {
+                end = cursor + 1;
+            }
+        }
+        if end > start {
+            self.anchor = Some(start);
+            self.buffer.set_cursor(end);
+        }
+    }
+
+    fn select_next_occurrence(&mut self) {
+        if self.selection().is_none() && self.extra_cursors.is_empty() {
+            self.select_word_at_cursor();
+            return;
+        }
+
+        let Some(primary) = self.selection() else {
+            return;
+        };
+        let needle = self.buffer.slice(primary);
+        if needle.is_empty() {
+            return;
+        }
+
+        let furthest = self
+            .selection_ranges()
+            .into_iter()
+            .map(|range| range.end)
+            .max()
+            .unwrap_or(0);
+        let text = self.buffer.text();
+        let Some(start) = literal_after(&text, &needle, furthest) else {
+            self.find.message = Some("no more occurrences".to_string());
+            return;
+        };
+        let selection = CursorState {
+            cursor: start + needle.chars().count(),
+            anchor: Some(start),
+        };
+        if !self.extra_cursors.contains(&selection) {
+            self.extra_cursors.push(selection);
+        }
+    }
+
+    fn add_cursor_vertical(&mut self, delta: isize) {
+        let cursor = self.buffer.cursor();
+        if let Some(target) = self.vertical_target(cursor, delta) {
+            let state = CursorState {
+                cursor: target,
+                anchor: None,
+            };
+            if target != cursor && !self.extra_cursors.contains(&state) {
+                self.extra_cursors.push(state);
+            }
+        }
+    }
+
+    /// The character index one visual row above or below `index`, following wrapped rows.
+    fn vertical_target(&self, index: usize, delta: isize) -> Option<usize> {
+        let (line, col) = self.buffer.line_col_at(index);
+        let current = self
+            .last_rows
+            .iter()
+            .rposition(|meta| meta.line == line && meta.start <= col)?;
+        let target = current as isize + delta;
+        if target < 0 || target as usize >= self.last_rows.len() {
+            return None;
+        }
+        let current_meta = self.last_rows[current];
+        let target_meta = self.last_rows[target as usize];
+        let offset = (col - current_meta.start).min(target_meta.end - target_meta.start);
+        Some(
+            self.buffer
+                .char_index_at(target_meta.line, target_meta.start + offset),
+        )
+    }
+
+    /// Move every caret with a buffer movement, collapsing their selections.
+    fn move_all_cursors(&mut self, mut movement: impl FnMut(&mut Buffer)) {
+        if self.extra_cursors.is_empty() {
+            self.collapse_selection();
+            movement(&mut self.buffer);
+            return;
+        }
+
+        let mut states = self.all_cursor_states();
+        for state in &mut states {
+            self.buffer.set_cursor(state.cursor);
+            movement(&mut self.buffer);
+            state.cursor = self.buffer.cursor();
+            state.anchor = None;
+        }
+        self.set_cursor_states(states);
+    }
+
+    /// Move every caret one visual row. Used when several carets are active.
+    fn move_all_vertical(&mut self, delta: isize) {
+        if self.extra_cursors.is_empty() {
+            self.collapse_selection();
+            self.move_vertical(delta);
+            return;
+        }
+
+        let mut states = self.all_cursor_states();
+        for state in &mut states {
+            if let Some(target) = self.vertical_target(state.cursor, delta) {
+                state.cursor = target;
+            }
+            state.anchor = None;
+        }
+        self.set_cursor_states(states);
     }
 
     /// Scroll the editor just enough to keep the caret (with a line of context) visible.
@@ -808,107 +1891,151 @@ impl Editor {
     }
 
     fn delete_selection(&mut self) -> bool {
-        if let Some(selection) = self.selection() {
-            self.buffer.delete_range(selection);
-            self.anchor = None;
-            true
-        } else {
-            false
+        let has_extra_selection = self
+            .extra_cursors
+            .iter()
+            .any(|state| state.anchor.is_some_and(|anchor| anchor != state.cursor));
+        if self.selection().is_none() && !has_extra_selection {
+            return false;
         }
+        self.delete_selections() > 0
     }
 
     fn insert_text(&mut self, text: &str) {
-        if let Some(selection) = self.selection() {
-            self.buffer.replace(selection, text);
-        } else {
-            self.buffer.insert(text);
+        if self.extra_cursors.is_empty() {
+            if let Some(selection) = self.selection() {
+                self.buffer.replace(selection, text);
+            } else {
+                self.buffer.insert(text);
+            }
+            self.anchor = None;
+            self.refresh_autocomplete();
+            return;
         }
-        self.anchor = None;
+
+        self.apply_cursor_edits(text);
+        self.refresh_autocomplete();
     }
 
     fn backspace(&mut self, _: &Backspace, _window: &mut Window, cx: &mut Context<Self>) {
-        if !self.delete_selection() {
-            self.buffer.backspace();
+        if self.find.open {
+            self.find_backspace();
+            cx.notify();
+            return;
         }
+        if self.vim.enabled() && self.vim.mode() != VimMode::Insert {
+            let mut anchor = self.anchor;
+            let outcome = self
+                .vim
+                .handle_key("backspace", &mut self.buffer, &mut anchor);
+            self.anchor = anchor;
+            self.vim.set_message(outcome.message);
+            cx.notify();
+            return;
+        }
+        if self.extra_cursors.is_empty() {
+            if !self.delete_selection() {
+                self.buffer.backspace();
+            }
+        } else if self.delete_selections() == 0 {
+            self.delete_at_cursors(true);
+        }
+        self.refresh_autocomplete();
         cx.notify();
     }
 
     fn delete(&mut self, _: &Delete, _window: &mut Window, cx: &mut Context<Self>) {
-        if !self.delete_selection() {
-            self.buffer.delete_forward();
+        if self.find.open {
+            return;
         }
+        if self.vim.enabled() && self.vim.mode() != VimMode::Insert {
+            let mut anchor = self.anchor;
+            let outcome = self.vim.handle_key("delete", &mut self.buffer, &mut anchor);
+            self.anchor = anchor;
+            self.vim.set_message(outcome.message);
+            cx.notify();
+            return;
+        }
+        if self.extra_cursors.is_empty() {
+            if !self.delete_selection() {
+                self.buffer.delete_forward();
+            }
+        } else if self.delete_selections() == 0 {
+            self.delete_at_cursors(false);
+        }
+        self.refresh_autocomplete();
         cx.notify();
     }
 
     fn left(&mut self, _: &Left, _window: &mut Window, cx: &mut Context<Self>) {
-        self.collapse_selection();
-        self.buffer.move_left();
+        self.dismiss_autocomplete();
+        self.move_all_cursors(|buffer| buffer.move_left());
         cx.notify();
     }
 
     fn right(&mut self, _: &Right, _window: &mut Window, cx: &mut Context<Self>) {
-        self.collapse_selection();
-        self.buffer.move_right();
+        self.dismiss_autocomplete();
+        self.move_all_cursors(|buffer| buffer.move_right());
         cx.notify();
     }
 
     fn up(&mut self, _: &Up, _window: &mut Window, cx: &mut Context<Self>) {
-        self.collapse_selection();
-        self.move_vertical(-1);
+        if self.autocomplete.open {
+            self.move_autocomplete(-1);
+            cx.notify();
+            return;
+        }
+        self.move_all_vertical(-1);
         cx.notify();
     }
 
     fn down(&mut self, _: &Down, _window: &mut Window, cx: &mut Context<Self>) {
-        self.collapse_selection();
-        self.move_vertical(1);
+        if self.autocomplete.open {
+            self.move_autocomplete(1);
+            cx.notify();
+            return;
+        }
+        self.move_all_vertical(1);
         cx.notify();
     }
 
     fn home(&mut self, _: &Home, _window: &mut Window, cx: &mut Context<Self>) {
-        self.collapse_selection();
-        self.buffer.move_home();
+        self.move_all_cursors(|buffer| buffer.move_home());
         cx.notify();
     }
 
     fn end(&mut self, _: &End, _window: &mut Window, cx: &mut Context<Self>) {
-        self.collapse_selection();
-        self.buffer.move_end();
+        self.move_all_cursors(|buffer| buffer.move_end());
         cx.notify();
     }
 
     fn word_left(&mut self, _: &WordLeft, _window: &mut Window, cx: &mut Context<Self>) {
-        self.collapse_selection();
-        self.buffer.move_word_left();
+        self.move_all_cursors(|buffer| buffer.move_word_left());
         cx.notify();
     }
 
     fn word_right(&mut self, _: &WordRight, _window: &mut Window, cx: &mut Context<Self>) {
-        self.collapse_selection();
-        self.buffer.move_word_right();
+        self.move_all_cursors(|buffer| buffer.move_word_right());
         cx.notify();
     }
 
     fn paragraph_up(&mut self, _: &ParagraphUp, _window: &mut Window, cx: &mut Context<Self>) {
-        self.collapse_selection();
-        self.buffer.move_paragraph_up();
+        self.move_all_cursors(|buffer| buffer.move_paragraph_up());
         cx.notify();
     }
 
     fn paragraph_down(&mut self, _: &ParagraphDown, _window: &mut Window, cx: &mut Context<Self>) {
-        self.collapse_selection();
-        self.buffer.move_paragraph_down();
+        self.move_all_cursors(|buffer| buffer.move_paragraph_down());
         cx.notify();
     }
 
     fn document_start(&mut self, _: &DocumentStart, _window: &mut Window, cx: &mut Context<Self>) {
-        self.collapse_selection();
-        self.buffer.move_document_start();
+        self.move_all_cursors(|buffer| buffer.move_document_start());
         cx.notify();
     }
 
     fn document_end(&mut self, _: &DocumentEnd, _window: &mut Window, cx: &mut Context<Self>) {
-        self.collapse_selection();
-        self.buffer.move_document_end();
+        self.move_all_cursors(|buffer| buffer.move_document_end());
         cx.notify();
     }
 
@@ -918,8 +2045,12 @@ impl Editor {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if !self.delete_selection() {
-            self.buffer.delete_word_left();
+        if self.extra_cursors.is_empty() {
+            if !self.delete_selection() {
+                self.buffer.delete_word_left();
+            }
+        } else {
+            self.delete_word_at_cursors(true);
         }
         cx.notify();
     }
@@ -930,10 +2061,43 @@ impl Editor {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if !self.delete_selection() {
-            self.buffer.delete_word_right();
+        if self.extra_cursors.is_empty() {
+            if !self.delete_selection() {
+                self.buffer.delete_word_right();
+            }
+        } else {
+            self.delete_word_at_cursors(false);
         }
         cx.notify();
+    }
+
+    fn delete_word_at_cursors(&mut self, backwards: bool) {
+        let states = self.all_cursor_states();
+        let mut targets = Vec::new();
+        for (index, state) in states.into_iter().enumerate() {
+            let range = if let Some(anchor) = state.anchor {
+                if anchor != state.cursor {
+                    anchor.min(state.cursor)..anchor.max(state.cursor)
+                } else if backwards {
+                    self.buffer.word_left_at(state.cursor)..state.cursor
+                } else {
+                    state.cursor..self.buffer.word_right_at(state.cursor)
+                }
+            } else if backwards {
+                self.buffer.word_left_at(state.cursor)..state.cursor
+            } else {
+                state.cursor..self.buffer.word_right_at(state.cursor)
+            };
+            if range.start == range.end {
+                continue;
+            }
+            targets.push(EditTarget {
+                range,
+                text: String::new(),
+                primary: index == 0,
+            });
+        }
+        self.apply_edit_targets(targets);
     }
 
     fn select_left(&mut self, _: &SelectLeft, _window: &mut Window, cx: &mut Context<Self>) {
@@ -1023,6 +2187,7 @@ impl Editor {
             return;
         }
         self.anchor = Some(0);
+        self.extra_cursors.clear();
         self.buffer.set_cursor(self.buffer.len_chars());
         cx.notify();
     }
@@ -1034,26 +2199,39 @@ impl Editor {
             }
             return;
         }
-        if let Some(selection) = self.selection() {
-            cx.write_to_clipboard(ClipboardItem::new_string(self.buffer.slice(selection)));
+        let ranges = self.selection_ranges();
+        if ranges.is_empty() {
+            return;
         }
+        let text = ranges
+            .into_iter()
+            .map(|range| self.buffer.slice(range))
+            .collect::<Vec<_>>()
+            .join("\n");
+        cx.write_to_clipboard(ClipboardItem::new_string(text));
     }
 
     fn cut(&mut self, _: &Cut, _window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(selection) = self.selection() {
-            cx.write_to_clipboard(ClipboardItem::new_string(
-                self.buffer.slice(selection.clone()),
-            ));
-            self.buffer.delete_range(selection);
-            self.anchor = None;
-            cx.notify();
+        let ranges = self.selection_ranges();
+        if ranges.is_empty() {
+            return;
         }
+        let text = ranges
+            .iter()
+            .map(|range| self.buffer.slice(range.clone()))
+            .collect::<Vec<_>>()
+            .join("\n");
+        cx.write_to_clipboard(ClipboardItem::new_string(text));
+        self.delete_selections();
+        cx.notify();
     }
 
     fn undo(&mut self, _: &Undo, _window: &mut Window, cx: &mut Context<Self>) {
         if self.buffer.undo() {
             self.anchor = None;
+            self.extra_cursors.clear();
             self.marked_range = None;
+            self.vim.reset();
             cx.notify();
         }
     }
@@ -1061,14 +2239,36 @@ impl Editor {
     fn redo(&mut self, _: &Redo, _window: &mut Window, cx: &mut Context<Self>) {
         if self.buffer.redo() {
             self.anchor = None;
+            self.extra_cursors.clear();
             self.marked_range = None;
+            self.vim.reset();
             cx.notify();
         }
     }
 
     fn enter(&mut self, _: &Enter, _window: &mut Window, cx: &mut Context<Self>) {
-        self.delete_selection();
-        self.buffer.insert("\n");
+        if self.accept_autocomplete() {
+            cx.notify();
+            return;
+        }
+        if self.find.open {
+            self.find_next(false);
+            cx.notify();
+            return;
+        }
+        if self.vim.enabled() && self.vim.mode() != VimMode::Insert {
+            let mut anchor = self.anchor;
+            let outcome = self.vim.handle_key("enter", &mut self.buffer, &mut anchor);
+            self.anchor = anchor;
+            self.vim.set_message(outcome.message);
+            if outcome.save {
+                let _ = self.save();
+            }
+            cx.notify();
+            return;
+        }
+        self.delete_selections();
+        self.insert_text("\n");
         cx.notify();
     }
 
@@ -1233,8 +2433,648 @@ impl Editor {
         cx.notify();
     }
 
+    fn toggle_bold(&mut self, _: &ToggleBold, _window: &mut Window, cx: &mut Context<Self>) {
+        self.apply_style(text_format::Style::Bold);
+        cx.notify();
+    }
+
+    fn toggle_italic(&mut self, _: &ToggleItalic, _window: &mut Window, cx: &mut Context<Self>) {
+        self.apply_style(text_format::Style::Italic);
+        cx.notify();
+    }
+
+    fn toggle_strikethrough(
+        &mut self,
+        _: &ToggleStrikethrough,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.apply_style(text_format::Style::Strikethrough);
+        cx.notify();
+    }
+
+    fn toggle_highlight(
+        &mut self,
+        _: &ToggleHighlight,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.apply_style(text_format::Style::Highlight);
+        cx.notify();
+    }
+
+    fn toggle_inline_code(
+        &mut self,
+        _: &ToggleInlineCode,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.apply_style(text_format::Style::InlineCode);
+        cx.notify();
+    }
+
+    fn toggle_comment(&mut self, _: &ToggleComment, _window: &mut Window, cx: &mut Context<Self>) {
+        self.apply_style(text_format::Style::Comment);
+        cx.notify();
+    }
+
+    fn insert_wikilink(
+        &mut self,
+        _: &InsertWikilink,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.start_wikilink();
+        cx.notify();
+    }
+
     fn toggle_reading(&mut self, _: &ToggleReading, _window: &mut Window, cx: &mut Context<Self>) {
         self.reading = !self.reading;
+        cx.notify();
+    }
+
+    /// Character index under a window-space point, using the geometry from the last paint.
+    /// Enable or disable Vim-style modal editing for this editor.
+    pub fn set_vim_enabled(&mut self, enabled: bool) {
+        self.vim.set_enabled(enabled);
+    }
+
+    pub fn vim_enabled(&self) -> bool {
+        self.vim.enabled()
+    }
+
+    pub fn vim_status(&self) -> String {
+        self.vim.status()
+    }
+
+    /// Open the in-note find bar, optionally with the replacement field.
+    pub fn open_find(&mut self, replace: bool) {
+        if self.reading {
+            self.set_reading_mode(false);
+        }
+        if !self.find.open {
+            let selection = self.selection().map(|range| self.buffer.slice(range));
+            if let Some(text) = selection {
+                if !text.contains('\n') && text.chars().count() <= 200 {
+                    self.find.pattern = text;
+                }
+            }
+        }
+        self.find.open = true;
+        self.find.replace |= replace;
+        self.find.field = FindField::Pattern;
+        self.find.message = None;
+        self.refresh_find(true);
+    }
+
+    /// Escape closes the find bar, leaves Vim insert/visual mode, or drops extra carets.
+    /// Returns whether the editor consumed the key.
+    pub fn handle_escape(&mut self) -> bool {
+        if self.autocomplete.open {
+            self.dismiss_autocomplete();
+            return true;
+        }
+        if self.find.open {
+            self.find.open = false;
+            self.find.error = None;
+            self.find.message = None;
+            return true;
+        }
+        if self.vim.enabled() {
+            let mut anchor = self.anchor;
+            let outcome = self.vim.handle_key("escape", &mut self.buffer, &mut anchor);
+            self.anchor = anchor;
+            self.vim.set_message(outcome.message);
+            return true;
+        }
+        if !self.extra_cursors.is_empty() {
+            self.extra_cursors.clear();
+            return true;
+        }
+        false
+    }
+
+    fn refresh_find(&mut self, select: bool) {
+        let text = self.buffer.text();
+        match find_engine::find_all(&text, &self.find.pattern, self.find.options()) {
+            Ok(matches) => {
+                self.find.error = None;
+                self.find.matches = matches.into_iter().map(|found| found.range).collect();
+            }
+            Err(error) => {
+                self.find.error = Some(error);
+                self.find.matches.clear();
+            }
+        }
+
+        if self.find.matches.is_empty() {
+            self.find.current = 0;
+            if self.find.pattern.is_empty() {
+                self.find.message = None;
+            }
+            return;
+        }
+
+        if select {
+            let from = self
+                .selection()
+                .map(|range| range.start)
+                .unwrap_or(self.buffer.cursor());
+            let index = self
+                .find
+                .matches
+                .iter()
+                .position(|range| range.start >= from)
+                .unwrap_or(0);
+            self.select_find_match(index);
+        } else if self.find.current >= self.find.matches.len() {
+            self.find.current = self.find.matches.len() - 1;
+        }
+    }
+
+    fn select_find_match(&mut self, index: usize) {
+        if self.find.matches.is_empty() {
+            return;
+        }
+        let index = index % self.find.matches.len();
+        self.find.current = index;
+        let range = self.find.matches[index].clone();
+        self.anchor = Some(range.start);
+        self.buffer.set_cursor(range.end);
+    }
+
+    fn find_append(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        let select = self.find.field == FindField::Pattern;
+        match self.find.field {
+            FindField::Pattern => self.find.pattern.push_str(text),
+            FindField::Replacement => self.find.replacement.push_str(text),
+        }
+        self.find.message = None;
+        self.refresh_find(select);
+    }
+
+    fn find_backspace(&mut self) {
+        let select = self.find.field == FindField::Pattern;
+        match self.find.field {
+            FindField::Pattern => {
+                self.find.pattern.pop();
+            }
+            FindField::Replacement => {
+                self.find.replacement.pop();
+            }
+        }
+        self.find.message = None;
+        self.refresh_find(select);
+    }
+
+    fn find_next(&mut self, backwards: bool) {
+        if self.find.matches.is_empty() {
+            self.refresh_find(true);
+            return;
+        }
+        let len = self.find.matches.len();
+        let index = if backwards {
+            (self.find.current + len - 1) % len
+        } else {
+            (self.find.current + 1) % len
+        };
+        self.select_find_match(index);
+    }
+
+    fn find_replace_one(&mut self) {
+        if self.find.matches.is_empty() {
+            self.refresh_find(true);
+        }
+        let Some(range) = self.find.matches.get(self.find.current).cloned() else {
+            self.find.message = Some("no matches".to_string());
+            return;
+        };
+        let text = self.buffer.text();
+        let target = find_engine::Match {
+            range: range.clone(),
+        };
+        match find_engine::replacement_for(
+            &text,
+            &target,
+            &self.find.pattern,
+            &self.find.replacement,
+            self.find.options(),
+        ) {
+            Ok(Some(replacement)) => {
+                self.buffer.replace(range, &replacement);
+                self.find.message = Some("replaced 1".to_string());
+                self.refresh_find(false);
+                if !self.find.matches.is_empty() {
+                    let index = self.find.current.min(self.find.matches.len() - 1);
+                    self.select_find_match(index);
+                }
+            }
+            Ok(None) => {
+                self.find.message = Some("match changed; press Find next".to_string());
+                self.refresh_find(true);
+            }
+            Err(error) => self.find.error = Some(error),
+        }
+    }
+
+    fn find_replace_all(&mut self) {
+        let text = self.buffer.text();
+        match find_engine::replace_all(
+            &text,
+            &self.find.pattern,
+            &self.find.replacement,
+            self.find.options(),
+        ) {
+            Ok((new_text, count)) => {
+                if count > 0 {
+                    self.buffer.replace(0..self.buffer.len_chars(), &new_text);
+                    self.anchor = None;
+                    self.buffer.set_cursor(0);
+                }
+                self.find.message = Some(format!("replaced {count}"));
+                self.find.error = None;
+                self.refresh_find(false);
+            }
+            Err(error) => {
+                self.find.error = Some(error);
+                self.find.matches.clear();
+            }
+        }
+    }
+
+    fn open_find_action(&mut self, _: &OpenFind, _window: &mut Window, cx: &mut Context<Self>) {
+        self.open_find(false);
+        cx.notify();
+    }
+
+    fn open_find_replace_action(
+        &mut self,
+        _: &OpenFindReplace,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_find(true);
+        cx.notify();
+    }
+
+    fn find_next_action(&mut self, _: &FindNext, _window: &mut Window, cx: &mut Context<Self>) {
+        self.find_next(false);
+        cx.notify();
+    }
+
+    fn find_prev_action(&mut self, _: &FindPrev, _window: &mut Window, cx: &mut Context<Self>) {
+        self.find_next(true);
+        cx.notify();
+    }
+
+    fn find_replace_one_action(
+        &mut self,
+        _: &FindReplaceOne,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.find_replace_one();
+        cx.notify();
+    }
+
+    fn find_replace_all_action(
+        &mut self,
+        _: &FindReplaceAll,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.find_replace_all();
+        cx.notify();
+    }
+
+    fn find_toggle_regex_action(
+        &mut self,
+        _: &FindToggleRegex,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.find.regex = !self.find.regex;
+        self.refresh_find(true);
+        cx.notify();
+    }
+
+    fn find_toggle_case_action(
+        &mut self,
+        _: &FindToggleCase,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.find.case_sensitive = !self.find.case_sensitive;
+        self.refresh_find(true);
+        cx.notify();
+    }
+
+    fn find_toggle_word_action(
+        &mut self,
+        _: &FindToggleWord,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.find.whole_word = !self.find.whole_word;
+        self.refresh_find(true);
+        cx.notify();
+    }
+
+    fn select_next_occurrence_action(
+        &mut self,
+        _: &SelectNextOccurrence,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.select_next_occurrence();
+        cx.notify();
+    }
+
+    fn add_cursor_above_action(
+        &mut self,
+        _: &AddCursorAbove,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.add_cursor_vertical(-1);
+        cx.notify();
+    }
+
+    fn add_cursor_below_action(
+        &mut self,
+        _: &AddCursorBelow,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.add_cursor_vertical(1);
+        cx.notify();
+    }
+
+    fn render_find_bar(&self, theme: Theme, cx: &mut Context<Self>) -> AnyElement {
+        let pattern = if self.find.pattern.is_empty() {
+            "Find".to_string()
+        } else {
+            self.find.pattern.clone()
+        };
+        let replacement = if self.find.replacement.is_empty() {
+            "Replace with".to_string()
+        } else {
+            self.find.replacement.clone()
+        };
+        let pattern_empty = self.find.pattern.is_empty();
+        let replacement_empty = self.find.replacement.is_empty();
+        let pattern_active = self.find.field == FindField::Pattern;
+        let replacement_active = self.find.field == FindField::Replacement;
+        let status = if let Some(error) = &self.find.error {
+            error.clone()
+        } else if !self.find.pattern.is_empty() && self.find.matches.is_empty() {
+            "no matches".to_string()
+        } else if !self.find.matches.is_empty() {
+            format!("{}/{}", self.find.current + 1, self.find.matches.len())
+        } else {
+            String::new()
+        };
+        let status_color = if self.find.error.is_some() {
+            theme.warn
+        } else {
+            theme.muted
+        };
+        let active_caret = |active: bool| if active { "\u{2502}" } else { "" };
+
+        let field = |text: String, empty: bool, active: bool, replacement: bool| {
+            div()
+                .id(if replacement {
+                    "find-replace"
+                } else {
+                    "find-pattern"
+                })
+                .flex_1()
+                .min_w(px(110.0))
+                .px_2()
+                .py_1()
+                .rounded_md()
+                .bg(theme.input_bg)
+                .border_1()
+                .border_color(if active { theme.accent } else { theme.border })
+                .text_sm()
+                .text_color(if empty { theme.muted } else { theme.text })
+                .cursor_pointer()
+                .child(format!("{text}{}", active_caret(active)))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _event, _window, cx| {
+                        this.find.field = if replacement {
+                            FindField::Replacement
+                        } else {
+                            FindField::Pattern
+                        };
+                        cx.notify();
+                    }),
+                )
+        };
+
+        let toggle =
+            |id: &'static str,
+             label: &'static str,
+             on: bool,
+             action: fn(&mut Self, &MouseDownEvent, &mut Window, &mut Context<Self>)| {
+                div()
+                    .id(id)
+                    .px_2()
+                    .py_1()
+                    .rounded_md()
+                    .cursor_pointer()
+                    .bg(if on {
+                        theme.accent.opacity(0.25)
+                    } else {
+                        theme.chip
+                    })
+                    .text_color(if on { theme.accent_text } else { theme.muted })
+                    .text_xs()
+                    .child(label)
+                    .on_mouse_down(MouseButton::Left, cx.listener(action))
+            };
+
+        let button =
+            |id: &'static str,
+             label: &'static str,
+             action: fn(&mut Self, &MouseDownEvent, &mut Window, &mut Context<Self>)| {
+                div()
+                    .id(id)
+                    .px_2()
+                    .py_1()
+                    .rounded_md()
+                    .cursor_pointer()
+                    .bg(theme.chip)
+                    .text_color(theme.text_dim)
+                    .text_xs()
+                    .hover(move |style| style.bg(theme.hover))
+                    .child(label)
+                    .on_mouse_down(MouseButton::Left, cx.listener(action))
+            };
+
+        div()
+            .id("find-bar")
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2()
+            .h(px(36.0))
+            .px_3()
+            .flex_shrink_0()
+            .bg(theme.panel)
+            .border_b_1()
+            .border_color(theme.border)
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(theme.muted)
+                    .child(if self.find.replace { "REPLACE" } else { "FIND" }),
+            )
+            .child(field(pattern, pattern_empty, pattern_active, false))
+            .child(toggle(
+                "find-regex",
+                ".*",
+                self.find.regex,
+                Self::find_toggle_regex_button,
+            ))
+            .child(toggle(
+                "find-case",
+                "Aa",
+                self.find.case_sensitive,
+                Self::find_toggle_case_button,
+            ))
+            .child(toggle(
+                "find-word",
+                "W",
+                self.find.whole_word,
+                Self::find_toggle_word_button,
+            ))
+            .child(
+                div()
+                    .min_w(px(56.0))
+                    .text_xs()
+                    .text_color(status_color)
+                    .child(status),
+            )
+            .when(self.find.replace, |row| {
+                row.child(field(
+                    replacement,
+                    replacement_empty,
+                    replacement_active,
+                    true,
+                ))
+            })
+            .child(button("find-prev", "prev", Self::find_prev_button))
+            .child(button("find-next", "next", Self::find_next_button))
+            .when(self.find.replace, |row| {
+                row.child(button(
+                    "find-replace-one",
+                    "replace",
+                    Self::find_replace_one_button,
+                ))
+                .child(button(
+                    "find-replace-all",
+                    "all",
+                    Self::find_replace_all_button,
+                ))
+            })
+            .child(
+                div()
+                    .id("find-close")
+                    .px_2()
+                    .py_1()
+                    .rounded_md()
+                    .cursor_pointer()
+                    .text_color(theme.muted)
+                    .hover(move |style| style.bg(theme.hover))
+                    .child("\u{00d7}")
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _event, _window, cx| {
+                            this.find.open = false;
+                            this.find.error = None;
+                            this.find.message = None;
+                            cx.notify();
+                        }),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    fn find_toggle_regex_button(
+        &mut self,
+        _: &MouseDownEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.find.regex = !self.find.regex;
+        self.refresh_find(true);
+        cx.notify();
+    }
+
+    fn find_toggle_case_button(
+        &mut self,
+        _: &MouseDownEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.find.case_sensitive = !self.find.case_sensitive;
+        self.refresh_find(true);
+        cx.notify();
+    }
+
+    fn find_toggle_word_button(
+        &mut self,
+        _: &MouseDownEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.find.whole_word = !self.find.whole_word;
+        self.refresh_find(true);
+        cx.notify();
+    }
+
+    fn find_next_button(
+        &mut self,
+        _: &MouseDownEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.find_next(false);
+        cx.notify();
+    }
+
+    fn find_prev_button(
+        &mut self,
+        _: &MouseDownEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.find_next(true);
+        cx.notify();
+    }
+
+    fn find_replace_one_button(
+        &mut self,
+        _: &MouseDownEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.find_replace_one();
+        cx.notify();
+    }
+
+    fn find_replace_all_button(
+        &mut self,
+        _: &MouseDownEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.find_replace_all();
         cx.notify();
     }
 
@@ -1265,20 +3105,103 @@ impl Editor {
         )
     }
 
+    /// Fold or unfold a heading when its gutter marker is clicked.
+    fn fold_from_gutter(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) -> bool {
+        let Some(bounds) = self.last_bounds else {
+            return false;
+        };
+        let x = position.x;
+        // The gutter sits just left of the text column, beyond the editor's padding.
+        let right = bounds.left() - px(26.0);
+        let left = right - px(GUTTER_WIDTH);
+        if x >= right || x < left {
+            return false;
+        }
+        let y = position.y - bounds.top();
+        if y < px(0.0) {
+            return false;
+        }
+        let row = (f32::from(y) / f32::from(self.line_height)).floor() as usize;
+        let Some(meta) = self.last_rows.get(row) else {
+            return false;
+        };
+        if meta.start != 0 {
+            return false;
+        }
+        if self.toggle_fold_line(meta.line) {
+            cx.notify();
+            return true;
+        }
+        false
+    }
+
+    /// Capture the selection before the platform turns the first `[` into text, so
+    /// `[[` over a selection can still use that text as the link alias.
+    fn on_pre_key_down(
+        &mut self,
+        event: &KeyDownEvent,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) {
+        if self.reading || self.find.open {
+            return;
+        }
+        match event.keystroke.key_char.as_deref() {
+            Some("[") => {
+                if self.selection().is_some() {
+                    self.capture_link_alias("[");
+                    self.pending_link_start = true;
+                }
+                // Keep `swallow_bracket`: the text-input event for this key fires next.
+            }
+            Some(_) | None if event.keystroke.key == "enter" || event.keystroke.key == "escape" => {
+                self.pending_link_start = false;
+                self.swallow_bracket = false;
+            }
+            Some(_) => {
+                self.pending_link_start = false;
+                self.swallow_bracket = false;
+            }
+            None => {}
+        }
+    }
+
     fn on_mouse_down(
         &mut self,
         event: &MouseDownEvent,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.dismiss_autocomplete();
         window.focus(&self.focus_handle);
+        if self.fold_from_gutter(event.position, cx) {
+            return;
+        }
         let Some(index) = self.index_for_point(event.position) else {
             return;
         };
 
+        if self.find.open {
+            self.find.open = false;
+            self.find.error = None;
+            self.find.message = None;
+        }
+
         if event.modifiers.shift {
             self.begin_selection();
+        } else if event.modifiers.alt {
+            let state = CursorState {
+                cursor: index,
+                anchor: None,
+            };
+            if !self.extra_cursors.contains(&state) {
+                self.extra_cursors.push(state);
+            }
+            self.selecting = false;
+            cx.notify();
+            return;
         } else {
+            self.extra_cursors.clear();
             self.anchor = Some(index);
         }
         self.buffer.set_cursor(index);
@@ -1322,6 +3245,7 @@ impl Render for Editor {
 
         // Keep the caret on screen before the tree is laid out, so typing never runs off
         // the bottom of a long note.
+        self.unfold_cursor_section();
         self.keep_cursor_visible();
 
         // Text style for rich runs (highlights) in reading mode.
@@ -1358,13 +3282,26 @@ impl Render for Editor {
             div()
                 .flex_1()
                 .min_h(px(0.0))
-                .child(self.reading_content.element(
-                    self.vault_root.clone(),
-                    theme,
-                    run_template.clone(),
-                    self.link_opener.clone(),
-                    cx,
-                ))
+                .child({
+                    let fold: crate::reading::FoldToggle = {
+                        let weak = cx.entity().downgrade();
+                        Rc::new(move |index: usize, window: &mut Window, cx: &mut App| {
+                            let _ = weak.update(cx, |editor, cx| {
+                                editor.reading_content.toggle_fold(index);
+                                cx.notify();
+                            });
+                            window.refresh();
+                        })
+                    };
+                    self.reading_content.element(
+                        self.vault_root.clone(),
+                        theme,
+                        run_template.clone(),
+                        self.link_opener.clone(),
+                        Some(fold),
+                        cx,
+                    )
+                })
                 .into_any_element()
         } else {
             div()
@@ -1403,11 +3340,172 @@ impl Render for Editor {
                 .into_any_element()
         };
 
+        let autocomplete_bar = if self.autocomplete.open {
+            let entity = cx.entity();
+            let kind = match self.autocomplete.kind {
+                Some(SuggestionKind::Link) => "link",
+                Some(SuggestionKind::Tag) => "tag",
+                Some(SuggestionKind::Slash) => "command",
+                None => "",
+            };
+            let selected = self.autocomplete.selected;
+            let query = self.autocomplete.query.clone();
+            let rows: Vec<AnyElement> = self
+                .autocomplete
+                .items
+                .iter()
+                .take(8)
+                .enumerate()
+                .map(|(index, item)| {
+                    let entity = entity.clone();
+                    let mut row = div()
+                        .id(ElementId::Name(format!("autocomplete-{index}").into()))
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_3()
+                        .h(px(24.0))
+                        .px_3()
+                        .text_sm()
+                        .text_color(theme.text)
+                        .cursor_pointer()
+                        .child(item.label.clone())
+                        .child(div().text_color(theme.muted).child(item.detail.clone()));
+                    if index == selected {
+                        row = row.bg(theme.accent);
+                    } else {
+                        row = row.hover(move |style| style.bg(theme.hover));
+                    }
+                    row.on_mouse_down(MouseButton::Left, move |_event, _window, cx| {
+                        entity.update(cx, |this, cx| {
+                            this.autocomplete.selected = index;
+                            if this.accept_autocomplete() {
+                                cx.notify();
+                            }
+                        });
+                    })
+                    .into_any_element()
+                })
+                .collect();
+
+            Some(
+                div()
+                    .id("autocomplete")
+                    .flex()
+                    .flex_col()
+                    .flex_shrink_0()
+                    .max_h(px(220.0))
+                    .overflow_y_scroll()
+                    .bg(theme.input_bg)
+                    .border_t_1()
+                    .border_color(theme.border)
+                    .child(
+                        div()
+                            .px_3()
+                            .py_1()
+                            .text_xs()
+                            .text_color(theme.muted)
+                            .child(format!("{kind}: {query}")),
+                    )
+                    .children(rows)
+                    .into_any_element(),
+            )
+        } else {
+            None
+        };
+
+        let format_bar = if !reading && self.selection().is_some() {
+            let entity = cx.entity();
+            let buttons: Vec<(&str, text_format::Style, &str)> = vec![
+                ("B", text_format::Style::Bold, "format-bold"),
+                ("I", text_format::Style::Italic, "format-italic"),
+                ("S", text_format::Style::Strikethrough, "format-strike"),
+                ("`", text_format::Style::InlineCode, "format-code"),
+                ("==", text_format::Style::Highlight, "format-highlight"),
+                ("%%", text_format::Style::Comment, "format-comment"),
+            ];
+            let buttons: Vec<AnyElement> = buttons
+                .into_iter()
+                .map(|(label, style, id)| {
+                    let entity = entity.clone();
+                    div()
+                        .id(ElementId::Name(id.into()))
+                        .px_2()
+                        .py_1()
+                        .rounded_sm()
+                        .cursor_pointer()
+                        .text_color(theme.text)
+                        .hover(move |style| style.bg(theme.hover))
+                        .child(label.to_string())
+                        .on_mouse_down(MouseButton::Left, move |_event, window, cx| {
+                            entity.update(cx, |this, cx| {
+                                this.apply_style(style);
+                                window.focus(&this.focus_handle);
+                                cx.notify();
+                            });
+                        })
+                        .into_any_element()
+                })
+                .collect();
+
+            let link_entity = cx.entity();
+            let link = div()
+                .id("format-link")
+                .px_2()
+                .py_1()
+                .rounded_sm()
+                .cursor_pointer()
+                .text_color(theme.text)
+                .hover(move |style| style.bg(theme.hover))
+                .child("[[ ]]")
+                .on_mouse_down(MouseButton::Left, move |_event, window, cx| {
+                    link_entity.update(cx, |this, cx| {
+                        this.start_wikilink();
+                        window.focus(&this.focus_handle);
+                        cx.notify();
+                    });
+                })
+                .into_any_element();
+
+            Some(
+                div()
+                    .id("format-bar")
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_1()
+                    .px_3()
+                    .py_1()
+                    .flex_shrink_0()
+                    .bg(theme.panel_alt)
+                    .border_t_1()
+                    .border_color(theme.border)
+                    .text_xs()
+                    .text_color(theme.text)
+                    .child(div().mr_1().text_color(theme.muted).child("Format"))
+                    .children(buttons)
+                    .child(link)
+                    .into_any_element(),
+            )
+        } else {
+            None
+        };
+
         let (line, column) = self.buffer.line_col();
         let line_count = self.buffer.line_count();
         let words = self.stats_cache.1.words;
         let git_stat = self.git_stat;
         let selection = self.selection_stats();
+        let vim_status = self.vim_enabled().then(|| self.vim_status());
+        let find_status = self.find.open.then(|| {
+            if self.find.matches.is_empty() {
+                "find".to_string()
+            } else {
+                format!("find {}/{}", self.find.current + 1, self.find.matches.len())
+            }
+        });
+        let extra_cursors = (!self.extra_cursors.is_empty())
+            .then(|| format!("{} cursors", self.extra_cursors.len() + 1));
         let status = div()
             .flex()
             .flex_row()
@@ -1424,6 +3522,22 @@ impl Render for Editor {
             .child(format!("Ln {}, Col {}", line + 1, column + 1))
             .child(format!("{line_count} lines"))
             .child(format!("{words} words"))
+            .when_some(extra_cursors, |d, label| {
+                d.child(div().text_color(theme.accent_text).child(label))
+            })
+            .when_some(vim_status, |d, label| {
+                d.child(
+                    div()
+                        .px_1()
+                        .rounded_sm()
+                        .bg(theme.chip)
+                        .text_color(theme.accent_text)
+                        .child(label),
+                )
+            })
+            .when_some(find_status, |d, label| {
+                d.child(div().text_color(theme.accent_text).child(label))
+            })
             .when_some(git_stat, |d, stat| {
                 d.child(
                     div()
@@ -1448,6 +3562,8 @@ impl Render for Editor {
                 ))
             });
 
+        let find_bar = self.find.open.then(|| self.render_find_bar(theme, cx));
+
         div()
             .key_context("Editor")
             .track_focus(&self.focus_handle)
@@ -1458,6 +3574,15 @@ impl Render for Editor {
             // Action handlers must live on the node that tracks focus: GPUI dispatches actions
             // only along the root-to-focus path, so handlers on descendants would never run.
             .on_action(cx.listener(Self::toggle_reading))
+            .on_action(cx.listener(Self::toggle_fold))
+            .on_action(cx.listener(Self::toggle_bold))
+            .on_action(cx.listener(Self::toggle_italic))
+            .on_action(cx.listener(Self::toggle_strikethrough))
+            .on_action(cx.listener(Self::toggle_highlight))
+            .on_action(cx.listener(Self::toggle_inline_code))
+            .on_action(cx.listener(Self::toggle_comment))
+            .on_action(cx.listener(Self::insert_wikilink))
+            .on_key_down(cx.listener(Self::on_pre_key_down))
             .on_action(cx.listener(Self::backspace))
             .on_action(cx.listener(Self::delete))
             .on_action(cx.listener(Self::delete_word_left))
@@ -1494,6 +3619,18 @@ impl Render for Editor {
             .on_action(cx.listener(Self::on_save))
             .on_action(cx.listener(Self::move_block_up_action))
             .on_action(cx.listener(Self::move_block_down_action))
+            .on_action(cx.listener(Self::open_find_action))
+            .on_action(cx.listener(Self::open_find_replace_action))
+            .on_action(cx.listener(Self::find_next_action))
+            .on_action(cx.listener(Self::find_prev_action))
+            .on_action(cx.listener(Self::find_replace_one_action))
+            .on_action(cx.listener(Self::find_replace_all_action))
+            .on_action(cx.listener(Self::find_toggle_regex_action))
+            .on_action(cx.listener(Self::find_toggle_case_action))
+            .on_action(cx.listener(Self::find_toggle_word_action))
+            .on_action(cx.listener(Self::select_next_occurrence_action))
+            .on_action(cx.listener(Self::add_cursor_above_action))
+            .on_action(cx.listener(Self::add_cursor_below_action))
             .flex()
             .flex_col()
             .size_full()
@@ -1550,7 +3687,10 @@ impl Render for Editor {
                         ),
                 ),
             )
+            .when_some(find_bar, |d, bar| d.child(bar))
             .child(body)
+            .when_some(format_bar, |d, bar| d.child(bar))
+            .when_some(autocomplete_bar, |d, bar| d.child(bar))
             .child(status)
     }
 }
@@ -1603,6 +3743,53 @@ impl EntityInputHandler for Editor {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.find.open {
+            self.find_append(new_text);
+            self.marked_range = None;
+            cx.notify();
+            return;
+        }
+        if self.vim.enabled() && self.vim.mode() != VimMode::Insert {
+            let mut anchor = self.anchor;
+            let outcome = self
+                .vim
+                .handle_text(new_text, &mut self.buffer, &mut anchor);
+            self.anchor = anchor;
+            self.vim.set_message(outcome.message);
+            if outcome.save {
+                let _ = self.save();
+            }
+            if outcome.handled {
+                self.marked_range = None;
+                cx.notify();
+                return;
+            }
+        }
+
+        // A `[` pressed over a selection starts the wikilink immediately. Waiting for the
+        // second `[` would already have replaced the selected text, losing the alias.
+        if self.pending_link_start && (new_text == "[" || new_text == "[[") {
+            self.pending_link_start = false;
+            let swallow = new_text == "[";
+            if !self.wrap_selection_as_wikilink(swallow) {
+                self.swallow_bracket = swallow;
+                self.start_wikilink();
+            }
+            self.marked_range = None;
+            cx.notify();
+            return;
+        }
+        if self.swallow_bracket && new_text == "[" {
+            self.swallow_bracket = false;
+            self.marked_range = None;
+            self.refresh_autocomplete();
+            cx.notify();
+            return;
+        }
+        self.swallow_bracket = false;
+        self.pending_link_start = false;
+
+        self.capture_link_alias(new_text);
         let range = self
             .range_from_utf16(range_utf16)
             .or_else(|| self.marked_range.clone())
@@ -1616,6 +3803,7 @@ impl EntityInputHandler for Editor {
 
         self.anchor = None;
         self.marked_range = None;
+        self.refresh_autocomplete();
         cx.notify();
     }
 
@@ -1627,6 +3815,47 @@ impl EntityInputHandler for Editor {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.find.open {
+            self.find_append(new_text);
+            cx.notify();
+            return;
+        }
+        if self.vim.enabled() && self.vim.mode() != VimMode::Insert {
+            let mut anchor = self.anchor;
+            let outcome = self
+                .vim
+                .handle_text(new_text, &mut self.buffer, &mut anchor);
+            self.anchor = anchor;
+            self.vim.set_message(outcome.message);
+            if outcome.handled {
+                self.marked_range = None;
+                cx.notify();
+                return;
+            }
+        }
+
+        if self.pending_link_start && (new_text == "[" || new_text == "[[") {
+            self.pending_link_start = false;
+            let swallow = new_text == "[";
+            if !self.wrap_selection_as_wikilink(swallow) {
+                self.swallow_bracket = swallow;
+                self.start_wikilink();
+            }
+            self.marked_range = None;
+            cx.notify();
+            return;
+        }
+        if self.swallow_bracket && new_text == "[" {
+            self.swallow_bracket = false;
+            self.marked_range = None;
+            self.refresh_autocomplete();
+            cx.notify();
+            return;
+        }
+        self.swallow_bracket = false;
+        self.pending_link_start = false;
+
+        self.capture_link_alias(new_text);
         let range = self
             .range_from_utf16(range_utf16)
             .or_else(|| self.marked_range.clone())
@@ -1640,6 +3869,7 @@ impl EntityInputHandler for Editor {
         } else {
             Some(start..start + new_text.chars().count())
         };
+        self.refresh_autocomplete();
         cx.notify();
     }
 
@@ -2343,6 +4573,13 @@ struct LineNumbers {
     editor: Entity<Editor>,
 }
 
+/// One gutter row: its line number, plus a fold marker on expandable headings.
+struct GutterRow {
+    row: usize,
+    number: Rc<ShapedLine>,
+    marker: Option<Rc<ShapedLine>>,
+}
+
 impl IntoElement for LineNumbers {
     type Element = Self;
 
@@ -2353,7 +4590,7 @@ impl IntoElement for LineNumbers {
 
 impl Element for LineNumbers {
     type RequestLayoutState = ();
-    type PrepaintState = Vec<(usize, Rc<ShapedLine>)>;
+    type PrepaintState = Vec<GutterRow>;
 
     fn id(&self) -> Option<ElementId> {
         None
@@ -2371,11 +4608,14 @@ impl Element for LineNumbers {
         cx: &mut App,
     ) -> (LayoutId, ()) {
         let editor = self.editor.read(cx);
-        let rows = editor
-            .last_shaped
-            .len()
-            .max(editor.buffer.line_count())
-            .max(1);
+        // Match the text's height. Using the logical line count here would leave blank
+        // gutter rows under a folded section.
+        let rows = if editor.last_shaped.is_empty() {
+            editor.buffer.line_count()
+        } else {
+            editor.last_shaped.len()
+        }
+        .max(1);
         let mut style = Style::default();
         style.size.width = px(GUTTER_WIDTH).into();
         style.size.height = (editor.line_height * rows as f32).into();
@@ -2390,13 +4630,14 @@ impl Element for LineNumbers {
         _state: &mut (),
         window: &mut Window,
         cx: &mut App,
-    ) -> Vec<(usize, Rc<ShapedLine>)> {
+    ) -> Vec<GutterRow> {
         let editor = self.editor.read(cx);
         let line_height = editor.line_height;
         let metas = editor.last_rows.clone();
         if metas.is_empty() {
             return Vec::new();
         }
+        let fold_markers = editor.fold_markers.clone();
 
         let theme = *cx.global::<Theme>();
         let mut font = window.text_style().font();
@@ -2430,7 +4671,34 @@ impl Element for LineNumbers {
                 &[run],
                 None,
             );
-            shaped.push((row, Rc::new(line)));
+
+            let marker = fold_markers
+                .get(meta.line)
+                .copied()
+                .filter(|marker| *marker != 0)
+                .map(|marker| {
+                    let text = if marker == 2 { "\u{25B8}" } else { "\u{25BE}" };
+                    let run = TextRun {
+                        len: text.len(),
+                        font: font.clone(),
+                        color: theme.muted,
+                        background_color: None,
+                        underline: None,
+                        strikethrough: None,
+                    };
+                    Rc::new(window.text_system().shape_line(
+                        SharedString::from(text),
+                        font_size,
+                        &[run],
+                        None,
+                    ))
+                });
+
+            shaped.push(GutterRow {
+                row,
+                number: Rc::new(line),
+                marker,
+            });
         }
         shaped
     }
@@ -2441,17 +4709,33 @@ impl Element for LineNumbers {
         _inspector_id: Option<&InspectorElementId>,
         bounds: Bounds<Pixels>,
         _state: &mut (),
-        lines: &mut Vec<(usize, Rc<ShapedLine>)>,
+        lines: &mut Vec<GutterRow>,
         window: &mut Window,
         cx: &mut App,
     ) {
         let line_height = self.editor.read(cx).line_height;
-        for (row, line) in lines.drain(..) {
+        for GutterRow {
+            row,
+            number,
+            marker,
+        } in lines.drain(..)
+        {
+            if let Some(marker) = marker {
+                let _ = marker.paint(
+                    point(
+                        bounds.left() + px(8.0),
+                        bounds.top() + line_height * row as f32,
+                    ),
+                    line_height,
+                    window,
+                    cx,
+                );
+            }
             let origin = point(
-                bounds.right() - line.width - px(8.0),
+                bounds.right() - number.width - px(8.0),
                 bounds.top() + line_height * row as f32,
             );
-            let _ = line.paint(origin, line_height, window, cx);
+            let _ = number.paint(origin, line_height, window, cx);
         }
     }
 }
@@ -2524,8 +4808,10 @@ struct Prepaint {
     rows: Rc<Vec<Rc<ShapedLine>>>,
     metas: Rc<Vec<RowMeta>>,
     selection: Vec<PaintQuad>,
+    find_matches: Vec<PaintQuad>,
     current_line: Option<PaintQuad>,
     cursor: Option<PaintQuad>,
+    extra_cursors: Vec<PaintQuad>,
     /// Rows intersecting the viewport; only these are painted.
     visible: Range<usize>,
 }
@@ -2604,7 +4890,7 @@ impl Element for EditorText {
         };
 
         let mut selection_quads = Vec::new();
-        if let Some(selection) = editor.selection() {
+        for selection in editor.selection_ranges() {
             for row_index in visible.clone() {
                 let meta = metas[row_index];
                 let line_start = editor.buffer.char_index_at(meta.line, 0);
@@ -2628,6 +4914,39 @@ impl Element for EditorText {
                         point(bounds.left() + x1, top + line_height),
                     ),
                     theme.selection,
+                ));
+            }
+        }
+
+        let mut find_quads = Vec::new();
+        for (index, matched) in editor.find.matches.iter().enumerate() {
+            let color = if index == editor.find.current {
+                theme.accent.opacity(0.45)
+            } else {
+                theme.accent.opacity(0.20)
+            };
+            for row_index in visible.clone() {
+                let meta = metas[row_index];
+                let line_start = editor.buffer.char_index_at(meta.line, 0);
+                let start = matched.start.max(line_start + meta.start);
+                let end = matched.end.min(line_start + meta.end);
+                if start >= end {
+                    continue;
+                }
+                let x0 = rows[row_index].x_for_index(row_byte(
+                    meta.line,
+                    meta.start,
+                    start - line_start,
+                ));
+                let x1 =
+                    rows[row_index].x_for_index(row_byte(meta.line, meta.start, end - line_start));
+                let top = bounds.top() + line_height * row_index as f32;
+                find_quads.push(fill(
+                    Bounds::from_corners(
+                        point(bounds.left() + x0, top),
+                        point(bounds.left() + x1, top + line_height),
+                    ),
+                    color,
                 ));
             }
         }
@@ -2656,6 +4975,30 @@ impl Element for EditorText {
             )
         });
 
+        let mut extra_cursor_quads = Vec::new();
+        for state in &editor.extra_cursors {
+            let (state_line, state_col) = editor.buffer.line_col_at(state.cursor);
+            let Some(row_index) = visible.clone().find(|row_index| {
+                let meta = metas[*row_index];
+                meta.line == state_line && meta.start <= state_col && state_col <= meta.end
+            }) else {
+                continue;
+            };
+            let meta = metas[row_index];
+            let col = state_col.min(meta.end);
+            let x = rows[row_index].x_for_index(row_byte(meta.line, meta.start, col));
+            extra_cursor_quads.push(fill(
+                Bounds::new(
+                    point(
+                        bounds.left() + x,
+                        bounds.top() + line_height * row_index as f32,
+                    ),
+                    size(px(2.0), line_height),
+                ),
+                theme.accent,
+            ));
+        }
+
         let current_line = cursor_row.map(|row_index| {
             fill(
                 Bounds::new(
@@ -2670,8 +5013,10 @@ impl Element for EditorText {
             rows,
             metas,
             selection: selection_quads,
+            find_matches: find_quads,
             current_line,
             cursor,
+            extra_cursors: extra_cursor_quads,
             visible,
         }
     }
@@ -2699,6 +5044,10 @@ impl Element for EditorText {
             window.paint_quad(quad);
         }
 
+        for quad in prepaint.find_matches.drain(..) {
+            window.paint_quad(quad);
+        }
+
         for quad in prepaint.selection.drain(..) {
             window.paint_quad(quad);
         }
@@ -2715,6 +5064,9 @@ impl Element for EditorText {
 
         if focus_handle.is_focused(window) {
             if let Some(cursor) = prepaint.cursor.take() {
+                window.paint_quad(cursor);
+            }
+            for cursor in prepaint.extra_cursors.drain(..) {
                 window.paint_quad(cursor);
             }
         }
@@ -2780,6 +5132,77 @@ fn visible_row_range(
 mod tests {
     use super::*;
     use gpui::{point, size};
+
+    #[test]
+    fn a_selection_becomes_the_wikilink_alias() {
+        assert_eq!(
+            link_text("notes/Other", "Other", Some("My Note")),
+            "[[notes/Other|My Note]]"
+        );
+        assert_eq!(link_text("notes/Other", "Other", None), "[[notes/Other]]");
+        assert_eq!(
+            link_text("notes/Other", "Other", Some("")),
+            "[[notes/Other]]"
+        );
+        assert_eq!(
+            link_text("notes/Other", "Other", Some("  other  ")),
+            "[[notes/Other]]"
+        );
+        assert_eq!(
+            link_text("notes/Other", "Other", Some("  My Note  ")),
+            "[[notes/Other|My Note]]"
+        );
+    }
+
+    #[test]
+    fn aliases_are_flattened_for_wikilinks() {
+        assert_eq!(clean_link_alias("My\nNote"), "My Note");
+        assert_eq!(clean_link_alias("a | b [c]"), "a - b c");
+        assert_eq!(clean_link_alias("   "), "");
+    }
+
+    #[test]
+    fn selected_text_becomes_a_wikilink() {
+        assert_eq!(
+            wikilink_for_selection("My Note").as_deref(),
+            Some("[[My Note]]")
+        );
+        assert_eq!(
+            wikilink_for_selection("  My\nNote  ").as_deref(),
+            Some("[[My Note]]")
+        );
+        assert_eq!(wikilink_for_selection("   "), None);
+    }
+
+    #[test]
+    fn formatting_round_trips_through_the_buffer() {
+        // The same edits the toolbar and shortcuts apply, exercised on a plain string.
+        let text = "hello";
+        let bold =
+            dragonglass_core::format::toggle(text, 0..5, dragonglass_core::format::Style::Bold);
+        assert_eq!(bold.text, "**hello**");
+        assert_eq!(bold.selection, 2..7);
+        let again = dragonglass_core::format::toggle(
+            &bold.text,
+            bold.selection.clone(),
+            dragonglass_core::format::Style::Bold,
+        );
+        assert_eq!(again.text, "hello");
+    }
+
+    #[test]
+    fn literal_after_finds_multibyte_occurrences_by_character() {
+        let text = "héllo héllo";
+        assert_eq!(literal_after(text, "héllo", 0), Some(0));
+        assert_eq!(literal_after(text, "héllo", 1), Some(6));
+        assert_eq!(literal_after(text, "héllo", 7), None);
+        assert_eq!(literal_after(text, "é", 2), Some(7));
+    }
+
+    #[test]
+    fn literal_after_rejects_an_empty_needle() {
+        assert_eq!(literal_after("abc", "", 0), None);
+    }
 
     #[test]
     fn visible_rows_at_the_top_include_only_the_first_screen() {
@@ -2887,5 +5310,63 @@ mod tests {
         // Caret below the viewport: move the content up, just enough to show it.
         let below = scroll_delta(px(520.0), px(540.0), px(100.0), px(500.0));
         assert_eq!(f32::from(below), -40.0);
+    }
+
+    #[test]
+    fn setext_underlines_are_recognised() {
+        assert!(Editor::is_setext_underline("==="));
+        assert!(Editor::is_setext_underline("  ---  "));
+        assert!(!Editor::is_setext_underline("- item"));
+        assert!(!Editor::is_setext_underline(""));
+    }
+
+    fn heading(level: u8, line: usize) -> markdown::Heading {
+        markdown::Heading {
+            level,
+            text: format!("h{line}"),
+            line,
+        }
+    }
+
+    #[test]
+    fn a_folded_heading_hides_its_section_but_not_the_next_sibling() {
+        let headings = vec![heading(1, 1), heading(2, 2), heading(3, 5), heading(2, 9)];
+        let mut folded = HashSet::new();
+        folded.insert(1);
+
+        let hidden = Editor::hidden_lines(&headings, &folded, 12);
+
+        // The level-2 heading on line 2 hides lines 3..=8; the next level-2 heading on
+        // line 9 and everything after it stay visible.
+        assert_eq!(&hidden[..2], &[false, false]);
+        assert!(hidden[2..8].iter().all(|line| *line));
+        assert!(hidden[8..].iter().all(|line| !*line));
+    }
+
+    #[test]
+    fn folding_the_top_heading_hides_the_rest_of_the_document() {
+        let headings = vec![heading(1, 1), heading(2, 2), heading(3, 4)];
+        let mut folded = HashSet::new();
+        folded.insert(0);
+
+        let hidden = Editor::hidden_lines(&headings, &folded, 7);
+
+        assert!(!hidden[0]);
+        assert!(hidden[1..].iter().all(|line| *line));
+    }
+
+    #[test]
+    fn gutter_markers_show_open_and_folded_headings_only() {
+        let headings = vec![heading(1, 1), heading(2, 3), heading(3, 4), heading(2, 6)];
+        let mut folded = HashSet::new();
+        folded.insert(0);
+
+        let markers = Editor::fold_markers(&headings, &folded, 8);
+
+        assert_eq!(markers[0], 2);
+        // A heading with a nested heading gets an open marker; the last level-2
+        // heading has no children and gets none.
+        assert_eq!(markers[2], 1);
+        assert_eq!(markers[5], 0);
     }
 }

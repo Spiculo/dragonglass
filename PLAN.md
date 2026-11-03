@@ -3,7 +3,7 @@
 A native, local-first Obsidian replacement. No Electron. Fast, low-memory, native.
 
 **Status:** Active — Phase 0 (foundations)
-**Platforms:** Windows + Linux (priority), macOS (later)
+**Platforms:** Windows + Linux (priority), macOS (in progress)
 **Team:** Solo developer
 **License:** GPL-3.0-or-later
 
@@ -192,12 +192,12 @@ optimize for shipping working code over schedule precision.
 
 | Phase | Duration | Contents | Milestone |
 |---|---|---|---|
-| **0 — Foundations** | 3–5 wk | repo + CI (Windows/Linux) ✅, `core` crate ✅, FS vault model ✅, **GPUI spike ✅** | GPUI builds on Windows ✅ and Linux ✅; editor approach = build our own ✅ |
+| **0 — Foundations** | 3–5 wk | repo + CI (Windows/Linux/macOS) ✅, `core` crate ✅, FS vault model ✅, **GPUI spike ✅** | GPUI builds on Windows ✅ and Linux ✅; macOS CI/bundle in progress; editor approach = build our own ✅ |
 | **1 — Alpha** | 3–5 mo | rope buffer + undo/redo, editor element (source + live preview), file tree, tabs, quick switcher, full-text search, tags, wikilinks + backlinks, reading mode, **RaTeX math**, **git init/commit/push/pull** | dogfood on your own vault, zero data loss, git round-trip works |
 | **2 — Beta** | 3–4 mo | graph view, outline, daily notes, templates, properties, bookmarks, command palette, hotkeys, themes/CSS, embeds, attachments, file recovery, update prompt | feature-complete core |
 | **3 — Power** | 3–5 mo | WASM plugins, CLI, URI scheme, multi-window, workspaces, query/Bases views | public beta |
 | **4 — Ecosystem** | TBD | plugin/theme store, importers (Notion/Evernote/Roam), export/publish, MCP | ecosystem |
-| **5 — macOS** | TBD | cross-compile + platform polish, code signing/notarization | macOS parity |
+| **5 — macOS** | in progress | CI + unsigned `.app`/DMG ✅, Cmd+Q save ✅; signing/notarization, Intel/universal, runtime polish | macOS parity |
 
 **Critical path:** Phase 0 → 1. Everything else is gated on a proven native editor.
 
@@ -284,17 +284,22 @@ vault, the way Obsidian does.
 
 ## 11. What is deliberately not done
 
-- **Phase 5 (macOS).** Not started, and not verifiable from this machine: it needs a Mac for
-  signing and notarization. The code is already cross-platform and CI builds the GPUI app on
-  Linux and Windows.
+- **Phase 5 (macOS).** In progress. The macOS CI job, unsigned `.app`/DMG bundler and
+  `Info.plist` (URL scheme and Markdown document types) are in place, and Cmd+Q now saves
+  dirty buffers through an app-quit observer. Signing/notarization, Intel/universal builds,
+  the native app menu and runtime testing (IME, VoiceOver, trackpad, Metal) still require a
+  Mac and an Apple Developer ID.
 - **Community/online theme and plugin store.** The locked decision is "no network by default";
   the local store covers installation from a directory. A network store would contradict that.
 - **End-to-end-encrypted sync.** Listed conditionally ("if pursued") and not pursued; git sync
   covers the sync requirement.
 - **Packaging.** In place: `register-uri`/`unregister-uri`, a release profile, a Windows icon
   and VERSIONINFO resource embedded at build time, a `.deb` builder, Inno Setup and winget
-  manifests, Flatpak and AppImage recipes, and a tag-triggered release workflow.
-- **Mobile.** Explicitly deferred by the locked decisions.
+  manifests, Flatpak and AppImage recipes, a macOS `.app`/DMG bundler, and a tag-triggered
+  release workflow (macOS artifacts are currently unsigned).
+- **Mobile.** Originally deferred. An Android shell now exists in `mobile/android` on top of
+  the UniFFI bridge in `crates/dragonglass-ffi`; iOS can reuse the same bridge with Swift
+  bindings. The first slice edits app-private vaults; SAF/USB-document access is next.
 - **Full LaTeX layout.** Implemented per **`docs/math-typesetting.md`**: RaTeX
   (KaTeX-compatible, pure Rust) lays formulas out into a display list that a GPUI vector
   painter draws. Display math is fully typeset (fractions, radicals, limits, matrices,
@@ -351,7 +356,48 @@ shift the cached tail instead of dropping it). Before this, every keystroke re-m
 re-shaped the whole note — noticeable on the 1,000+ line notes in the test vault. The view
 also follows the caret, and `Ctrl+Z` / `Ctrl+Shift+Z` / `Ctrl+Y` undo and redo.
 
-**Phase 5 — not started.** macOS cross-compile, signing/notarization, platform polish.
+**Phase 5 — in progress.** macOS is now in the CI matrix and releases get an unsigned
+`.app` and DMG from `packaging/macos/`. The bundle declares the `dragonglass://` URL scheme
+and Markdown document types, Cmd+Q is wired to an app-quit save so unsaved tabs are not
+dropped, the vault registry already uses `~/Library/Application Support/DragonGlass`, and
+recent-vault deduplication is case-insensitive on macOS as well as Windows. Still required:
+Developer ID signing and notarization, Intel/universal binaries, a native app menu and
+runtime validation of IME, VoiceOver, trackpad gestures and Metal on a Mac.
+
+### Editor tooling
+
+The editor now has an in-note find/replace bar (`Ctrl+F`, `Ctrl+H` for replace) with
+literal or regex patterns, case-sensitive and whole-word toggles, live match counts,
+invalid-pattern feedback, per-match replacement and replace-all. Regex replacements support
+`$1`/`${name}` capture expansion; literal replacements are literal (including `$`). Search
+and replacement operate on character offsets, so emoji and accented text never split.
+
+Multi-cursor editing is built into the editor rather than bolted onto the buffer: `Ctrl+D`
+selects the word under the caret and then each next occurrence, `Ctrl+Alt+Up/Down` adds a
+caret on the visual row above or below, and `Alt+click` places extra carets. Typing,
+Enter, Backspace/Delete, paste, cut/copy and selections apply at every caret, and all edits
+in one keystroke are a single undo step (`Buffer::replace_many`).
+
+Autocomplete works while typing: `[[` lists vault notes, `#` lists tags used anywhere in the
+vault, and a line that starts with `/` lists slash commands (headings, lists, tasks, tables,
+code, math, callouts). `Up`/`Down` and `Enter` choose, `Esc` dismisses.
+
+Selecting text reveals a **Format** bar above the status line. Bold (`Ctrl+B`), italic
+(`Ctrl+I`), strikethrough (`Ctrl+Shift+X`), highlight (`Ctrl+Shift+H`) and inline code
+(`Ctrl+Shift+C`) wrap the selection, and pressing the same shortcut again unwraps it.
+Comments and wikilinks are on the bar. `Ctrl+K` starts a wikilink from the caret, or from the
+selection: picking a note writes `[[target|selected text]]` (or `[[target]]` when the text
+already matches). Typing `[[` over a selection is the direct route: it wraps the selection
+as `[[selected text]]` without opening the picker.
+
+**Settings** (`Ctrl+,`) is an in-app page for the theme, accent colour, editor font size, Vim
+mode, snippets and the daily/weekly/monthly/templates/attachments folders. Values are written
+to `.dragon-glass/config.txt`, so they remain plain text and per vault.
+
+Vim mode is optional and per vault (`vim_mode=true` in `.dragon-glass/config.txt`, the
+command palette, or `Ctrl+Alt+V`). It covers normal/visual/visual-line/insert modes,
+counts, `h j k l w b e 0 ^ $ gg G`, `i a I A o O`, `x X s S D C J`, `d/y/c` operators,
+`p/P`, `u`, `r`, `/` search with `n/N`, and `:w`, `:wq`, `:N`, `:s/…/…/`, `:%s/…/…/g`.
 
 ### Editorial system
 
@@ -386,3 +432,13 @@ UI entry points: Ctrl+Shift+R toggles the document-relations pane; Ctrl+Shift+�
 block; the command palette has versions, templates, shared blocks (insert, extract, edit),
 review, relations, the relation graph, block duplicate/delete, "reload note from disk" and
 "add related note". Compare output renders as a line-numbered diff until Escape.
+
+### Data safety
+
+Closing a window with dirty tabs now shows a **Save and quit / Quit without saving / Cancel**
+bar instead of dropping the edits; the same save runs from **Save all open notes** in Settings.
+Deleting from the file tree moves the note or folder to `.dragon-glass/trash/<stamp>/`, closing
+its tabs first (and refusing to continue if a dirty tab cannot be saved). Renaming or moving
+keeps open tabs pointed at the new path. **File recovery** in the palette lists the snapshots
+that are written whenever a note is overwritten, with a diff against the current buffer and a
+one-click restore that snapshots the current buffer first.

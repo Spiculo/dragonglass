@@ -2,6 +2,7 @@
 //! monitor while the editor stays put.
 
 use std::path::PathBuf;
+use std::rc::Rc;
 
 use gpui::{
     div, prelude::*, px, size, App, Bounds, Context, Entity, FocusHandle, Render, Subscription,
@@ -80,6 +81,17 @@ impl Render for PreviewWindow {
             self.reading.update(version, &text, Some(&root));
         }
 
+        let fold: crate::reading::FoldToggle = {
+            let weak = cx.entity().downgrade();
+            Rc::new(move |index: usize, window: &mut Window, cx: &mut App| {
+                let _ = weak.update(cx, |preview, cx| {
+                    preview.reading.toggle_fold(index);
+                    cx.notify();
+                });
+                window.refresh();
+            })
+        };
+
         div()
             .id("preview-window")
             .track_focus(&self.focus_handle)
@@ -91,6 +103,7 @@ impl Render for PreviewWindow {
                 theme,
                 template,
                 Some(self.opener.clone()),
+                Some(fold),
                 cx,
             ))
     }

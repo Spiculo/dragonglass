@@ -5,7 +5,7 @@
 //! and highlights all render inside paragraphs, list items, headings and table cells.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
@@ -37,6 +37,9 @@ const MAX_EMBED_DEPTH: usize = 3;
 /// Called when a link in the reading view is clicked. The target is either a vault-relative
 /// note target or an `http(s)`/`mailto` URL; the app decides which.
 pub type LinkOpener = Rc<dyn Fn(&str, &mut Window, &mut App)>;
+
+/// Called when a heading's fold chevron is clicked. The index is the heading's block.
+pub type FoldToggle = Rc<dyn Fn(usize, &mut Window, &mut App)>;
 
 /// A point in the reading view: a block and a byte offset into its display text.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -96,6 +99,12 @@ struct RenderCtx<'a> {
     opener: Option<&'a LinkOpener>,
     /// Display formulas, typeset once per document version.
     math: &'a HashMap<(String, MathStyle), Rc<MathScene>>,
+    /// Folded heading blocks in the current reading view.
+    folded: &'a HashSet<usize>,
+    /// Called with a heading's block index when its fold chevron is clicked.
+    on_fold: Option<&'a FoldToggle>,
+    /// All blocks, so a heading can tell whether it has a nested section.
+    blocks: &'a [Block],
     depth: usize,
     theme: Theme,
     template: &'a TextRun,
@@ -340,6 +349,8 @@ pub struct ReadingCache {
     footnote_defs: Rc<RefCell<HashMap<String, usize>>>,
     /// The picker overlay, created on first render.
     footnote_popup: Option<Entity<FootnotePopup>>,
+    /// Heading blocks whose sections are folded.
+    folded: HashSet<usize>,
 }
 
 impl ReadingCache {
@@ -357,7 +368,20 @@ impl ReadingCache {
             footnote_refs: Rc::new(RefCell::new(HashMap::new())),
             footnote_defs: Rc::new(RefCell::new(HashMap::new())),
             footnote_popup: None,
+            folded: HashSet::new(),
         }
+    }
+
+    /// Fold or unfold the section under a heading block.
+    pub fn toggle_fold(&mut self, index: usize) {
+        if !self.folded.remove(&index) {
+            self.folded.insert(index);
+        }
+        // Folded blocks collapse to zero height, so the list's cached item sizes are stale.
+        let scroll = self.list_state.logical_scroll_top();
+        let count = self.blocks.len();
+        self.list_state.splice(0..count, count);
+        self.list_state.scroll_to(scroll);
     }
 
     pub fn needs_update(&self, version: (u64, u64)) -> bool {
@@ -376,6 +400,11 @@ impl ReadingCache {
     pub fn update(&mut self, version: (u64, u64), source: &str, root: Option<&Path>) {
         if self.version == version {
             return;
+        }
+
+        // Folds are per document; an edit keeps them, a different note does not.
+        if self.version.0 != version.0 {
+            self.folded.clear();
         }
 
         let source = match root {
@@ -542,6 +571,7 @@ impl ReadingCache {
         theme: Theme,
         template: TextRun,
         opener: Option<LinkOpener>,
+        on_fold: Option<FoldToggle>,
         cx: &mut App,
     ) -> impl IntoElement {
         if vault_root.as_deref() != self.attachments_root.as_deref() {
@@ -598,6 +628,8 @@ impl ReadingCache {
         let attachments = self.attachments.clone();
         let selection = self.selection.clone();
         let math = self.math.clone();
+        let hidden = Rc::new(hidden_blocks(self.blocks.as_slice(), &self.folded));
+        let folded = self.folded.clone();
         div()
             .relative()
             .size_full()
@@ -613,6 +645,9 @@ impl ReadingCache {
                         let Some(block) = blocks.get(index).cloned() else {
                             return div().into_any_element();
                         };
+                        if hidden.get(index).copied().unwrap_or(false) {
+                            return div().w_full().h(px(0.0)).into_any_element();
+                        }
 
                         let ctx = RenderCtx {
                             vault_root: vault_root.as_deref(),
@@ -620,6 +655,9 @@ impl ReadingCache {
                             selection: &selection,
                             opener: opener.as_ref(),
                             math: &math,
+                            folded: &folded,
+                            on_fold: on_fold.as_ref(),
+                            blocks: blocks.as_slice(),
                             depth: 0,
                             theme,
                             template: &template,
@@ -655,6 +693,41 @@ impl Default for ReadingCache {
     }
 }
 
+/// Mark the blocks hidden by folded headings.
+///
+/// A folded heading hides every following block up to the next heading of the same or a
+/// higher level. Hidden blocks are still list items, but they render at zero height, so
+/// list indices stay stable while a section opens and closes.
+fn hidden_blocks(blocks: &[Block], folded: &HashSet<usize>) -> Vec<bool> {
+    let mut hidden = vec![false; blocks.len()];
+    let mut hide_until_level: Option<u8> = None;
+
+    for (index, block) in blocks.iter().enumerate() {
+        let heading_level = match block {
+            Block::Heading { level, .. } => Some(*level),
+            _ => None,
+        };
+
+        if let (Some(level), Some(limit)) = (heading_level, hide_until_level) {
+            if level <= limit {
+                hide_until_level = None;
+            }
+        }
+        if hide_until_level.is_some() {
+            hidden[index] = true;
+            continue;
+        }
+
+        if let Some(level) = heading_level {
+            if folded.contains(&index) {
+                hide_until_level = Some(level);
+            }
+        }
+    }
+
+    hidden
+}
+
 /// A non-virtualized column, used for nested `![[note]]` embeds where a second scroll
 /// container would be wrong.
 fn reading_column(src: &str, ctx: &RenderCtx) -> impl IntoElement {
@@ -670,6 +743,9 @@ fn reading_column(src: &str, ctx: &RenderCtx) -> impl IntoElement {
         selection: ctx.selection,
         opener: ctx.opener,
         math: ctx.math,
+        folded: ctx.folded,
+        on_fold: None,
+        blocks: &[],
         depth: ctx.depth + 1,
         theme: ctx.theme,
         template: &template,
@@ -693,9 +769,38 @@ fn render_block(block: Block, block_index: Option<usize>, ctx: &RenderCtx) -> An
                 3 => 20.0,
                 _ => 17.0,
             };
-            div()
-                .pb_1()
-                .child(rich_text_styled(
+            let foldable = block_index.is_some_and(|index| {
+                matches!(
+                    ctx.blocks.get(index + 1),
+                    Some(Block::Heading { level: next, .. }) if *next > level
+                )
+            });
+            let collapsed = block_index.is_some_and(|index| ctx.folded.contains(&index));
+
+            let mut heading = div().flex().flex_row().items_center().gap_2().pb_1();
+            if foldable {
+                let mut chevron = div()
+                    .w(px(14.0))
+                    .flex_shrink_0()
+                    .cursor_pointer()
+                    .text_color(theme.muted)
+                    .child(if collapsed { "\u{25B8}" } else { "\u{25BE}" });
+                if let (Some(on_fold), Some(index)) = (ctx.on_fold, block_index) {
+                    let on_fold = on_fold.clone();
+                    chevron = chevron
+                        .hover(move |style| style.text_color(theme.text))
+                        .on_mouse_down(MouseButton::Left, move |_ev, window, cx| {
+                            cx.stop_propagation();
+                            on_fold(index, window, cx);
+                        });
+                }
+                heading = heading.child(chevron);
+            } else {
+                heading = heading.child(div().w(px(14.0)).flex_shrink_0());
+            }
+
+            heading
+                .child(div().flex_1().min_w(px(0.0)).child(rich_text_styled(
                     &text,
                     size,
                     block_index,
@@ -703,7 +808,7 @@ fn render_block(block: Block, block_index: Option<usize>, ctx: &RenderCtx) -> An
                     ctx,
                     gpui::FontWeight::BOLD,
                     1.25,
-                ))
+                )))
                 .into_any_element()
         }
         Block::Paragraph(text) => rich_text(&text, 15.0, block_index, 0, ctx),
@@ -854,6 +959,9 @@ impl<'a> RenderCtx<'a> {
             selection: self.selection,
             opener: self.opener,
             math: self.math,
+            folded: self.folded,
+            on_fold: self.on_fold,
+            blocks: self.blocks,
             depth: self.depth,
             theme: self.theme,
             template,
@@ -1989,5 +2097,31 @@ mod tests {
             rows: vec![vec!["1".to_string(), "2".to_string()]],
         };
         assert_eq!(block_display(&block), "a\tb\n1\t2");
+    }
+
+    #[test]
+    fn a_folded_reading_heading_hides_blocks_until_its_sibling() {
+        let blocks = vec![
+            Block::Heading {
+                level: 1,
+                text: "One".to_string(),
+            },
+            Block::Paragraph("body".to_string()),
+            Block::Heading {
+                level: 2,
+                text: "Nested".to_string(),
+            },
+            Block::Paragraph("nested body".to_string()),
+            Block::Heading {
+                level: 1,
+                text: "Two".to_string(),
+            },
+        ];
+        let mut folded = HashSet::new();
+        folded.insert(0);
+
+        let hidden = hidden_blocks(&blocks, &folded);
+
+        assert_eq!(hidden, vec![false, true, true, true, false]);
     }
 }

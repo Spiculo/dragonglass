@@ -3,8 +3,8 @@
 //! Deliberately UI-free so it can be unit-tested and shared with the CLI. Positions are
 //! **character indices**, never byte offsets, so multibyte text is handled correctly.
 //!
-//! Not yet implemented (tracked for Phase 1): multi-cursor, selections, and file loading/
-//! saving through this type.
+//! The editor owns cursor/selection state; the buffer stores the primary caret and applies
+//! (possibly batched) edits.
 
 use ropey::Rope;
 
@@ -21,6 +21,8 @@ enum Edit {
         removed: String,
         inserted: String,
     },
+    /// Several replacements applied as one undoable step. Used by multi-cursor edits.
+    Batch(Vec<Edit>),
 }
 
 #[derive(Debug, Clone, Default)]
@@ -201,6 +203,71 @@ impl Buffer {
         self.redo.clear();
         self.dirty = true;
         self.revision = self.revision.wrapping_add(1);
+    }
+
+    /// Apply several replacements as one undoable step, for multi-cursor edits.
+    ///
+    /// Ranges may be supplied in any order; they are applied bottom-up so earlier edits do
+    /// not shift later offsets. Overlapping ranges are ignored rather than corrupting the
+    /// buffer. Returns the number of edits that actually changed something.
+    pub fn replace_many(&mut self, mut edits: Vec<(std::ops::Range<usize>, String)>) -> usize {
+        let len = self.rope.len_chars();
+        for (range, _) in &mut edits {
+            range.start = range.start.min(len);
+            range.end = range.end.min(len).max(range.start);
+        }
+
+        // Keep the first of any duplicate/overlapping ranges. The caller normally sends
+        // selections from top to bottom; sorting by start makes overlap checks predictable.
+        edits.sort_by_key(|(range, _)| (range.start, range.end));
+        let mut kept: Vec<(std::ops::Range<usize>, String)> = Vec::new();
+        let mut last_end = 0usize;
+        let mut seen: Vec<(usize, usize)> = Vec::new();
+        for (range, text) in edits {
+            if range.start < last_end {
+                continue;
+            }
+            if seen.contains(&(range.start, range.end)) {
+                continue;
+            }
+            let removed_len = range.end - range.start;
+            if removed_len == 0 && text.is_empty() {
+                continue;
+            }
+            seen.push((range.start, range.end));
+            last_end = if range.start == range.end {
+                range.start + 1
+            } else {
+                range.end
+            };
+            kept.push((range, text));
+        }
+
+        if kept.is_empty() {
+            return 0;
+        }
+
+        let count = kept.len();
+        let lowest_start = kept[0].0.start;
+        let lowest_inserted = kept[0].1.chars().count();
+        let mut batch = Vec::with_capacity(count);
+        for (range, text) in kept.into_iter().rev() {
+            let removed = self.rope.slice(range.clone()).to_string();
+            self.rope.remove(range.clone());
+            self.rope.insert(range.start, &text);
+            batch.push(Edit::Replace {
+                at: range.start,
+                removed,
+                inserted: text,
+            });
+        }
+
+        self.cursor = lowest_start + lowest_inserted;
+        self.undo.push(Edit::Batch(batch));
+        self.redo.clear();
+        self.dirty = true;
+        self.revision = self.revision.wrapping_add(1);
+        count
     }
 
     /// Delete `range`, as a single undoable step.
@@ -456,6 +523,16 @@ impl Buffer {
         (index < self.rope.len_chars()).then(|| self.rope.char(index))
     }
 
+    /// The start of the word before `from`, for word-wise deletion and Vim motions.
+    pub fn word_left_at(&self, from: usize) -> usize {
+        self.word_left_from(from)
+    }
+
+    /// The start of the word after `from`.
+    pub fn word_right_at(&self, from: usize) -> usize {
+        self.word_right_from(from)
+    }
+
     fn word_left_from(&self, from: usize) -> usize {
         let mut index = from.min(self.rope.len_chars());
         while index > 0 && self.char_at(index - 1).is_some_and(|ch| ch.is_whitespace()) {
@@ -487,7 +564,27 @@ impl Buffer {
         let Some(edit) = self.undo.pop() else {
             return false;
         };
-        match &edit {
+        self.revert(&edit);
+        self.redo.push(edit);
+        self.dirty = true;
+        self.revision = self.revision.wrapping_add(1);
+        true
+    }
+
+    pub fn redo(&mut self) -> bool {
+        let Some(edit) = self.redo.pop() else {
+            return false;
+        };
+        self.apply(&edit);
+        self.undo.push(edit);
+        self.dirty = true;
+        self.revision = self.revision.wrapping_add(1);
+        true
+    }
+
+    /// Revert one stored edit. Batches are reverted bottom-up so offsets stay valid.
+    fn revert(&mut self, edit: &Edit) {
+        match edit {
             Edit::Insert { at, text } => {
                 self.rope.remove(*at..*at + text.chars().count());
                 self.cursor = *at;
@@ -505,18 +602,17 @@ impl Buffer {
                 self.rope.insert(*at, removed);
                 self.cursor = *at + removed.chars().count();
             }
+            Edit::Batch(edits) => {
+                for edit in edits.iter().rev() {
+                    self.revert(edit);
+                }
+            }
         }
-        self.redo.push(edit);
-        self.dirty = true;
-        self.revision = self.revision.wrapping_add(1);
-        true
     }
 
-    pub fn redo(&mut self) -> bool {
-        let Some(edit) = self.redo.pop() else {
-            return false;
-        };
-        match &edit {
+    /// Re-apply one stored edit. Batches are applied in their original order.
+    fn apply(&mut self, edit: &Edit) {
+        match edit {
             Edit::Insert { at, text } => {
                 self.rope.insert(*at, text);
                 self.cursor = *at + text.chars().count();
@@ -534,11 +630,12 @@ impl Buffer {
                 self.rope.insert(*at, inserted);
                 self.cursor = *at + inserted.chars().count();
             }
+            Edit::Batch(edits) => {
+                for edit in edits {
+                    self.apply(edit);
+                }
+            }
         }
-        self.undo.push(edit);
-        self.dirty = true;
-        self.revision = self.revision.wrapping_add(1);
-        true
     }
 
     /// Number of chars before the newline (and any `\r`) at the end of `line`.
@@ -680,6 +777,40 @@ mod tests {
         assert_eq!(b.text(), "hello world");
         assert!(b.redo());
         assert_eq!(b.text(), "hello there");
+    }
+
+    #[test]
+    fn replace_many_is_one_undo_step() {
+        let mut b = Buffer::from_text("one two one");
+        let count = b.replace_many(vec![(0..3, "1".to_string()), (8..11, "1".to_string())]);
+        assert_eq!(count, 2);
+        assert_eq!(b.text(), "1 two 1");
+        assert!(b.undo());
+        assert_eq!(b.text(), "one two one");
+        assert!(b.redo());
+        assert_eq!(b.text(), "1 two 1");
+    }
+
+    #[test]
+    fn replace_many_ignores_overlaps_and_noops() {
+        let mut b = Buffer::from_text("abcdef");
+        let count = b.replace_many(vec![
+            (1..4, "X".to_string()),
+            (2..5, "Y".to_string()),
+            (6..6, String::new()),
+        ]);
+        assert_eq!(count, 1);
+        assert_eq!(b.text(), "aXef");
+        assert!(b.undo());
+        assert_eq!(b.text(), "abcdef");
+    }
+
+    #[test]
+    fn replace_many_deduplicates_identical_carets() {
+        let mut b = Buffer::from_text("ab");
+        let count = b.replace_many(vec![(1..1, "X".to_string()), (1..1, "X".to_string())]);
+        assert_eq!(count, 1);
+        assert_eq!(b.text(), "aXb");
     }
 
     #[test]

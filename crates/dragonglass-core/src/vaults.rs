@@ -173,7 +173,9 @@ fn same(a: &Path, b: &Path) -> bool {
         } else if let Some(rest) = text.strip_prefix("//?/") {
             text = rest.to_string();
         }
-        if cfg!(windows) {
+        // APFS is case-insensitive by default, just like NTFS. Treat macOS the same way
+        // so the recent-vault list cannot gain case-only duplicates.
+        if cfg!(any(windows, target_os = "macos")) {
             text.to_lowercase()
         } else {
             text

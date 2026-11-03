@@ -1,0 +1,18 @@
+[package]
+name = "dragonglass-ffi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "Mobile/FFI bindings for the Dragon Glass engine."
+
+[lib]
+name = "dragonglass_ffi"
+crate-type = ["cdylib", "staticlib", "lib"]
+
+[dependencies]
+dragonglass-core.workspace = true
+thiserror.workspace = true
+chrono = "0.4"
+uniffi = "0.32"
