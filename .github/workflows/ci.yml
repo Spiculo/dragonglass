@@ -64,6 +64,23 @@ jobs:
           packaging/macos/build-app.sh 0.0.0 "$RUNNER_TEMP/dist"
           test -d "$RUNNER_TEMP/dist/Dragon Glass.app"
           test -f "$RUNNER_TEMP/dist/DragonGlass-0.0.0-macos.dmg"
+      - name: Launch smoke test
+        # GitHub's macOS runners can launch GUI apps, but this can be flaky in a headless
+        # session; the artifact is still uploaded if the check fails.
+        continue-on-error: true
+        run: |
+          mkdir -p "$RUNNER_TEMP/smoke-vault"
+          printf '# Smoke\n\nHello from macOS.\n' > "$RUNNER_TEMP/smoke-vault/Note.md"
+          open -n "$RUNNER_TEMP/dist/Dragon Glass.app" --args "$RUNNER_TEMP/smoke-vault"
+          sleep 8
+          if pgrep -f "Dragon Glass.app/Contents/MacOS/dragon-glass-app" >/dev/null; then
+            echo "Dragon Glass launched and stayed alive for 8 seconds"
+            pkill -f "Dragon Glass.app/Contents/MacOS/dragon-glass-app" || true
+          else
+            echo "Dragon Glass exited before the smoke-test window"
+            exit 1
+          fi
+
       - name: Upload app bundle
         uses: actions/upload-artifact@v7
         with:
