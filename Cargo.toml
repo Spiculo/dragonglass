@@ -31,6 +31,6 @@ strip = true
 dragonglass-core = { path = "crates/dragonglass-core" }
 dragonglass-plugins = { path = "crates/dragonglass-plugins" }
 anyhow = "1"
-thiserror = "1"
+thiserror = "2"
 walkdir = "2"
 ropey = "1.6"
