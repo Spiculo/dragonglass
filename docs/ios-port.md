@@ -67,10 +67,11 @@ Neither is exposed through `crates/dragonglass-ffi`.
    caps future parity.
 3. **Static linking.** The FFI must be linked as a static library into the app binary;
    there is no side-loading a `.dylib`.
-4. **Filesystem access.** App-private storage is identical to Android. Reading
-   user-chosen vaults needs `UIDocumentPickerViewController` plus security-scoped
-   bookmarks. That gap already exists on Android (SAF), so iOS adds no new parity debt —
-   but it is the single most-requested feature on both platforms.
+4. **Filesystem access.** App-private storage is identical to Android. Reading user-chosen
+   vaults needs `UIDocumentPickerViewController` plus security-scoped bookmarks. Android now
+   imports a folder and mirrors saves back through SAF while editing an app-private copy;
+   iOS can follow the same model, or mount user folders directly once a storage abstraction
+   exists.
 5. **Licensing — the real blocker.** The project is GPL-3.0-or-later. GPLv3's
    anti-DRM/installation-information terms are generally considered incompatible with the
    Apple App Store terms of service. Shipping on the App Store likely requires either a

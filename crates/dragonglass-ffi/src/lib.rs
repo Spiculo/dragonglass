@@ -15,7 +15,7 @@ use dragonglass_core::graph::{self, EdgeKind, Graph};
 use dragonglass_core::relations::{self, NoteRelations};
 use dragonglass_core::{
     bookmarks, frontmatter, html, markdown, query, search, stats, storage, templates, tree,
-    NodeKind, Note, NoteRef, TreeNode, Vault,
+    vaultfs, NodeKind, Note, NoteRef, TreeNode, Vault,
 };
 
 #[derive(Debug, thiserror::Error, uniffi::Error)]
@@ -140,6 +140,17 @@ pub struct TemplateInfo {
     pub relative: String,
 }
 
+/// A deleted note or folder waiting in the vault trash.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct TrashEntry {
+    /// Vault-relative path of the trash entry, for `restore_trash_entry`.
+    pub trash_relative: String,
+    /// Where the entry was before it was deleted.
+    pub original: String,
+    /// Deletion time in milliseconds since the Unix epoch, when known.
+    pub deleted_at: i64,
+}
+
 struct State {
     notes: Vec<NoteRef>,
     graph: Option<Graph>,
@@ -205,7 +216,10 @@ impl MobileVault {
         let Ok(state) = self.lock() else {
             return Vec::new();
         };
-        let tree = tree::build(&state.notes);
+        let folders = Vault::open(&self.root)
+            .map(|vault| vault.folders())
+            .unwrap_or_default();
+        let tree = tree::build_with_dirs(&state.notes, &folders);
         let mut rows = Vec::new();
         flatten_tree(&tree, 0, &mut rows);
         rows
@@ -246,10 +260,55 @@ impl MobileVault {
         self.refresh()
     }
 
-    pub fn delete_note(&self, relative: String) -> Result<(), MobileError> {
-        let path = self.readable_path(&relative)?;
-        fs::remove_file(path)?;
+    /// Create a folder (and any missing parents).
+    pub fn create_folder(&self, relative: String) -> Result<(), MobileError> {
+        vaultfs::create_folder(&self.root, &relative)?;
         self.refresh()
+    }
+
+    /// Rename or move a note or folder. Fails rather than overwriting another entry.
+    /// Returns the sanitized vault-relative destination.
+    pub fn rename_entry(&self, from: String, to: String) -> Result<String, MobileError> {
+        let renamed = vaultfs::rename(&self.root, &from, &to)?;
+        self.refresh()?;
+        Ok(renamed)
+    }
+
+    /// Move a note or folder to the vault trash. Returns its trash-relative path.
+    pub fn trash_note(&self, relative: String) -> Result<String, MobileError> {
+        let path = vaultfs::trash(&self.root, &relative)?;
+        let trashed = path
+            .strip_prefix(&self.root)
+            .unwrap_or(&path)
+            .to_string_lossy()
+            .replace('\\', "/");
+        self.refresh()?;
+        Ok(trashed)
+    }
+
+    /// Everything currently in the vault trash, newest first.
+    pub fn trash_entries(&self) -> Vec<TrashEntry> {
+        vaultfs::list_trash(&self.root)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|entry| TrashEntry {
+                trash_relative: entry.trash_relative,
+                original: entry.original,
+                deleted_at: entry.deleted_at_ms as i64,
+            })
+            .collect()
+    }
+
+    /// Restore one trash entry to its original path. Returns that path.
+    pub fn restore_trash_entry(&self, trash_relative: String) -> Result<String, MobileError> {
+        let restored = vaultfs::restore(&self.root, &trash_relative)?;
+        self.refresh()?;
+        Ok(restored)
+    }
+
+    /// Permanently remove everything in the trash. Returns the entry count.
+    pub fn empty_trash(&self) -> Result<i64, MobileError> {
+        Ok(vaultfs::empty_trash(&self.root)? as i64)
     }
 
     /// Full-text search, capped at `limit` hits.
@@ -719,6 +778,40 @@ mod tests {
         assert_eq!(sanitize_name("My: note?"), "My- note-");
         assert_eq!(sanitize_name("  ...  "), "Untitled");
         assert_eq!(sanitize_name("a/b"), "a-b");
+    }
+
+    #[test]
+    fn moves_renames_and_restores_through_the_trash() {
+        let root = temp_vault("trash");
+        let vault = MobileVault::open(root.to_string_lossy().to_string()).unwrap();
+        vault
+            .create_note("notes/gone.md".to_string(), "keep me".to_string())
+            .unwrap();
+
+        vault
+            .rename_entry("notes/gone.md".to_string(), "notes/kept.md".to_string())
+            .unwrap();
+        assert_eq!(vault.notes()[0].relative, "notes/kept.md");
+
+        let trashed = vault.trash_note("notes/kept.md".to_string()).unwrap();
+        assert!(trashed.starts_with(".dragon-glass/trash/"));
+        assert!(vault.notes().is_empty());
+
+        let entries = vault.trash_entries();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].original, "notes/kept.md");
+
+        let restored = vault
+            .restore_trash_entry(entries[0].trash_relative.clone())
+            .unwrap();
+        assert_eq!(restored, "notes/kept.md");
+        assert_eq!(
+            vault.note_source("notes/kept.md".to_string()).unwrap(),
+            "keep me"
+        );
+        assert!(vault.trash_entries().is_empty());
+
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
