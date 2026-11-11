@@ -284,10 +284,15 @@ vault, the way Obsidian does.
 
 ## 11. What is deliberately not done
 
-- **Signed and notarized macOS builds.** The macOS app is built, packaged and verified on
-  Apple Silicon and Intel from a universal bundle; the menu bar, Command shortcuts and the
-  `dragonglass://` URL scheme work. Releases are only ad-hoc signed: users clear Gatekeeper
-  once. Notarization needs an Apple Developer ID certificate and credentials.
+- **Signed and notarized macOS builds.** The macOS app is built and packaged as a universal
+  (Apple Silicon + Intel) bundle, and the menu bar, Command shortcuts and `dragonglass://`
+  scheme are verified on Apple Silicon. The Intel slice builds and links but has not run on
+  Intel hardware. Releases are only ad-hoc signed: users clear Gatekeeper once. Notarization
+  needs an Apple Developer ID certificate and credentials.
+- **macOS polish.** Not blockers for v0.0.1: no About panel (GPUI has no standard one),
+  `Cmd+W` closes the tab rather than the window, the dmg has no custom layout, and a `.md`
+  opened from Finder while the app runs is dropped because GPUI has no open-file event.
+  The macOS CI bundle is manual-dispatch only to save runner minutes.
 - **Community/online theme and plugin store.** The locked decision is "no network by default";
   the local store covers installation from a directory. A network store would contradict that.
 - **End-to-end-encrypted sync.** Listed conditionally ("if pursued") and not pursued; git sync
@@ -357,8 +362,9 @@ also follows the caret, and `Ctrl+Z` / `Ctrl+Shift+Z` / `Ctrl+Y` undo and redo.
 
 **Phase 5 — done, except signing.** macOS builds as a universal (Apple Silicon + Intel)
 `.app` with an icon and `Info.plist`, Command shortcuts, a menu bar, and `dragonglass://`
-registration through Launch Services. CI builds and launch-tests the bundle on
-`macos-latest`. Still open: Developer ID signing and notarization, so Gatekeeper needs one
+registration through Launch Services. The `macos-bundle` CI job builds and launch-tests the
+bundle on `macos-latest`, on manual dispatch only so it does not spend runner minutes on
+every push. Still open: Developer ID signing and notarization, so Gatekeeper needs one
 manual approval per download.
 
 ### Editor tooling

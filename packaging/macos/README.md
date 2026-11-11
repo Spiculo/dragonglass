@@ -71,6 +71,17 @@ packaging/macos/build-universal.sh 0.0.1 dist
 The script then signs with the hardened runtime, submits the ZIP with `notarytool`, and
 staples the ticket to the app.
 
+## Markdown documents
+
+`Info.plist` declares Markdown as a document type, so Finder lists Dragon Glass under
+**Open With**. Launching the app with a `.md` file opens that note: the app resolves the
+file to its vault (the most recent vault that contains it, otherwise its folder) and loads
+the note.
+
+While the app is already running, macOS delivers the file as an Apple Event and GPUI 0.2.2
+only surfaces URL opens (`on_open_urls`), so the request is dropped. Quit the app first, or
+use `dragonglass://open?vault=/path/to/vault&note=notes/a.md`.
+
 ## URL scheme
 
 `Info.plist` declares `CFBundleURLTypes` for `dragonglass`. When the app runs from a
@@ -81,3 +92,18 @@ Launch Services, so install it first.
 
 `dragon-glass register-uri --apply` does the same with `lsregister` for a bundle; run it
 from `DragonGlass.app/Contents/MacOS/dragon-glass`.
+
+## Known gaps
+
+None of these block v0.0.1:
+
+- No **About** panel. GPUI has no standard about window and the app does not build one.
+- `Cmd+W` closes the tab, not the window, and there is no **Close Window** menu item.
+- The dmg has no background image or arranged window; it holds the app and an
+  `Applications` link.
+- The CLI ships in `Contents/MacOS` but is not linked into `PATH`.
+- Release builds are ad-hoc signed until a Developer ID and notarization credentials are
+  available.
+- The Intel (`x86_64`) slice is built and lipo'd but has not been executed on Intel
+  hardware or under Rosetta.
+- Double-clicking a `.md` while the app runs does nothing; see **Markdown documents** above.

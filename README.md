@@ -114,10 +114,11 @@ open dist/DragonGlass.app
 ```
 
 The bundle is ad-hoc signed. Move `DragonGlass.app` to `/Applications` before you rely on
-`dragonglass://` links: Launch Services ignores bundles in a temporary directory. CI runs
-the same script on a macOS runner, launches the app for eight seconds and uploads the dmg
-and zip as the `dragon-glass-macos-ci` artifact. Signing, notarization and the
-single-architecture path are covered in
+`dragonglass://` links: Launch Services ignores bundles in a temporary directory. The
+`macos-bundle` CI job runs the same script, launches the app for eight seconds and uploads
+the dmg and zip as the `dragon-glass-macos-ci` artifact; it runs only on manual dispatch
+(`gh workflow run ci.yml`) because a universal build costs about 30 runner minutes. Signing,
+notarization and the single-architecture path are covered in
 [`packaging/macos/README.md`](packaging/macos/README.md).
 
 `target/release/dragon-glass-app` is the app; `target/release/dragon-glass` is the CLI.
@@ -139,6 +140,10 @@ dragon-glass-app
 ```text
 dragonglass://open?vault=/path/to/vault&note=notes/Index.md
 ```
+
+Finder's **Open With → Dragon Glass** opens a note on a cold start. While the app is
+running macOS delivers the file as an Apple Event, which GPUI does not surface yet, so use
+the `dragonglass://` form or quit the app first.
 
 ### Vaults
 
@@ -213,8 +218,9 @@ cargo fmt --all -- --check
 cargo clippy --all-targets --all-features
 ```
 
-CI runs exactly those checks on Windows, Linux and macOS, and builds the GPUI app on all
-three. See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the ground rules, and
+CI runs those checks on Windows, Linux and macOS. The GPUI app is built on Windows and
+Linux on every push; the macOS bundle runs on manual dispatch to save runner minutes. See
+[`CONTRIBUTING.md`](CONTRIBUTING.md) for the ground rules, and
 [`PLAN.md`](PLAN.md) for architecture, phases and settled design decisions.
 
 ## Project layout
