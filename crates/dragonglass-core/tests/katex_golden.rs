@@ -124,7 +124,7 @@ fn decode(png: &[u8]) -> (Vec<u8>, usize, usize, usize) {
     let mut decoder = png::Decoder::new(Cursor::new(png));
     decoder.set_transformations(png::Transformations::normalize_to_color8());
     let mut reader = decoder.read_info().expect("PNG header");
-    let mut buffer = vec![0; reader.output_buffer_size()];
+    let mut buffer = vec![0; reader.output_buffer_size().expect("PNG frame size")];
     let info = reader.next_frame(&mut buffer).expect("PNG data");
     buffer.truncate(info.buffer_size());
     let channels = match info.color_type {
