@@ -17,9 +17,12 @@ This is the first vertical slice, not full parity yet:
 - Create notes from the vault's markdown templates
 - Rename or move notes, create folders, and delete through a recoverable trash that can be
   browsed, restored or emptied
+- Import a vault folder from device storage and export it back through the system folder
+  picker (Android SAF), keeping several vaults side by side
 
-Still to come: importing existing vaults through SAF, themes, workspaces, plugin support,
-and git-aware features that do not make sense on Android.
+Still to come: live editing of a `content://` vault (import/export is a copy, not a mount),
+themes, workspaces, plugin support, and git-aware features that do not make sense on
+Android.
 
 ## Prerequisites
 
@@ -89,7 +92,19 @@ The token is encrypted with Android Keystore and never written into the vault or
 
 ## Storage model
 
-The first slice uses an app-private vault at `filesDir/vault`. That keeps the core's
-`std::fs`-based vault model unchanged. Accessing a user-chosen folder requires a storage
-abstraction (Android SAF `content://` trees, iOS security-scoped bookmarks), which is the
-next infrastructure step for true vault parity.
+The engine uses `std::fs`, so every vault lives in app-private storage:
+
+- the default vault is `filesDir/vault`
+- imported vaults are copied into `filesDir/vaults/<id>`
+
+**Import folder…** (in the vaults sheet, opened from the vault name in the top bar) copies a
+folder tree from the system picker into a new app-private vault. **Export vault…** writes the
+current notes back into a folder you pick, merging by file name. A persistent SAF grant is
+kept for folders that support it.
+
+This is a copy, not a mount: the app never reads or writes `content://` URIs while editing,
+so changes made in another app do not appear until you import again, and changes made here do
+not reach that folder until you export. Live vault access needs a storage abstraction (SAF
+`content://` trees on Android, security-scoped bookmarks on iOS), which is the next
+infrastructure step for true vault parity. Importing is also how you can keep the vault and
+the desktop app in step today: import, edit, export, then let desktop git sync pick it up.

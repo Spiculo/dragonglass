@@ -2,6 +2,8 @@ package com.dragonglass.app.ui
 
 import android.webkit.WebView
 import androidx.activity.compose.BackHandler
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectTapGestures
@@ -68,6 +70,7 @@ import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import com.dragonglass.app.BrowseMode
 import com.dragonglass.app.DragonGlassViewModel
+import com.dragonglass.app.storage.StoredVault
 import com.dragonglass.app.sync.GitStatus
 import uniffi.dragonglass.GraphView
 import uniffi.dragonglass.HeadingInfo
@@ -126,6 +129,8 @@ fun DragonGlassApp(vm: DragonGlassViewModel) {
     }
 }
 
+private enum class VaultAction { Import, Export }
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun NotesScreen(vm: DragonGlassViewModel) {
@@ -134,17 +139,36 @@ private fun NotesScreen(vm: DragonGlassViewModel) {
     var showTemplates by remember { mutableStateOf(false) }
     var showTrash by remember { mutableStateOf(false) }
     var showNewFolder by remember { mutableStateOf(false) }
+    var showVaults by remember { mutableStateOf(false) }
+    var pendingAction by remember { mutableStateOf<VaultAction?>(null) }
     var menuOpen by remember { mutableStateOf(false) }
     var todayOpen by remember { mutableStateOf(false) }
+
+    val vaultPicker = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenDocumentTree(),
+    ) { uri ->
+        val action = pendingAction
+        pendingAction = null
+        showVaults = false
+        if (uri != null) {
+            when (action) {
+                VaultAction.Import -> vm.importVault(uri)
+                VaultAction.Export -> vm.exportVault(uri)
+                null -> Unit
+            }
+        }
+    }
 
     Scaffold(
         topBar = {
             TopAppBar(
                 title = {
-                    Column {
+                    Column(
+                        modifier = Modifier.clickable { showVaults = true },
+                    ) {
                         Text("Dragon Glass", fontWeight = FontWeight.SemiBold)
                         Text(
-                            text = vm.vaultLabel,
+                            text = "${vm.vaultLabel} · tap to switch",
                             style = MaterialTheme.typography.labelSmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
@@ -213,6 +237,13 @@ private fun NotesScreen(vm: DragonGlassViewModel) {
                                 onClick = {
                                     menuOpen = false
                                     showTrash = true
+                                },
+                            )
+                            DropdownMenuItem(
+                                text = { Text("Vaults and storage…") },
+                                onClick = {
+                                    menuOpen = false
+                                    showVaults = true
                                 },
                             )
                             DropdownMenuItem(
@@ -315,6 +346,22 @@ private fun NotesScreen(vm: DragonGlassViewModel) {
             onConfirm = {
                 vm.createFolder(it)
                 showNewFolder = false
+            },
+        )
+    }
+    if (showVaults) {
+        VaultsSheet(
+            vm = vm,
+            onDismiss = { showVaults = false },
+            onImport = {
+                showVaults = false
+                pendingAction = VaultAction.Import
+                vaultPicker.launch(null)
+            },
+            onExport = {
+                showVaults = false
+                pendingAction = VaultAction.Export
+                vaultPicker.launch(null)
             },
         )
     }
@@ -1384,6 +1431,92 @@ private fun TextInputDialog(
         dismissButton = {
             TextButton(onClick = onDismiss) { Text("Cancel") }
         },
+    )
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun VaultsSheet(
+    vm: DragonGlassViewModel,
+    onDismiss: () -> Unit,
+    onImport: () -> Unit,
+    onExport: () -> Unit,
+) {
+    ModalBottomSheet(onDismissRequest = onDismiss) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 16.dp)
+                .padding(bottom = 24.dp),
+        ) {
+            Text(
+                text = "Vaults",
+                style = MaterialTheme.typography.titleLarge,
+                modifier = Modifier.padding(vertical = 8.dp),
+            )
+            Muted(
+                "Import copies a folder from device storage into the app. Export writes the " +
+                    "current notes back to a folder you pick.",
+            )
+            LazyColumn(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(max = 360.dp)
+                    .padding(top = 8.dp),
+            ) {
+                items(vm.vaults, key = { it.id }) { vault ->
+                    StoredVaultRow(
+                        vault = vault,
+                        active = vault.id == vm.activeVaultId,
+                        onOpen = {
+                            vm.switchVault(vault)
+                            onDismiss()
+                        },
+                    )
+                }
+            }
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(top = 16.dp),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                Button(onClick = onImport) { Text("Import folder…") }
+                OutlinedButton(onClick = onExport) { Text("Export vault…") }
+            }
+        }
+    }
+}
+
+@Composable
+private fun StoredVaultRow(vault: StoredVault, active: Boolean, onOpen: () -> Unit) {
+    ListItem(
+        headlineContent = {
+            Text(vault.name, maxLines = 1, overflow = TextOverflow.Ellipsis)
+        },
+        supportingContent = {
+            Text(
+                text = if (vault.id == "default") {
+                    "App storage"
+                } else {
+                    "Imported from device storage"
+                },
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        },
+        trailingContent = {
+            if (active) {
+                Text(
+                    text = "Current",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.primary,
+                )
+            } else {
+                TextButton(onClick = onOpen) { Text("Open") }
+            }
+        },
+        modifier = Modifier.clickable(enabled = !active, onClick = onOpen),
     )
 }
 

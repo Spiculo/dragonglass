@@ -2,11 +2,14 @@ package com.dragonglass.app
 
 import android.app.Application
 import android.content.Context
+import android.net.Uri
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import com.dragonglass.app.storage.StoredVault
+import com.dragonglass.app.storage.VaultStore
 import com.dragonglass.app.sync.GitStatus
 import com.dragonglass.app.sync.GitSyncException
 import com.dragonglass.app.sync.GitSyncManager
@@ -47,15 +50,22 @@ private data class OpenNote(
 enum class BrowseMode { List, Tree }
 
 class DragonGlassViewModel(application: Application) : AndroidViewModel(application) {
-    private val vaultDirectory = File(application.filesDir, "vault")
+    private val vaultStore = VaultStore(application)
+    private var activeVault = vaultStore.activeVault()
+    private var vaultDirectory = activeVault.root
     private val gitPreferences =
         application.getSharedPreferences("dragon_glass_git", Context.MODE_PRIVATE)
     private val tokenStore = SecureTokenStore(application)
     private var vault: MobileVault? = null
 
-    val vaultPath: String = vaultDirectory.absolutePath
-    val baseUrl: String = "file://${vaultDirectory.absolutePath}/"
-    val vaultLabel: String = "On this device"
+    var vaults by mutableStateOf(vaultStore.vaults())
+        private set
+    var activeVaultId by mutableStateOf(activeVault.id)
+        private set
+    var baseUrl by mutableStateOf("file://${vaultDirectory.absolutePath}/")
+        private set
+    var vaultLabel by mutableStateOf(activeVault.name)
+        private set
 
     var notes by mutableStateOf<List<NoteSummary>>(emptyList())
         private set
@@ -155,7 +165,7 @@ class DragonGlassViewModel(application: Application) : AndroidViewModel(applicat
 
     private fun ensureVault(): MobileVault {
         vaultDirectory.mkdirs()
-        if (vaultDirectory.listFiles()?.isEmpty() != false) {
+        if (vaultStore.isDefault(activeVault) && vaultDirectory.listFiles()?.isEmpty() != false) {
             File(vaultDirectory, "Welcome.md").writeText(
                 """
                 # Welcome to Dragon Glass
@@ -202,6 +212,84 @@ class DragonGlassViewModel(application: Application) : AndroidViewModel(applicat
 
     fun toggleBrowseMode() {
         browseMode = if (browseMode == BrowseMode.Tree) BrowseMode.List else BrowseMode.Tree
+    }
+
+    /// Copy a folder picked through SAF into a new app-private vault and open it.
+    fun importVault(treeUri: Uri) {
+        viewModelScope.launch {
+            loading = true
+            val result = runCatching {
+                saveDirtyNote()
+                withContext(Dispatchers.IO) { vaultStore.importTree(treeUri) }
+            }
+            result
+                .onSuccess { stored ->
+                    applyActiveVault(stored)
+                    message = "Imported ${stored.name}"
+                }
+                .onFailure { error = it.message ?: "Could not import that folder" }
+            loading = false
+        }
+    }
+
+    /// Write the active vault into a folder picked through SAF, merging by file name.
+    fun exportVault(treeUri: Uri) {
+        val active = activeVault
+        viewModelScope.launch {
+            loading = true
+            val result = runCatching {
+                saveDirtyNote()
+                withContext(Dispatchers.IO) { vaultStore.exportTree(active, treeUri) }
+            }
+            result
+                .onSuccess { message = "Exported $it ${if (it == 1) "file" else "files"}" }
+                .onFailure { error = it.message ?: "Could not export the vault" }
+            loading = false
+        }
+    }
+
+    /// Switch to the app-private vault or one imported from device storage.
+    fun switchVault(vault: StoredVault) {
+        if (vault.id == activeVault.id) return
+        viewModelScope.launch {
+            runCatching { saveDirtyNote() }
+            vaultStore.activate(if (vaultStore.isDefault(vault)) null else vault.id)
+            applyActiveVault(vaultStore.activeVault())
+            message = "Opened ${vault.name}"
+        }
+    }
+
+    /// Save the open note so switching vaults or exporting never drops an edit.
+    private suspend fun saveDirtyNote() {
+        val note = selected ?: return
+        if (!dirty) return
+        val text = source
+        withContext(Dispatchers.IO) { ensureVault().saveNote(note, text) }
+        dirty = false
+    }
+
+    private fun applyActiveVault(stored: StoredVault) {
+        activeVault = stored
+        vaultDirectory = stored.root
+        vaultLabel = stored.name
+        activeVaultId = stored.id
+        baseUrl = "file://${stored.root.absolutePath}/"
+        vault = null
+        vaults = vaultStore.vaults()
+        selected = null
+        source = ""
+        preview = false
+        previewHtml = ""
+        dirty = false
+        query = ""
+        results = emptyList()
+        hits = emptyList()
+        graph = null
+        trash = emptyList()
+        browseMode = BrowseMode.List
+        collapsedDirs = emptySet()
+        refresh()
+        refreshGitStatus()
     }
 
     fun toggleBookmarksOnly() {
