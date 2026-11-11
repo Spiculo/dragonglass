@@ -1,0 +1,123 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-labelledby="title desc">
+  <title id="title">Dragon Glass</title>
+  <desc id="desc">A faceted obsidian spearhead on a dark glass badge.</desc>
+
+  <defs>
+    <linearGradient id="badge" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#211d35"/>
+      <stop offset="0.55" stop-color="#0e0d18"/>
+      <stop offset="1" stop-color="#05060a"/>
+    </linearGradient>
+
+    <radialGradient id="aura" cx="0.5" cy="0.44" r="0.56">
+      <stop offset="0" stop-color="#7a67ff" stop-opacity="0.30"/>
+      <stop offset="0.55" stop-color="#3d2e86" stop-opacity="0.10"/>
+      <stop offset="1" stop-color="#000000" stop-opacity="0"/>
+    </radialGradient>
+
+    <linearGradient id="facet-left" x1="0" y1="0" x2="0.85" y2="1">
+      <stop offset="0" stop-color="#7367a3"/>
+      <stop offset="0.3" stop-color="#3b335e"/>
+      <stop offset="0.65" stop-color="#191625"/>
+      <stop offset="1" stop-color="#08070d"/>
+    </linearGradient>
+
+    <linearGradient id="facet-right" x1="1" y1="0" x2="0.15" y2="1">
+      <stop offset="0" stop-color="#342b4d"/>
+      <stop offset="0.35" stop-color="#181425"/>
+      <stop offset="0.75" stop-color="#0a0911"/>
+      <stop offset="1" stop-color="#040407"/>
+    </linearGradient>
+
+    <linearGradient id="ridge" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#f4f1ff" stop-opacity="0.9"/>
+      <stop offset="0.28" stop-color="#b7abff" stop-opacity="0.5"/>
+      <stop offset="0.7" stop-color="#5b4f9e" stop-opacity="0.18"/>
+      <stop offset="1" stop-color="#1a1730" stop-opacity="0"/>
+    </linearGradient>
+
+    <linearGradient id="glint" x1="0.2" y1="0" x2="0.8" y2="1">
+      <stop offset="0" stop-color="#ffffff" stop-opacity="0.95"/>
+      <stop offset="0.3" stop-color="#d3ccff" stop-opacity="0.45"/>
+      <stop offset="1" stop-color="#8f7bff" stop-opacity="0"/>
+    </linearGradient>
+
+    <linearGradient id="edge" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#e3dcff" stop-opacity="0.95"/>
+      <stop offset="0.4" stop-color="#8978d8" stop-opacity="0.45"/>
+      <stop offset="1" stop-color="#241f42" stop-opacity="0.05"/>
+    </linearGradient>
+
+    <filter id="soft-glow" x="-60%" y="-60%" width="220%" height="220%">
+      <feGaussianBlur stdDeviation="7"/>
+    </filter>
+  </defs>
+
+  <!-- Badge -->
+  <rect width="512" height="512" rx="112" fill="url(#badge)"/>
+  <rect x="1" y="1" width="510" height="510" rx="111" fill="none" stroke="#3a3457" stroke-opacity="0.8" stroke-width="2"/>
+  <ellipse cx="256" cy="258" rx="188" ry="224" fill="url(#aura)"/>
+
+  <!-- Spearhead silhouette -->
+  <path d="M256 38
+           C296 106 344 180 354 250
+           C363 320 336 378 298 412
+           L278 424
+           L278 454
+           L234 454
+           L234 424
+           L214 412
+           C176 378 149 320 158 250
+           C168 180 216 106 256 38 Z"
+        fill="#08080e"/>
+
+  <!-- Main glass planes -->
+  <path d="M256 38
+           C216 106 168 180 158 250
+           C149 320 176 378 214 412
+           L234 424 L234 454 L256 454 Z"
+        fill="url(#facet-left)"/>
+
+  <path d="M256 38
+           C296 106 344 180 354 250
+           C363 320 336 378 298 412
+           L278 424 L278 454 L256 454 Z"
+        fill="url(#facet-right)"/>
+
+  <!-- Knapped facets -->
+  <path d="M256 38 L204 200 L218 316 L206 388 L238 424 L256 424 Z" fill="#05050a" fill-opacity="0.45"/>
+  <path d="M256 38 L310 214 L296 330 L308 390 L274 424 L256 424 Z" fill="#000000" fill-opacity="0.4"/>
+  <path d="M256 38 L268 182 L260 306 L256 424 L247 300 L242 170 Z" fill="url(#ridge)"/>
+
+  <!-- Flake-scar glints -->
+  <path d="M243 90
+           C225 148 208 205 203 258
+           C198 312 211 354 229 390
+           C218 342 218 292 225 246
+           C232 192 239 144 243 90 Z"
+        fill="url(#glint)" fill-opacity="0.6"/>
+  <path d="M311 212 L298 330 L306 358 L320 300 Z" fill="#b8aeff" fill-opacity="0.2"/>
+  <path d="M196 246 L212 300 L205 336 L190 286 Z" fill="#d8d1ff" fill-opacity="0.1"/>
+
+  <!-- Rim light -->
+  <path d="M256 38
+           C296 106 344 180 354 250
+           C363 320 336 378 298 412
+           L278 424
+           L278 454
+           L234 454
+           L234 424
+           L214 412
+           C176 378 149 320 158 250
+           C168 180 216 106 256 38 Z"
+        fill="none" stroke="url(#edge)" stroke-width="3" stroke-linejoin="round"/>
+
+  <!-- Socket collar -->
+  <path d="M234 424 L278 424 L278 454 L234 454 Z" fill="#0a0912"/>
+  <rect x="232" y="429" width="48" height="5" rx="2.5" fill="#8a7db4" fill-opacity="0.6"/>
+  <rect x="232" y="442" width="48" height="5" rx="2.5" fill="#8a7db4" fill-opacity="0.4"/>
+
+  <!-- Cold spark at the point -->
+  <circle cx="256" cy="46" r="10" fill="#cfc6ff" fill-opacity="0.55" filter="url(#soft-glow)"/>
+  <circle cx="256" cy="43" r="2.6" fill="#ffffff" fill-opacity="0.95"/>
+</svg>
