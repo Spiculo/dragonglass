@@ -11,9 +11,9 @@ description = "WASM plugin runtime for Dragon Glass."
 dragonglass-core.workspace = true
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-thiserror = "1"
+thiserror = "2"
 # Trimmed feature set: no async, no component model, no threads.
-wasmtime = { version = "49", default-features = false, features = [
+wasmtime = { version = "50", default-features = false, features = [
     "runtime",
     "cranelift",
     "std",

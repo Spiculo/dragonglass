@@ -31,4 +31,4 @@ ab_glyph = "0.2"
 ratex-svg = { version = "=0.1.15", features = ["embed-fonts"] }
 # Used by the KaTeX reference-image test.
 ratex-render = { version = "=0.1.15", features = ["embed-fonts"] }
-png = "0.17"
+png = "0.18"
