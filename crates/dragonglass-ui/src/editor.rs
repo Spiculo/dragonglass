@@ -130,6 +130,21 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("ctrl-shift-up", MoveBlockUp, None),
         KeyBinding::new("ctrl-shift-down", MoveBlockDown, None),
     ]);
+
+    // macOS conventions: Command jumps to the line or document edge, Option works by word.
+    #[cfg(target_os = "macos")]
+    cx.bind_keys([
+        KeyBinding::new("cmd-left", Home, None),
+        KeyBinding::new("cmd-right", End, None),
+        KeyBinding::new("cmd-up", DocumentStart, None),
+        KeyBinding::new("cmd-down", DocumentEnd, None),
+        KeyBinding::new("cmd-shift-left", SelectHome, None),
+        KeyBinding::new("cmd-shift-right", SelectEnd, None),
+        KeyBinding::new("cmd-shift-up", SelectDocumentStart, None),
+        KeyBinding::new("cmd-shift-down", SelectDocumentEnd, None),
+        KeyBinding::new("alt-backspace", DeleteWordLeft, None),
+        KeyBinding::new("alt-delete", DeleteWordRight, None),
+    ]);
 }
 
 pub struct Editor {
@@ -504,10 +519,11 @@ impl Editor {
         // A monospace face for editing, with per-platform fallbacks.
         font.family = "Cascadia Mono".into();
         font.fallbacks = Some(gpui::FontFallbacks(std::sync::Arc::new(vec![
+            "SF Mono".to_string(),
+            "Menlo".to_string(),
             "Consolas".to_string(),
             "DejaVu Sans Mono".to_string(),
             "Liberation Mono".to_string(),
-            "Menlo".to_string(),
             "monospace".to_string(),
         ])));
 

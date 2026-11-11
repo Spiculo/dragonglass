@@ -20,5 +20,12 @@ gpui = "0.2.2"
 notify = "8.2"
 smol = "2"
 
+# macOS: compile the Metal shaders at startup instead of at build time. The build-time
+# path calls `xcrun metal`, which ships with a full Xcode install but not with the
+# Command Line Tools, so a plain CLT machine could not build the app. The shaders are
+# small; the extra work happens once per launch.
+[target.'cfg(target_os = "macos")'.dependencies]
+gpui = { version = "0.2.2", features = ["runtime_shaders"] }
+
 [build-dependencies]
 winresource = "0.1"

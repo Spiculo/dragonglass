@@ -266,13 +266,16 @@ fn register_uri(args: Vec<String>, unregister: bool) -> Result<()> {
     };
 
     let steps = if unregister {
-        unregister_plan()
+        unregister_plan(&exe)
     } else {
         register_plan(&exe)
     };
 
     if steps.is_empty() {
-        println!("URI registration is not implemented on this platform");
+        println!(
+            "URI registration is not available here. On macOS, run this from inside \
+             DragonGlass.app, or launch the app once from an installed bundle."
+        );
         return Ok(());
     }
 
@@ -328,7 +331,7 @@ fn register_plan(exe: &str) -> Vec<Step> {
 }
 
 #[cfg(target_os = "windows")]
-fn unregister_plan() -> Vec<Step> {
+fn unregister_plan(_exe: &str) -> Vec<Step> {
     vec![Step::Run(vec![
         "reg".into(),
         "delete".into(),
@@ -364,17 +367,60 @@ fn register_plan(exe: &str) -> Vec<Step> {
 }
 
 #[cfg(target_os = "linux")]
-fn unregister_plan() -> Vec<Step> {
+fn unregister_plan(_exe: &str) -> Vec<Step> {
     vec![Step::RemoveFile(desktop_file_path())]
 }
 
-#[cfg(not(any(target_os = "windows", target_os = "linux")))]
+/// The Launch Services database tool. Registering a bundle here is what teaches macOS
+/// that `dragonglass://` belongs to the app.
+#[cfg(target_os = "macos")]
+fn launch_services() -> PathBuf {
+    PathBuf::from(
+        "/System/Library/Frameworks/CoreServices.framework/Frameworks/\
+         LaunchServices.framework/Support/lsregister",
+    )
+}
+
+/// The `.app` bundle that contains `exe`, if any.
+#[cfg(target_os = "macos")]
+fn app_bundle(exe: &str) -> Option<PathBuf> {
+    Path::new(exe)
+        .ancestors()
+        .find(|path| path.to_string_lossy().ends_with(".app"))
+        .map(Path::to_path_buf)
+}
+
+#[cfg(target_os = "macos")]
+fn register_plan(exe: &str) -> Vec<Step> {
+    let Some(bundle) = app_bundle(exe) else {
+        return Vec::new();
+    };
+    vec![Step::Run(vec![
+        launch_services().display().to_string(),
+        "-f".into(),
+        bundle.display().to_string(),
+    ])]
+}
+
+#[cfg(target_os = "macos")]
+fn unregister_plan(exe: &str) -> Vec<Step> {
+    let Some(bundle) = app_bundle(exe) else {
+        return Vec::new();
+    };
+    vec![Step::Run(vec![
+        launch_services().display().to_string(),
+        "-u".into(),
+        bundle.display().to_string(),
+    ])]
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
 fn register_plan(_exe: &str) -> Vec<Step> {
     Vec::new()
 }
 
-#[cfg(not(any(target_os = "windows", target_os = "linux")))]
-fn unregister_plan() -> Vec<Step> {
+#[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
+fn unregister_plan(_exe: &str) -> Vec<Step> {
     Vec::new()
 }
 
@@ -857,4 +903,23 @@ fn classify(index: &resolve::NoteIndex, target: &str) -> Resolution {
     }
 
     Resolution::Broken
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn finds_the_app_bundle_that_contains_the_binary() {
+        let exe = "/Applications/DragonGlass.app/Contents/MacOS/dragon-glass-app";
+        assert_eq!(
+            app_bundle(exe).as_deref(),
+            Some(Path::new("/Applications/DragonGlass.app"))
+        );
+    }
+
+    #[test]
+    fn a_loose_binary_has_no_bundle() {
+        assert_eq!(app_bundle("/usr/local/bin/dragon-glass"), None);
+    }
 }

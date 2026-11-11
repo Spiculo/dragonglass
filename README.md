@@ -10,8 +10,8 @@ webview, no account.
 Point Dragon Glass at an existing Obsidian vault. It reads and writes plain `.md`, preserves
 YAML frontmatter, and leaves `.obsidian/` alone. There is no import step.
 
-> **Status: v0.0.1, early.** Windows and Linux are the target platforms; macOS is not built
-> yet. Keep backups (git is a good one) and expect rough edges.
+> **Status: v0.0.1, early.** Windows, Linux and macOS (Apple Silicon and Intel) are
+> supported. Keep backups (git is a good one) and expect rough edges.
 
 ## Why another notes app?
 
@@ -54,7 +54,7 @@ A lot already works. This is a working application, not a mockup — but it is e
 - A local package store for themes and WASM plugins
 - A vault picker that remembers recent vaults and reopens the note you were last in
 
-**Not there yet:** macOS, Mermaid diagrams, a community (online) theme/plugin store,
+**Not there yet:** Mermaid diagrams, a community (online) theme/plugin store,
 end-to-end-encrypted sync, and mobile. See [`PLAN.md`](PLAN.md) for the full roadmap and
 the decisions behind it.
 
@@ -64,6 +64,10 @@ Requirements: Rust **1.85+** (stable) and `git`.
 
 On Windows, install the MSVC toolchain and Visual Studio Build Tools with the "Desktop
 development with C++" workload. No other system libraries are needed.
+
+On macOS, install the Xcode Command Line Tools (`xcode-select --install`). A full Xcode
+install is not required: the UI crate compiles GPUI's Metal shaders at startup
+(`runtime_shaders`), because the build-time shader compiler ships only with Xcode.
 
 On Linux, install the build and GPU/windowing dependencies:
 
@@ -99,6 +103,17 @@ dragon-glass-app /path/to/vault
 dragon-glass-app
 ```
 
+On macOS, build a double-clickable app bundle instead of running the bare binary:
+
+```bash
+packaging/macos/build-universal.sh 0.0.1 dist   # Apple Silicon + Intel, ad-hoc signed
+open dist/DragonGlass.app
+```
+
+Move `DragonGlass.app` to `/Applications` before using the URL scheme; Launch Services
+does not deliver `dragonglass://` URLs to a bundle in a temporary directory. A debug build
+can also be wrapped with `packaging/macos/build-app.sh <binary> <version> <out-dir>`.
+
 `dragonglass://` URIs (for example from a shortcut or automation) are also accepted:
 
 ```text
@@ -108,11 +123,13 @@ dragonglass://open?vault=/path/to/vault&note=notes/Index.md
 ### Vaults
 
 The app remembers the vaults you open, outside any vault, in
-`%APPDATA%\DragonGlass\vaults.txt` on Windows or `~/.config/dragon-glass/vaults.txt`
-elsewhere (`$XDG_CONFIG_HOME` is respected, and `DRAGON_GLASS_CONFIG_DIR` overrides both).
+`%APPDATA%\DragonGlass\vaults.txt` on Windows,
+`~/Library/Application Support/DragonGlass/vaults.txt` on macOS, or
+`~/.config/dragon-glass/vaults.txt` on Linux (`$XDG_CONFIG_HOME` is respected, and
+`DRAGON_GLASS_CONFIG_DIR` overrides all of them).
 On launch it reopens the last vault and the note you were last in — stored per vault in
-`.dragon-glass/session.txt`. Use **Open vault** in the command palette (`Ctrl+P`) to open
-another vault in its own window, or remove stale entries in the picker.
+`.dragon-glass/session.txt`. Use **Open vault** in the command palette (`Ctrl+P`, `Cmd+P`
+on macOS) to open another vault in its own window, or remove stale entries in the picker.
 
 ## CLI
 
@@ -139,8 +156,8 @@ cargo fmt --all -- --check
 cargo clippy --all-targets --all-features
 ```
 
-CI runs exactly those checks on Windows and Linux, and builds the GPUI app on both.
-See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the ground rules, and
+CI runs exactly those checks on Windows, Linux and macOS, and builds the GPUI app on all
+three. See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the ground rules, and
 [`PLAN.md`](PLAN.md) for architecture, phases and settled design decisions.
 
 ## Project layout
@@ -152,7 +169,7 @@ See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the ground rules, and
 | `crates/dragonglass-cli` | `dragon-glass`, the headless CLI |
 | `crates/dragonglass-plugins` | WASM plugin host (experimental) |
 | `docs/` | Design notes, such as the math/typesetting spec |
-| `packaging/` | Windows (Inno Setup, winget) and Linux (deb, AppImage, Flatpak) recipes |
+| `packaging/` | Windows (Inno Setup, winget), Linux (deb, AppImage, Flatpak) and macOS (app bundle, dmg) recipes |
 
 ## Design principles
 

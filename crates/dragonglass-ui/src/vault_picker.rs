@@ -32,8 +32,13 @@ pub struct VaultPicker {
 
 impl VaultPicker {
     /// Open the chooser. `error` is shown above the list, e.g. when the last vault has
-    /// been moved or deleted.
-    pub fn open(cx: &mut App, error: Option<String>, open: OpenVault) {
+    /// been moved or deleted. Returns the window, so a late `dragonglass://` URL can
+    /// replace the chooser with the vault the URL names.
+    pub fn open(
+        cx: &mut App,
+        error: Option<String>,
+        open: OpenVault,
+    ) -> gpui::WindowHandle<VaultPicker> {
         // The palette is per-vault, and at launch no vault has been read yet.
         if !cx.has_global::<Theme>() {
             cx.set_global(Theme::dark());
@@ -62,6 +67,7 @@ impl VaultPicker {
             .open_window(options, move |_window, _cx| view_for_window.clone())
             .expect("failed to open the vault picker");
         let _ = window.update(cx, |_view, window, _cx| window.focus(&focus_handle));
+        window
     }
 
     /// Validate and open `path`, then close the chooser.

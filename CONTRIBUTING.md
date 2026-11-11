@@ -17,7 +17,8 @@ By participating you agree to the [Code of Conduct](CODE_OF_CONDUCT.md).
 ## Set up
 
 You need Rust 1.85+ (stable) and `git`. Linux system packages are listed in the
-[README](README.md#build-from-source). Then:
+[README](README.md#build-from-source); on macOS the Xcode Command Line Tools are enough
+(a full Xcode install is not needed).
 
 ```bash
 git clone https://github.com/Spiculo/dragonglass.git
@@ -30,7 +31,7 @@ Use a copy of a real vault, or an empty folder, while developing. The repository
 
 ## Checks before opening a pull request
 
-CI runs these on Windows and Linux; run them locally first:
+CI runs these on Windows, Linux and macOS; run them locally first:
 
 ```bash
 cargo fmt --all -- --check

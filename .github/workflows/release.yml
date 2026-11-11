@@ -16,7 +16,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-latest, ubuntu-latest]
+        os: [windows-latest, ubuntu-latest, macos-latest]
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -33,13 +33,21 @@ jobs:
             libxcb-xfixes0-dev libvulkan-dev libfontconfig1-dev libfreetype-dev \
             libasound2-dev
 
-      - name: Build
-        run: cargo build --release -p dragonglass-ui -p dragonglass-cli
-
       - name: Version
         id: version
         shell: bash
         run: echo "value=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Build
+        if: runner.os != 'macOS'
+        run: cargo build --release -p dragonglass-ui -p dragonglass-cli
+
+      - name: Package (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          chmod +x packaging/macos/build-universal.sh packaging/macos/build-app.sh
+          packaging/macos/build-universal.sh \
+            "${{ steps.version.outputs.value }}" dist
 
       - name: Package (Linux)
         if: runner.os == 'Linux'
@@ -64,6 +72,8 @@ jobs:
             dist/*.deb
             dist/*.tar.gz
             dist/*-setup.exe
+            dist/*.dmg
+            dist/*.zip
           if-no-files-found: error
 
   publish:
@@ -85,3 +95,5 @@ jobs:
             dist/*.deb
             dist/*.tar.gz
             dist/*-setup.exe
+            dist/*.dmg
+            dist/*.zip
