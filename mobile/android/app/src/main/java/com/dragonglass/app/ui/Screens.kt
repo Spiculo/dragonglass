@@ -1455,8 +1455,9 @@ private fun VaultsSheet(
                 modifier = Modifier.padding(vertical = 8.dp),
             )
             Muted(
-                "Import copies a folder from device storage into the app. Export writes the " +
-                    "current notes back to a folder you pick.",
+                "A vault imported from device storage stays linked to that folder: saves are " +
+                    "written back, and Sync pulls edits made elsewhere. Import copies a new " +
+                    "folder in; Export writes the current notes to a folder you pick.",
             )
             LazyColumn(
                 modifier = Modifier
@@ -1475,13 +1476,22 @@ private fun VaultsSheet(
                     )
                 }
             }
+            if (vm.canSyncWithFolder) {
+                Button(
+                    onClick = {
+                        onDismiss()
+                        vm.syncVault()
+                    },
+                    modifier = Modifier.padding(top = 12.dp),
+                ) { Text("Sync with folder") }
+            }
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
                     .padding(top = 16.dp),
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
             ) {
-                Button(onClick = onImport) { Text("Import folder…") }
+                OutlinedButton(onClick = onImport) { Text("Import folder…") }
                 OutlinedButton(onClick = onExport) { Text("Export vault…") }
             }
         }

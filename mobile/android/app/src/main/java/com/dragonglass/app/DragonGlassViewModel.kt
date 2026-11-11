@@ -62,6 +62,8 @@ class DragonGlassViewModel(application: Application) : AndroidViewModel(applicat
         private set
     var activeVaultId by mutableStateOf(activeVault.id)
         private set
+    var canSyncWithFolder by mutableStateOf(activeVault.treeUri != null)
+        private set
     var baseUrl by mutableStateOf("file://${vaultDirectory.absolutePath}/")
         private set
     var vaultLabel by mutableStateOf(activeVault.name)
@@ -156,11 +158,11 @@ class DragonGlassViewModel(application: Application) : AndroidViewModel(applicat
     private var searchJob: Job? = null
 
     init {
-        gitRemote = gitPreferences.getString("remote", "").orEmpty()
-        gitBranch = gitPreferences.getString("branch", "main").orEmpty().ifBlank { "main" }
+        loadGitSettings()
         gitHasToken = tokenStore.hasToken()
         refresh()
         refreshGitStatus()
+        pullFromFolder()
     }
 
     private fun ensureVault(): MobileVault {
@@ -259,6 +261,83 @@ class DragonGlassViewModel(application: Application) : AndroidViewModel(applicat
         }
     }
 
+    /// Git settings are per vault; the unscoped keys keep existing setups working.
+    private fun gitKey(key: String) = "${activeVault.id}.$key"
+
+    private fun loadGitSettings() {
+        gitRemote = readGit("remote", "")
+        gitBranch = readGit("branch", "main").ifBlank { "main" }
+    }
+
+    private fun readGit(key: String, fallback: String): String {
+        gitPreferences.getString(gitKey(key), null)?.let { return it }
+        if (activeVault.id == "default") {
+            return gitPreferences.getString(key, fallback).orEmpty()
+        }
+        return fallback
+    }
+
+    /// Copy newer files from the linked folder, then mirror local changes back.
+    fun syncVault() {
+        val vault = activeVault
+        if (vault.treeUri == null) return
+        viewModelScope.launch {
+            loading = true
+            val result = runCatching {
+                saveDirtyNote()
+                withContext(Dispatchers.IO) { vaultStore.sync(vault) }
+            }
+            result
+                .onSuccess { (pulled, written) ->
+                    message = "Synced with the folder: pulled $pulled, wrote $written"
+                    refresh()
+                }
+                .onFailure { error = it.message ?: "Could not sync with the folder" }
+            loading = false
+        }
+    }
+
+    /// Pull files that changed elsewhere whenever a linked vault is opened.
+    private fun pullFromFolder() {
+        val vault = activeVault
+        if (vault.treeUri == null) return
+        viewModelScope.launch {
+            val pulled = runCatching {
+                withContext(Dispatchers.IO) { vaultStore.pullNewer(vault) }
+            }.getOrDefault(0)
+            if (pulled > 0) {
+                message = "Pulled $pulled file${if (pulled == 1) "" else "s"} from the folder"
+                refresh()
+            }
+        }
+    }
+
+    /// Best-effort write-through after one note changes.
+    private fun mirrorNote(relative: String) {
+        val vault = activeVault
+        if (vault.treeUri == null) return
+        viewModelScope.launch {
+            runCatching { withContext(Dispatchers.IO) { vaultStore.pushFile(vault, relative) } }
+                .onFailure { message = "Saved on the device; the folder copy failed" }
+        }
+    }
+
+    /// Best-effort mirror after a structural change (folder, rename, trash, restore).
+    private fun mirrorAll() {
+        val vault = activeVault
+        if (vault.treeUri == null) return
+        viewModelScope.launch {
+            runCatching {
+                withContext(Dispatchers.IO) {
+                    val pulled = vaultStore.pullNewer(vault)
+                    pulled to vaultStore.pushAll(vault)
+                }
+            }
+                .onSuccess { (pulled, _) -> if (pulled > 0) refresh() }
+                .onFailure { message = "Changed on the device; the folder copy failed" }
+        }
+    }
+
     /// Save the open note so switching vaults or exporting never drops an edit.
     private suspend fun saveDirtyNote() {
         val note = selected ?: return
@@ -266,6 +345,7 @@ class DragonGlassViewModel(application: Application) : AndroidViewModel(applicat
         val text = source
         withContext(Dispatchers.IO) { ensureVault().saveNote(note, text) }
         dirty = false
+        mirrorNote(note)
     }
 
     private fun applyActiveVault(stored: StoredVault) {
@@ -273,6 +353,7 @@ class DragonGlassViewModel(application: Application) : AndroidViewModel(applicat
         vaultDirectory = stored.root
         vaultLabel = stored.name
         activeVaultId = stored.id
+        canSyncWithFolder = stored.treeUri != null
         baseUrl = "file://${stored.root.absolutePath}/"
         vault = null
         vaults = vaultStore.vaults()
@@ -288,8 +369,14 @@ class DragonGlassViewModel(application: Application) : AndroidViewModel(applicat
         trash = emptyList()
         browseMode = BrowseMode.List
         collapsedDirs = emptySet()
+        gitStatus = null
+        gitConflicts = emptyList()
+        gitMessage = null
+        gitError = null
+        loadGitSettings()
         refresh()
         refreshGitStatus()
+        pullFromFolder()
     }
 
     fun toggleBookmarksOnly() {
@@ -376,6 +463,7 @@ class DragonGlassViewModel(application: Application) : AndroidViewModel(applicat
             if (note != null && dirty) {
                 runCatching { withContext(Dispatchers.IO) { ensureVault().saveNote(note, source) } }
                     .onFailure { error = it.message ?: "Could not save the note" }
+                mirrorNote(note)
             }
             selected = null
             source = ""
@@ -409,6 +497,7 @@ class DragonGlassViewModel(application: Application) : AndroidViewModel(applicat
                     properties = newProperties
                     dirty = false
                     if (showMessage) message = "Saved"
+                    mirrorNote(note)
                 }
                 .onFailure { error = it.message ?: "Could not save the note" }
         }
@@ -452,6 +541,7 @@ class DragonGlassViewModel(application: Application) : AndroidViewModel(applicat
                 .onSuccess {
                     refresh()
                     openNote(it)
+                    mirrorNote(it)
                 }
                 .onFailure { error = it.message ?: "Could not create the note" }
         }
@@ -472,6 +562,7 @@ class DragonGlassViewModel(application: Application) : AndroidViewModel(applicat
                 .onSuccess {
                     refresh()
                     openNote(it)
+                    mirrorNote(it)
                 }
                 .onFailure { error = it.message ?: "Could not open the $label note" }
         }
@@ -495,6 +586,7 @@ class DragonGlassViewModel(application: Application) : AndroidViewModel(applicat
                 .onSuccess {
                     refresh()
                     openNote(it)
+                    mirrorNote(it)
                 }
                 .onFailure { error = it.message ?: "Could not create the note" }
             loading = false
@@ -532,6 +624,7 @@ class DragonGlassViewModel(application: Application) : AndroidViewModel(applicat
                     dirty = false
                     message = "Moved $note to the trash"
                     refresh()
+                    mirrorAll()
                 }
                 .onFailure { error = it.message ?: "Could not move the note to the trash" }
         }
@@ -566,6 +659,7 @@ class DragonGlassViewModel(application: Application) : AndroidViewModel(applicat
                     message = "Moved to $renamed"
                     refresh()
                     openNote(renamed)
+                    mirrorAll()
                 }
                 .onFailure { error = it.message ?: "Could not move the note" }
             loading = false
@@ -587,6 +681,7 @@ class DragonGlassViewModel(application: Application) : AndroidViewModel(applicat
                     browseMode = BrowseMode.Tree
                     message = "Created $trimmed"
                     refresh()
+                    mirrorAll()
                 }
                 .onFailure { error = it.message ?: "Could not create the folder" }
         }
@@ -613,6 +708,7 @@ class DragonGlassViewModel(application: Application) : AndroidViewModel(applicat
                     message = "Restored $it"
                     refresh()
                     loadTrash()
+                    mirrorAll()
                 }
                 .onFailure { error = it.message ?: "Could not restore the entry" }
         }
@@ -671,8 +767,8 @@ class DragonGlassViewModel(application: Application) : AndroidViewModel(applicat
         gitRemote = cleanRemote
         gitBranch = cleanBranch
         gitPreferences.edit()
-            .putString("remote", cleanRemote)
-            .putString("branch", cleanBranch)
+            .putString(gitKey("remote"), cleanRemote)
+            .putString(gitKey("branch"), cleanBranch)
             .apply()
         if (!token.isNullOrBlank()) {
             tokenStore.save(token.trim())

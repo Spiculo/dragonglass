@@ -20,10 +20,10 @@ data class StoredVault(
 /**
  * App-private vaults plus the SAF folders they came from.
  *
- * The engine is `std::fs` based, so every vault lives in app-private storage. SAF is used to
- * copy a folder in on import and to write the notes back out on export; vaults are not read
- * or written through `content://` URIs directly. This keeps the shared engine unchanged and
- * the notes identical in both places, at the cost of an explicit export step.
+ * The engine is `std::fs` based, so every vault lives in app-private storage. Importing
+ * copies a folder in, and the copy stays linked to its `content://` tree: saves are written
+ * back, structural changes mirror the tree, and opening the vault pulls newer documents.
+ * The app-private copy remains the source of truth, which keeps the shared engine unchanged.
  */
 class VaultStore(private val context: Context) {
     private val preferences =
@@ -156,6 +156,115 @@ class VaultStore(private val context: Context) {
             }
         }
         return written
+    }
+
+    /** Copy documents from the folder that are newer (or new) into the local vault. */
+    fun pullNewer(vault: StoredVault): Int {
+        val tree = treeFor(vault) ?: return 0
+        return pullDirectory(tree, vault.root, "")
+    }
+
+    /** Write one note back to the folder after a save. */
+    fun pushFile(vault: StoredVault, relative: String): Boolean {
+        val tree = treeFor(vault) ?: return false
+        val local = File(vault.root, relative)
+        if (!local.isFile) return false
+
+        val parent = remoteDirectory(tree, relative.substringBeforeLast('/', "")) ?: return false
+        val existing = parent.findFile(local.name)?.takeIf { it.isFile }
+        val document = existing
+            ?: parent.createFile("application/octet-stream", local.name)
+            ?: return false
+        val output = context.contentResolver.openOutputStream(document.uri, "wt") ?: return false
+        local.inputStream().use { input ->
+            output.use { stream -> input.copyTo(stream) }
+        }
+        return true
+    }
+
+    /** Mirror the whole local vault into the folder and prune files deleted locally. */
+    fun pushAll(vault: StoredVault): Int {
+        val tree = treeFor(vault) ?: return 0
+        val written = copyOut(vault.root, tree)
+        pruneRemote(tree, vault.root)
+        return written
+    }
+
+    /** Pull newer documents, then mirror local changes, destructively. */
+    fun sync(vault: StoredVault): Pair<Int, Int> {
+        val tree = treeFor(vault) ?: return 0 to 0
+        val pulled = pullDirectory(tree, vault.root, "")
+        val written = copyOut(vault.root, tree)
+        pruneRemote(tree, vault.root)
+        return pulled to written
+    }
+
+    private fun pullDirectory(source: DocumentFile, target: File, prefix: String): Int {
+        var pulled = 0
+        for (child in source.listFiles()) {
+            val name = child.name ?: continue
+            if (name.startsWith(".")) continue
+            val relative = if (prefix.isEmpty()) name else "$prefix/$name"
+            if (child.isDirectory) {
+                val directory = File(target, name)
+                directory.mkdirs()
+                pulled += pullDirectory(child, directory, relative)
+            } else if (child.isFile) {
+                val local = File(target, name)
+                val remoteTime = child.lastModified()
+                val newer = remoteTime > 0 && remoteTime > local.lastModified() + 1_000
+                if (!local.exists() || newer) {
+                    if (copyIn(child, local)) pulled++
+                }
+            }
+        }
+        return pulled
+    }
+
+    private fun copyIn(document: DocumentFile, target: File): Boolean {
+        val input = context.contentResolver.openInputStream(document.uri) ?: return false
+        try {
+            input.use { stream ->
+                target.outputStream().use { file -> stream.copyTo(file) }
+            }
+            val modified = document.lastModified()
+            if (modified > 0) target.setLastModified(modified)
+            return true
+        } catch (_: java.io.IOException) {
+            return false
+        }
+    }
+
+    private fun remoteDirectory(tree: DocumentFile, path: String): DocumentFile? {
+        var current = tree
+        if (path.isBlank()) return current
+        for (segment in path.split('/')) {
+            if (segment.isEmpty()) continue
+            current = current.findFile(segment)?.takeIf { it.isDirectory }
+                ?: current.createDirectory(segment)
+                ?: return null
+        }
+        return current
+    }
+
+    private fun pruneRemote(directory: DocumentFile, local: File) {
+        for (child in directory.listFiles()) {
+            val name = child.name ?: continue
+            if (name.startsWith(".")) continue
+            val localChild = File(local, name)
+            if (!localChild.exists()) {
+                child.delete()
+            } else if (child.isDirectory) {
+                pruneRemote(child, localChild)
+            }
+        }
+    }
+
+    private fun treeFor(vault: StoredVault): DocumentFile? {
+        val uri = vault.treeUri ?: return null
+        val parsed = Uri.parse(uri)
+        takePermission(parsed, write = true)
+        return DocumentFile.fromTreeUri(context, parsed)
     }
 
     private fun takePermission(treeUri: Uri, write: Boolean) {
