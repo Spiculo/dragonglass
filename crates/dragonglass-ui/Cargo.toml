@@ -20,5 +20,6 @@ gpui = "0.2.2"
 notify = "8.2"
 smol = "2"
 
-[build-dependencies]
+# The Windows resource compiler is only needed for the icon/VERSIONINFO block.
+[target.'cfg(windows)'.build-dependencies]
 winresource = "0.1"

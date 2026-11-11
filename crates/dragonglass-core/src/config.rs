@@ -17,6 +17,10 @@ pub struct Config {
     pub accent: Option<String>,
     /// Whether `.dragon-glass/snippets` overrides are applied.
     pub snippets: bool,
+    /// Whether Vim-style modal editing is enabled for this vault.
+    pub vim_mode: bool,
+    /// Editor text size in points, persisted so the setting follows the vault.
+    pub font_size: u16,
 }
 
 impl Default for Config {
@@ -29,6 +33,8 @@ impl Default for Config {
             attachments_folder: "attachments".to_string(),
             accent: None,
             snippets: true,
+            vim_mode: false,
+            font_size: 14,
         }
     }
 }
@@ -45,6 +51,8 @@ impl Config {
             out.push_str(&format!("accent={accent}\n"));
         }
         out.push_str(&format!("snippets={}\n", self.snippets));
+        out.push_str(&format!("vim_mode={}\n", self.vim_mode));
+        out.push_str(&format!("font_size={}\n", self.font_size));
         out
     }
 
@@ -73,6 +81,14 @@ impl Config {
                 "accent" => config.accent = Some(value),
                 "snippets" => {
                     config.snippets = !matches!(value.to_lowercase().as_str(), "false" | "0" | "no")
+                }
+                "vim_mode" => {
+                    config.vim_mode = !matches!(value.to_lowercase().as_str(), "false" | "0" | "no")
+                }
+                "font_size" => {
+                    if let Ok(size) = value.parse::<u16>() {
+                        config.font_size = size.clamp(9, 32);
+                    }
                 }
                 _ => {}
             }
@@ -108,6 +124,30 @@ mod tests {
         assert_eq!(config.daily_folder, "Daily");
         assert_eq!(config.attachments_folder, "attachments");
         assert_eq!(config.accent, None);
+        assert!(!config.vim_mode);
+        assert_eq!(config.font_size, 14);
+    }
+
+    #[test]
+    fn font_size_roundtrips_and_is_clamped() {
+        let config = Config {
+            font_size: 18,
+            ..Config::default()
+        };
+        assert_eq!(Config::from_text(&config.to_text()).font_size, 18);
+        assert_eq!(Config::from_text("font_size=2").font_size, 9);
+        assert_eq!(Config::from_text("font_size=99").font_size, 32);
+    }
+
+    #[test]
+    fn vim_mode_roundtrips() {
+        let config = Config {
+            vim_mode: true,
+            ..Config::default()
+        };
+        let parsed = Config::from_text(&config.to_text());
+        assert!(parsed.vim_mode);
+        assert!(!Config::from_text("vim_mode=false").vim_mode);
     }
 
     #[test]

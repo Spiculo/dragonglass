@@ -95,6 +95,20 @@ impl Theme {
         }
     }
 
+    /// Apply a user accent colour, choosing readable text on top of it.
+    pub fn with_accent(&self, accent: Hsla) -> Self {
+        let mut theme = *self;
+        let rgba = gpui::Rgba::from(accent);
+        let luminance = 0.299 * rgba.r + 0.587 * rgba.g + 0.114 * rgba.b;
+        theme.accent = accent;
+        theme.accent_text = if luminance > 0.6 {
+            h(0x101010)
+        } else {
+            h(0xffffff)
+        };
+        theme
+    }
+
     pub fn toggled(&self) -> Self {
         if self.dark {
             Self::light()

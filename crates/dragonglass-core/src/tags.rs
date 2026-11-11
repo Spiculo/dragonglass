@@ -47,6 +47,23 @@ pub fn inline(src: &str) -> Vec<String> {
     out
 }
 
+/// Every tag used anywhere in the vault, sorted and deduped.
+///
+/// This reads note bodies, so it belongs on a vault refresh rather than in a render path.
+pub fn vault_tags(notes: &[crate::NoteRef]) -> Vec<String> {
+    let mut out = Vec::new();
+    for note in notes {
+        let Ok(text) = std::fs::read_to_string(&note.path) else {
+            continue;
+        };
+        let split = crate::frontmatter::split(&text);
+        out.extend(extract(split.body, split.frontmatter));
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
 /// Parse `tags:` / `tag:` from raw frontmatter. Supports inline lists and block lists.
 pub fn from_frontmatter(frontmatter: &str) -> Vec<String> {
     let mut out = Vec::new();
@@ -158,5 +175,26 @@ mod tests {
     #[test]
     fn frontmatter_bare() {
         assert_eq!(from_frontmatter("tag: solo\n"), vec!["solo"]);
+    }
+
+    #[test]
+    fn collects_tags_across_a_vault() {
+        let dir = std::env::temp_dir().join(format!(
+            "dragon-glass-tags-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("a.md"),
+            "---\ntags: [alpha]\n---\n# Heading\n\n#beta #alpha\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("b.md"), "text #gamma\n").unwrap();
+
+        let notes = crate::vault::Vault::open(&dir).unwrap().notes();
+        assert_eq!(vault_tags(&notes), vec!["alpha", "beta", "gamma"]);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
