@@ -177,13 +177,17 @@ class DragonGlassViewModel(application: Application) : AndroidViewModel(applicat
 
                 - Tap a note to open it.
                 - Use **Edit** to change the source and **Preview** to render it.
-                - The “More” menu has the outline, document details and deletion.
+                - The **•••** menu has the outline, details, move/rename and trash.
+                - Tap the vault name at the top to import a folder from your device; imported
+                  vaults stay linked and save back to that folder.
 
-                ## Next steps
+                ## What else is here
 
-                Import an existing vault through Android's document picker once the storage
-                layer lands. The shared Rust engine already parses notes, links, math and
-                properties; this app is the Android shell around it.
+                - **Search** matches note titles and note text; tap a text match to jump to it.
+                - **Tree** browses folders, and **••• → Graph view** maps the vault's links.
+                - **Today** opens the daily, weekly or monthly note. **New from template** reads
+                  the vault's `Templates` folder.
+                - **Git sync** pushes and pulls the vault through your own GitHub token.
                 """.trimIndent()
             )
         }

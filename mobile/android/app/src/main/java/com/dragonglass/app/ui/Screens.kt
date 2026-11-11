@@ -7,6 +7,7 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -273,7 +274,11 @@ private fun NotesScreen(vm: DragonGlassViewModel) {
             )
         },
         floatingActionButton = {
-            FloatingActionButton(onClick = vm::newNote) {
+            FloatingActionButton(
+                onClick = vm::newNote,
+                containerColor = MaterialTheme.colorScheme.primary,
+                contentColor = MaterialTheme.colorScheme.onPrimary,
+            ) {
                 Text("+", fontSize = 26.sp)
             }
         },
@@ -1631,6 +1636,15 @@ private fun MarkdownWebView(
     baseUrl: String,
     modifier: Modifier = Modifier,
 ) {
+    val dark = isSystemInDarkTheme()
+    val themed = remember(html, dark) {
+        if (dark) {
+            html.replace("</head>", "<style>$DARK_PREVIEW_CSS</style></head>")
+        } else {
+            html
+        }
+    }
+
     AndroidView(
         modifier = modifier,
         factory = { context ->
@@ -1644,7 +1658,22 @@ private fun MarkdownWebView(
             }
         },
         update = { webView ->
-            webView.loadDataWithBaseURL(baseUrl, html, "text/html", "utf-8", null)
+            webView.loadDataWithBaseURL(baseUrl, themed, "text/html", "utf-8", null)
         },
     )
 }
+
+/// The engine's export CSS targets light pages, so dark mode overrides the few colors that
+/// would otherwise be dark-on-dark. Math is drawn as black SVG, hence the invert.
+private const val DARK_PREVIEW_CSS = """
+body{color:#E4E7EE}
+h1,h2,h3,h4,h5,h6{color:#F2F4F8}
+a,.fn{color:#9DB8FF}
+blockquote{border-left-color:#3A4150;color:#B9C0CF}
+hr{border-top-color:#3A4150}
+mark{background:#4A4420;color:#E4E7EE}
+pre,code,th,.math{background:#222733}
+th,td{border-color:#3A4150}
+.footnote{color:#B9C0CF}
+.math svg,.math-display svg{filter:invert(1)}
+"""
