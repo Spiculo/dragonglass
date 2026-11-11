@@ -33,12 +33,50 @@ impl TreeNode {
 
 /// Build a directory tree from a sorted list of notes.
 pub fn build(notes: &[NoteRef]) -> TreeNode {
+    build_with_dirs(notes, &[])
+}
+
+/// Build the tree from notes plus a list of folders, so an empty folder is still shown.
+pub fn build_with_dirs(notes: &[NoteRef], folders: &[String]) -> TreeNode {
     let mut root = TreeNode::root();
+    for folder in folders {
+        insert_dir(&mut root, folder);
+    }
     for note in notes {
         insert(&mut root, note);
     }
     sort(&mut root);
     root
+}
+
+fn insert_dir(root: &mut TreeNode, relative: &str) {
+    let mut node = root;
+    let mut prefix = String::new();
+
+    for part in relative.split('/').filter(|part| !part.is_empty()) {
+        if !prefix.is_empty() {
+            prefix.push('/');
+        }
+        prefix.push_str(part);
+
+        let existing = node
+            .children
+            .iter()
+            .position(|child| child.kind == NodeKind::Dir && child.name == part);
+        let index = match existing {
+            Some(index) => index,
+            None => {
+                node.children.push(TreeNode {
+                    name: part.to_string(),
+                    path: prefix.clone(),
+                    kind: NodeKind::Dir,
+                    children: Vec::new(),
+                });
+                node.children.len() - 1
+            }
+        };
+        node = &mut node.children[index];
+    }
 }
 
 fn insert(root: &mut TreeNode, note: &NoteRef) {
@@ -138,6 +176,24 @@ mod tests {
         let tree = build(&[note("a/x.md"), note("a/y.md")]);
         assert_eq!(tree.children.len(), 1);
         assert_eq!(tree.children[0].children.len(), 2);
+    }
+
+    #[test]
+    fn includes_empty_folders() {
+        let tree = build_with_dirs(
+            &[note("a/one.md")],
+            &["a".to_string(), "empty".to_string(), "a/nested".to_string()],
+        );
+        let names: Vec<_> = tree
+            .children
+            .iter()
+            .map(|child| child.name.as_str())
+            .collect();
+        assert_eq!(names, vec!["a", "empty"]);
+        let a = &tree.children[0];
+        let a_children: Vec<_> = a.children.iter().map(|child| child.name.as_str()).collect();
+        assert_eq!(a_children, vec!["nested", "one"]);
+        assert_eq!(tree.children[1].children.len(), 0);
     }
 
     #[test]

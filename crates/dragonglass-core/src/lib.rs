@@ -11,6 +11,8 @@ pub mod buffer;
 pub mod config;
 pub mod conflict;
 pub mod diff;
+pub mod find;
+pub mod format;
 pub mod frontmatter;
 pub mod git;
 pub mod graph;
@@ -41,6 +43,7 @@ pub mod tree;
 pub mod update;
 pub mod uri;
 pub mod vault;
+pub mod vaultfs;
 pub mod vaults;
 pub mod versions;
 pub mod wikilink;
@@ -68,6 +71,12 @@ pub enum Error {
 
     #[error("json error: {0}")]
     Json(#[from] serde_json::Error),
+
+    #[error("invalid vault path: {0}")]
+    InvalidPath(String),
+
+    #[error("already exists: {0}")]
+    AlreadyExists(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

@@ -1,61 +1,128 @@
 #!/usr/bin/env bash
 #
-# Assemble DragonGlass.app (and a zip and dmg) from an already-built binary.
-# No Rust toolchain needed, so this runs on a release runner or by hand.
+# Assemble DragonGlass.app (and a zip and dmg) from already-built binaries.
+# Must run on macOS: it uses sips, iconutil, ditto and hdiutil.
 #
-# usage: build-app.sh <binary> <version> <out-dir> [cli-binary]
+# usage: packaging/macos/build-app.sh <version> <out-dir>
+#
+# Optional environment:
+#   BUNDLE_ID            bundle identifier (default: io.github.dragonglass.DragonGlass)
+#   BIN_DIR              directory holding dragon-glass-app and dragon-glass
+#                        (default: target/release)
+#   CODESIGN_IDENTITY    Developer ID Application identity; enables signing and
+#                        notarization. Without it the app is ad-hoc signed.
+#   APPLE_ID             Apple ID for notarization
+#   APPLE_TEAM_ID        Apple team id for notarization
+#   APPLE_APP_PASSWORD   app-specific password for notarization
 
 set -euo pipefail
 
-BINARY="${1:?usage: build-app.sh <binary> <version> <out-dir> [cli-binary]}"
-VERSION="${2:?version required}"
-OUT="${3:?output directory required}"
-CLI="${4:-}"
+VERSION="${1:?usage: build-app.sh <version> <out-dir>}"
+OUT="${2:?output directory required}"
 HERE="$(cd "$(dirname "$0")" && pwd)"
+REPO="$(cd "$HERE/../.." && pwd)"
+BIN_DIR="${BIN_DIR:-$REPO/target/release}"
 NAME="DragonGlass"
+APP_NAME="Dragon Glass"
+APP="$OUT/$NAME.app"
+BUNDLE_ID="${BUNDLE_ID:-io.github.dragonglass.DragonGlass}"
+# CFBundleVersion must be a dotted numeric build number; keep the full version for
+# CFBundleShortVersionString and the artefact names.
+BUNDLE_VERSION="${VERSION%%-*}"
+BUNDLE_VERSION="${BUNDLE_VERSION%%+*}"
 
-if [[ ! -f "$BINARY" ]]; then
-  echo "no binary at $BINARY" >&2
-  exit 1
+if [ "$(uname -s)" != "Darwin" ]; then
+    echo "build-app.sh must run on macOS (sips, iconutil, ditto and hdiutil are required)" >&2
+    exit 1
 fi
+for binary in dragon-glass-app dragon-glass; do
+    if [ ! -x "$BIN_DIR/$binary" ]; then
+        echo "missing $BIN_DIR/$binary; run cargo build --release -p dragonglass-ui -p dragonglass-cli first" >&2
+        exit 1
+    fi
+done
 
 mkdir -p "$OUT"
-APP="$OUT/$NAME.app"
+echo "==> staging $APP"
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+install -m 0755 "$BIN_DIR/dragon-glass-app" "$APP/Contents/MacOS/dragon-glass-app"
+install -m 0755 "$BIN_DIR/dragon-glass" "$APP/Contents/MacOS/dragon-glass"
 
-install -m 0755 "$BINARY" "$APP/Contents/MacOS/dragon-glass-app"
-if [[ -n "$CLI" ]]; then
-  install -m 0755 "$CLI" "$APP/Contents/MacOS/dragon-glass"
-fi
-install -m 0644 "$HERE/dragon-glass.icns" "$APP/Contents/Resources/dragon-glass.icns"
-install -m 0644 "$HERE/Info.plist" "$APP/Contents/Info.plist"
+# Info.plist: substitute the version and bundle id. `|` avoids escaping the slashes in
+# the identifier and version.
+sed \
+    -e "s|@VERSION@|$VERSION|g" \
+    -e "s|@BUNDLE_VERSION@|$BUNDLE_VERSION|g" \
+    -e "s|@BUNDLE_ID@|$BUNDLE_ID|g" \
+    "$HERE/Info.plist" > "$APP/Contents/Info.plist"
 printf 'APPL????' > "$APP/Contents/PkgInfo"
 
-# CFBundleVersion must be a dotted list of integers; a tag like v0.1.0-rc1 is not.
-NUMERIC_VERSION="$(printf '%s' "$VERSION" | sed -E 's/[^0-9.].*$//; s/^\.//; s/\.$//')"
-[[ -n "$NUMERIC_VERSION" ]] || NUMERIC_VERSION="0.0.0"
-/usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $VERSION" "$APP/Contents/Info.plist"
-/usr/libexec/PlistBuddy -c "Set :CFBundleVersion $NUMERIC_VERSION" "$APP/Contents/Info.plist"
+echo "==> building DragonGlass.icns"
+ICONSET="$OUT/DragonGlass.iconset"
+rm -rf "$ICONSET"
+SOURCE_ICON="$REPO/packaging/logo.png"
+if [ -f "$SOURCE_ICON" ]; then
+    mkdir -p "$ICONSET"
+    for size in 16 32 128 256 512; do
+        sips -z "$size" "$size" "$SOURCE_ICON" \
+            --out "$ICONSET/icon_${size}x${size}.png" >/dev/null
+        double=$((size * 2))
+        sips -z "$double" "$double" "$SOURCE_ICON" \
+            --out "$ICONSET/icon_${size}x${size}@2x.png" >/dev/null
+    done
+    iconutil -c icns "$ICONSET" -o "$APP/Contents/Resources/DragonGlass.icns"
+    rm -rf "$ICONSET"
+else
+    echo "warning: $SOURCE_ICON is missing; the app gets a generic icon" >&2
+fi
 
-# Ad-hoc signature: enough for the app to launch on Apple Silicon and for Launch Services
-# to register the bundle, without a Developer ID certificate.
-codesign --force --deep --sign - "$APP" >/dev/null
+if [ -n "${CODESIGN_IDENTITY:-}" ]; then
+    echo "==> signing with $CODESIGN_IDENTITY"
+    codesign --force --deep --options runtime --timestamp \
+        --sign "$CODESIGN_IDENTITY" "$APP"
+    codesign --verify --deep --strict --verbose=2 "$APP"
+else
+    # Ad-hoc signature: Apple Silicon refuses to run unsigned arm64 binaries, and Launch
+    # Services only registers a signed bundle.
+    echo "==> no CODESIGN_IDENTITY set; ad-hoc signing"
+    codesign --force --deep --sign - "$APP" >/dev/null
+fi
 
 ZIP="$OUT/$NAME-$VERSION-macos.zip"
-ditto -c -k --sequesterRsrc --keepParent "$APP" "$ZIP"
+if [ -n "${CODESIGN_IDENTITY:-}" ] \
+    && [ -n "${APPLE_ID:-}" ] \
+    && [ -n "${APPLE_TEAM_ID:-}" ] \
+    && [ -n "${APPLE_APP_PASSWORD:-}" ]; then
+    echo "==> notarizing"
+    rm -f "$ZIP"
+    ditto -c -k --keepParent "$APP" "$ZIP"
+    xcrun notarytool submit "$ZIP" \
+        --apple-id "$APPLE_ID" \
+        --team-id "$APPLE_TEAM_ID" \
+        --password "$APPLE_APP_PASSWORD" \
+        --wait
+    xcrun stapler staple "$APP"
+else
+    echo "==> skipping notarization (set CODESIGN_IDENTITY, APPLE_ID, APPLE_TEAM_ID and APPLE_APP_PASSWORD)"
+fi
 
-# Stage the app next to an Applications link, so the dmg window supports drag-to-install.
+echo "==> writing $ZIP"
+rm -f "$ZIP"
+ditto -c -k --keepParent "$APP" "$ZIP"
+
+echo "==> writing DMG"
 DMG="$OUT/$NAME-$VERSION-macos.dmg"
-STAGE="$OUT/.dmg-stage"
+STAGE="$OUT/dmg-stage"
 rm -rf "$STAGE"
 mkdir -p "$STAGE"
-cp -R "$APP" "$STAGE/$NAME.app"
+cp -R "$APP" "$STAGE/"
 ln -s /Applications "$STAGE/Applications"
 rm -f "$DMG"
-hdiutil create -quiet -volname "Dragon Glass" -srcfolder "$STAGE" -ov -format UDZO "$DMG"
+hdiutil create -volname "$APP_NAME" -srcfolder "$STAGE" -ov -format UDZO "$DMG" >/dev/null
 rm -rf "$STAGE"
 
-echo "wrote $APP"
-echo "wrote $ZIP"
-echo "wrote $DMG"
+echo "wrote:"
+echo "  $APP"
+echo "  $ZIP"
+echo "  $DMG"

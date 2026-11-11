@@ -32,4 +32,4 @@ lipo -create \
   "target/x86_64-apple-darwin/release/dragon-glass" \
   -output "$STAGE/dragon-glass"
 
-"$HERE/build-app.sh" "$STAGE/dragon-glass-app" "$VERSION" "$OUT" "$STAGE/dragon-glass"
+BIN_DIR="$STAGE" "$HERE/build-app.sh" "$VERSION" "$OUT"

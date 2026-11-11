@@ -74,9 +74,24 @@ impl Vault {
         notes
     }
 
+    /// All folders in the vault, so empty folders still appear in the sidebar.
+    pub fn folders(&self) -> Vec<String> {
+        let mut folders: Vec<String> = WalkDir::new(&self.root)
+            .follow_links(false)
+            .into_iter()
+            .filter_entry(|entry| !is_skipped(entry.path(), &self.root))
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.file_type().is_dir())
+            .map(|entry| relative_string(&self.root, entry.path()))
+            .filter(|relative| !relative.is_empty())
+            .collect();
+        folders.sort();
+        folders
+    }
+
     /// The vault's directory tree, for the sidebar.
     pub fn tree(&self) -> crate::TreeNode {
-        crate::tree::build(&self.notes())
+        crate::tree::build_with_dirs(&self.notes(), &self.folders())
     }
 }
 

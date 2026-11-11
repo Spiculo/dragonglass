@@ -19,21 +19,24 @@ mod preview_window;
 mod reading;
 mod theme;
 mod vault_picker;
+mod vim;
 
 use std::cell::RefCell;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use dragonglass_core::frontmatter::{Property, PropertyValue};
 use dragonglass_core::{
-    bookmarks, config, conflict, diff, git, graph, keymap, lint, markdown, query, relations,
-    resolve, search, session, shared, stats, storage, store, templates, tree, update, uri, vaults,
-    versions, workspace, NodeKind, Note, NoteRef, TreeNode, Vault,
+    bookmarks, config, conflict, diff, git, graph, history, keymap, lint, markdown, query,
+    relations, resolve, search, session, shared, stats, storage, store, tags, templates, tree,
+    update, uri, vaultfs, vaults, versions, workspace, NodeKind, Note, NoteRef, TreeNode, Vault,
 };
 
 /// Actions the hotkey editor can rebind: `(action, default key, label)`.
 const HOTKEYS: &[(&str, &str, &str)] = &[
     ("OpenCommands", "secondary+p", "Command palette"),
+    ("OpenSettings", "secondary-,", "Settings"),
     ("OpenSwitcher", "secondary+o", "Quick switcher"),
     ("OpenSearch", "secondary+shift+f", "Search"),
     ("OpenGraph", "secondary+shift+g", "Graph view"),
@@ -69,6 +72,7 @@ fn bind_named(cx: &mut App, key: &str, action: &str) {
     let key = key.as_str();
     match action {
         "OpenCommands" => cx.bind_keys([KeyBinding::new(key, OpenCommands, None)]),
+        "OpenSettings" => cx.bind_keys([KeyBinding::new(key, OpenSettings, None)]),
         "OpenSwitcher" => cx.bind_keys([KeyBinding::new(key, OpenSwitcher, None)]),
         "OpenSearch" => cx.bind_keys([KeyBinding::new(key, OpenSearch, None)]),
         "OpenGraph" => cx.bind_keys([KeyBinding::new(key, OpenGraph, None)]),
@@ -112,7 +116,9 @@ actions!(
         OpenProperties,
         ToggleBookmark,
         OpenCommands,
+        OpenSettings,
         ToggleTheme,
+        ToggleVim,
         OpenGraph,
         OpenRelations,
         OpenWeekly,
@@ -155,6 +161,12 @@ enum SwitcherMode {
     NewNoteName,
     SharedName,
     RelationInput,
+    NewFolderName,
+    RenameInput,
+    DeleteConfirm,
+    FileMenu,
+    HistoryMenu,
+    SettingInput,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -207,6 +219,16 @@ enum CommandId {
     AddRelation,
     ToggleSplitEditor,
     DetachTab,
+    FindReplace,
+    ToggleVim,
+    ToggleFold,
+    Settings,
+    NewNote,
+    NewFolder,
+    RenameNote,
+    DeleteNote,
+    SaveAs,
+    History,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -235,6 +257,52 @@ enum Item {
     Shared(String),
     SharedEdit(String),
     Issue(usize),
+    Tree(TreeAction),
+    HistoryCompare(String),
+    HistoryRestore(String),
+}
+
+/// Actions offered by the sidebar's context menu.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TreeAction {
+    Open,
+    NewNote,
+    NewFolder,
+    Rename,
+    Delete,
+}
+
+/// The note or folder a file-menu action applies to.
+#[derive(Clone, PartialEq, Eq)]
+struct TreeTarget {
+    path: String,
+    is_dir: bool,
+}
+
+/// A numeric or text setting edited through the command panel.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SettingKey {
+    FontSize,
+    Accent,
+    AttachmentsFolder,
+    TemplatesFolder,
+    DailyFolder,
+    WeeklyFolder,
+    MonthlyFolder,
+}
+
+impl SettingKey {
+    fn label(self) -> &'static str {
+        match self {
+            SettingKey::FontSize => "Editor font size",
+            SettingKey::Accent => "Accent colour",
+            SettingKey::AttachmentsFolder => "Attachments folder",
+            SettingKey::TemplatesFolder => "Templates folder",
+            SettingKey::DailyFolder => "Daily notes folder",
+            SettingKey::WeeklyFolder => "Weekly notes folder",
+            SettingKey::MonthlyFolder => "Monthly notes folder",
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -372,19 +440,7 @@ fn resize_handle(panel: ResizePanel, theme: Theme, cx: &mut Context<DragonGlassA
 
 /// Sanitize a vault-relative path for a newly created note.
 fn sanitize_relative(path: &str) -> String {
-    path.split('/')
-        .filter(|segment| !segment.is_empty() && *segment != "." && *segment != "..")
-        .map(|segment| {
-            segment
-                .chars()
-                .map(|ch| match ch {
-                    ':' | '*' | '?' | '"' | '<' | '>' | '|' | '\\' => '-',
-                    other => other,
-                })
-                .collect::<String>()
-        })
-        .collect::<Vec<_>>()
-        .join("/")
+    vaultfs::sanitize_relative(path)
 }
 
 fn tab_title(relative: &str) -> String {
@@ -417,12 +473,20 @@ struct DragonGlassApp {
     cache_epoch: u64,
     vault_root: PathBuf,
     tree: TreeNode,
-    /// Flattened tree rows for the sidebar. Rebuilt when the vault changes, never in
-    /// `render`, so scrolling does not recursively walk the tree each frame.
+    /// Flattened tree rows for the sidebar. Rebuilt when the vault changes or a folder
+    /// is collapsed, never in `render`, so scrolling does not walk the tree each frame.
     file_rows: Rc<Vec<Row>>,
+    /// Vault-relative paths of folders whose contents are hidden in the sidebar.
+    collapsed_dirs: HashSet<String>,
+    /// Heading indices whose sections are folded in the outline.
+    collapsed_outline: HashSet<usize>,
     note_refs: Vec<NoteRef>,
     /// Link resolution for the whole vault: paths, stems, frontmatter names and aliases.
     note_index: resolve::NoteIndex,
+    /// `(insertion path, display name)` for wikilink autocomplete.
+    note_suggestions: Rc<Vec<(String, String)>>,
+    /// All tags in the vault, for `#tag` autocomplete.
+    tag_suggestions: Rc<Vec<String>>,
     properties: Vec<Property>,
     /// Outline headings, cached per document version so scrolling never re-parses the note.
     headings: Rc<Vec<markdown::Heading>>,
@@ -477,6 +541,24 @@ struct DragonGlassApp {
     switcher: Option<Switcher>,
     switcher_focus: FocusHandle,
     focus_handle: FocusHandle,
+    /// Set while closing the window is waiting on the user's decision about unsaved notes.
+    quit_prompt: bool,
+    /// Set once the user has chosen to quit, so the close callback lets the window go.
+    allow_close: bool,
+    /// The settings page replaces the editor while it is open.
+    show_settings: bool,
+    /// Which setting the input panel is editing.
+    pending_setting: Option<SettingKey>,
+    /// Focus while the settings page is open, so typing cannot reach the hidden editor.
+    settings_focus: FocusHandle,
+    /// File or folder targeted by the sidebar menu.
+    tree_menu: Option<TreeTarget>,
+    /// Folder new notes and folders are created in.
+    pending_dir: Option<String>,
+    /// Path being renamed or deleted.
+    pending_path: Option<String>,
+    /// The name panel is choosing a file for the active untitled buffer.
+    pending_save_as: bool,
 }
 
 impl DragonGlassApp {
@@ -589,6 +671,301 @@ impl DragonGlassApp {
         }
     }
 
+    /// Create a blank note, optionally inside a folder. A name containing `/` is taken as
+    /// a vault-relative path.
+    fn create_note_in(
+        &mut self,
+        dir: Option<&str>,
+        name: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let name = name.trim();
+        if name.is_empty() {
+            self.status_message = Some("a note needs a name".to_string());
+            cx.notify();
+            return;
+        }
+
+        let mut relative = if name.contains('/') {
+            name.to_string()
+        } else {
+            match dir {
+                Some(dir) if !dir.is_empty() => format!("{dir}/{name}"),
+                _ => name.to_string(),
+            }
+        };
+        if !relative.to_ascii_lowercase().ends_with(".md") {
+            relative.push_str(".md");
+        }
+        let relative = sanitize_relative(&relative);
+        if relative.is_empty() {
+            self.status_message = Some("a note needs a name".to_string());
+            cx.notify();
+            return;
+        }
+
+        let title = relative
+            .rsplit('/')
+            .next()
+            .unwrap_or(&relative)
+            .trim_end_matches(".md");
+        let content = format!("# {title}\n\n");
+
+        match vaultfs::create_note(&self.vault_root, &relative, &content) {
+            Ok(_) => {
+                self.refresh_vault(cx);
+                self.status_message = Some(format!("created note: {relative}"));
+                self.open_note(&relative, window, cx);
+            }
+            Err(error) => {
+                self.status_message = Some(format!("could not create note: {error}"));
+                cx.notify();
+            }
+        }
+    }
+
+    /// Give the active untitled buffer a file name, writing its current contents there.
+    fn save_active_as(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let name = name.trim();
+        if name.is_empty() {
+            self.status_message = Some("a note needs a name".to_string());
+            cx.notify();
+            return;
+        }
+        let mut relative = name.to_string();
+        if !relative.to_ascii_lowercase().ends_with(".md") {
+            relative.push_str(".md");
+        }
+        let relative = sanitize_relative(&relative);
+        if relative.is_empty() {
+            self.status_message = Some("a note needs a name".to_string());
+            cx.notify();
+            return;
+        }
+        if self.vault_root.join(&relative).exists() {
+            self.status_message = Some(format!("{relative} already exists"));
+            cx.notify();
+            return;
+        }
+
+        let content = self.editor.read(cx).text();
+        match vaultfs::create_note(&self.vault_root, &relative, &content) {
+            Ok(path) => {
+                let editor = self.editor.clone();
+                editor.update(cx, |editor, _cx| {
+                    editor.set_path(Some(path));
+                    // The file already holds this content; this just marks the buffer clean.
+                    let _ = editor.save();
+                });
+                let index = self.active_tab;
+                if let Some(tab) = self.tabs.get_mut(index) {
+                    tab.relative = Some(relative.clone());
+                    tab.title = tab_title(&relative);
+                }
+                self.active = Some(relative.clone());
+                self.show_settings = false;
+                self.refresh_vault(cx);
+                self.remember_session(cx);
+                self.status_message = Some(format!("saved as {relative}"));
+                window.focus(&self.editor.focus_handle(cx));
+            }
+            Err(error) => {
+                self.status_message = Some(format!("could not save note: {error}"));
+            }
+        }
+        cx.notify();
+    }
+
+    fn create_folder_in(&mut self, dir: Option<&str>, name: &str, cx: &mut Context<Self>) {
+        let name = name.trim();
+        if name.is_empty() {
+            self.status_message = Some("a folder needs a name".to_string());
+            cx.notify();
+            return;
+        }
+        let relative = match dir {
+            Some(dir) if !dir.is_empty() => format!("{dir}/{name}"),
+            _ => name.to_string(),
+        };
+        match vaultfs::create_folder(&self.vault_root, &relative) {
+            Ok(_) => {
+                self.refresh_vault(cx);
+                self.status_message =
+                    Some(format!("created folder: {}", sanitize_relative(&relative)));
+            }
+            Err(error) => {
+                self.status_message = Some(format!("could not create folder: {error}"));
+            }
+        }
+        cx.notify();
+    }
+
+    /// Rename or move an entry, keeping open tabs pointed at the new path.
+    fn rename_entry(&mut self, from: &str, to: &str, cx: &mut Context<Self>) {
+        let mut to = sanitize_relative(to);
+        if to.is_empty() {
+            self.status_message = Some("a name is required".to_string());
+            cx.notify();
+            return;
+        }
+        // Renaming a note by its display name should keep the extension.
+        if from.to_ascii_lowercase().ends_with(".md") && !to.to_ascii_lowercase().ends_with(".md") {
+            to.push_str(".md");
+        }
+
+        if let Err(error) = vaultfs::rename(&self.vault_root, from, &to) {
+            self.status_message = Some(format!("could not rename: {error}"));
+            cx.notify();
+            return;
+        }
+
+        let root = self.vault_root.clone();
+        let prefix = format!("{from}/");
+        for tab in &mut self.tabs {
+            let Some(relative) = tab.relative.clone() else {
+                continue;
+            };
+            let updated = if relative == from {
+                Some(to.clone())
+            } else if relative.starts_with(&prefix) {
+                Some(format!("{to}/{}", &relative[prefix.len()..]))
+            } else {
+                None
+            };
+            if let Some(updated) = updated {
+                tab.title = tab_title(&updated);
+                tab.relative = Some(updated.clone());
+                let path = root.join(&updated);
+                tab.editor
+                    .update(cx, |editor, _cx| editor.set_path(Some(path)));
+            }
+        }
+        self.active = self
+            .tabs
+            .get(self.active_tab)
+            .and_then(|tab| tab.relative.clone());
+        self.refresh_vault(cx);
+        self.remember_session(cx);
+        self.status_message = Some(format!("renamed {from} to {to}"));
+        cx.notify();
+    }
+
+    /// Move an entry to `.dragon-glass/trash`, closing its tabs first so unsaved edits are
+    /// written before the file leaves the vault.
+    fn delete_entry(&mut self, relative: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let prefix = format!("{relative}/");
+        let indices: Vec<usize> = self
+            .tabs
+            .iter()
+            .enumerate()
+            .filter(|(_, tab)| {
+                tab.relative
+                    .as_deref()
+                    .is_some_and(|path| path == relative || path.starts_with(&prefix))
+            })
+            .map(|(index, _)| index)
+            .collect();
+
+        // Never trash a note whose unsaved buffer could not be written.
+        for index in &indices {
+            let editor = self.tabs[*index].editor.clone();
+            if editor.read(cx).is_dirty() {
+                if let Err(error) = editor.update(cx, |editor, _| editor.save()) {
+                    self.status_message = Some(format!("could not save before delete: {error}"));
+                    cx.notify();
+                    return;
+                }
+            }
+        }
+        for index in indices.into_iter().rev() {
+            self.close_tab(index, window, cx);
+        }
+
+        match vaultfs::trash(&self.vault_root, relative) {
+            Ok(_) => {
+                self.refresh_vault(cx);
+                self.status_message = Some(format!("moved to trash: {relative}"));
+            }
+            Err(error) => {
+                self.status_message = Some(format!("could not delete: {error}"));
+            }
+        }
+        cx.notify();
+    }
+
+    fn open_tree_menu(
+        &mut self,
+        path: String,
+        is_dir: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.tree_menu = Some(TreeTarget { path, is_dir });
+        self.open_panel(SwitcherMode::FileMenu, window, cx);
+    }
+
+    /// Compare a recovery snapshot with the current buffer.
+    fn compare_snapshot(&mut self, id: &str, cx: &mut Context<Self>) {
+        let Some(relative) = self.active.clone() else {
+            return;
+        };
+        let snapshot = match history::read(&self.vault_root, &relative, id) {
+            Ok(text) => text,
+            Err(error) => {
+                self.status_message = Some(format!("could not read snapshot: {error}"));
+                cx.notify();
+                return;
+            }
+        };
+        let current = self.editor.read(cx).text();
+        let diff = diff::lines(&snapshot, &current);
+        self.diff_title = format!("current ↔ snapshot {id}");
+        self.diff_summary = diff.summary();
+        self.diff_rows = Rc::new(diff.lines);
+        self.show_diff = true;
+        self.show_graph = false;
+        self.show_query = false;
+        self.show_settings = false;
+        self.status_message = Some(format!("snapshot diff: {}", self.diff_summary));
+        cx.notify();
+    }
+
+    /// Restore a snapshot over the note. The current buffer is snapshotted first, so the
+    /// restore is reversible through the same history list.
+    fn restore_snapshot(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(relative) = self.active.clone() else {
+            return;
+        };
+        let snapshot = match history::read(&self.vault_root, &relative, id) {
+            Ok(text) => text,
+            Err(error) => {
+                self.status_message = Some(format!("could not read snapshot: {error}"));
+                cx.notify();
+                return;
+            }
+        };
+
+        let current = self.editor.read(cx).text();
+        let _ = history::record(&self.vault_root, &relative, &current);
+        let path = self.vault_root.join(&relative);
+        if let Err(error) = storage::write_atomic(&path, &snapshot) {
+            self.status_message = Some(format!("could not restore snapshot: {error}"));
+            cx.notify();
+            return;
+        }
+        self.editor.update(cx, |editor, cx| {
+            let _ = editor.reload();
+            cx.notify();
+        });
+        self.cache_epoch = self.cache_epoch.wrapping_add(1);
+        self.refresh_properties(cx);
+        self.refresh_git();
+        self.status_message = Some(format!("restored snapshot {id}"));
+        window.focus(&self.editor.focus_handle(cx));
+        cx.notify();
+    }
+
     /// Resize a side panel while its splitter is being dragged.
     ///
     /// A full app repaint is expensive, so movement is applied at most once per frame
@@ -664,10 +1041,15 @@ impl DragonGlassApp {
         let root = self.vault_root.clone();
         let folder = self.config.attachments_folder.clone();
         let opener = self.link_opener(cx);
+        let notes = (*self.note_suggestions).clone();
+        let tags = (*self.tag_suggestions).clone();
         editor.update(cx, |editor, _cx| {
             editor.set_vault_root(&root);
             editor.set_attachments_folder(&folder);
             editor.set_link_opener(opener);
+            editor.set_vim_enabled(self.config.vim_mode);
+            editor.set_font_size(px(self.config.font_size as f32));
+            editor.set_suggestions(notes, tags);
         });
         editor
     }
@@ -699,6 +1081,105 @@ impl DragonGlassApp {
         let _ = session::save(&self.vault_root, &saved);
     }
 
+    /// Save every dirty tab, returning how many were written. All tabs are attempted even
+    /// when one fails, so a quit never leaves later notes unwritten because of an earlier
+    /// error.
+    fn save_all(&mut self, cx: &mut Context<Self>) -> Result<usize, String> {
+        let mut saved = 0;
+        let mut first_error: Option<String> = None;
+
+        for tab in &self.tabs {
+            let editor = tab.editor.clone();
+            if !editor.read(cx).is_dirty() {
+                continue;
+            }
+            if !editor.read(cx).has_path() {
+                first_error
+                    .get_or_insert_with(|| "an untitled note has no file name yet".to_string());
+                continue;
+            }
+            match editor.update(cx, |editor, _cx| editor.save()) {
+                Ok(()) => saved += 1,
+                Err(error) => {
+                    first_error.get_or_insert_with(|| error.to_string());
+                }
+            }
+        }
+
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(saved),
+        }
+    }
+
+    /// macOS quits through `applicationWillTerminate`, which does not call
+    /// `windowShouldClose`. Save dirty buffers from the app-quit observer so Cmd+Q cannot
+    /// drop edits. Other platforms keep their explicit window-close prompt.
+    fn install_quit_saver(&self, cx: &mut Context<Self>) {
+        if cfg!(target_os = "macos") {
+            cx.on_app_quit(|app, cx| {
+                let _ = app.save_all(cx);
+                async {}
+            })
+            .detach();
+        }
+    }
+
+    /// Intercept the window close so unsaved notes are not silently dropped.
+    fn request_close(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> bool {
+        self.remember_session(cx);
+
+        if self.allow_close {
+            return true;
+        }
+
+        let dirty = self
+            .tabs
+            .iter()
+            .filter(|tab| tab.editor.read(cx).is_dirty())
+            .count();
+        if dirty == 0 {
+            return true;
+        }
+
+        self.quit_prompt = true;
+        self.status_message = Some(format!(
+            "{dirty} open {} unsaved changes",
+            if dirty == 1 { "note has" } else { "notes have" }
+        ));
+        cx.notify();
+        false
+    }
+
+    fn save_and_quit(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        match self.save_all(cx) {
+            Ok(saved) => {
+                self.allow_close = true;
+                self.quit_prompt = false;
+                self.close_requested = true;
+                self.status_message = Some(format!("saved {saved} note(s)"));
+                cx.notify();
+            }
+            Err(error) => {
+                self.status_message = Some(format!("could not save: {error}"));
+                cx.notify();
+            }
+        }
+    }
+
+    fn discard_and_quit(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        self.allow_close = true;
+        self.quit_prompt = false;
+        self.close_requested = true;
+        cx.notify();
+    }
+
+    fn cancel_quit(&mut self, cx: &mut Context<Self>) {
+        self.quit_prompt = false;
+        self.status_message = None;
+        cx.notify();
+    }
+
     /// Switch the active tab, syncing the editor, outline and properties.
     fn activate_tab(&mut self, index: usize, cx: &mut Context<Self>) {
         if index >= self.tabs.len() {
@@ -710,6 +1191,8 @@ impl DragonGlassApp {
         self.active = self.tabs[index].relative.clone();
         self.conflict = self.tabs[index].conflict;
         self.cache_epoch = self.cache_epoch.wrapping_add(1);
+        self.collapsed_outline.clear();
+        self.show_settings = false;
         self.show_graph = false;
         self.show_query = false;
         self.show_diff = false;
@@ -744,6 +1227,7 @@ impl DragonGlassApp {
     }
 
     fn open_note(&mut self, relative: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.show_settings = false;
         // Already open: just focus it.
         if let Some(index) = self
             .tabs
@@ -790,6 +1274,7 @@ impl DragonGlassApp {
             self.active = Some(relative.to_string());
             self.conflict = false;
             self.cache_epoch = self.cache_epoch.wrapping_add(1);
+            self.collapsed_outline.clear();
             self.show_graph = false;
             self.show_query = false;
             self.show_diff = false;
@@ -946,20 +1431,53 @@ impl DragonGlassApp {
         if let Ok(vault) = Vault::open(&self.vault_root) {
             self.note_refs = vault.notes();
             self.note_index = resolve::NoteIndex::new(&self.note_refs);
-            self.tree = tree::build(&self.note_refs);
+            self.tree = tree::build_with_dirs(&self.note_refs, &vault.folders());
             self.notes = self.note_refs.len();
             self.full_graph = graph::build(&self.note_refs);
             if self.show_relations {
                 self.relations = relations::build(&self.note_refs);
             }
         }
+        self.note_suggestions = Rc::new(
+            self.note_refs
+                .iter()
+                .map(|note| (note.path_no_ext().to_string(), note.stem().to_string()))
+                .collect(),
+        );
+        self.tag_suggestions = Rc::new(tags::vault_tags(&self.note_refs));
+        let notes = (*self.note_suggestions).clone();
+        let tag_list = (*self.tag_suggestions).clone();
+        for tab in &self.tabs {
+            tab.editor.update(cx, |editor, _| {
+                editor.set_suggestions(notes.clone(), tag_list.clone())
+            });
+        }
         // A rescan is also when attachments may have appeared or disappeared.
         self.editor
             .update(cx, |editor, _| editor.invalidate_attachments());
         let mut rows = Vec::new();
-        flatten(&self.tree, 0, &mut rows);
+        flatten(&self.tree, 0, &self.collapsed_dirs, &mut rows);
         self.file_rows = Rc::new(rows);
         self.refresh_git();
+    }
+
+    /// Show or hide a folder's children in the sidebar.
+    fn toggle_dir(&mut self, path: &str, cx: &mut Context<Self>) {
+        if !self.collapsed_dirs.remove(path) {
+            self.collapsed_dirs.insert(path.to_string());
+        }
+        let mut rows = Vec::new();
+        flatten(&self.tree, 0, &self.collapsed_dirs, &mut rows);
+        self.file_rows = Rc::new(rows);
+        cx.notify();
+    }
+
+    /// Fold or unfold a heading in the table of contents.
+    fn toggle_outline(&mut self, index: usize, cx: &mut Context<Self>) {
+        if !self.collapsed_outline.remove(&index) {
+            self.collapsed_outline.insert(index);
+        }
+        cx.notify();
     }
 
     /// Open (or create) today's daily note, using `Templates/Daily.md` when present.
@@ -1144,6 +1662,106 @@ impl DragonGlassApp {
             SwitcherMode::NewNoteName => Vec::new(),
             SwitcherMode::SharedName => Vec::new(),
             SwitcherMode::RelationInput => Vec::new(),
+            SwitcherMode::NewFolderName
+            | SwitcherMode::RenameInput
+            | SwitcherMode::DeleteConfirm
+            | SwitcherMode::SettingInput => Vec::new(),
+            SwitcherMode::FileMenu => {
+                let Some(target) = &self.tree_menu else {
+                    return Vec::new();
+                };
+                let menu_dir = if target.is_dir {
+                    target.path.clone()
+                } else {
+                    target
+                        .path
+                        .rsplit_once('/')
+                        .map(|(dir, _)| dir.to_string())
+                        .unwrap_or_default()
+                };
+
+                let mut items = vec![
+                    SwitcherItem {
+                        label: if target.is_dir {
+                            "Open folder".to_string()
+                        } else {
+                            "Open note".to_string()
+                        },
+                        detail: target.path.clone(),
+                        item: Item::Tree(TreeAction::Open),
+                    },
+                    SwitcherItem {
+                        label: "New note here".to_string(),
+                        detail: if menu_dir.is_empty() {
+                            "vault root".to_string()
+                        } else {
+                            menu_dir.clone()
+                        },
+                        item: Item::Tree(TreeAction::NewNote),
+                    },
+                    SwitcherItem {
+                        label: "New folder here".to_string(),
+                        detail: if menu_dir.is_empty() {
+                            "vault root".to_string()
+                        } else {
+                            menu_dir.clone()
+                        },
+                        item: Item::Tree(TreeAction::NewFolder),
+                    },
+                ];
+                if !target.path.is_empty() {
+                    items.push(SwitcherItem {
+                        label: "Rename / move".to_string(),
+                        detail: target.path.clone(),
+                        item: Item::Tree(TreeAction::Rename),
+                    });
+                    items.push(SwitcherItem {
+                        label: "Delete (to trash)".to_string(),
+                        detail: target.path.clone(),
+                        item: Item::Tree(TreeAction::Delete),
+                    });
+                }
+
+                let needle = query.to_lowercase();
+                items.retain(|item| {
+                    needle.is_empty() || item.label.to_lowercase().contains(&needle)
+                });
+                items
+            }
+            SwitcherMode::HistoryMenu => {
+                let Some(relative) = self.active.clone() else {
+                    return Vec::new();
+                };
+                let ids = history::list(&self.vault_root, &relative);
+                let count = ids.len();
+                let mut items = Vec::new();
+                for (index, id) in ids.iter().rev().enumerate() {
+                    let number = count - index;
+                    let detail = if index == 0 {
+                        format!("newest · {id}")
+                    } else {
+                        id.clone()
+                    };
+                    items.push(SwitcherItem {
+                        label: format!("Compare with snapshot {number}"),
+                        detail: detail.clone(),
+                        item: Item::HistoryCompare(id.clone()),
+                    });
+                    items.push(SwitcherItem {
+                        label: format!("Restore snapshot {number}"),
+                        detail,
+                        item: Item::HistoryRestore(id.clone()),
+                    });
+                }
+                if items.is_empty() {
+                    items.push(SwitcherItem {
+                        label: "No snapshots yet".to_string(),
+                        detail: "a snapshot is written whenever a note is overwritten".to_string(),
+                        item: Item::Command(CommandId::History),
+                    });
+                }
+                items
+            }
             SwitcherMode::VersionMenu => {
                 let Some(relative) = self.active.clone() else {
                     return Vec::new();
@@ -1252,8 +1870,26 @@ impl DragonGlassApp {
                     "secondary+e",
                     CommandId::ToggleReading,
                 ),
+                command_item(
+                    "Find and replace",
+                    "secondary-alt+f",
+                    CommandId::FindReplace,
+                ),
+                command_item("Toggle Vim mode", "secondary-alt+v", CommandId::ToggleVim),
+                command_item(
+                    "Fold/unfold heading",
+                    "secondary-shift+[",
+                    CommandId::ToggleFold,
+                ),
                 command_item("Save", "secondary+s", CommandId::Save),
                 command_item("Toggle theme", "secondary+shift+l", CommandId::ToggleTheme),
+                command_item("Settings", "secondary-,", CommandId::Settings),
+                command_item("New note", "", CommandId::NewNote),
+                command_item("New folder", "", CommandId::NewFolder),
+                command_item("Rename current note", "", CommandId::RenameNote),
+                command_item("Delete current note", "", CommandId::DeleteNote),
+                command_item("Save note as", "", CommandId::SaveAs),
+                command_item("File recovery", "", CommandId::History),
                 command_item("Check for updates", "", CommandId::CheckUpdates),
                 command_item("Graph view", "secondary+shift+g", CommandId::OpenGraph),
                 command_item(
@@ -1350,15 +1986,38 @@ impl DragonGlassApp {
 
     fn close_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.switcher = None;
-        window.focus(&self.editor.focus_handle(cx));
+        // A cancelled dialog must not leave its target behind for the next one.
+        self.pending_template = None;
+        self.pending_dir = None;
+        self.pending_path = None;
+        self.pending_save_as = false;
+        self.pending_setting = None;
+        self.pending_shared = None;
+        if self.show_settings {
+            window.focus(&self.settings_focus);
+        } else {
+            window.focus(&self.editor.focus_handle(cx));
+        }
         cx.notify();
     }
 
+    /// Drop the target of any half-finished dialog before opening a general panel.
+    fn clear_pending_inputs(&mut self) {
+        self.pending_template = None;
+        self.pending_dir = None;
+        self.pending_path = None;
+        self.pending_save_as = false;
+        self.pending_setting = None;
+        self.pending_shared = None;
+    }
+
     fn open_switcher(&mut self, _: &OpenSwitcher, window: &mut Window, cx: &mut Context<Self>) {
+        self.clear_pending_inputs();
         self.open_panel(SwitcherMode::QuickSwitch, window, cx);
     }
 
     fn open_search(&mut self, _: &OpenSearch, window: &mut Window, cx: &mut Context<Self>) {
+        self.clear_pending_inputs();
         self.open_panel(SwitcherMode::Search, window, cx);
     }
 
@@ -1368,7 +2027,24 @@ impl DragonGlassApp {
     }
 
     fn open_commands(&mut self, _: &OpenCommands, window: &mut Window, cx: &mut Context<Self>) {
+        self.clear_pending_inputs();
         self.open_panel(SwitcherMode::CommandsMenu, window, cx);
+    }
+
+    fn open_settings_action(
+        &mut self,
+        _: &OpenSettings,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.clear_pending_inputs();
+        self.switcher = None;
+        self.show_settings = true;
+        self.show_graph = false;
+        self.show_query = false;
+        self.show_diff = false;
+        window.focus(&self.settings_focus);
+        cx.notify();
     }
 
     fn save_workspace(&mut self, name: &str, cx: &mut Context<Self>) {
@@ -1810,7 +2486,15 @@ impl DragonGlassApp {
 
     /// The centre pane: the graph, the query table, a diff, or the editor (optionally with
     /// a preview pane beside it).
-    fn center_view(&self, theme: Theme, preview: Option<AnyElement>) -> AnyElement {
+    fn center_view(
+        &self,
+        theme: Theme,
+        preview: Option<AnyElement>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        if self.show_settings {
+            return self.settings_view(theme, cx);
+        }
         if self.show_diff {
             return diff_view(
                 self.diff_title.clone(),
@@ -1873,10 +2557,94 @@ impl DragonGlassApp {
         }
     }
 
+    /// A bar offered when the window is closed with unsaved notes.
+    fn quit_prompt_bar(&self, theme: Theme, cx: &mut Context<Self>) -> AnyElement {
+        let save = cx.entity();
+        let discard = cx.entity();
+        let cancel = cx.entity();
+
+        let button = |label: &str,
+                      color: gpui::Hsla,
+                      id: &str,
+                      entity: Entity<DragonGlassApp>,
+                      action: fn(
+            &mut DragonGlassApp,
+            &mut Window,
+            &mut Context<DragonGlassApp>,
+        )| {
+            div()
+                .id(ElementId::Name(id.to_string().into()))
+                .px_3()
+                .py_1()
+                .rounded_md()
+                .cursor_pointer()
+                .bg(color)
+                .text_color(theme.accent_text)
+                .hover(move |style| style.opacity(0.85))
+                .child(label.to_string())
+                .on_mouse_down(MouseButton::Left, move |_event, window, cx| {
+                    entity.update(cx, |app, cx| action(app, window, cx));
+                })
+        };
+
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_3()
+            .px_4()
+            .py_2()
+            .bg(theme.panel_alt)
+            .border_b_1()
+            .border_color(theme.warn)
+            .text_sm()
+            .text_color(theme.text)
+            .child(
+                div()
+                    .flex_1()
+                    .text_color(theme.warn)
+                    .child("This window has unsaved notes."),
+            )
+            .child(button(
+                "Save and quit",
+                theme.accent,
+                "quit-save",
+                save,
+                Self::save_and_quit,
+            ))
+            .child(button(
+                "Quit without saving",
+                theme.chip,
+                "quit-discard",
+                discard,
+                Self::discard_and_quit,
+            ))
+            .child(button(
+                "Cancel",
+                theme.chip,
+                "quit-cancel",
+                cancel,
+                |app, _window, cx| app.cancel_quit(cx),
+            ))
+            .into_any_element()
+    }
+
     /// Escape closes whatever is on top: the panel, then the query view, then the graph.
     fn close_overlay(&mut self, _: &CloseOverlay, window: &mut Window, cx: &mut Context<Self>) {
+        if self.quit_prompt {
+            self.cancel_quit(cx);
+            return;
+        }
+
         if self.switcher.is_some() {
             self.close_panel(window, cx);
+            return;
+        }
+
+        if self.show_settings {
+            self.show_settings = false;
+            window.focus(&self.editor.focus_handle(cx));
+            cx.notify();
             return;
         }
 
@@ -1905,7 +2673,14 @@ impl DragonGlassApp {
             self.show_relations = false;
             window.focus(&self.editor.focus_handle(cx));
             cx.notify();
+            return;
         }
+
+        self.editor.update(cx, |editor, cx| {
+            if editor.handle_escape() {
+                cx.notify();
+            }
+        });
     }
 
     fn new_window(&mut self, _: &NewWindow, window: &mut Window, cx: &mut Context<Self>) {
@@ -1933,9 +2708,14 @@ impl DragonGlassApp {
     /// Open another window on the same vault, with its own editor and panes.
     fn open_new_window(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         let editor = cx.new(Editor::new);
+        let notes = (*self.note_suggestions).clone();
+        let tags = (*self.tag_suggestions).clone();
         editor.update(cx, |editor, _cx| {
             editor.set_vault_root(&self.vault_root);
             editor.set_attachments_folder(&self.config.attachments_folder);
+            editor.set_vim_enabled(self.config.vim_mode);
+            editor.set_font_size(px(self.config.font_size as f32));
+            editor.set_suggestions(notes, tags);
             if let Some(active) = &self.active {
                 let _ = editor.load(&self.vault_root.join(active));
             }
@@ -2319,69 +3099,88 @@ impl DragonGlassApp {
         };
 
         let parent_for_close = cx.entity().downgrade();
-        let sibling = cx.new(|cx| DragonGlassApp {
-            editor: editor.clone(),
-            tabs,
-            active_tab,
-            split_tabs: Vec::new(),
-            split_axis: SplitAxis::Horizontal,
-            minimal,
-            close_requested: false,
-            dragging: None,
-            cache_epoch: 1,
-            vault_root: self.vault_root.clone(),
-            tree: self.tree.clone(),
-            file_rows: self.file_rows.clone(),
-            note_refs: self.note_refs.clone(),
-            note_index: self.note_index.clone(),
-            properties: Vec::new(),
-            headings: Rc::new(Vec::new()),
-            headings_version: (u64::MAX, u64::MAX),
-            preview_content: ReadingCache::new(),
-            bookmarks: self.bookmarks.clone(),
-            theme: self.theme,
-            active,
-            vault_path: self.vault_path.clone(),
-            notes: self.notes,
-            links: self.links,
-            git_status: self.git_status.clone(),
-            status_message: None,
-            switcher: None,
-            switcher_focus: cx.focus_handle(),
-            focus_handle: cx.focus_handle(),
-            conflict: false,
-            watcher: None,
-            update_source: self.update_source.clone(),
-            update_available: self.update_available.clone(),
-            full_graph: self.full_graph.clone(),
-            graph_view: None,
-            show_graph: false,
-            relations: self.relations.clone(),
-            show_relations: self.show_relations && !minimal,
-            sidebar_width: self.sidebar_width,
-            outline_width: self.outline_width,
-            relations_width: self.relations_width,
-            resize: None,
-            show_diff: false,
-            diff_title: String::new(),
-            diff_summary: String::new(),
-            diff_rows: Rc::new(Vec::new()),
-            review_issues: Vec::new(),
-            pending_shared: None,
-            pending_template: None,
-            stats: self.stats,
-            stats_version: (u64::MAX, u64::MAX),
-            query_results: Rc::new(Vec::new()),
-            show_query: false,
-            split_preview: self.split_preview && !minimal,
-            plugins: self.plugins.clone(),
-            plugin_commands: self.plugin_commands.clone(),
-            workspaces: self.workspaces.clone(),
-            user_themes: self.user_themes.clone(),
-            bindings: self.bindings.clone(),
-            base_theme: self.base_theme,
-            snippet_overrides: self.snippet_overrides.clone(),
-            config: self.config.clone(),
+        let sibling = cx.new(|cx| {
+            let app = DragonGlassApp {
+                editor: editor.clone(),
+                tabs,
+                active_tab,
+                split_tabs: Vec::new(),
+                split_axis: SplitAxis::Horizontal,
+                minimal,
+                close_requested: false,
+                dragging: None,
+                cache_epoch: 1,
+                vault_root: self.vault_root.clone(),
+                tree: self.tree.clone(),
+                file_rows: self.file_rows.clone(),
+                collapsed_dirs: self.collapsed_dirs.clone(),
+                collapsed_outline: HashSet::new(),
+                note_refs: self.note_refs.clone(),
+                note_index: self.note_index.clone(),
+                note_suggestions: self.note_suggestions.clone(),
+                tag_suggestions: self.tag_suggestions.clone(),
+                properties: Vec::new(),
+                headings: Rc::new(Vec::new()),
+                headings_version: (u64::MAX, u64::MAX),
+                preview_content: ReadingCache::new(),
+                bookmarks: self.bookmarks.clone(),
+                theme: self.theme,
+                active,
+                vault_path: self.vault_path.clone(),
+                notes: self.notes,
+                links: self.links,
+                git_status: self.git_status.clone(),
+                status_message: None,
+                switcher: None,
+                switcher_focus: cx.focus_handle(),
+                focus_handle: cx.focus_handle(),
+                quit_prompt: false,
+                // Popped-out windows hand their tabs back to the parent on close; the parent
+                // owns the save prompt, so this window can close immediately.
+                allow_close: true,
+                show_settings: false,
+                pending_setting: None,
+                settings_focus: cx.focus_handle(),
+                tree_menu: None,
+                pending_dir: None,
+                pending_path: None,
+                pending_save_as: false,
+                conflict: false,
+                watcher: None,
+                update_source: self.update_source.clone(),
+                update_available: self.update_available.clone(),
+                full_graph: self.full_graph.clone(),
+                graph_view: None,
+                show_graph: false,
+                relations: self.relations.clone(),
+                show_relations: self.show_relations && !minimal,
+                sidebar_width: self.sidebar_width,
+                outline_width: self.outline_width,
+                relations_width: self.relations_width,
+                resize: None,
+                show_diff: false,
+                diff_title: String::new(),
+                diff_summary: String::new(),
+                diff_rows: Rc::new(Vec::new()),
+                review_issues: Vec::new(),
+                pending_shared: None,
+                pending_template: None,
+                stats: self.stats,
+                stats_version: (u64::MAX, u64::MAX),
+                query_results: Rc::new(Vec::new()),
+                show_query: false,
+                split_preview: self.split_preview && !minimal,
+                plugins: self.plugins.clone(),
+                plugin_commands: self.plugin_commands.clone(),
+                workspaces: self.workspaces.clone(),
+                user_themes: self.user_themes.clone(),
+                bindings: self.bindings.clone(),
+                base_theme: self.base_theme,
+                snippet_overrides: self.snippet_overrides.clone(),
+                config: self.config.clone(),
+            };
+            app.install_quit_saver(cx);
+            app
         });
 
         let graph_view = cx.new(|cx| GraphView::new(sibling.downgrade(), cx));
@@ -2414,7 +3213,7 @@ impl DragonGlassApp {
                 }
                 if !tabs.is_empty() {
                     if let Some(target) = target.upgrade() {
-                        let _ = target.update(cx, |app, cx| app.adopt_tabs(tabs, cx));
+                        target.update(cx, |app, cx| app.adopt_tabs(tabs, cx));
                     }
                 }
                 true
@@ -2521,11 +3320,20 @@ impl DragonGlassApp {
 
     /// The theme with snippets layered on, if enabled.
     fn effective_theme(&self) -> Theme {
-        if self.config.snippets {
+        let mut theme = if self.config.snippets {
             self.base_theme.with_overrides(&self.snippet_overrides)
         } else {
             self.base_theme
+        };
+        if let Some(accent) = self
+            .config
+            .accent
+            .as_deref()
+            .and_then(crate::theme::parse_hex)
+        {
+            theme = theme.with_accent(accent);
         }
+        theme
     }
 
     /// Recompute the effective theme and push it to every view.
@@ -2557,6 +3365,422 @@ impl DragonGlassApp {
         cx.notify();
     }
 
+    fn toggle_vim(&mut self, cx: &mut Context<Self>) {
+        self.config.vim_mode = !self.config.vim_mode;
+        let enabled = self.config.vim_mode;
+        for tab in &self.tabs {
+            tab.editor
+                .update(cx, |editor, _| editor.set_vim_enabled(enabled));
+        }
+        let message = match config::save(&self.vault_root, &self.config) {
+            Ok(()) => format!("Vim mode: {}", if enabled { "on" } else { "off" }),
+            Err(error) => format!(
+                "Vim mode: {} (not saved: {error})",
+                if enabled { "on" } else { "off" }
+            ),
+        };
+        self.status_message = Some(message);
+        cx.notify();
+    }
+
+    /// Open the input panel for one setting, seeded with its current value.
+    fn open_setting(&mut self, key: SettingKey, window: &mut Window, cx: &mut Context<Self>) {
+        let value = match key {
+            SettingKey::FontSize => self.config.font_size.to_string(),
+            SettingKey::Accent => self.config.accent.clone().unwrap_or_default(),
+            SettingKey::AttachmentsFolder => self.config.attachments_folder.clone(),
+            SettingKey::TemplatesFolder => self.config.templates_folder.clone(),
+            SettingKey::DailyFolder => self.config.daily_folder.clone(),
+            SettingKey::WeeklyFolder => self.config.weekly_folder.clone(),
+            SettingKey::MonthlyFolder => self.config.monthly_folder.clone(),
+        };
+        self.pending_setting = Some(key);
+        self.open_panel(SwitcherMode::SettingInput, window, cx);
+        if let Some(panel) = self.switcher.as_mut() {
+            panel.query = value;
+        }
+        cx.notify();
+    }
+
+    fn apply_setting(&mut self, key: SettingKey, value: &str, cx: &mut Context<Self>) {
+        match key {
+            SettingKey::FontSize => match value.trim().parse::<u16>() {
+                Ok(size) => {
+                    let size = size.clamp(9, 32);
+                    self.config.font_size = size;
+                    self.apply_font_size(cx);
+                }
+                Err(_) => {
+                    self.status_message =
+                        Some("font size must be a number from 9 to 32".to_string());
+                    cx.notify();
+                    return;
+                }
+            },
+            SettingKey::Accent => {
+                let value = value.trim().trim_start_matches('#');
+                self.config.accent = if value.is_empty() {
+                    None
+                } else if crate::theme::parse_hex(value).is_some() {
+                    Some(value.to_string())
+                } else {
+                    self.status_message =
+                        Some("accent must be a hex colour such as 4ea1ff".to_string());
+                    cx.notify();
+                    return;
+                };
+                self.refresh_theme(cx);
+            }
+            SettingKey::AttachmentsFolder => {
+                let folder = value.trim();
+                if !folder.is_empty() {
+                    self.config.attachments_folder = folder.to_string();
+                    for tab in &self.tabs {
+                        tab.editor.update(cx, |editor, _| {
+                            editor.set_attachments_folder(folder);
+                        });
+                    }
+                }
+            }
+            SettingKey::TemplatesFolder => {
+                if !value.trim().is_empty() {
+                    self.config.templates_folder = value.trim().to_string();
+                }
+            }
+            SettingKey::DailyFolder => {
+                if !value.trim().is_empty() {
+                    self.config.daily_folder = value.trim().to_string();
+                }
+            }
+            SettingKey::WeeklyFolder => {
+                if !value.trim().is_empty() {
+                    self.config.weekly_folder = value.trim().to_string();
+                }
+            }
+            SettingKey::MonthlyFolder => {
+                if !value.trim().is_empty() {
+                    self.config.monthly_folder = value.trim().to_string();
+                }
+            }
+        }
+
+        self.status_message = Some(match config::save(&self.vault_root, &self.config) {
+            Ok(()) => format!("{}: saved", key.label()),
+            Err(error) => format!("{}: not saved ({error})", key.label()),
+        });
+        cx.notify();
+    }
+
+    fn apply_font_size(&mut self, cx: &mut Context<Self>) {
+        let size = px(self.config.font_size as f32);
+        for tab in &self.tabs {
+            tab.editor
+                .update(cx, |editor, _| editor.set_font_size(size));
+        }
+        self.editor.update(cx, |_, cx| cx.notify());
+        cx.notify();
+    }
+
+    /// Dispatch a click on the settings page.
+    fn run_setting_action(&mut self, action: &str, window: &mut Window, cx: &mut Context<Self>) {
+        match action {
+            "theme" => self.toggle_theme_now(cx),
+            "vim" => self.toggle_vim(cx),
+            "snippets" => self.toggle_snippets(cx),
+            "font" => self.open_setting(SettingKey::FontSize, window, cx),
+            "accent" => self.open_setting(SettingKey::Accent, window, cx),
+            "attachments" => self.open_setting(SettingKey::AttachmentsFolder, window, cx),
+            "templates" => self.open_setting(SettingKey::TemplatesFolder, window, cx),
+            "daily" => self.open_setting(SettingKey::DailyFolder, window, cx),
+            "weekly" => self.open_setting(SettingKey::WeeklyFolder, window, cx),
+            "monthly" => self.open_setting(SettingKey::MonthlyFolder, window, cx),
+            "save-all" => {
+                self.status_message = Some(match self.save_all(cx) {
+                    Ok(saved) => format!("saved {saved} note(s)"),
+                    Err(error) => format!("could not save: {error}"),
+                });
+                cx.notify();
+            }
+            "updates" => {
+                self.check_updates();
+                cx.notify();
+            }
+            "vault" => {
+                self.show_settings = false;
+                vault_picker::VaultPicker::open(cx, None, Rc::new(open_vault_in_new_process));
+            }
+            "close" => {
+                self.show_settings = false;
+                window.focus(&self.editor.focus_handle(cx));
+                cx.notify();
+            }
+            _ => {}
+        }
+    }
+
+    /// The settings page, shown in place of the editor while `show_settings` is set.
+    fn settings_view(&self, theme: Theme, cx: &mut Context<Self>) -> AnyElement {
+        let entity = cx.entity();
+        let row = move |id: &str,
+                        label: &str,
+                        value: String,
+                        action: &'static str,
+                        theme: Theme|
+              -> AnyElement {
+            let entity = entity.clone();
+            div()
+                .id(ElementId::Name(id.to_string().into()))
+                .flex()
+                .flex_row()
+                .items_center()
+                .justify_between()
+                .h(px(36.0))
+                .px_3()
+                .rounded_md()
+                .cursor_pointer()
+                .text_sm()
+                .text_color(theme.text)
+                .hover(move |style| style.bg(theme.hover))
+                .child(label.to_string())
+                .child(div().text_color(theme.muted).child(if value.is_empty() {
+                    "not set".to_string()
+                } else {
+                    value
+                }))
+                .on_mouse_down(MouseButton::Left, move |_event, window, cx| {
+                    entity.update(cx, |this, cx| this.run_setting_action(action, window, cx));
+                })
+                .into_any_element()
+        };
+
+        let heading = |text: &str, theme: Theme| -> AnyElement {
+            div()
+                .pt_4()
+                .pb_1()
+                .text_xs()
+                .text_color(theme.muted)
+                .child(text.to_string())
+                .into_any_element()
+        };
+
+        // Read-only reference rows: the editor no longer prints shortcut hints on screen.
+        let info = |label: &str, value: &str, theme: Theme| -> AnyElement {
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .justify_between()
+                .h(px(28.0))
+                .px_3()
+                .text_sm()
+                .text_color(theme.text)
+                .child(label.to_string())
+                .child(div().text_color(theme.muted).child(value.to_string()))
+                .into_any_element()
+        };
+
+        let accent = self
+            .config
+            .accent
+            .clone()
+            .unwrap_or_else(|| "theme default".to_string());
+        let user_themes = if self.user_themes.is_empty() {
+            "none installed".to_string()
+        } else {
+            self.user_themes
+                .iter()
+                .map(|(name, _)| name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+
+        div()
+            .id("settings-page")
+            .track_focus(&self.settings_focus)
+            .size_full()
+            .overflow_y_scroll()
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .max_w(px(720.0))
+                    .mx_auto()
+                    .px_6()
+                    .py_6()
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .child(div().text_xl().text_color(theme.text).child("Settings"))
+                            .child(
+                                div()
+                                    .id("settings-close")
+                                    .px_3()
+                                    .py_1()
+                                    .rounded_md()
+                                    .cursor_pointer()
+                                    .bg(theme.chip)
+                                    .text_sm()
+                                    .text_color(theme.muted)
+                                    .hover(move |style| style.bg(theme.hover))
+                                    .child("Close (Esc)")
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(|this, _event, window, cx| {
+                                            this.run_setting_action("close", window, cx);
+                                        }),
+                                    ),
+                            ),
+                    )
+                    .child(heading("Appearance", theme))
+                    .child(row(
+                        "setting-theme",
+                        "Theme",
+                        self.theme.name().to_string(),
+                        "theme",
+                        theme,
+                    ))
+                    .child(row(
+                        "setting-accent",
+                        "Accent colour",
+                        accent,
+                        "accent",
+                        theme,
+                    ))
+                    .child(row(
+                        "setting-font",
+                        "Editor font size",
+                        format!("{} px", self.config.font_size),
+                        "font",
+                        theme,
+                    ))
+                    .child(row(
+                        "setting-themes",
+                        "Installed themes",
+                        user_themes,
+                        "none",
+                        theme,
+                    ))
+                    .child(heading("Editor", theme))
+                    .child(row(
+                        "setting-vim",
+                        "Vim mode",
+                        if self.config.vim_mode { "on" } else { "off" }.to_string(),
+                        "vim",
+                        theme,
+                    ))
+                    .child(row(
+                        "setting-snippets",
+                        "Snippets",
+                        if self.config.snippets { "on" } else { "off" }.to_string(),
+                        "snippets",
+                        theme,
+                    ))
+                    .child(heading("Editor shortcuts", theme))
+                    .child(info("Bold", &platform::label("secondary-b"), theme))
+                    .child(info("Italic", &platform::label("secondary-i"), theme))
+                    .child(info(
+                        "Strikethrough",
+                        &platform::label("secondary-shift-x"),
+                        theme,
+                    ))
+                    .child(info(
+                        "Highlight",
+                        &platform::label("secondary-shift-h"),
+                        theme,
+                    ))
+                    .child(info(
+                        "Inline code",
+                        &platform::label("secondary-shift-c"),
+                        theme,
+                    ))
+                    .child(info(
+                        "Wikilink picker",
+                        &platform::label("secondary-k"),
+                        theme,
+                    ))
+                    .child(info("Link selected text", "type [[", theme))
+                    .child(info("Autocomplete", "↑ / ↓ then Enter", theme))
+                    .child(heading("Files", theme))
+                    .child(row(
+                        "setting-attachments",
+                        "Attachments folder",
+                        self.config.attachments_folder.clone(),
+                        "attachments",
+                        theme,
+                    ))
+                    .child(row(
+                        "setting-templates",
+                        "Templates folder",
+                        self.config.templates_folder.clone(),
+                        "templates",
+                        theme,
+                    ))
+                    .child(row(
+                        "setting-daily",
+                        "Daily notes folder",
+                        self.config.daily_folder.clone(),
+                        "daily",
+                        theme,
+                    ))
+                    .child(row(
+                        "setting-weekly",
+                        "Weekly notes folder",
+                        self.config.weekly_folder.clone(),
+                        "weekly",
+                        theme,
+                    ))
+                    .child(row(
+                        "setting-monthly",
+                        "Monthly notes folder",
+                        self.config.monthly_folder.clone(),
+                        "monthly",
+                        theme,
+                    ))
+                    .child(heading("Data", theme))
+                    .child(row(
+                        "setting-save-all",
+                        "Save all open notes",
+                        format!("{} open", self.tabs.len()),
+                        "save-all",
+                        theme,
+                    ))
+                    .child(row(
+                        "setting-updates",
+                        "Updates",
+                        self.update_available
+                            .clone()
+                            .unwrap_or_else(|| "check for updates".to_string()),
+                        "updates",
+                        theme,
+                    ))
+                    .child(row(
+                        "setting-vault",
+                        "Open another vault",
+                        self.vault_path.clone(),
+                        "vault",
+                        theme,
+                    ))
+                    .child(row(
+                        "setting-git",
+                        "Git",
+                        git_label(&self.git_status),
+                        "none",
+                        theme,
+                    ))
+                    .child(row(
+                        "setting-version",
+                        "Version",
+                        env!("CARGO_PKG_VERSION").to_string(),
+                        "none",
+                        theme,
+                    )),
+            )
+            .into_any_element()
+    }
+
     fn apply_user_theme(&mut self, index: usize, cx: &mut Context<Self>) {
         let Some((name, theme)) = self.user_themes.get(index).cloned() else {
             return;
@@ -2576,6 +3800,10 @@ impl DragonGlassApp {
     fn toggle_theme(&mut self, _: &ToggleTheme, window: &mut Window, cx: &mut Context<Self>) {
         self.toggle_theme_now(cx);
         let _ = window;
+    }
+
+    fn toggle_vim_action(&mut self, _: &ToggleVim, _window: &mut Window, cx: &mut Context<Self>) {
+        self.toggle_vim(cx);
     }
 
     fn check_updates(&mut self) {
@@ -2827,9 +4055,53 @@ impl DragonGlassApp {
                 if panel.mode == SwitcherMode::NewNoteName {
                     let name = panel.query.clone();
                     let template = self.pending_template.take();
+                    let dir = self.pending_dir.take();
+                    let save_as = self.pending_save_as;
+                    self.pending_save_as = false;
                     self.close_panel(window, cx);
-                    if let Some(template) = template {
+                    if save_as {
+                        self.save_active_as(&name, window, cx);
+                    } else if let Some(template) = template {
                         self.create_from_template(&name, &template, window, cx);
+                    } else {
+                        self.create_note_in(dir.as_deref(), &name, window, cx);
+                    }
+                    return;
+                }
+
+                if panel.mode == SwitcherMode::NewFolderName {
+                    let name = panel.query.clone();
+                    let dir = self.pending_dir.take();
+                    self.close_panel(window, cx);
+                    self.create_folder_in(dir.as_deref(), &name, cx);
+                    return;
+                }
+
+                if panel.mode == SwitcherMode::RenameInput {
+                    let to = panel.query.clone();
+                    let from = self.pending_path.take();
+                    self.close_panel(window, cx);
+                    if let Some(from) = from {
+                        self.rename_entry(&from, &to, cx);
+                    }
+                    return;
+                }
+
+                if panel.mode == SwitcherMode::DeleteConfirm {
+                    let path = self.pending_path.take();
+                    self.close_panel(window, cx);
+                    if let Some(path) = path {
+                        self.delete_entry(&path, window, cx);
+                    }
+                    return;
+                }
+
+                if panel.mode == SwitcherMode::SettingInput {
+                    let value = panel.query.clone();
+                    let key = self.pending_setting.take();
+                    self.close_panel(window, cx);
+                    if let Some(key) = key {
+                        self.apply_setting(key, &value, cx);
                     }
                     return;
                 }
@@ -2984,6 +4256,101 @@ impl DragonGlassApp {
                             window.focus(&self.editor.focus_handle(cx));
                             return;
                         }
+                        Item::HistoryCompare(id) => {
+                            let id = id.clone();
+                            self.close_panel(window, cx);
+                            self.compare_snapshot(&id, cx);
+                            return;
+                        }
+                        Item::HistoryRestore(id) => {
+                            let id = id.clone();
+                            self.close_panel(window, cx);
+                            self.restore_snapshot(&id, window, cx);
+                            return;
+                        }
+                        Item::Tree(action) => {
+                            let action = *action;
+                            let Some(target) = self.tree_menu.clone() else {
+                                self.close_panel(window, cx);
+                                return;
+                            };
+                            let menu_dir = if target.is_dir {
+                                target.path.clone()
+                            } else {
+                                target
+                                    .path
+                                    .rsplit_once('/')
+                                    .map(|(dir, _)| dir.to_string())
+                                    .unwrap_or_default()
+                            };
+
+                            match action {
+                                TreeAction::Open => {
+                                    self.close_panel(window, cx);
+                                    if target.is_dir {
+                                        self.toggle_dir(&target.path, cx);
+                                    } else {
+                                        self.open_note(&target.path, window, cx);
+                                    }
+                                    return;
+                                }
+                                TreeAction::NewNote => {
+                                    self.pending_dir = Some(menu_dir);
+                                    self.pending_template = None;
+                                    panel.mode = SwitcherMode::NewNoteName;
+                                    panel.query.clear();
+                                    panel.property_key = None;
+                                    panel.results.clear();
+                                    panel.selected = 0;
+                                    self.switcher = Some(panel);
+                                    cx.notify();
+                                    return;
+                                }
+                                TreeAction::NewFolder => {
+                                    self.pending_dir = Some(menu_dir);
+                                    panel.mode = SwitcherMode::NewFolderName;
+                                    panel.query.clear();
+                                    panel.property_key = None;
+                                    panel.results.clear();
+                                    panel.selected = 0;
+                                    self.switcher = Some(panel);
+                                    cx.notify();
+                                    return;
+                                }
+                                TreeAction::Rename => {
+                                    self.pending_path = Some(target.path.clone());
+                                    panel.mode = SwitcherMode::RenameInput;
+                                    panel.query = target.path;
+                                    panel.property_key = None;
+                                    panel.results.clear();
+                                    panel.selected = 0;
+                                    self.switcher = Some(panel);
+                                    cx.notify();
+                                    return;
+                                }
+                                TreeAction::Delete => {
+                                    if panel.mode == SwitcherMode::DeleteConfirm {
+                                        let path = target.path;
+                                        self.close_panel(window, cx);
+                                        self.delete_entry(&path, window, cx);
+                                        return;
+                                    }
+                                    self.pending_path = Some(target.path.clone());
+                                    panel.mode = SwitcherMode::DeleteConfirm;
+                                    panel.query.clear();
+                                    panel.property_key = None;
+                                    panel.results = vec![SwitcherItem {
+                                        label: format!("Delete {}", target.path),
+                                        detail: "moves to .dragon-glass/trash".to_string(),
+                                        item: Item::Tree(TreeAction::Delete),
+                                    }];
+                                    panel.selected = 0;
+                                    self.switcher = Some(panel);
+                                    cx.notify();
+                                    return;
+                                }
+                            }
+                        }
                         Item::Command(command) => {
                             let command = *command;
 
@@ -3029,6 +4396,29 @@ impl DragonGlassApp {
                                         cx.notify();
                                     });
                                     self.remember_session(cx);
+                                }
+                                CommandId::FindReplace => {
+                                    self.close_panel(window, cx);
+                                    self.editor.update(cx, |editor, cx| {
+                                        editor.open_find(true);
+                                        cx.notify();
+                                    });
+                                    window.focus(&self.editor.focus_handle(cx));
+                                    return;
+                                }
+                                CommandId::ToggleVim => {
+                                    self.toggle_vim(cx);
+                                    self.close_panel(window, cx);
+                                    return;
+                                }
+                                CommandId::ToggleFold => {
+                                    self.close_panel(window, cx);
+                                    self.editor.update(cx, |editor, cx| {
+                                        editor.toggle_fold_at_cursor();
+                                        cx.notify();
+                                    });
+                                    window.focus(&self.editor.focus_handle(cx));
+                                    return;
                                 }
                                 CommandId::Save => self.editor.update(cx, |editor, cx| {
                                     let _ = editor.save();
@@ -3307,6 +4697,119 @@ impl DragonGlassApp {
                                     panel.query.clear();
                                     panel.property_key = None;
                                     panel.results.clear();
+                                    panel.selected = 0;
+                                    self.switcher = Some(panel);
+                                    cx.notify();
+                                    return;
+                                }
+                                CommandId::Settings => {
+                                    self.close_panel(window, cx);
+                                    self.show_settings = true;
+                                    self.show_graph = false;
+                                    self.show_query = false;
+                                    self.show_diff = false;
+                                    self.status_message = Some("settings".to_string());
+                                    window.focus(&self.settings_focus);
+                                    cx.notify();
+                                    return;
+                                }
+                                CommandId::NewNote => {
+                                    let dir = self
+                                        .active
+                                        .as_deref()
+                                        .and_then(|active| active.rsplit_once('/'))
+                                        .map(|(dir, _)| dir.to_string())
+                                        .unwrap_or_default();
+                                    self.pending_dir = Some(dir);
+                                    self.pending_template = None;
+                                    panel.mode = SwitcherMode::NewNoteName;
+                                    panel.query.clear();
+                                    panel.property_key = None;
+                                    panel.results.clear();
+                                    panel.selected = 0;
+                                    self.switcher = Some(panel);
+                                    cx.notify();
+                                    return;
+                                }
+                                CommandId::NewFolder => {
+                                    let dir = self
+                                        .active
+                                        .as_deref()
+                                        .and_then(|active| active.rsplit_once('/'))
+                                        .map(|(dir, _)| dir.to_string())
+                                        .unwrap_or_default();
+                                    self.pending_dir = Some(dir);
+                                    panel.mode = SwitcherMode::NewFolderName;
+                                    panel.query.clear();
+                                    panel.property_key = None;
+                                    panel.results.clear();
+                                    panel.selected = 0;
+                                    self.switcher = Some(panel);
+                                    cx.notify();
+                                    return;
+                                }
+                                CommandId::SaveAs => {
+                                    self.pending_save_as = true;
+                                    self.pending_template = None;
+                                    panel.mode = SwitcherMode::NewNoteName;
+                                    panel.query.clear();
+                                    panel.property_key = None;
+                                    panel.results.clear();
+                                    panel.selected = 0;
+                                    self.switcher = Some(panel);
+                                    cx.notify();
+                                    return;
+                                }
+                                CommandId::RenameNote => {
+                                    let Some(relative) = self.active.clone() else {
+                                        self.close_panel(window, cx);
+                                        self.status_message =
+                                            Some("open a note before renaming".to_string());
+                                        cx.notify();
+                                        return;
+                                    };
+                                    self.pending_path = Some(relative.clone());
+                                    panel.mode = SwitcherMode::RenameInput;
+                                    panel.query = relative;
+                                    panel.property_key = None;
+                                    panel.results.clear();
+                                    panel.selected = 0;
+                                    self.switcher = Some(panel);
+                                    cx.notify();
+                                    return;
+                                }
+                                CommandId::DeleteNote => {
+                                    let Some(relative) = self.active.clone() else {
+                                        self.close_panel(window, cx);
+                                        self.status_message =
+                                            Some("open a note before deleting".to_string());
+                                        cx.notify();
+                                        return;
+                                    };
+                                    self.tree_menu = Some(TreeTarget {
+                                        path: relative.clone(),
+                                        is_dir: false,
+                                    });
+                                    self.pending_path = Some(relative.clone());
+                                    panel.mode = SwitcherMode::DeleteConfirm;
+                                    panel.query.clear();
+                                    panel.property_key = None;
+                                    panel.results = vec![SwitcherItem {
+                                        label: format!("Delete {relative}"),
+                                        detail: "moves to .dragon-glass/trash".to_string(),
+                                        item: Item::Tree(TreeAction::Delete),
+                                    }];
+                                    panel.selected = 0;
+                                    self.switcher = Some(panel);
+                                    cx.notify();
+                                    return;
+                                }
+                                CommandId::History => {
+                                    panel.mode = SwitcherMode::HistoryMenu;
+                                    panel.query.clear();
+                                    panel.property_key = None;
+                                    panel.results =
+                                        self.compute_results(SwitcherMode::HistoryMenu, "");
                                     panel.selected = 0;
                                     self.switcher = Some(panel);
                                     cx.notify();
@@ -3646,28 +5149,65 @@ struct Row {
     name: String,
     path: Option<String>,
     is_dir: bool,
+    /// A folder whose children are hidden.
+    collapsed: bool,
 }
 
-fn flatten(node: &TreeNode, depth: usize, out: &mut Vec<Row>) {
+fn flatten(node: &TreeNode, depth: usize, collapsed: &HashSet<String>, out: &mut Vec<Row>) {
     for child in &node.children {
         match child.kind {
             NodeKind::Dir => {
+                let is_collapsed = collapsed.contains(&child.path);
                 out.push(Row {
                     depth,
                     name: child.name.clone(),
-                    path: None,
+                    path: Some(child.path.clone()),
                     is_dir: true,
+                    collapsed: is_collapsed,
                 });
-                flatten(child, depth + 1, out);
+                if !is_collapsed {
+                    flatten(child, depth + 1, collapsed, out);
+                }
             }
             NodeKind::Note => out.push(Row {
                 depth,
                 name: child.name.clone(),
                 path: Some(child.path.clone()),
                 is_dir: false,
+                collapsed: false,
             }),
         }
     }
+}
+
+/// The outline headings that are currently visible, as `(index, heading)` pairs.
+///
+/// A folded heading hides the headings nested under it, up to the next heading of the
+/// same or a higher level.
+fn visible_headings(
+    headings: &[markdown::Heading],
+    collapsed: &HashSet<usize>,
+) -> Vec<(usize, markdown::Heading)> {
+    let mut visible = Vec::new();
+    let mut hide_until_level: Option<u8> = None;
+
+    for (index, heading) in headings.iter().enumerate() {
+        if let Some(level) = hide_until_level {
+            if heading.level <= level {
+                hide_until_level = None;
+            }
+        }
+        if hide_until_level.is_some() {
+            continue;
+        }
+
+        visible.push((index, heading.clone()));
+        if collapsed.contains(&index) {
+            hide_until_level = Some(heading.level);
+        }
+    }
+
+    visible
 }
 
 fn git_label(status: &Option<git::Status>) -> String {
@@ -3722,6 +5262,7 @@ impl Render for DragonGlassApp {
         // A preview pane beside the editor, sharing the same document text.
         let preview: Option<AnyElement> = if self.split_preview
             && self.split_tabs.is_empty()
+            && !self.show_settings
             && !self.show_graph
             && !self.show_diff
             && !self.show_query
@@ -3745,6 +5286,16 @@ impl Render for DragonGlassApp {
             };
 
             let opener = self.link_opener(cx);
+            let fold: reading::FoldToggle = {
+                let weak = cx.entity().downgrade();
+                Rc::new(move |index: usize, window: &mut Window, cx: &mut App| {
+                    let _ = weak.update(cx, |app, cx| {
+                        app.preview_content.toggle_fold(index);
+                        cx.notify();
+                    });
+                    window.refresh();
+                })
+            };
             Some(
                 div()
                     .flex_1()
@@ -3756,6 +5307,7 @@ impl Render for DragonGlassApp {
                         theme,
                         template,
                         Some(opener),
+                        Some(fold),
                         cx,
                     ))
                     .into_any_element(),
@@ -3792,6 +5344,7 @@ impl Render for DragonGlassApp {
                         .id(ElementId::Name(format!("row-{i}").into()))
                         .flex()
                         .items_center()
+                        .gap_1()
                         .h(px(24.0))
                         .w_full()
                         .min_w(px(0.0))
@@ -3801,26 +5354,75 @@ impl Render for DragonGlassApp {
                         .pr_2()
                         .text_sm()
                         .cursor_pointer()
-                        .text_color(color)
-                        .child(row.name.clone());
+                        .text_color(color);
+
+                    if row.is_dir {
+                        base = base
+                            .font_weight(gpui::FontWeight::BOLD)
+                            .child(
+                                div()
+                                    .w(px(12.0))
+                                    .flex_shrink_0()
+                                    .text_color(theme.muted)
+                                    .child(if row.collapsed {
+                                        "\u{25B8}"
+                                    } else {
+                                        "\u{25BE}"
+                                    }),
+                            )
+                            .child(row.name.clone());
+                    } else {
+                        base = base.child(row.name.clone());
+                    }
 
                     if is_active {
                         base = base.bg(theme.accent);
                     }
 
-                    match &row.path {
-                        Some(path) => {
-                            let path = path.clone();
-                            let me = me_for_list.clone();
-                            base.hover(move |style| style.bg(theme.hover))
-                                .on_mouse_down(MouseButton::Left, move |_ev, window, cx| {
-                                    me.update(cx, |this, cx| {
-                                        this.open_note(&path, window, cx);
-                                    });
-                                })
-                                .into_any_element()
+                    if row.is_dir {
+                        let path = row.path.clone().unwrap_or_default();
+                        let menu_path = path.clone();
+                        let me = me_for_list.clone();
+                        let menu_me = me_for_list.clone();
+                        base.hover(move |style| style.bg(theme.hover))
+                            .on_mouse_down(MouseButton::Left, move |_ev, _window, cx| {
+                                me.update(cx, |this, cx| this.toggle_dir(&path, cx));
+                            })
+                            .on_mouse_down(MouseButton::Right, move |_ev, window, cx| {
+                                cx.stop_propagation();
+                                menu_me.update(cx, |this, cx| {
+                                    this.open_tree_menu(menu_path.clone(), true, window, cx);
+                                });
+                            })
+                            .into_any_element()
+                    } else {
+                        match &row.path {
+                            Some(path) => {
+                                let path = path.clone();
+                                let menu_path = path.clone();
+                                let me = me_for_list.clone();
+                                let menu_me = me_for_list.clone();
+                                base.hover(move |style| style.bg(theme.hover))
+                                    .on_mouse_down(MouseButton::Left, move |_ev, window, cx| {
+                                        me.update(cx, |this, cx| {
+                                            this.open_note(&path, window, cx);
+                                        });
+                                    })
+                                    .on_mouse_down(MouseButton::Right, move |_ev, window, cx| {
+                                        cx.stop_propagation();
+                                        menu_me.update(cx, |this, cx| {
+                                            this.open_tree_menu(
+                                                menu_path.clone(),
+                                                false,
+                                                window,
+                                                cx,
+                                            );
+                                        });
+                                    })
+                                    .into_any_element()
+                            }
+                            None => base.into_any_element(),
                         }
-                        None => base.font_weight(gpui::FontWeight::BOLD).into_any_element(),
                     }
                 })
                 .collect::<Vec<AnyElement>>()
@@ -3903,7 +5505,31 @@ impl Render for DragonGlassApp {
                     .pb_1()
                     .text_xs()
                     .text_color(theme.muted)
-                    .child("FILES")
+                    .child(
+                        div().flex().items_center().gap_2().child("FILES").child(
+                            div()
+                                .id("new-note-button")
+                                .px_1()
+                                .rounded_sm()
+                                .cursor_pointer()
+                                .hover(move |style| style.bg(theme.hover).text_color(theme.text))
+                                .child("+")
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _ev, window, cx| {
+                                        let dir = this
+                                            .active
+                                            .as_deref()
+                                            .and_then(|active| active.rsplit_once('/'))
+                                            .map(|(dir, _)| dir.to_string())
+                                            .unwrap_or_default();
+                                        this.pending_dir = Some(dir);
+                                        this.pending_template = None;
+                                        this.open_panel(SwitcherMode::NewNoteName, window, cx);
+                                    }),
+                                ),
+                        ),
+                    )
                     .child(format!("{}", self.notes)),
             )
             .child(file_list);
@@ -3914,19 +5540,63 @@ impl Render for DragonGlassApp {
             None
         } else {
             let me = cx.entity();
-            let heading_count = headings.len();
-            let rows = uniform_list("outline-list", heading_count, move |range, _window, _cx| {
+            let outline_rows: Vec<(usize, markdown::Heading, bool, bool)> =
+                visible_headings(&headings, &self.collapsed_outline)
+                    .into_iter()
+                    .map(|(index, heading)| {
+                        let foldable = headings
+                            .get(index + 1)
+                            .is_some_and(|next| next.level > heading.level);
+                        let collapsed = self.collapsed_outline.contains(&index);
+                        (index, heading, foldable, collapsed)
+                    })
+                    .collect();
+            let row_count = outline_rows.len();
+            let rows = uniform_list("outline-list", row_count, move |range, _window, _cx| {
                 range
-                    .filter_map(|i| headings.get(i).map(|heading| (i, heading)))
-                    .map(|(i, heading)| {
+                    .filter_map(|i| outline_rows.get(i))
+                    .map(|(index, heading, foldable, collapsed)| {
+                        let index = *index;
+                        let foldable = *foldable;
+                        let collapsed = *collapsed;
                         let indent = px(8.0 + heading.level.saturating_sub(1) as f32 * 10.0);
                         let line = heading.line;
                         let heading_text = heading.text.clone();
                         let me = me.clone();
-                        div()
-                            .id(ElementId::Name(format!("outline-{i}").into()))
+
+                        let mut chevron = div()
+                            .id(ElementId::Name(format!("outline-fold-{index}").into()))
                             .flex()
                             .items_center()
+                            .justify_center()
+                            .w(px(14.0))
+                            .flex_shrink_0()
+                            .text_color(theme.muted)
+                            .child(if foldable {
+                                if collapsed {
+                                    "\u{25B8}"
+                                } else {
+                                    "\u{25BE}"
+                                }
+                            } else {
+                                ""
+                            });
+                        if foldable {
+                            let toggle = me.clone();
+                            chevron = chevron
+                                .cursor_pointer()
+                                .hover(move |style| style.text_color(theme.text))
+                                .on_mouse_down(MouseButton::Left, move |_ev, _window, cx| {
+                                    cx.stop_propagation();
+                                    toggle.update(cx, |this, cx| this.toggle_outline(index, cx));
+                                });
+                        }
+
+                        div()
+                            .id(ElementId::Name(format!("outline-{index}").into()))
+                            .flex()
+                            .items_center()
+                            .gap_1()
                             .h(px(24.0))
                             .mx_1()
                             .rounded_sm()
@@ -3936,14 +5606,21 @@ impl Render for DragonGlassApp {
                             .cursor_pointer()
                             .text_color(theme.text)
                             .hover(move |style| style.bg(theme.hover))
-                            .child(heading.text.clone())
+                            .child(chevron)
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w(px(0.0))
+                                    .overflow_hidden()
+                                    .child(heading.text.clone()),
+                            )
                             .on_mouse_down(MouseButton::Left, move |_ev, window, cx| {
                                 me.update(cx, |this, cx| {
                                     this.editor.update(cx, |editor, cx| {
                                         editor.jump_to_heading(
                                             line.saturating_sub(1),
                                             &heading_text,
-                                            i,
+                                            index,
                                         );
                                         cx.notify();
                                     });
@@ -4185,9 +5862,21 @@ impl Render for DragonGlassApp {
                 SwitcherMode::SharedMenu => "shared block:",
                 SwitcherMode::SharedEditMenu => "edit shared block:",
                 SwitcherMode::ReviewMenu => "review:",
-                SwitcherMode::NewNoteName => "note name:",
+                SwitcherMode::NewNoteName => {
+                    if self.pending_save_as {
+                        "save as:"
+                    } else {
+                        "note name:"
+                    }
+                }
                 SwitcherMode::SharedName => "shared block name:",
                 SwitcherMode::RelationInput => "related note:",
+                SwitcherMode::NewFolderName => "folder name:",
+                SwitcherMode::RenameInput => "rename to:",
+                SwitcherMode::DeleteConfirm => "delete:",
+                SwitcherMode::FileMenu => "file:",
+                SwitcherMode::HistoryMenu => "history:",
+                SwitcherMode::SettingInput => "setting:",
             };
             let rows = panel.results.iter().enumerate().map(|(i, item)| {
                 let mut row = div()
@@ -4233,6 +5922,8 @@ impl Render for DragonGlassApp {
                 .into_any_element()
         });
 
+        let quit_bar = self.quit_prompt.then(|| self.quit_prompt_bar(theme, cx));
+
         let tab_host = cx.entity();
         let drop_overlay = if cx.has_active_drag() {
             Some(self.tab_drop_overlay(theme, cx))
@@ -4245,7 +5936,7 @@ impl Render for DragonGlassApp {
             // this pane claim the whole row and push the outline off-screen.
             .min_w(px(0.0))
             .relative()
-            .child(self.center_view(theme, preview))
+            .child(self.center_view(theme, preview, cx))
             .children(drop_overlay);
 
         if self.minimal {
@@ -4276,6 +5967,7 @@ impl Render for DragonGlassApp {
                 .on_action(cx.listener(Self::toggle_bookmark))
                 .on_action(cx.listener(Self::open_commands))
                 .on_action(cx.listener(Self::toggle_theme))
+                .on_action(cx.listener(Self::toggle_vim_action))
                 .on_action(cx.listener(Self::close_overlay))
                 .on_action(cx.listener(Self::new_window))
                 .on_action(cx.listener(Self::toggle_side_by_side_action))
@@ -4449,7 +6141,9 @@ impl Render for DragonGlassApp {
             .on_action(cx.listener(Self::open_properties))
             .on_action(cx.listener(Self::toggle_bookmark))
             .on_action(cx.listener(Self::open_commands))
+            .on_action(cx.listener(Self::open_settings_action))
             .on_action(cx.listener(Self::toggle_theme))
+            .on_action(cx.listener(Self::toggle_vim_action))
             .on_action(cx.listener(Self::close_overlay))
             .on_action(cx.listener(Self::new_window))
             .on_action(cx.listener(Self::toggle_side_by_side_action))
@@ -4514,6 +6208,7 @@ impl Render for DragonGlassApp {
                     ),
             )
             .children(panel)
+            .children(quit_bar)
             .child(tab_bar)
             .child(
                 div()
@@ -4558,6 +6253,8 @@ fn install_menus(cx: &mut App) {
         Menu {
             name: "Dragon Glass".into(),
             items: vec![
+                MenuItem::action("Settings\u{2026}", OpenSettings),
+                MenuItem::separator(),
                 MenuItem::os_submenu("Services", SystemMenuType::Services),
                 MenuItem::separator(),
                 MenuItem::action("Quit Dragon Glass", Quit),
@@ -4567,6 +6264,7 @@ fn install_menus(cx: &mut App) {
             name: "File".into(),
             items: vec![
                 MenuItem::action("New Window", NewWindow),
+                MenuItem::action("Move Tab to New Window", DetachTab),
                 MenuItem::action("Close Tab", CloseTab),
                 MenuItem::separator(),
                 MenuItem::action("Save", editor::Save),
@@ -4582,6 +6280,9 @@ fn install_menus(cx: &mut App) {
                 MenuItem::os_action("Copy", editor::Copy, OsAction::Copy),
                 MenuItem::os_action("Paste", editor::Paste, OsAction::Paste),
                 MenuItem::os_action("Select All", editor::SelectAll, OsAction::SelectAll),
+                MenuItem::separator(),
+                MenuItem::action("Find", editor::OpenFind),
+                MenuItem::action("Find and Replace", editor::OpenFindReplace),
             ],
         },
         Menu {
@@ -4607,6 +6308,13 @@ fn install_menus(cx: &mut App) {
                 MenuItem::action("Daily Note", OpenDaily),
                 MenuItem::action("Weekly Note", OpenWeekly),
                 MenuItem::action("Monthly Note", OpenMonthly),
+            ],
+        },
+        Menu {
+            name: "Window".into(),
+            items: vec![
+                MenuItem::action("Next Tab", NextTab),
+                MenuItem::action("Previous Tab", PrevTab),
             ],
         },
     ];
@@ -4682,7 +6390,32 @@ fn main() {
     let (requested_vault, uri_note) = match requested {
         Some(argument) => match uri::parse(&argument) {
             Some(parsed) => (parsed.vault.map(PathBuf::from), parsed.note),
-            None => (Some(PathBuf::from(argument)), None),
+            None => {
+                let path = vaults::canonical(Path::new(&argument));
+                if path.is_dir() {
+                    (Some(path), None)
+                } else if path.is_file() {
+                    // macOS/Linux/Windows file associations pass a note path. Prefer the
+                    // deepest recent vault that contains it; otherwise treat its folder as
+                    // the vault.
+                    let registry = vaults::Registry::load();
+                    let vault = registry
+                        .recent()
+                        .iter()
+                        .filter(|vault| path.starts_with(vault))
+                        .max_by_key(|vault| vault.components().count())
+                        .cloned()
+                        .or_else(|| path.parent().map(Path::to_path_buf));
+                    let note = vault.as_ref().and_then(|vault| {
+                        path.strip_prefix(vault)
+                            .ok()
+                            .map(|relative| relative.to_string_lossy().replace('\\', "/"))
+                    });
+                    (vault, note)
+                } else {
+                    (Some(path), None)
+                }
+            }
         },
         None => (None, None),
     };
@@ -4714,6 +6447,7 @@ fn main() {
             KeyBinding::new("ctrl-pagedown", NextTab, None),
             KeyBinding::new("ctrl-pageup", PrevTab, None),
             KeyBinding::new("secondary-q", Quit, None),
+            KeyBinding::new("secondary-alt-v", ToggleVim, None),
         ]);
 
         #[cfg(target_os = "macos")]
@@ -4780,12 +6514,7 @@ fn open_vault_at_startup(vault_path: PathBuf, cx: &mut App) {
 /// Each window owns its vault, theme and keymap, so switching vaults is a fresh launch
 /// rather than a reset of the current window. The current vault stays open beside it.
 fn open_vault_in_new_process(vault_path: PathBuf, cx: &mut App) {
-    let spawned = std::env::current_exe().and_then(|exe| {
-        std::process::Command::new(exe)
-            .arg(&vault_path)
-            .spawn()
-            .map(|_| ())
-    });
+    let spawned = spawn_vault_process(&vault_path);
 
     if let Err(error) = spawned {
         open_vault_picker(
@@ -4794,6 +6523,38 @@ fn open_vault_in_new_process(vault_path: PathBuf, cx: &mut App) {
             Rc::new(open_vault_in_new_process),
         );
     }
+}
+
+/// Launch another Dragon Glass process for a second vault.
+///
+/// Inside a macOS `.app`, launching the inner executable directly bypasses LaunchServices;
+/// use `open -n` on the bundle instead so the new instance gets a Dock icon, menu and
+/// activation. Dev builds fall back to running the binary.
+fn spawn_vault_process(vault_path: &Path) -> std::io::Result<()> {
+    let exe = std::env::current_exe()?;
+
+    if cfg!(target_os = "macos") {
+        let bundle = exe.ancestors().find(|candidate| {
+            candidate
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("app"))
+        });
+        if let Some(bundle) = bundle {
+            return std::process::Command::new("open")
+                .arg("-n")
+                .arg(bundle)
+                .arg("--args")
+                .arg(vault_path)
+                .spawn()
+                .map(|_| ());
+        }
+    }
+
+    std::process::Command::new(exe)
+        .arg(vault_path)
+        .spawn()
+        .map(|_| ())
 }
 
 /// Build the main window for `vault_path`. Returns false when the vault cannot be opened.
@@ -4829,18 +6590,35 @@ fn open_vault_window(vault_path: PathBuf, uri_note: Option<String>, cx: &mut App
         }
     }
 
-    let tree = tree::build(&note_refs);
+    let tree = tree::build_with_dirs(&note_refs, &vault.folders());
     let mut initial_rows = Vec::new();
-    flatten(&tree, 0, &mut initial_rows);
+    flatten(&tree, 0, &HashSet::new(), &mut initial_rows);
     let file_rows = Rc::new(initial_rows);
     let vault_root = vault.root().to_path_buf();
     let initial_session = session::load(&vault_root);
     let initial_bookmarks = bookmarks::load(&vault_root);
     let initial_user_themes = load_user_themes(&vault_root);
-    let initial_theme = load_theme(&vault_root, &initial_user_themes);
+    let initial_config = config::load(&vault_root);
+    let initial_theme = {
+        let mut theme = load_theme(&vault_root, &initial_user_themes);
+        if let Some(accent) = initial_config
+            .accent
+            .as_deref()
+            .and_then(crate::theme::parse_hex)
+        {
+            theme = theme.with_accent(accent);
+        }
+        theme
+    };
     let initial_snippets = store::load_overrides(&store::snippets_dir(&vault_root));
     let initial_graph = graph::build(&note_refs);
-    let initial_config = config::load(&vault_root);
+    let initial_suggestions: Rc<Vec<(String, String)>> = Rc::new(
+        note_refs
+            .iter()
+            .map(|note| (note.path_no_ext().to_string(), note.stem().to_string()))
+            .collect(),
+    );
+    let initial_tags: Rc<Vec<String>> = Rc::new(tags::vault_tags(&note_refs));
     let initial_plugins = plugins::discover(&vault_root);
     let initial_workspaces = workspace::load(&vault_root);
     let initial_bindings = keymap::load(&vault_root);
@@ -4889,11 +6667,11 @@ fn open_vault_window(vault_path: PathBuf, uri_note: Option<String>, cx: &mut App
     for binding in &initial_bindings {
         bind_named(cx, &binding.key, &binding.action);
     }
-    for binding in &initial_bindings {
-        bind_named(cx, &binding.key, &binding.action);
-    }
 
     let editor = cx.new(Editor::new);
+    editor.update(cx, |editor, _cx| {
+        editor.set_suggestions((*initial_suggestions).clone(), (*initial_tags).clone());
+    });
     if let Some(path) = &first_path {
         editor.update(cx, |editor, _cx| {
             let _ = editor.load(path);
@@ -4913,6 +6691,8 @@ fn open_vault_window(vault_path: PathBuf, uri_note: Option<String>, cx: &mut App
     editor.update(cx, |editor, _cx| {
         editor.set_vault_root(&vault_root);
         editor.set_attachments_folder(&initial_config.attachments_folder);
+        editor.set_vim_enabled(initial_config.vim_mode);
+        editor.set_font_size(px(initial_config.font_size as f32));
     });
     let initial_tabs = vec![Tab {
         relative: first_rel.clone(),
@@ -4936,69 +6716,86 @@ fn open_vault_window(vault_path: PathBuf, uri_note: Option<String>, cx: &mut App
         ..Default::default()
     };
 
-    let app_view = cx.new(|cx| DragonGlassApp {
-        editor: editor.clone(),
-        tabs: initial_tabs,
-        active_tab: 0,
-        split_tabs: Vec::new(),
-        split_axis: SplitAxis::Horizontal,
-        minimal: false,
-        close_requested: false,
-        dragging: None,
-        cache_epoch: initial_cache_epoch,
-        vault_root: vault_root.clone(),
-        tree: tree.clone(),
-        file_rows: file_rows.clone(),
-        note_refs: note_refs.clone(),
-        note_index,
-        properties: initial_properties,
-        headings: initial_headings,
-        headings_version: initial_headings_version,
-        preview_content: ReadingCache::new(),
-        bookmarks: initial_bookmarks,
-        theme: initial_theme,
-        active: first_rel.clone(),
-        vault_path: display_path.clone(),
-        notes: note_count,
-        links: link_count,
-        git_status: initial_git.clone(),
-        status_message: None,
-        switcher: None,
-        switcher_focus: cx.focus_handle(),
-        focus_handle: cx.focus_handle(),
-        conflict: false,
-        watcher: None,
-        update_source,
-        update_available,
-        full_graph: initial_graph.clone(),
-        graph_view: None,
-        show_graph: false,
-        relations: Vec::new(),
-        show_relations: false,
-        sidebar_width: 240.0,
-        outline_width: 200.0,
-        relations_width: 240.0,
-        resize: None,
-        show_diff: false,
-        diff_title: String::new(),
-        diff_summary: String::new(),
-        diff_rows: Rc::new(Vec::new()),
-        review_issues: Vec::new(),
-        pending_shared: None,
-        pending_template: None,
-        stats: initial_stats,
-        stats_version: initial_headings_version,
-        query_results: Rc::new(Vec::new()),
-        show_query: false,
-        split_preview: std::env::var("DRAGON_GLASS_PREVIEW").is_ok(),
-        plugins: initial_plugins,
-        plugin_commands: initial_plugin_commands,
-        workspaces: initial_workspaces,
-        user_themes: initial_user_themes,
-        bindings: initial_bindings,
-        base_theme: initial_theme,
-        snippet_overrides: initial_snippets,
-        config: initial_config,
+    let app_view = cx.new(|cx| {
+        let app = DragonGlassApp {
+            editor: editor.clone(),
+            tabs: initial_tabs,
+            active_tab: 0,
+            split_tabs: Vec::new(),
+            split_axis: SplitAxis::Horizontal,
+            minimal: false,
+            close_requested: false,
+            dragging: None,
+            cache_epoch: initial_cache_epoch,
+            vault_root: vault_root.clone(),
+            tree: tree.clone(),
+            file_rows: file_rows.clone(),
+            collapsed_dirs: HashSet::new(),
+            collapsed_outline: HashSet::new(),
+            note_refs: note_refs.clone(),
+            note_index,
+            note_suggestions: initial_suggestions,
+            tag_suggestions: initial_tags,
+            properties: initial_properties,
+            headings: initial_headings,
+            headings_version: initial_headings_version,
+            preview_content: ReadingCache::new(),
+            bookmarks: initial_bookmarks,
+            theme: initial_theme,
+            active: first_rel.clone(),
+            vault_path: display_path.clone(),
+            notes: note_count,
+            links: link_count,
+            git_status: initial_git.clone(),
+            status_message: None,
+            switcher: None,
+            switcher_focus: cx.focus_handle(),
+            focus_handle: cx.focus_handle(),
+            quit_prompt: false,
+            allow_close: false,
+            show_settings: false,
+            pending_setting: None,
+            settings_focus: cx.focus_handle(),
+            tree_menu: None,
+            pending_dir: None,
+            pending_path: None,
+            pending_save_as: false,
+            conflict: false,
+            watcher: None,
+            update_source,
+            update_available,
+            full_graph: initial_graph.clone(),
+            graph_view: None,
+            show_graph: false,
+            relations: Vec::new(),
+            show_relations: false,
+            sidebar_width: 240.0,
+            outline_width: 200.0,
+            relations_width: 240.0,
+            resize: None,
+            show_diff: false,
+            diff_title: String::new(),
+            diff_summary: String::new(),
+            diff_rows: Rc::new(Vec::new()),
+            review_issues: Vec::new(),
+            pending_shared: None,
+            pending_template: None,
+            stats: initial_stats,
+            stats_version: initial_headings_version,
+            query_results: Rc::new(Vec::new()),
+            show_query: false,
+            split_preview: std::env::var("DRAGON_GLASS_PREVIEW").is_ok(),
+            plugins: initial_plugins,
+            plugin_commands: initial_plugin_commands,
+            workspaces: initial_workspaces,
+            user_themes: initial_user_themes,
+            bindings: initial_bindings,
+            base_theme: initial_theme,
+            snippet_overrides: initial_snippets,
+            config: initial_config,
+        };
+        app.install_quit_saver(cx);
+        app
     });
 
     let graph_view_entity = cx.new(|cx| GraphView::new(app_view.downgrade(), cx));
@@ -5019,9 +6816,8 @@ fn open_vault_window(vault_path: PathBuf, uri_note: Option<String>, cx: &mut App
             // Persist the reading mode too, including changes made with Ctrl+E, which
             // the editor handles without telling the app.
             let saver = view_for_window.clone();
-            window.on_window_should_close(cx, move |_window, cx| {
-                saver.update(cx, |app, cx| app.remember_session(cx));
-                true
+            window.on_window_should_close(cx, move |window, cx| {
+                saver.update(cx, |app, cx| app.request_close(window, cx))
             });
             view_for_window
         })
@@ -5032,4 +6828,51 @@ fn open_vault_window(vault_path: PathBuf, uri_note: Option<String>, cx: &mut App
         cx.activate(true);
     });
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn heading(level: u8, line: usize) -> markdown::Heading {
+        markdown::Heading {
+            level,
+            text: format!("h{line}"),
+            line,
+        }
+    }
+
+    #[test]
+    fn a_folded_outline_heading_hides_only_its_children() {
+        let headings = vec![
+            heading(1, 1),
+            heading(2, 2),
+            heading(3, 4),
+            heading(2, 6),
+            heading(1, 8),
+        ];
+        let mut collapsed = HashSet::new();
+        collapsed.insert(0);
+
+        let visible: Vec<usize> = visible_headings(&headings, &collapsed)
+            .into_iter()
+            .map(|(index, _)| index)
+            .collect();
+
+        assert_eq!(visible, vec![0, 4]);
+    }
+
+    #[test]
+    fn folding_a_nested_outline_heading_leaves_the_parent_visible() {
+        let headings = vec![heading(1, 1), heading(2, 2), heading(3, 4), heading(2, 6)];
+        let mut collapsed = HashSet::new();
+        collapsed.insert(1);
+
+        let visible: Vec<usize> = visible_headings(&headings, &collapsed)
+            .into_iter()
+            .map(|(index, _)| index)
+            .collect();
+
+        assert_eq!(visible, vec![0, 1, 3]);
+    }
 }

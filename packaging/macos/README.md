@@ -1,7 +1,7 @@
 # macOS packaging
 
-Builds `DragonGlass.app`, a zip and a dmg from an already-built binary. The bundle is
-**ad-hoc signed**, not notarized: it runs, but the first launch needs a right-click →
+Builds `DragonGlass.app`, a zip and a dmg. The bundle is **ad-hoc signed** by default,
+not notarized: it runs, but the first launch of a downloaded copy needs a right-click →
 **Open** (or System Settings → Privacy & Security → **Open Anyway**) because Gatekeeper
 does not trust it.
 
@@ -15,41 +15,61 @@ This builds `dragon-glass-app` and `dragon-glass` for `aarch64-apple-darwin` and
 `x86_64-apple-darwin`, merges them with `lipo`, then calls `build-app.sh`. Add the Rust
 targets once with `rustup target add aarch64-apple-darwin x86_64-apple-darwin`.
 
-To wrap a single-architecture build (for example a debug binary):
+To wrap a single-architecture build, for example a debug binary:
 
 ```bash
 cargo build -p dragonglass-ui -p dragonglass-cli
-packaging/macos/build-app.sh target/debug/dragon-glass-app 0.0.1 dist target/debug/dragon-glass
+BIN_DIR=target/debug packaging/macos/build-app.sh 0.0.1 dist
 ```
+
+Xcode command line tools are required once (`xcode-select --install`). GPUI compiles its
+Metal shaders at runtime on macOS, so a full Xcode install is not needed.
+
+Artifacts:
+
+- `dist/DragonGlass.app`
+- `dist/DragonGlass-<version>-macos.zip`
+- `dist/DragonGlass-<version>-macos.dmg`, with an `Applications` link for drag-to-install
 
 ## Files
 
 | File | Purpose |
 |---|---|
 | `build-universal.sh` | Universal release build, then packaging |
-| `build-app.sh` | Assembles the `.app`, zip and dmg (with an Applications link for drag-to-install) from a binary |
-| `Info.plist` | Bundle metadata and the `dragonglass://` URL type |
-| `dragon-glass.icns` | App icon, generated from `make-icon.swift` |
-| `make-icon.swift` | Draws the placeholder 1024×1024 icon |
-| `make-icns.sh` | Regenerates `dragon-glass.icns` (`sips` + `iconutil`) |
+| `build-app.sh` | Assembles the `.app`, zip and dmg from built binaries |
+| `Info.plist` | Bundle metadata, `dragonglass://` URL type and Markdown document types |
 
-The icon is a placeholder until real artwork exists; replace `dragon-glass.icns` or edit
-`make-icon.swift` and rerun `make-icns.sh`.
+The icon is generated from `packaging/logo.png` with `sips` and `iconutil`.
+
+## First launch of a downloaded build
+
+A ZIP or dmg downloaded from the internet gets a quarantine flag. Either right-click the
+app and choose **Open**, or clear the flag:
+
+```bash
+xattr -dr com.apple.quarantine DragonGlass.app
+open DragonGlass.app
+```
 
 ## Signing and notarization
+
+Without `CODESIGN_IDENTITY` the script ad-hoc signs the bundle. That is enough to run
+locally and for Launch Services to register the URL scheme.
 
 For a release that opens without a Gatekeeper prompt, sign with a Developer ID and
 notarize:
 
 ```bash
-codesign --force --deep --options runtime \
-  --sign "Developer ID Application: <Name> (<TEAMID>)" dist/DragonGlass.app
-xcrun notarytool submit dist/DragonGlass-0.0.1-macos.zip \
-  --apple-id <id> --team-id <TEAMID> --password <app-specific-password> --wait
-xcrun stapler staple dist/DragonGlass.app
+export CODESIGN_IDENTITY="Developer ID Application: <Name> (<TEAMID>)"
+export APPLE_ID="you@example.com"
+export APPLE_TEAM_ID="TEAMID"
+export APPLE_APP_PASSWORD="xxxx-xxxx-xxxx-xxxx"
+
+packaging/macos/build-universal.sh 0.0.1 dist
 ```
 
-`build-app.sh` never signs with a certificate; CI uses the ad-hoc signature.
+The script then signs with the hardened runtime, submits the ZIP with `notarytool`, and
+staples the ticket to the app.
 
 ## URL scheme
 
