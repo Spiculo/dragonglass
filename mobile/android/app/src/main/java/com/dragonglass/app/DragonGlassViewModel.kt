@@ -949,6 +949,13 @@ class DragonGlassViewModel(application: Application) : AndroidViewModel(applicat
                 lower.contains("401") ->
                 "GitHub rejected the token. Check that it is valid, not expired, and has " +
                     "Contents: Read and write for this repository."
+            lower.contains("receive-pack") ||
+                lower.contains("not permitted") ||
+                lower.contains("403") ||
+                lower.contains("forbidden") ->
+                "GitHub refused the push. The token can read this repository but not write " +
+                    "to it: give it Contents: Read and write and make sure the repository is " +
+                    "included in the token's access."
             lower.contains("not found") || lower.contains("404") ->
                 "Repository not found. Check the remote URL and that the token can access it."
             else -> raw

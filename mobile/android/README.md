@@ -90,6 +90,23 @@ binary; both read and write the same repository format.
 The token is encrypted with Android Keystore and never written into the vault or
 `.git/config`. Local `file://` remotes are supported for testing and do not require a token.
 
+### Troubleshooting
+
+**`git-receive-pack not permitted on 'https://github.com/...'`**
+
+GitHub refused the *push*. The token can read the repository but not write to it, so the
+clone or pull may already have succeeded. Create a fine-grained token with:
+
+- **Repository access** → Only select repositories → the vault repository
+- **Permissions** → Repository permissions → **Contents: Read and write**
+- Metadata is added as read-only automatically
+
+Classic tokens need the `repo` scope instead. Also check that the token has not expired and
+belongs to an account with access to the repository.
+
+If the repository already has a `main` branch, use **Link existing** (clone) rather than
+**Create new**; the latter expects an empty remote.
+
 ## Storage model
 
 The engine uses `std::fs`, so every vault lives in app-private storage:
