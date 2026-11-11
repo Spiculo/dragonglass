@@ -6378,6 +6378,8 @@ fn open_vault_picker(cx: &mut App, error: Option<String>, open: vault_picker::Op
 }
 
 /// Close the chooser, if one is open.
+/// Close the chooser when a `dragonglass://` URL replaces it.
+#[cfg(target_os = "macos")]
 fn close_vault_picker(cx: &mut App) {
     let Some(window) = VAULT_PICKER.with(|slot| slot.borrow_mut().take()) else {
         return;
