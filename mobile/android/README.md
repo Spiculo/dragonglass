@@ -5,17 +5,20 @@ A native Android shell around `dragonglass-core`. The Rust engine is exposed thr
 
 This is the first vertical slice, not full parity yet:
 
-- Open the app-private vault and list notes
-- Fuzzy search and full-text search through the engine
-- Bookmarks, stored in the vault's `.dragon-glass` folder
+- Open the app-private vault and list notes, either flat or as a folder tree
+- Fuzzy title search plus full-text search with line-level hits that jump into the editor
+- Bookmarks, stored in the vault's `.dragon-glass` folder, with a bookmarks-only filter
 - One-commit git sync with a GitHub HTTPS token
 - Edit markdown source and save atomically
 - Render markdown/HTML (headings, lists, tables, math, code) in a WebView
 - Outline, properties, stats, relations and tags from the shared engine
-- Daily notes from `Templates/Daily.md`
+- Daily, weekly and monthly notes from `Templates/`
+- A graph view of links, embeds and frontmatter relations
+- Create notes from the vault's markdown templates
 
-Still to come: importing existing vaults through SAF, a graph view, bookmarks, themes,
-workspaces, plugin support and git-aware features that do not make sense on Android.
+Still to come: importing existing vaults through SAF, themes, workspaces, plugin support,
+in-app rename/move and recovery of deleted notes, and git-aware features that do not make
+sense on Android.
 
 ## Prerequisites
 

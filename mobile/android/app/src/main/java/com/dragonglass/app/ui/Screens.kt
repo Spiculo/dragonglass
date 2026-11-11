@@ -2,7 +2,9 @@ package com.dragonglass.app.ui
 
 import android.webkit.WebView
 import androidx.activity.compose.BackHandler
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -51,7 +53,9 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.text.TextRange
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontFamily
@@ -62,10 +66,19 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
+import com.dragonglass.app.BrowseMode
 import com.dragonglass.app.DragonGlassViewModel
 import com.dragonglass.app.sync.GitStatus
+import uniffi.dragonglass.GraphView
 import uniffi.dragonglass.HeadingInfo
 import uniffi.dragonglass.NoteSummary
+import uniffi.dragonglass.SearchHit
+import uniffi.dragonglass.TreeRow
+import kotlin.math.PI
+import kotlin.math.cos
+import kotlin.math.min
+import kotlin.math.sin
+import kotlin.math.sqrt
 
 @Composable
 fun DragonGlassApp(vm: DragonGlassViewModel) {
@@ -117,6 +130,10 @@ fun DragonGlassApp(vm: DragonGlassViewModel) {
 @Composable
 private fun NotesScreen(vm: DragonGlassViewModel) {
     var showSync by remember { mutableStateOf(false) }
+    var showGraph by remember { mutableStateOf(false) }
+    var showTemplates by remember { mutableStateOf(false) }
+    var menuOpen by remember { mutableStateOf(false) }
+    var todayOpen by remember { mutableStateOf(false) }
 
     Scaffold(
         topBar = {
@@ -132,14 +149,79 @@ private fun NotesScreen(vm: DragonGlassViewModel) {
                     }
                 },
                 actions = {
-                    TextButton(
-                        onClick = {
-                            vm.clearGitMessages()
-                            vm.refreshGitStatus()
-                            showSync = true
-                        },
-                    ) { Text("Sync") }
-                    TextButton(onClick = vm::openDaily) { Text("Today") }
+                    Box {
+                        TextButton(onClick = { todayOpen = true }) { Text("Today") }
+                        DropdownMenu(
+                            expanded = todayOpen,
+                            onDismissRequest = { todayOpen = false },
+                        ) {
+                            DropdownMenuItem(
+                                text = { Text("Daily note") },
+                                onClick = {
+                                    todayOpen = false
+                                    vm.openDaily()
+                                },
+                            )
+                            DropdownMenuItem(
+                                text = { Text("Weekly note") },
+                                onClick = {
+                                    todayOpen = false
+                                    vm.openWeekly()
+                                },
+                            )
+                            DropdownMenuItem(
+                                text = { Text("Monthly note") },
+                                onClick = {
+                                    todayOpen = false
+                                    vm.openMonthly()
+                                },
+                            )
+                        }
+                    }
+                    Box {
+                        TextButton(onClick = { menuOpen = true }) { Text("•••") }
+                        DropdownMenu(
+                            expanded = menuOpen,
+                            onDismissRequest = { menuOpen = false },
+                        ) {
+                            DropdownMenuItem(
+                                text = { Text("Graph view") },
+                                onClick = {
+                                    menuOpen = false
+                                    vm.loadGraph()
+                                    showGraph = true
+                                },
+                            )
+                            DropdownMenuItem(
+                                text = { Text("New from template") },
+                                onClick = {
+                                    menuOpen = false
+                                    showTemplates = true
+                                },
+                            )
+                            DropdownMenuItem(
+                                text = {
+                                    Text(
+                                        if (vm.bookmarksOnly) "Show all notes" else "Bookmarks only",
+                                    )
+                                },
+                                onClick = {
+                                    menuOpen = false
+                                    vm.toggleBookmarksOnly()
+                                },
+                            )
+                            HorizontalDivider()
+                            DropdownMenuItem(
+                                text = { Text("Git sync") },
+                                onClick = {
+                                    menuOpen = false
+                                    vm.clearGitMessages()
+                                    vm.refreshGitStatus()
+                                    showSync = true
+                                },
+                            )
+                        }
+                    }
                 },
             )
         },
@@ -154,34 +236,38 @@ private fun NotesScreen(vm: DragonGlassViewModel) {
                 .fillMaxSize()
                 .padding(padding),
         ) {
-            OutlinedTextField(
-                value = vm.query,
-                onValueChange = vm::onQueryChange,
-                placeholder = { Text("Search notes") },
-                singleLine = true,
+            Row(
                 modifier = Modifier
                     .fillMaxWidth()
                     .padding(horizontal = 16.dp, vertical = 8.dp),
-            )
-
-            when {
-                vm.notes.isEmpty() && !vm.loading -> EmptyVault()
-                vm.visibleNotes.isEmpty() -> Text(
-                    text = "No notes match “${vm.query}”.",
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    modifier = Modifier.padding(16.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                OutlinedTextField(
+                    value = vm.query,
+                    onValueChange = vm::onQueryChange,
+                    placeholder = {
+                        Text(if (vm.bookmarksOnly) "Search bookmarks" else "Search notes")
+                    },
+                    singleLine = true,
+                    modifier = Modifier.weight(1f),
                 )
-                else -> LazyColumn(Modifier.fillMaxSize()) {
-                    items(vm.visibleNotes, key = { it.relative }) { note ->
-                        NoteRow(
-                            note = note,
-                            bookmarked = note.relative in vm.bookmarks,
-                            onClick = { vm.openNote(note.relative) },
-                            onToggleBookmark = { vm.toggleBookmark(note.relative) },
-                        )
-                        HorizontalDivider(color = MaterialTheme.colorScheme.outline.copy(alpha = 0.25f))
+                if (vm.bookmarksOnly) {
+                    TextButton(onClick = vm::toggleBookmarksOnly) { Text("All") }
+                } else if (vm.query.isBlank()) {
+                    TextButton(onClick = vm::toggleBrowseMode) {
+                        Text(if (vm.browseMode == BrowseMode.Tree) "List" else "Tree")
                     }
                 }
+            }
+
+            when {
+                vm.query.isNotBlank() -> SearchResults(vm)
+                vm.notes.isEmpty() && !vm.loading -> EmptyVault()
+                vm.browseMode == BrowseMode.Tree -> TreeList(vm)
+                vm.visibleNotes.isEmpty() -> MutedLine(
+                    if (vm.bookmarksOnly) "No bookmarked notes yet." else "No notes here yet.",
+                )
+                else -> NoteList(vm)
             }
         }
     }
@@ -189,6 +275,143 @@ private fun NotesScreen(vm: DragonGlassViewModel) {
     if (showSync) {
         GitSyncSheet(vm, onDismiss = { showSync = false })
     }
+    if (showGraph) {
+        GraphSheet(vm, onDismiss = { showGraph = false })
+    }
+    if (showTemplates) {
+        TemplatesSheet(
+            vm = vm,
+            onDismiss = { showTemplates = false },
+            onCreated = { showTemplates = false },
+        )
+    }
+}
+
+@Composable
+private fun NoteList(vm: DragonGlassViewModel) {
+    LazyColumn(Modifier.fillMaxSize()) {
+        items(vm.visibleNotes, key = { it.relative }) { note ->
+            NoteRow(
+                note = note,
+                bookmarked = note.relative in vm.bookmarks,
+                onClick = { vm.openNote(note.relative) },
+                onToggleBookmark = { vm.toggleBookmark(note.relative) },
+            )
+            HorizontalDivider(color = MaterialTheme.colorScheme.outline.copy(alpha = 0.25f))
+        }
+    }
+}
+
+@Composable
+private fun TreeList(vm: DragonGlassViewModel) {
+    LazyColumn(Modifier.fillMaxSize()) {
+        items(vm.visibleTreeRows, key = { it.path }) { row ->
+            if (row.isDir) {
+                DirectoryRow(
+                    row = row,
+                    collapsed = row.path in vm.collapsedDirs,
+                    onClick = { vm.toggleDirectory(row.path) },
+                )
+            } else {
+                NoteRow(
+                    note = NoteSummary(relative = row.path, title = row.name),
+                    bookmarked = row.path in vm.bookmarks,
+                    depth = row.depth,
+                    onClick = { vm.openNote(row.path) },
+                    onToggleBookmark = { vm.toggleBookmark(row.path) },
+                )
+            }
+            HorizontalDivider(color = MaterialTheme.colorScheme.outline.copy(alpha = 0.2f))
+        }
+    }
+}
+
+@Composable
+private fun DirectoryRow(row: TreeRow, collapsed: Boolean, onClick: () -> Unit) {
+    ListItem(
+        headlineContent = {
+            Text(
+                text = (if (collapsed) "▸ " else "▾ ") + row.name,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                fontWeight = FontWeight.Medium,
+            )
+        },
+        modifier = Modifier
+            .clickable(onClick = onClick)
+            .padding(start = (row.depth * 16).dp),
+    )
+}
+
+@Composable
+private fun SearchResults(vm: DragonGlassViewModel) {
+    if (vm.visibleNotes.isEmpty() && vm.visibleHits.isEmpty() && !vm.loading) {
+        MutedLine("No notes or text match “${vm.query}”.")
+        return
+    }
+    LazyColumn(Modifier.fillMaxSize()) {
+        if (vm.visibleNotes.isNotEmpty()) {
+            item { SectionHeader("Notes") }
+            items(vm.visibleNotes, key = { "note:${it.relative}" }) { note ->
+                NoteRow(
+                    note = note,
+                    bookmarked = note.relative in vm.bookmarks,
+                    onClick = { vm.openNote(note.relative) },
+                    onToggleBookmark = { vm.toggleBookmark(note.relative) },
+                )
+                HorizontalDivider(color = MaterialTheme.colorScheme.outline.copy(alpha = 0.2f))
+            }
+        }
+        if (vm.visibleHits.isNotEmpty()) {
+            item { SectionHeader("Text matches") }
+            items(vm.visibleHits, key = { "hit:${it.relative}:${it.line}" }) { hit ->
+                SearchHitRow(hit) { vm.openSearchHit(hit.relative, hit.line) }
+                HorizontalDivider(color = MaterialTheme.colorScheme.outline.copy(alpha = 0.2f))
+            }
+        }
+    }
+}
+
+@Composable
+private fun SearchHitRow(hit: SearchHit, onClick: () -> Unit) {
+    ListItem(
+        headlineContent = {
+            Text(
+                text = hit.text.trim().ifBlank { "(empty line)" },
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis,
+            )
+        },
+        supportingContent = {
+            Text(
+                text = "${hit.relative} · line ${hit.line}",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+        },
+        modifier = Modifier.clickable(onClick = onClick),
+    )
+}
+
+@Composable
+private fun SectionHeader(text: String) {
+    Text(
+        text = text.uppercase(),
+        style = MaterialTheme.typography.labelMedium,
+        color = MaterialTheme.colorScheme.primary,
+        modifier = Modifier.padding(start = 16.dp, top = 12.dp, bottom = 4.dp),
+    )
+}
+
+@Composable
+private fun MutedLine(text: String) {
+    Text(
+        text = text,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+        modifier = Modifier.padding(16.dp),
+    )
 }
 
 @Composable
@@ -212,6 +435,7 @@ private fun EmptyVault() {
 private fun NoteRow(
     note: NoteSummary,
     bookmarked: Boolean,
+    depth: Int = 0,
     onClick: () -> Unit,
     onToggleBookmark: () -> Unit,
 ) {
@@ -240,7 +464,9 @@ private fun NoteRow(
                 )
             }
         },
-        modifier = Modifier.clickable(onClick = onClick),
+        modifier = Modifier
+            .clickable(onClick = onClick)
+            .padding(start = (depth * 16).dp),
     )
 }
 
@@ -257,6 +483,17 @@ private fun EditorScreen(vm: DragonGlassViewModel, relative: String) {
     val title = relative.substringAfterLast('/').removeSuffix(".md")
 
     LaunchedEffect(relative) { focusRequester.requestFocus() }
+
+    // Jump to a full-text search hit once the note source has loaded.
+    LaunchedEffect(relative, vm.pendingLine) {
+        val line = vm.pendingLine ?: return@LaunchedEffect
+        if (vm.source.isEmpty()) return@LaunchedEffect
+        editorValue = TextFieldValue(
+            text = vm.source,
+            selection = TextRange(vm.offsetForLine(line)),
+        )
+        vm.consumePendingLine()
+    }
 
     Scaffold(
         topBar = {
@@ -771,6 +1008,285 @@ private fun statusLine(status: GitStatus?): String {
         if (status.ahead > 0) append(" · ↑${status.ahead}")
         if (status.behind > 0) append(" · ↓${status.behind}")
         if (status.conflicts.isNotEmpty()) append(" · ${status.conflicts.size} conflicts")
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun GraphSheet(vm: DragonGlassViewModel, onDismiss: () -> Unit) {
+    val graph = vm.graph
+    val layout = remember(graph) { graph?.let(::layoutGraph).orEmpty() }
+
+    ModalBottomSheet(onDismissRequest = onDismiss) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 16.dp)
+                .padding(bottom = 24.dp),
+        ) {
+            Text(
+                text = "Graph",
+                style = MaterialTheme.typography.titleLarge,
+                modifier = Modifier.padding(vertical = 8.dp),
+            )
+            when {
+                vm.graphLoading || graph == null -> {
+                    if (vm.graphLoading) {
+                        LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+                    } else {
+                        Muted("No notes to graph yet.")
+                    }
+                }
+                graph.nodes.isEmpty() -> Muted("No notes to graph yet.")
+                else -> {
+                    Text(
+                        text = "${graph.nodes.size} notes · ${graph.edges.size} links",
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                    GraphCanvas(
+                        graph = graph,
+                        layout = layout,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(420.dp)
+                            .padding(top = 8.dp),
+                        onOpen = { relative ->
+                            onDismiss()
+                            vm.openNote(relative)
+                        },
+                    )
+                    Text(
+                        text = "Tap a node to open its note. Node size follows the link count.",
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        style = MaterialTheme.typography.bodySmall,
+                        modifier = Modifier.padding(top = 8.dp),
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun GraphCanvas(
+    graph: GraphView,
+    layout: Map<Int, Offset>,
+    modifier: Modifier = Modifier,
+    onOpen: (String) -> Unit,
+) {
+    val nodeColor = MaterialTheme.colorScheme.primary
+    val edgeColor = MaterialTheme.colorScheme.outline
+    val maxLinks = graph.nodes.maxOfOrNull { it.links }?.coerceAtLeast(1) ?: 1
+
+    Canvas(
+        modifier = modifier.pointerInput(graph, layout) {
+            detectTapGestures { tap ->
+                val width = size.width.toFloat()
+                val height = size.height.toFloat()
+                if (width <= 0f || height <= 0f) return@detectTapGestures
+                var nearest: Int? = null
+                var nearestDistance = Float.MAX_VALUE
+                for ((id, position) in layout) {
+                    val dx = position.x * width - tap.x
+                    val dy = position.y * height - tap.y
+                    val distance = sqrt(dx * dx + dy * dy)
+                    if (distance < nearestDistance) {
+                        nearest = id
+                        nearestDistance = distance
+                    }
+                }
+                val id = nearest ?: return@detectTapGestures
+                if (nearestDistance > 48f) return@detectTapGestures
+                graph.nodes.firstOrNull { it.id == id }?.let { onOpen(it.relative) }
+            }
+        },
+    ) {
+        val width = size.width
+        val height = size.height
+        fun center(id: Int): Offset? = layout[id]?.let { Offset(it.x * width, it.y * height) }
+
+        for (edge in graph.edges) {
+            val from = center(edge.from) ?: continue
+            val to = center(edge.to) ?: continue
+            drawLine(
+                color = edgeColor.copy(alpha = 0.35f),
+                start = from,
+                end = to,
+                strokeWidth = 1.5f,
+            )
+        }
+
+        for (node in graph.nodes) {
+            val point = center(node.id) ?: continue
+            val weight = sqrt(node.links.toFloat() / maxLinks)
+            drawCircle(
+                color = nodeColor.copy(alpha = 0.85f),
+                radius = 4f + 10f * weight,
+                center = point,
+            )
+        }
+    }
+}
+
+/// Positions nodes in unit space with a small force-directed pass, falling back to a circle
+/// for very large vaults so the layout stays instant.
+private fun layoutGraph(graph: GraphView): Map<Int, Offset> {
+    val nodes = graph.nodes
+    val count = nodes.size
+    if (count == 0) return emptyMap()
+    if (count == 1) return mapOf(nodes[0].id to Offset(0.5f, 0.5f))
+
+    val xs = FloatArray(count)
+    val ys = FloatArray(count)
+    for (i in 0 until count) {
+        val angle = i.toFloat() / count * 2f * PI.toFloat()
+        xs[i] = 0.5f + 0.36f * cos(angle)
+        ys[i] = 0.5f + 0.36f * sin(angle)
+    }
+
+    val iterations = when {
+        count > 400 -> 0
+        count > 160 -> 120
+        else -> 260
+    }
+    if (iterations > 0) {
+        val index = HashMap<Int, Int>(count)
+        nodes.forEachIndexed { i, node -> index[node.id] = i }
+        val links = ArrayList<IntArray>(graph.edges.size)
+        for (edge in graph.edges) {
+            val from = index[edge.from] ?: continue
+            val to = index[edge.to] ?: continue
+            if (from != to) links.add(intArrayOf(from, to))
+        }
+
+        val k = 1.1f / sqrt(count.toFloat())
+        val dispX = FloatArray(count)
+        val dispY = FloatArray(count)
+
+        repeat(iterations) { step ->
+            java.util.Arrays.fill(dispX, 0f)
+            java.util.Arrays.fill(dispY, 0f)
+
+            for (i in 0 until count) {
+                for (j in i + 1 until count) {
+                    var dx = xs[i] - xs[j]
+                    var dy = ys[i] - ys[j]
+                    var distanceSquared = dx * dx + dy * dy
+                    if (distanceSquared < 1e-6f) {
+                        dx = 0.001f * (i + 1)
+                        dy = 0.001f * (j + 1)
+                        distanceSquared = dx * dx + dy * dy
+                    }
+                    val distance = sqrt(distanceSquared)
+                    val force = k * k / distance
+                    val fx = dx / distance * force
+                    val fy = dy / distance * force
+                    dispX[i] += fx
+                    dispY[i] += fy
+                    dispX[j] -= fx
+                    dispY[j] -= fy
+                }
+            }
+
+            for (link in links) {
+                val from = link[0]
+                val to = link[1]
+                val dx = xs[from] - xs[to]
+                val dy = ys[from] - ys[to]
+                val distance = sqrt(dx * dx + dy * dy).coerceAtLeast(1e-4f)
+                val force = distance * distance / k
+                val fx = dx / distance * force
+                val fy = dy / distance * force
+                dispX[from] -= fx
+                dispY[from] -= fy
+                dispX[to] += fx
+                dispY[to] += fy
+            }
+
+            val temperature = 0.09f * (1f - step / iterations.toFloat()) + 0.004f
+            for (i in 0 until count) {
+                val length = sqrt(dispX[i] * dispX[i] + dispY[i] * dispY[i])
+                    .coerceAtLeast(1e-6f)
+                val scale = min(length, temperature) / length
+                xs[i] = (xs[i] + dispX[i] * scale).coerceIn(0.03f, 0.97f)
+                ys[i] = (ys[i] + dispY[i] * scale).coerceIn(0.03f, 0.97f)
+            }
+        }
+    }
+
+    val positions = HashMap<Int, Offset>(count)
+    nodes.forEachIndexed { i, node -> positions[node.id] = Offset(xs[i], ys[i]) }
+    return positions
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun TemplatesSheet(
+    vm: DragonGlassViewModel,
+    onDismiss: () -> Unit,
+    onCreated: () -> Unit,
+) {
+    var title by remember { mutableStateOf("") }
+
+    LaunchedEffect(Unit) { vm.loadTemplates() }
+
+    ModalBottomSheet(onDismissRequest = onDismiss) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 16.dp)
+                .padding(bottom = 24.dp),
+        ) {
+            Text(
+                text = "New from template",
+                style = MaterialTheme.typography.titleLarge,
+                modifier = Modifier.padding(vertical = 8.dp),
+            )
+            OutlinedTextField(
+                value = title,
+                onValueChange = { title = it },
+                label = { Text("Note title") },
+                placeholder = { Text("Leave blank to use the template name") },
+                singleLine = true,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(top = 8.dp),
+            )
+            if (vm.templates.isEmpty()) {
+                Muted(
+                    "No templates yet. Add markdown files to the vault's Templates/ folder " +
+                        "to use them here.",
+                )
+            } else {
+                LazyColumn(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .heightIn(max = 360.dp)
+                        .padding(top = 8.dp),
+                ) {
+                    items(vm.templates, key = { it.relative }) { template ->
+                        ListItem(
+                            headlineContent = { Text(template.name) },
+                            supportingContent = {
+                                Text(
+                                    text = template.relative,
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                            },
+                            modifier = Modifier.clickable {
+                                vm.createFromTemplate(
+                                    template.relative,
+                                    title.ifBlank { template.name },
+                                )
+                                onCreated()
+                            },
+                        )
+                    }
+                }
+            }
+        }
     }
 }
 

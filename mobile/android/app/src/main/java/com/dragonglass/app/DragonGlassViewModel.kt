@@ -16,13 +16,17 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import uniffi.dragonglass.GraphView
 import uniffi.dragonglass.HeadingInfo
 import uniffi.dragonglass.MobileVault
 import uniffi.dragonglass.NoteSummary
 import uniffi.dragonglass.PropertyInfo
 import uniffi.dragonglass.RelationInfo
+import uniffi.dragonglass.SearchHit
 import uniffi.dragonglass.StatsInfo
 import uniffi.dragonglass.TagCount
+import uniffi.dragonglass.TemplateInfo
+import uniffi.dragonglass.TreeRow
 import uniffi.dragonglass.documentStats
 import uniffi.dragonglass.headings as parseHeadings
 import uniffi.dragonglass.properties as parseProperties
@@ -38,6 +42,9 @@ private data class OpenNote(
     val relations: List<RelationInfo>,
 )
 
+/// How the note list is presented: a flat, recent-first list or the vault tree.
+enum class BrowseMode { List, Tree }
+
 class DragonGlassViewModel(application: Application) : AndroidViewModel(application) {
     private val vaultDirectory = File(application.filesDir, "vault")
     private val gitPreferences =
@@ -51,9 +58,27 @@ class DragonGlassViewModel(application: Application) : AndroidViewModel(applicat
 
     var notes by mutableStateOf<List<NoteSummary>>(emptyList())
         private set
+    var treeRows by mutableStateOf<List<TreeRow>>(emptyList())
+        private set
+    var collapsedDirs by mutableStateOf<Set<String>>(emptySet())
+        private set
+    var browseMode by mutableStateOf(BrowseMode.List)
+        private set
+    var bookmarksOnly by mutableStateOf(false)
+        private set
     var query by mutableStateOf("")
         private set
     var results by mutableStateOf<List<NoteSummary>>(emptyList())
+        private set
+    var hits by mutableStateOf<List<SearchHit>>(emptyList())
+        private set
+    var pendingLine by mutableStateOf<Int?>(null)
+        private set
+    var templates by mutableStateOf<List<TemplateInfo>>(emptyList())
+        private set
+    var graph by mutableStateOf<GraphView?>(null)
+        private set
+    var graphLoading by mutableStateOf(false)
         private set
     var selected by mutableStateOf<String?>(null)
         private set
@@ -101,7 +126,17 @@ class DragonGlassViewModel(application: Application) : AndroidViewModel(applicat
         private set
 
     val visibleNotes: List<NoteSummary>
-        get() = if (query.isBlank()) notes else results
+        get() = (if (query.isBlank()) notes else results)
+            .filter { !bookmarksOnly || it.relative in bookmarks }
+
+    /// Tree rows with the children of collapsed folders removed.
+    val visibleTreeRows: List<TreeRow>
+        get() = treeRows.filter { row ->
+            collapsedDirs.none { row.path.startsWith("$it/") }
+        }
+
+    val visibleHits: List<SearchHit>
+        get() = if (bookmarksOnly) hits.filter { it.relative in bookmarks } else hits
 
     private var searchJob: Job? = null
 
@@ -144,13 +179,15 @@ class DragonGlassViewModel(application: Application) : AndroidViewModel(applicat
             val result = runCatching {
                 withContext(Dispatchers.IO) {
                     val loaded = ensureVault()
-                    loaded.notes() to loaded.bookmarks().toSet()
+                    Triple(loaded.notes(), loaded.bookmarks().toSet(), loaded.treeRows())
                 }
             }
             result
-                .onSuccess { (loaded, marks) ->
+                .onSuccess { (loaded, marks, rows) ->
                     notes = loaded
                     bookmarks = marks
+                    treeRows = rows
+                    graph = null
                     if (query.isBlank()) results = loaded
                 }
                 .onFailure { error = it.message ?: "Could not open the vault" }
@@ -158,25 +195,54 @@ class DragonGlassViewModel(application: Application) : AndroidViewModel(applicat
         }
     }
 
+    fun toggleBrowseMode() {
+        browseMode = if (browseMode == BrowseMode.Tree) BrowseMode.List else BrowseMode.Tree
+    }
+
+    fun toggleBookmarksOnly() {
+        bookmarksOnly = !bookmarksOnly
+        if (bookmarksOnly && browseMode == BrowseMode.Tree) browseMode = BrowseMode.List
+    }
+
+    fun toggleDirectory(path: String) {
+        collapsedDirs = if (path in collapsedDirs) collapsedDirs - path else collapsedDirs + path
+    }
+
     fun onQueryChange(value: String) {
         query = value
         searchJob?.cancel()
         if (value.isBlank()) {
             results = notes
+            hits = emptyList()
             return
         }
         searchJob = viewModelScope.launch {
             delay(120)
             val result = runCatching {
-                withContext(Dispatchers.IO) { ensureVault().fuzzy(value, 100) }
+                withContext(Dispatchers.IO) {
+                    val loaded = ensureVault()
+                    loaded.fuzzy(value, 100) to loaded.search(value, 200)
+                }
             }
             result
-                .onSuccess { results = it }
+                .onSuccess { (matched, found) ->
+                    results = matched
+                    hits = found
+                }
                 .onFailure { error = it.message ?: "Search failed" }
         }
     }
 
-    fun openNote(relative: String) {
+    fun openNote(relative: String) = openNote(relative, jumpToLine = null)
+
+    /// Open a note and scroll the editor to a 1-based source line.
+    fun openSearchHit(relative: String, line: Int) = openNote(relative, jumpToLine = line)
+
+    fun consumePendingLine() {
+        pendingLine = null
+    }
+
+    private fun openNote(relative: String, jumpToLine: Int?) {
         viewModelScope.launch {
             loading = true
             val result = runCatching {
@@ -204,6 +270,7 @@ class DragonGlassViewModel(application: Application) : AndroidViewModel(applicat
                     preview = false
                     previewHtml = ""
                     dirty = false
+                    pendingLine = jumpToLine
                 }
                 .onFailure { error = it.message ?: "Could not open the note" }
             loading = false
@@ -297,17 +364,58 @@ class DragonGlassViewModel(application: Application) : AndroidViewModel(applicat
         }
     }
 
-    fun openDaily() {
+    fun openDaily() = openPeriodic("daily") { it.openDaily() }
+
+    fun openWeekly() = openPeriodic("weekly") { it.openWeekly() }
+
+    fun openMonthly() = openPeriodic("monthly") { it.openMonthly() }
+
+    private fun openPeriodic(label: String, open: (MobileVault) -> String) {
         viewModelScope.launch {
             val result = runCatching {
-                withContext(Dispatchers.IO) { ensureVault().openDaily() }
+                withContext(Dispatchers.IO) { open(ensureVault()) }
             }
             result
                 .onSuccess {
                     refresh()
                     openNote(it)
                 }
-                .onFailure { error = it.message ?: "Could not open the daily note" }
+                .onFailure { error = it.message ?: "Could not open the $label note" }
+        }
+    }
+
+    fun loadTemplates() {
+        viewModelScope.launch {
+            runCatching { withContext(Dispatchers.IO) { ensureVault().templates() } }
+                .onSuccess { templates = it }
+                .onFailure { error = it.message ?: "Could not load templates" }
+        }
+    }
+
+    fun createFromTemplate(template: String, title: String) {
+        viewModelScope.launch {
+            loading = true
+            val result = runCatching {
+                withContext(Dispatchers.IO) { ensureVault().createFromTemplate(template, title) }
+            }
+            result
+                .onSuccess {
+                    refresh()
+                    openNote(it)
+                }
+                .onFailure { error = it.message ?: "Could not create the note" }
+            loading = false
+        }
+    }
+
+    fun loadGraph() {
+        if (graphLoading) return
+        viewModelScope.launch {
+            graphLoading = true
+            runCatching { withContext(Dispatchers.IO) { ensureVault().graph() } }
+                .onSuccess { graph = it }
+                .onFailure { error = it.message ?: "Could not build the graph" }
+            graphLoading = false
         }
     }
 
@@ -315,20 +423,16 @@ class DragonGlassViewModel(application: Application) : AndroidViewModel(applicat
         val note = selected ?: return
         viewModelScope.launch {
             val result = runCatching {
-                withContext(Dispatchers.IO) {
-                    ensureVault().deleteNote(note)
-                    ensureVault().notes()
-                }
+                withContext(Dispatchers.IO) { ensureVault().deleteNote(note) }
             }
             result
                 .onSuccess {
-                    notes = it
-                    results = it
                     selected = null
                     source = ""
                     preview = false
                     dirty = false
                     message = "Deleted $note"
+                    refresh()
                 }
                 .onFailure { error = it.message ?: "Could not delete the note" }
         }
