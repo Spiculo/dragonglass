@@ -15,10 +15,11 @@ This is the first vertical slice, not full parity yet:
 - Daily, weekly and monthly notes from `Templates/`
 - A graph view of links, embeds and frontmatter relations
 - Create notes from the vault's markdown templates
+- Rename or move notes, create folders, and delete through a recoverable trash that can be
+  browsed, restored or emptied
 
 Still to come: importing existing vaults through SAF, themes, workspaces, plugin support,
-in-app rename/move and recovery of deleted notes, and git-aware features that do not make
-sense on Android.
+and git-aware features that do not make sense on Android.
 
 ## Prerequisites
 

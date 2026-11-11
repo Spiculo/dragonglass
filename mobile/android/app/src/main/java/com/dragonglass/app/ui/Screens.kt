@@ -132,6 +132,8 @@ private fun NotesScreen(vm: DragonGlassViewModel) {
     var showSync by remember { mutableStateOf(false) }
     var showGraph by remember { mutableStateOf(false) }
     var showTemplates by remember { mutableStateOf(false) }
+    var showTrash by remember { mutableStateOf(false) }
+    var showNewFolder by remember { mutableStateOf(false) }
     var menuOpen by remember { mutableStateOf(false) }
     var todayOpen by remember { mutableStateOf(false) }
 
@@ -197,6 +199,20 @@ private fun NotesScreen(vm: DragonGlassViewModel) {
                                 onClick = {
                                     menuOpen = false
                                     showTemplates = true
+                                },
+                            )
+                            DropdownMenuItem(
+                                text = { Text("New folder…") },
+                                onClick = {
+                                    menuOpen = false
+                                    showNewFolder = true
+                                },
+                            )
+                            DropdownMenuItem(
+                                text = { Text("Trash") },
+                                onClick = {
+                                    menuOpen = false
+                                    showTrash = true
                                 },
                             )
                             DropdownMenuItem(
@@ -283,6 +299,23 @@ private fun NotesScreen(vm: DragonGlassViewModel) {
             vm = vm,
             onDismiss = { showTemplates = false },
             onCreated = { showTemplates = false },
+        )
+    }
+    if (showTrash) {
+        TrashSheet(vm, onDismiss = { showTrash = false })
+    }
+    if (showNewFolder) {
+        TextInputDialog(
+            title = "New folder",
+            label = "Folder path",
+            initial = "",
+            hint = "Nested folders are fine, e.g. notes/projects.",
+            confirmLabel = "Create",
+            onDismiss = { showNewFolder = false },
+            onConfirm = {
+                vm.createFolder(it)
+                showNewFolder = false
+            },
         )
     }
 }
@@ -478,6 +511,7 @@ private fun EditorScreen(vm: DragonGlassViewModel, relative: String) {
     var menuOpen by remember { mutableStateOf(false) }
     var showOutline by remember { mutableStateOf(false) }
     var showDetails by remember { mutableStateOf(false) }
+    var showRename by remember { mutableStateOf(false) }
     var editorValue by remember(relative) { mutableStateOf(TextFieldValue(vm.source)) }
     val focusRequester = remember { FocusRequester() }
     val title = relative.substringAfterLast('/').removeSuffix(".md")
@@ -534,7 +568,14 @@ private fun EditorScreen(vm: DragonGlassViewModel, relative: String) {
                             )
                             HorizontalDivider()
                             DropdownMenuItem(
-                                text = { Text("Delete note") },
+                                text = { Text("Move or rename…") },
+                                onClick = {
+                                    menuOpen = false
+                                    showRename = true
+                                },
+                            )
+                            DropdownMenuItem(
+                                text = { Text("Move to trash") },
                                 onClick = {
                                     menuOpen = false
                                     vm.deleteSelected()
@@ -597,6 +638,21 @@ private fun EditorScreen(vm: DragonGlassViewModel, relative: String) {
 
     if (showDetails) {
         DetailsSheet(vm, onDismiss = { showDetails = false })
+    }
+
+    if (showRename) {
+        TextInputDialog(
+            title = "Move or rename",
+            label = "Vault path",
+            initial = relative,
+            hint = "Add folders to move the note, e.g. notes/New name.md.",
+            confirmLabel = "Move",
+            onDismiss = { showRename = false },
+            onConfirm = {
+                vm.renameSelected(it)
+                showRename = false
+            },
+        )
     }
 }
 
@@ -1288,6 +1344,142 @@ private fun TemplatesSheet(
             }
         }
     }
+}
+
+@Composable
+private fun TextInputDialog(
+    title: String,
+    label: String,
+    initial: String,
+    hint: String,
+    confirmLabel: String,
+    onDismiss: () -> Unit,
+    onConfirm: (String) -> Unit,
+) {
+    var value by remember { mutableStateOf(initial) }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(title) },
+        text = {
+            Column {
+                OutlinedTextField(
+                    value = value,
+                    onValueChange = { value = it },
+                    label = { Text(label) },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                Text(
+                    text = hint,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(top = 8.dp),
+                )
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = { onConfirm(value) }) { Text(confirmLabel) }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text("Cancel") }
+        },
+    )
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun TrashSheet(vm: DragonGlassViewModel, onDismiss: () -> Unit) {
+    var confirmEmpty by remember { mutableStateOf(false) }
+
+    LaunchedEffect(Unit) { vm.loadTrash() }
+
+    ModalBottomSheet(onDismissRequest = onDismiss) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 16.dp)
+                .padding(bottom = 24.dp),
+        ) {
+            Text(
+                text = "Trash",
+                style = MaterialTheme.typography.titleLarge,
+                modifier = Modifier.padding(vertical = 8.dp),
+            )
+            Muted("Deleted notes stay here until you empty the trash.")
+            when {
+                vm.trashLoading -> LinearProgressIndicator(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(top = 16.dp),
+                )
+                vm.trash.isEmpty() -> Muted("The trash is empty.")
+                else -> {
+                    LazyColumn(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .heightIn(max = 420.dp)
+                            .padding(top = 8.dp),
+                    ) {
+                        items(vm.trash, key = { it.trashRelative }) { entry ->
+                            ListItem(
+                                headlineContent = {
+                                    Text(
+                                        text = entry.original,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis,
+                                    )
+                                },
+                                supportingContent = {
+                                    Text(
+                                        text = "deleted ${trashTime(entry.deletedAt)}",
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    )
+                                },
+                                trailingContent = {
+                                    TextButton(
+                                        onClick = { vm.restoreTrashEntry(entry.trashRelative) },
+                                    ) { Text("Restore") }
+                                },
+                            )
+                        }
+                    }
+                    OutlinedButton(
+                        onClick = { confirmEmpty = true },
+                        modifier = Modifier.padding(top = 12.dp),
+                    ) { Text("Empty trash") }
+                }
+            }
+        }
+    }
+
+    if (confirmEmpty) {
+        AlertDialog(
+            onDismissRequest = { confirmEmpty = false },
+            title = { Text("Empty the trash?") },
+            text = { Text("Every deleted note in the trash will be removed permanently.") },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        confirmEmpty = false
+                        vm.emptyTrash()
+                    },
+                ) { Text("Empty") }
+            },
+            dismissButton = {
+                TextButton(onClick = { confirmEmpty = false }) { Text("Cancel") }
+            },
+        )
+    }
+}
+
+private fun trashTime(millis: Long): String {
+    if (millis <= 0L) return "at an unknown time"
+    val formatter = java.time.format.DateTimeFormatter
+        .ofPattern("MMM d, HH:mm")
+        .withZone(java.time.ZoneId.systemDefault())
+    return formatter.format(java.time.Instant.ofEpochMilli(millis))
 }
 
 @Composable

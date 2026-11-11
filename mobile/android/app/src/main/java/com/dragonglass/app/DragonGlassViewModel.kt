@@ -26,6 +26,7 @@ import uniffi.dragonglass.SearchHit
 import uniffi.dragonglass.StatsInfo
 import uniffi.dragonglass.TagCount
 import uniffi.dragonglass.TemplateInfo
+import uniffi.dragonglass.TrashEntry
 import uniffi.dragonglass.TreeRow
 import uniffi.dragonglass.documentStats
 import uniffi.dragonglass.headings as parseHeadings
@@ -79,6 +80,10 @@ class DragonGlassViewModel(application: Application) : AndroidViewModel(applicat
     var graph by mutableStateOf<GraphView?>(null)
         private set
     var graphLoading by mutableStateOf(false)
+        private set
+    var trash by mutableStateOf<List<TrashEntry>>(emptyList())
+        private set
+    var trashLoading by mutableStateOf(false)
         private set
     var selected by mutableStateOf<String?>(null)
         private set
@@ -421,9 +426,15 @@ class DragonGlassViewModel(application: Application) : AndroidViewModel(applicat
 
     fun deleteSelected() {
         val note = selected ?: return
+        val text = source
+        val wasDirty = dirty
         viewModelScope.launch {
             val result = runCatching {
-                withContext(Dispatchers.IO) { ensureVault().deleteNote(note) }
+                withContext(Dispatchers.IO) {
+                    val loaded = ensureVault()
+                    if (wasDirty) loaded.saveNote(note, text)
+                    loaded.trashNote(note)
+                }
             }
             result
                 .onSuccess {
@@ -431,10 +442,105 @@ class DragonGlassViewModel(application: Application) : AndroidViewModel(applicat
                     source = ""
                     preview = false
                     dirty = false
-                    message = "Deleted $note"
+                    message = "Moved $note to the trash"
                     refresh()
                 }
-                .onFailure { error = it.message ?: "Could not delete the note" }
+                .onFailure { error = it.message ?: "Could not move the note to the trash" }
+        }
+    }
+
+    /// Rename or move the open note, saving unsaved edits first.
+    fun renameSelected(destination: String) {
+        val note = selected ?: return
+        val text = source
+        val wasDirty = dirty
+        val trimmed = destination.trim().trimStart('/')
+        if (trimmed.isEmpty()) {
+            error = "Enter a file name"
+            return
+        }
+        val target = if (trimmed.substringAfterLast('/').contains('.')) {
+            trimmed
+        } else {
+            "$trimmed.md"
+        }
+        viewModelScope.launch {
+            loading = true
+            val result = runCatching {
+                withContext(Dispatchers.IO) {
+                    val loaded = ensureVault()
+                    if (wasDirty) loaded.saveNote(note, text)
+                    loaded.renameEntry(note, target)
+                }
+            }
+            result
+                .onSuccess { renamed ->
+                    message = "Moved to $renamed"
+                    refresh()
+                    openNote(renamed)
+                }
+                .onFailure { error = it.message ?: "Could not move the note" }
+            loading = false
+        }
+    }
+
+    fun createFolder(relative: String) {
+        val trimmed = relative.trim().trim('/')
+        if (trimmed.isEmpty()) {
+            error = "Enter a folder name"
+            return
+        }
+        viewModelScope.launch {
+            val result = runCatching {
+                withContext(Dispatchers.IO) { ensureVault().createFolder(trimmed) }
+            }
+            result
+                .onSuccess {
+                    browseMode = BrowseMode.Tree
+                    message = "Created $trimmed"
+                    refresh()
+                }
+                .onFailure { error = it.message ?: "Could not create the folder" }
+        }
+    }
+
+    fun loadTrash() {
+        if (trashLoading) return
+        viewModelScope.launch {
+            trashLoading = true
+            runCatching { withContext(Dispatchers.IO) { ensureVault().trashEntries() } }
+                .onSuccess { trash = it }
+                .onFailure { error = it.message ?: "Could not read the trash" }
+            trashLoading = false
+        }
+    }
+
+    fun restoreTrashEntry(trashRelative: String) {
+        viewModelScope.launch {
+            val result = runCatching {
+                withContext(Dispatchers.IO) { ensureVault().restoreTrashEntry(trashRelative) }
+            }
+            result
+                .onSuccess {
+                    message = "Restored $it"
+                    refresh()
+                    loadTrash()
+                }
+                .onFailure { error = it.message ?: "Could not restore the entry" }
+        }
+    }
+
+    fun emptyTrash() {
+        viewModelScope.launch {
+            val result = runCatching {
+                withContext(Dispatchers.IO) { ensureVault().emptyTrash() }
+            }
+            result
+                .onSuccess { removed ->
+                    trash = emptyList()
+                    message = if (removed == 1L) "Removed 1 entry" else "Removed $removed entries"
+                }
+                .onFailure { error = it.message ?: "Could not empty the trash" }
         }
     }
 

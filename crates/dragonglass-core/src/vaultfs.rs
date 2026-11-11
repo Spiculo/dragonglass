@@ -82,13 +82,13 @@ pub fn create_folder(root: &Path, relative: &str) -> Result<PathBuf> {
 }
 
 /// Rename or move a note/folder. Refuses to overwrite an existing entry or to move a
-/// folder inside itself.
-pub fn rename(root: &Path, from: &str, to: &str) -> Result<()> {
+/// folder inside itself. Returns the sanitized vault-relative destination.
+pub fn rename(root: &Path, from: &str, to: &str) -> Result<String> {
     let (from_relative, from_path) = existing(root, from)?;
     let (to_relative, to_path) = checked(root, to)?;
 
     if from_relative == to_relative {
-        return Ok(());
+        return Ok(to_relative);
     }
     if !from_path.exists() {
         return Err(Error::Io(std::io::Error::new(
@@ -113,10 +113,13 @@ pub fn rename(root: &Path, from: &str, to: &str) -> Result<()> {
         std::fs::create_dir_all(parent)?;
     }
     std::fs::rename(&from_path, &to_path)?;
-    Ok(())
+    Ok(to_relative)
 }
 
 /// Move a note/folder into the vault trash. Returns the trashed path.
+///
+/// Each delete gets its own stamp directory containing `entry` (the moved note or folder)
+/// and `meta.json` (the original relative path), so nested notes can be restored exactly.
 pub fn trash(root: &Path, relative: &str) -> Result<PathBuf> {
     let (relative, path) = existing(root, relative)?;
     if !path.exists() {
@@ -130,28 +133,191 @@ pub fn trash(root: &Path, relative: &str) -> Result<PathBuf> {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis())
         .unwrap_or(0);
-    let mut destination = root
-        .join(".dragon-glass")
-        .join("trash")
-        .join(format!("{stamp:013}"))
-        .join(&relative);
+    let mut base = trash_root(root).join(format!("{stamp:013}"));
 
     // Two deletes in the same millisecond must not collide.
     let mut suffix = 1usize;
-    while destination.exists() {
-        destination = root
-            .join(".dragon-glass")
-            .join("trash")
-            .join(format!("{stamp:013}-{suffix}"))
-            .join(&relative);
+    while base.exists() {
+        base = trash_root(root).join(format!("{stamp:013}-{suffix}"));
         suffix += 1;
     }
 
-    if let Some(parent) = destination.parent() {
+    std::fs::create_dir_all(&base)?;
+    let destination = base.join("entry");
+    std::fs::rename(&path, &destination)?;
+    write_trash_meta(&base, &relative)?;
+    Ok(destination)
+}
+
+/// A deleted entry waiting in the vault trash.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrashedEntry {
+    /// Vault-relative path of the stamp directory that holds the deleted entry.
+    pub trash_relative: String,
+    /// Where the entry was before it was deleted.
+    pub original: String,
+    /// Wall-clock deletion time in milliseconds since the Unix epoch, when known.
+    pub deleted_at_ms: u64,
+}
+
+const TRASH_META: &str = "meta.json";
+const TRASH_ENTRY: &str = "entry";
+
+fn write_trash_meta(base: &Path, original: &str) -> Result<()> {
+    let meta = serde_json::json!({ "original": original });
+    std::fs::write(base.join(TRASH_META), meta.to_string())?;
+    Ok(())
+}
+
+fn read_trash_meta(base: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(base.join(TRASH_META)).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&text).ok()?;
+    value
+        .get("original")
+        .and_then(|original| original.as_str())
+        .map(|original| original.to_string())
+}
+
+/// The stamp prefix, e.g. `.dragon-glass/trash/000001760000000-a`.
+fn stamp_from_name(name: &str) -> u64 {
+    name.split('-')
+        .next()
+        .and_then(|stamp| stamp.parse::<u64>().ok())
+        .unwrap_or(0)
+}
+
+/// List everything in the trash, newest first.
+pub fn list_trash(root: &Path) -> Result<Vec<TrashedEntry>> {
+    let trash = trash_root(root);
+    if !trash.is_dir() {
+        return Ok(Vec::new());
+    }
+
+    let mut entries = Vec::new();
+    for item in std::fs::read_dir(&trash)? {
+        let item = item?;
+        if !item.file_type()?.is_dir() {
+            continue;
+        }
+        let name = item.file_name().to_string_lossy().to_string();
+        let base = item.path();
+        let original = match read_trash_meta(&base) {
+            Some(original) => original,
+            // Trash written before meta.json existed: the stamp directory holds the
+            // original path directly. Descend while the path is unambiguous.
+            None => match legacy_entry(&base) {
+                Some(original) => original,
+                None => continue,
+            },
+        };
+        entries.push(TrashedEntry {
+            trash_relative: format!(".dragon-glass/trash/{name}"),
+            original,
+            deleted_at_ms: stamp_from_name(&name),
+        });
+    }
+
+    entries.sort_by_key(|entry| std::cmp::Reverse(entry.deleted_at_ms));
+    Ok(entries)
+}
+
+/// Restore one trash entry to its original path, refusing to overwrite an existing file.
+/// Returns the restored vault-relative path.
+pub fn restore(root: &Path, trash_relative: &str) -> Result<String> {
+    let (_, base) = existing(root, trash_relative)?;
+    let trash = trash_root(root);
+    let base = base
+        .canonicalize()
+        .map_err(|_| Error::InvalidPath(trash_relative.to_string()))?;
+    let trash = trash
+        .canonicalize()
+        .map_err(|_| Error::InvalidPath(trash_relative.to_string()))?;
+    if !base.starts_with(&trash) {
+        return Err(Error::InvalidPath(trash_relative.to_string()));
+    }
+
+    let original = match read_trash_meta(&base) {
+        Some(original) => original,
+        None => match legacy_entry(&base) {
+            Some(original) => original,
+            None => {
+                return Err(Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!("{trash_relative} is empty"),
+                )))
+            }
+        },
+    };
+    let (original, target) = checked(root, &original)?;
+    if target.exists() {
+        return Err(Error::AlreadyExists(original));
+    }
+
+    // Current layout stores `entry` next to `meta.json`; the legacy layout put the moved
+    // file or folder straight into the stamp directory.
+    let entry = base.join(TRASH_ENTRY);
+    let source = if entry.exists() {
+        entry
+    } else {
+        base.join(&original)
+    };
+
+    if let Some(parent) = target.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::rename(&path, &destination)?;
-    Ok(destination)
+    std::fs::rename(&source, &target)?;
+    let _ = std::fs::remove_dir_all(&base);
+    Ok(original)
+}
+
+/// Delete everything in the trash. Returns the number of entries removed.
+pub fn empty_trash(root: &Path) -> Result<usize> {
+    let trash = trash_root(root);
+    if !trash.is_dir() {
+        return Ok(0);
+    }
+    let mut removed = 0;
+    for item in std::fs::read_dir(&trash)? {
+        let item = item?;
+        if item.file_type()?.is_dir() {
+            std::fs::remove_dir_all(item.path())?;
+            removed += 1;
+        }
+    }
+    Ok(removed)
+}
+
+/// Reconstruct the original relative path of a legacy trash entry by descending while each
+/// directory has exactly one child. Returns `None` when two entries were trashed together.
+fn legacy_entry(base: &Path) -> Option<String> {
+    let mut current = base.to_path_buf();
+    let mut relative = String::new();
+
+    loop {
+        let children: Vec<PathBuf> = std::fs::read_dir(&current)
+            .ok()?
+            .flatten()
+            .map(|entry| entry.path())
+            .collect();
+        if children.len() != 1 {
+            return if relative.is_empty() {
+                None
+            } else {
+                Some(relative)
+            };
+        }
+        let child = &children[0];
+        let name = child.file_name()?.to_string_lossy().to_string();
+        relative = if relative.is_empty() {
+            name
+        } else {
+            format!("{relative}/{name}")
+        };
+        if !child.is_dir() {
+            return Some(relative);
+        }
+        current = child.clone();
+    }
 }
 
 /// Trash root, for the UI's "open trash" shortcut and for tests.
@@ -245,6 +411,75 @@ mod tests {
         assert!(!root.join("notes/gone.md").exists());
         assert_eq!(std::fs::read_to_string(&trashed).unwrap(), "keep me");
         assert!(trashed.starts_with(trash_root(&root)));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn lists_restores_and_empties_trash() {
+        let root = temp_root("trash-list");
+        create_note(&root, "notes/deep/gone.md", "keep").unwrap();
+        create_note(&root, "second.md", "two").unwrap();
+        trash(&root, "notes/deep/gone.md").unwrap();
+        trash(&root, "second.md").unwrap();
+
+        let listed = list_trash(&root).unwrap();
+        assert_eq!(listed.len(), 2);
+        let nested = listed
+            .iter()
+            .find(|entry| entry.original == "notes/deep/gone.md")
+            .expect("nested entry is listed with its original path");
+        assert!(listed.iter().any(|entry| entry.original == "second.md"));
+
+        let restored = restore(&root, &nested.trash_relative).unwrap();
+        assert_eq!(restored, "notes/deep/gone.md");
+        assert_eq!(
+            std::fs::read_to_string(root.join("notes/deep/gone.md")).unwrap(),
+            "keep"
+        );
+        assert_eq!(list_trash(&root).unwrap().len(), 1);
+
+        // Restoring over an existing note is refused rather than overwriting it.
+        assert!(restore(&root, &nested.trash_relative).is_err());
+
+        assert_eq!(empty_trash(&root).unwrap(), 1);
+        assert!(list_trash(&root).unwrap().is_empty());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn restores_legacy_trash_without_meta() {
+        let root = temp_root("trash-legacy");
+        create_note(&root, "old.md", "legacy").unwrap();
+        let legacy = trash_root(&root).join("0000000000001");
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::rename(root.join("old.md"), legacy.join("old.md")).unwrap();
+
+        let listed = list_trash(&root).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].original, "old.md");
+        restore(&root, &listed[0].trash_relative).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(root.join("old.md")).unwrap(),
+            "legacy"
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn restores_a_legacy_nested_path() {
+        let root = temp_root("trash-legacy-nested");
+        create_note(&root, "notes/nested.md", "nested").unwrap();
+        let legacy = trash_root(&root).join("0000000000002");
+        std::fs::create_dir_all(legacy.join("notes")).unwrap();
+        std::fs::rename(root.join("notes/nested.md"), legacy.join("notes/nested.md")).unwrap();
+
+        let listed = list_trash(&root).unwrap();
+        assert_eq!(listed[0].original, "notes/nested.md");
+        restore(&root, &listed[0].trash_relative).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(root.join("notes/nested.md")).unwrap(),
+            "nested"
+        );
         std::fs::remove_dir_all(&root).unwrap();
     }
 }

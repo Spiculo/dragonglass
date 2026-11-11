@@ -687,11 +687,13 @@ internal object IntegrityCheckingUniffiLib {
     ): Int
     external fun uniffi_dragonglass_ffi_checksum_method_mobilevault_bookmarks(
     ): Int
+    external fun uniffi_dragonglass_ffi_checksum_method_mobilevault_create_folder(
+    ): Int
     external fun uniffi_dragonglass_ffi_checksum_method_mobilevault_create_from_template(
     ): Int
     external fun uniffi_dragonglass_ffi_checksum_method_mobilevault_create_note(
     ): Int
-    external fun uniffi_dragonglass_ffi_checksum_method_mobilevault_delete_note(
+    external fun uniffi_dragonglass_ffi_checksum_method_mobilevault_empty_trash(
     ): Int
     external fun uniffi_dragonglass_ffi_checksum_method_mobilevault_fuzzy(
     ): Int
@@ -715,6 +717,10 @@ internal object IntegrityCheckingUniffiLib {
     ): Int
     external fun uniffi_dragonglass_ffi_checksum_method_mobilevault_relations(
     ): Int
+    external fun uniffi_dragonglass_ffi_checksum_method_mobilevault_rename_entry(
+    ): Int
+    external fun uniffi_dragonglass_ffi_checksum_method_mobilevault_restore_trash_entry(
+    ): Int
     external fun uniffi_dragonglass_ffi_checksum_method_mobilevault_root(
     ): Int
     external fun uniffi_dragonglass_ffi_checksum_method_mobilevault_save_note(
@@ -726,6 +732,10 @@ internal object IntegrityCheckingUniffiLib {
     external fun uniffi_dragonglass_ffi_checksum_method_mobilevault_templates(
     ): Int
     external fun uniffi_dragonglass_ffi_checksum_method_mobilevault_toggle_bookmark(
+    ): Int
+    external fun uniffi_dragonglass_ffi_checksum_method_mobilevault_trash_entries(
+    ): Int
+    external fun uniffi_dragonglass_ffi_checksum_method_mobilevault_trash_note(
     ): Int
     external fun uniffi_dragonglass_ffi_checksum_method_mobilevault_tree_rows(
     ): Int
@@ -759,12 +769,14 @@ internal object UniffiLib {
     ): Long
     external fun uniffi_dragonglass_ffi_fn_method_mobilevault_bookmarks(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
+    external fun uniffi_dragonglass_ffi_fn_method_mobilevault_create_folder(`ptr`: Long,`relative`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): Unit
     external fun uniffi_dragonglass_ffi_fn_method_mobilevault_create_from_template(`ptr`: Long,`template`: RustBuffer.ByValue,`title`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
     external fun uniffi_dragonglass_ffi_fn_method_mobilevault_create_note(`ptr`: Long,`relative`: RustBuffer.ByValue,`source`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
-    external fun uniffi_dragonglass_ffi_fn_method_mobilevault_delete_note(`ptr`: Long,`relative`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
-    ): Unit
+    external fun uniffi_dragonglass_ffi_fn_method_mobilevault_empty_trash(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
+    ): Long
     external fun uniffi_dragonglass_ffi_fn_method_mobilevault_fuzzy(`ptr`: Long,`query`: RustBuffer.ByValue,`limit`: Int,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
     external fun uniffi_dragonglass_ffi_fn_method_mobilevault_graph(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
@@ -787,6 +799,10 @@ internal object UniffiLib {
     ): Unit
     external fun uniffi_dragonglass_ffi_fn_method_mobilevault_relations(`ptr`: Long,`relative`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
+    external fun uniffi_dragonglass_ffi_fn_method_mobilevault_rename_entry(`ptr`: Long,`from`: RustBuffer.ByValue,`to`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
+    external fun uniffi_dragonglass_ffi_fn_method_mobilevault_restore_trash_entry(`ptr`: Long,`trashRelative`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
     external fun uniffi_dragonglass_ffi_fn_method_mobilevault_root(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
     external fun uniffi_dragonglass_ffi_fn_method_mobilevault_save_note(`ptr`: Long,`relative`: RustBuffer.ByValue,`source`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
@@ -799,6 +815,10 @@ internal object UniffiLib {
     ): RustBuffer.ByValue
     external fun uniffi_dragonglass_ffi_fn_method_mobilevault_toggle_bookmark(`ptr`: Long,`relative`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): Byte
+    external fun uniffi_dragonglass_ffi_fn_method_mobilevault_trash_entries(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
+    external fun uniffi_dragonglass_ffi_fn_method_mobilevault_trash_note(`ptr`: Long,`relative`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
     external fun uniffi_dragonglass_ffi_fn_method_mobilevault_tree_rows(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
     external fun uniffi_dragonglass_ffi_fn_func_document_stats(`source`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
@@ -948,13 +968,16 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if ((lib.uniffi_dragonglass_ffi_checksum_method_mobilevault_bookmarks() and 0xFFFF) != 6789) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if ((lib.uniffi_dragonglass_ffi_checksum_method_mobilevault_create_folder() and 0xFFFF) != 59670) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if ((lib.uniffi_dragonglass_ffi_checksum_method_mobilevault_create_from_template() and 0xFFFF) != 41219) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if ((lib.uniffi_dragonglass_ffi_checksum_method_mobilevault_create_note() and 0xFFFF) != 16690) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if ((lib.uniffi_dragonglass_ffi_checksum_method_mobilevault_delete_note() and 0xFFFF) != 27690) {
+    if ((lib.uniffi_dragonglass_ffi_checksum_method_mobilevault_empty_trash() and 0xFFFF) != 56931) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if ((lib.uniffi_dragonglass_ffi_checksum_method_mobilevault_fuzzy() and 0xFFFF) != 51429) {
@@ -990,6 +1013,12 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if ((lib.uniffi_dragonglass_ffi_checksum_method_mobilevault_relations() and 0xFFFF) != 61368) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if ((lib.uniffi_dragonglass_ffi_checksum_method_mobilevault_rename_entry() and 0xFFFF) != 37783) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if ((lib.uniffi_dragonglass_ffi_checksum_method_mobilevault_restore_trash_entry() and 0xFFFF) != 54831) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if ((lib.uniffi_dragonglass_ffi_checksum_method_mobilevault_root() and 0xFFFF) != 53877) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
@@ -1006,6 +1035,12 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if ((lib.uniffi_dragonglass_ffi_checksum_method_mobilevault_toggle_bookmark() and 0xFFFF) != 53035) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if ((lib.uniffi_dragonglass_ffi_checksum_method_mobilevault_trash_entries() and 0xFFFF) != 8143) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if ((lib.uniffi_dragonglass_ffi_checksum_method_mobilevault_trash_note() and 0xFFFF) != 60501) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if ((lib.uniffi_dragonglass_ffi_checksum_method_mobilevault_tree_rows() and 0xFFFF) != 9236) {
@@ -1197,6 +1232,29 @@ public object FfiConverterInt: FfiConverter<Int, Int> {
 /**
  * @suppress
  */
+public object FfiConverterLong: FfiConverter<Long, Long> {
+    override fun lift(value: Long): Long {
+        return value
+    }
+
+    override fun read(buf: ByteBuffer): Long {
+        return buf.getLong()
+    }
+
+    override fun lower(value: Long): Long {
+        return value
+    }
+
+    override fun allocationSize(value: Long) = 8UL
+
+    override fun write(value: Long, buf: ByteBuffer) {
+        buf.putLong(value)
+    }
+}
+
+/**
+ * @suppress
+ */
 public object FfiConverterBoolean: FfiConverter<Boolean, Byte> {
     override fun lift(value: Byte): Boolean {
         return value.toInt() != 0
@@ -1381,6 +1439,11 @@ public interface MobileVaultInterface {
     fun `bookmarks`(): List<kotlin.String>
     
     /**
+     * Create a folder (and any missing parents).
+     */
+    fun `createFolder`(`relative`: kotlin.String)
+    
+    /**
      * Create a note from a template, substituting the standard variables.
      */
     fun `createFromTemplate`(`template`: kotlin.String, `title`: kotlin.String): kotlin.String
@@ -1390,7 +1453,10 @@ public interface MobileVaultInterface {
      */
     fun `createNote`(`relative`: kotlin.String, `source`: kotlin.String)
     
-    fun `deleteNote`(`relative`: kotlin.String)
+    /**
+     * Permanently remove everything in the trash. Returns the entry count.
+     */
+    fun `emptyTrash`(): kotlin.Long
     
     /**
      * Quick-switcher style fuzzy path matching.
@@ -1438,6 +1504,17 @@ public interface MobileVaultInterface {
      */
     fun `relations`(`relative`: kotlin.String): List<RelationInfo>
     
+    /**
+     * Rename or move a note or folder. Fails rather than overwriting another entry.
+     * Returns the sanitized vault-relative destination.
+     */
+    fun `renameEntry`(`from`: kotlin.String, `to`: kotlin.String): kotlin.String
+    
+    /**
+     * Restore one trash entry to its original path. Returns that path.
+     */
+    fun `restoreTrashEntry`(`trashRelative`: kotlin.String): kotlin.String
+    
     fun `root`(): kotlin.String
     
     fun `saveNote`(`relative`: kotlin.String, `source`: kotlin.String)
@@ -1461,6 +1538,16 @@ public interface MobileVaultInterface {
      * Toggle a bookmark. Returns true when the note is now bookmarked.
      */
     fun `toggleBookmark`(`relative`: kotlin.String): kotlin.Boolean
+    
+    /**
+     * Everything currently in the vault trash, newest first.
+     */
+    fun `trashEntries`(): List<TrashEntry>
+    
+    /**
+     * Move a note or folder to the vault trash. Returns its trash-relative path.
+     */
+    fun `trashNote`(`relative`: kotlin.String): kotlin.String
     
     /**
      * Sidebar rows, directories first, with each row's indentation depth.
@@ -1592,6 +1679,23 @@ open class MobileVault: Disposable, AutoCloseable, MobileVaultInterface
 
     
     /**
+     * Create a folder (and any missing parents).
+     */
+    @Throws(MobileException::class)override fun `createFolder`(`relative`: kotlin.String)
+        = 
+    callWithHandle {
+    uniffiRustCallWithError(MobileException) { _status ->
+    UniffiLib.uniffi_dragonglass_ffi_fn_method_mobilevault_create_folder(
+        it,
+        
+        FfiConverterString.lower(`relative`),_status)
+}
+    }
+    
+    
+
+    
+    /**
      * Create a note from a template, substituting the standard variables.
      */
     @Throws(MobileException::class)override fun `createFromTemplate`(`template`: kotlin.String, `title`: kotlin.String): kotlin.String {
@@ -1628,17 +1732,20 @@ open class MobileVault: Disposable, AutoCloseable, MobileVaultInterface
     
 
     
-    @Throws(MobileException::class)override fun `deleteNote`(`relative`: kotlin.String)
-        = 
+    /**
+     * Permanently remove everything in the trash. Returns the entry count.
+     */
+    @Throws(MobileException::class)override fun `emptyTrash`(): kotlin.Long {
+            return FfiConverterLong.lift(
     callWithHandle {
     uniffiRustCallWithError(MobileException) { _status ->
-    UniffiLib.uniffi_dragonglass_ffi_fn_method_mobilevault_delete_note(
+    UniffiLib.uniffi_dragonglass_ffi_fn_method_mobilevault_empty_trash(
         it,
-        
-        FfiConverterString.lower(`relative`),_status)
+        _status)
 }
     }
-    
+    )
+    }
     
 
     
@@ -1819,6 +1926,44 @@ open class MobileVault: Disposable, AutoCloseable, MobileVaultInterface
     }
     
 
+    
+    /**
+     * Rename or move a note or folder. Fails rather than overwriting another entry.
+     * Returns the sanitized vault-relative destination.
+     */
+    @Throws(MobileException::class)override fun `renameEntry`(`from`: kotlin.String, `to`: kotlin.String): kotlin.String {
+            return FfiConverterString.lift(
+    callWithHandle {
+    uniffiRustCallWithError(MobileException) { _status ->
+    UniffiLib.uniffi_dragonglass_ffi_fn_method_mobilevault_rename_entry(
+        it,
+        
+        FfiConverterString.lower(`from`),
+        FfiConverterString.lower(`to`),_status)
+}
+    }
+    )
+    }
+    
+
+    
+    /**
+     * Restore one trash entry to its original path. Returns that path.
+     */
+    @Throws(MobileException::class)override fun `restoreTrashEntry`(`trashRelative`: kotlin.String): kotlin.String {
+            return FfiConverterString.lift(
+    callWithHandle {
+    uniffiRustCallWithError(MobileException) { _status ->
+    UniffiLib.uniffi_dragonglass_ffi_fn_method_mobilevault_restore_trash_entry(
+        it,
+        
+        FfiConverterString.lower(`trashRelative`),_status)
+}
+    }
+    )
+    }
+    
+
     override fun `root`(): kotlin.String {
             return FfiConverterString.lift(
     callWithHandle {
@@ -1906,6 +2051,40 @@ open class MobileVault: Disposable, AutoCloseable, MobileVaultInterface
     callWithHandle {
     uniffiRustCallWithError(MobileException) { _status ->
     UniffiLib.uniffi_dragonglass_ffi_fn_method_mobilevault_toggle_bookmark(
+        it,
+        
+        FfiConverterString.lower(`relative`),_status)
+}
+    }
+    )
+    }
+    
+
+    
+    /**
+     * Everything currently in the vault trash, newest first.
+     */override fun `trashEntries`(): List<TrashEntry> {
+            return FfiConverterSequenceTypeTrashEntry.lift(
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_dragonglass_ffi_fn_method_mobilevault_trash_entries(
+        it,
+        _status)
+}
+    }
+    )
+    }
+    
+
+    
+    /**
+     * Move a note or folder to the vault trash. Returns its trash-relative path.
+     */
+    @Throws(MobileException::class)override fun `trashNote`(`relative`: kotlin.String): kotlin.String {
+            return FfiConverterString.lift(
+    callWithHandle {
+    uniffiRustCallWithError(MobileException) { _status ->
+    UniffiLib.uniffi_dragonglass_ffi_fn_method_mobilevault_trash_note(
         it,
         
         FfiConverterString.lower(`relative`),_status)
@@ -2512,6 +2691,61 @@ public object FfiConverterTypeTemplateInfo: FfiConverterRustBuffer<TemplateInfo>
 
 
 /**
+ * A deleted note or folder waiting in the vault trash.
+ */
+data class TrashEntry (
+    /**
+     * Vault-relative path of the trash entry, for `restore_trash_entry`.
+     */
+    var `trashRelative`: kotlin.String
+    , 
+    /**
+     * Where the entry was before it was deleted.
+     */
+    var `original`: kotlin.String
+    , 
+    /**
+     * Deletion time in milliseconds since the Unix epoch, when known.
+     */
+    var `deletedAt`: kotlin.Long
+    
+){
+    
+
+    
+
+    
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeTrashEntry: FfiConverterRustBuffer<TrashEntry> {
+    override fun read(buf: ByteBuffer): TrashEntry {
+        return TrashEntry(
+            FfiConverterString.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterLong.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: TrashEntry) = (
+            FfiConverterString.allocationSize(value.`trashRelative`) +
+            FfiConverterString.allocationSize(value.`original`) +
+            FfiConverterLong.allocationSize(value.`deletedAt`)
+    )
+
+    override fun write(value: TrashEntry, buf: ByteBuffer) {
+            FfiConverterString.write(value.`trashRelative`, buf)
+            FfiConverterString.write(value.`original`, buf)
+            FfiConverterLong.write(value.`deletedAt`, buf)
+    }
+}
+
+
+
+/**
  * A flattened sidebar row, carrying its depth instead of a recursive tree.
  */
 data class TreeRow (
@@ -2990,6 +3224,34 @@ public object FfiConverterSequenceTypeTemplateInfo: FfiConverterRustBuffer<List<
         buf.putInt(value.size)
         value.iterator().forEach {
             FfiConverterTypeTemplateInfo.write(it, buf)
+        }
+    }
+}
+
+
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterSequenceTypeTrashEntry: FfiConverterRustBuffer<List<TrashEntry>> {
+    override fun read(buf: ByteBuffer): List<TrashEntry> {
+        val len = buf.getInt()
+        return List<TrashEntry>(len) {
+            FfiConverterTypeTrashEntry.read(buf)
+        }
+    }
+
+    override fun allocationSize(value: List<TrashEntry>): ULong {
+        val sizeForLength = 4UL
+        val sizeForItems = value.map { FfiConverterTypeTrashEntry.allocationSize(it) }.sum()
+        return sizeForLength + sizeForItems
+    }
+
+    override fun write(value: List<TrashEntry>, buf: ByteBuffer) {
+        buf.putInt(value.size)
+        value.iterator().forEach {
+            FfiConverterTypeTrashEntry.write(it, buf)
         }
     }
 }
