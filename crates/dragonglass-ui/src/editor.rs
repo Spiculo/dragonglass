@@ -186,6 +186,21 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("ctrl-k", InsertWikilink, None),
         KeyBinding::new("cmd-k", InsertWikilink, None),
     ]);
+
+    // macOS conventions: Command jumps to the line or document edge, Option works by word.
+    #[cfg(target_os = "macos")]
+    cx.bind_keys([
+        KeyBinding::new("cmd-left", Home, None),
+        KeyBinding::new("cmd-right", End, None),
+        KeyBinding::new("cmd-up", DocumentStart, None),
+        KeyBinding::new("cmd-down", DocumentEnd, None),
+        KeyBinding::new("cmd-shift-left", SelectHome, None),
+        KeyBinding::new("cmd-shift-right", SelectEnd, None),
+        KeyBinding::new("cmd-shift-up", SelectDocumentStart, None),
+        KeyBinding::new("cmd-shift-down", SelectDocumentEnd, None),
+        KeyBinding::new("alt-backspace", DeleteWordLeft, None),
+        KeyBinding::new("alt-delete", DeleteWordRight, None),
+    ]);
 }
 
 /// Slash commands: `(inserted text, description)`. Typing `/desc` narrows the list.
@@ -1085,8 +1100,8 @@ impl Editor {
                 continue;
             }
             let end = Self::fold_end(headings, index, line_count);
-            for line in (start + 1)..end {
-                hidden[line] = true;
+            for slot in hidden.iter_mut().take(end).skip(start + 1) {
+                *slot = true;
             }
         }
         hidden
@@ -1225,10 +1240,11 @@ impl Editor {
         // A monospace face for editing, with per-platform fallbacks.
         font.family = "Cascadia Mono".into();
         font.fallbacks = Some(gpui::FontFallbacks(std::sync::Arc::new(vec![
+            "SF Mono".to_string(),
+            "Menlo".to_string(),
             "Consolas".to_string(),
             "DejaVu Sans Mono".to_string(),
             "Liberation Mono".to_string(),
-            "Menlo".to_string(),
             "monospace".to_string(),
         ])));
 
@@ -1262,8 +1278,8 @@ impl Editor {
         let mut rows: Vec<Rc<ShapedLine>> = Vec::new();
         let mut metas: Vec<RowMeta> = Vec::new();
 
-        for line_index in 0..count {
-            if hidden[line_index] {
+        for (line_index, &is_hidden) in hidden.iter().enumerate().take(count) {
+            if is_hidden {
                 continue;
             }
             let reused = match self.line_cache.get(line_index).and_then(Option::as_ref) {

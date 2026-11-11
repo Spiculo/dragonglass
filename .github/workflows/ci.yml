@@ -46,23 +46,23 @@ jobs:
       - name: Test mobile bindings
         run: cargo test -p dragonglass-ffi
 
-  # Produces a runnable (unsigned) .app/DMG on every push. This is the macOS artefact
-  # users can download from CI while signing/notarization is being set up.
+  # On demand only: a universal macOS build takes ~30 minutes of runner time and is
+  # disabled here to keep Actions minutes for the core jobs. Run the workflow by hand
+  # from the Actions tab (or the `gh workflow run ci.yml` CLI) when you need the bundle.
   macos-bundle:
     name: macos app bundle
+    if: github.event_name == 'workflow_dispatch'
     runs-on: macos-latest
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Build release
-        run: cargo build --release -p dragonglass-ui -p dragonglass-cli
-      - name: Bundle
+      - name: Package
         run: |
-          chmod +x packaging/macos/build-app.sh
-          packaging/macos/build-app.sh 0.0.0 "$RUNNER_TEMP/dist"
-          test -d "$RUNNER_TEMP/dist/Dragon Glass.app"
+          chmod +x packaging/macos/build-universal.sh packaging/macos/build-app.sh
+          packaging/macos/build-universal.sh 0.0.0 "$RUNNER_TEMP/dist"
+          test -d "$RUNNER_TEMP/dist/DragonGlass.app"
           test -f "$RUNNER_TEMP/dist/DragonGlass-0.0.0-macos.dmg"
       - name: Launch smoke test
         # GitHub's macOS runners can launch GUI apps, but this can be flaky in a headless
@@ -71,11 +71,11 @@ jobs:
         run: |
           mkdir -p "$RUNNER_TEMP/smoke-vault"
           printf '# Smoke\n\nHello from macOS.\n' > "$RUNNER_TEMP/smoke-vault/Note.md"
-          open -n "$RUNNER_TEMP/dist/Dragon Glass.app" --args "$RUNNER_TEMP/smoke-vault"
+          open -n "$RUNNER_TEMP/dist/DragonGlass.app" --args "$RUNNER_TEMP/smoke-vault"
           sleep 8
-          if pgrep -f "Dragon Glass.app/Contents/MacOS/dragon-glass-app" >/dev/null; then
+          if pgrep -f "DragonGlass.app/Contents/MacOS/dragon-glass-app" >/dev/null; then
             echo "Dragon Glass launched and stayed alive for 8 seconds"
-            pkill -f "Dragon Glass.app/Contents/MacOS/dragon-glass-app" || true
+            pkill -f "DragonGlass.app/Contents/MacOS/dragon-glass-app" || true
           else
             echo "Dragon Glass exited before the smoke-test window"
             exit 1
@@ -98,8 +98,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # macos-latest is Apple Silicon (arm64); add macos-13 for Intel artefacts later.
-        os: [windows-latest, ubuntu-latest, macos-latest]
+        # The GPUI app is built on Windows and Linux only: a macOS UI build costs about
+        # 20 minutes of runner time per push. macOS coverage runs on demand in
+        # `macos-bundle`, which builds and launch-tests the universal app.
+        os: [windows-latest, ubuntu-latest]
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable

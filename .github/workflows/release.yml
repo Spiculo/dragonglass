@@ -44,13 +44,21 @@ jobs:
           if (-not $fxc) { throw "fxc.exe was not found in the Windows SDK" }
           $fxc.DirectoryName | Out-File -FilePath $env:GITHUB_PATH -Append
 
-      - name: Build
-        run: cargo build --release -p dragonglass-ui -p dragonglass-cli
-
       - name: Version
         id: version
         shell: bash
         run: echo "value=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Build
+        if: runner.os != 'macOS'
+        run: cargo build --release -p dragonglass-ui -p dragonglass-cli
+
+      - name: Package (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          chmod +x packaging/macos/build-universal.sh packaging/macos/build-app.sh
+          packaging/macos/build-universal.sh \
+            "${{ steps.version.outputs.value }}" dist
 
       - name: Package (Linux)
         if: runner.os == 'Linux'
@@ -75,6 +83,8 @@ jobs:
             dist/*.deb
             dist/*.tar.gz
             dist/*-setup.exe
+            dist/*.dmg
+            dist/*.zip
           if-no-files-found: error
 
   macos:
@@ -95,15 +105,10 @@ jobs:
         run: echo "value=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
 
       - name: Package
-        env:
-          # Optional: unset secrets produce an unsigned app, which is still runnable.
-          CODESIGN_IDENTITY: ${{ secrets.MACOS_CODESIGN_IDENTITY }}
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
         run: |
-          chmod +x packaging/macos/build-app.sh
-          packaging/macos/build-app.sh "${{ steps.version.outputs.value }}" dist
+          chmod +x packaging/macos/build-universal.sh packaging/macos/build-app.sh
+          packaging/macos/build-universal.sh \
+            "${{ steps.version.outputs.value }}" dist
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v7

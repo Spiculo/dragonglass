@@ -3,7 +3,7 @@
 A native, local-first Obsidian replacement. No Electron. Fast, low-memory, native.
 
 **Status:** Active — Phase 0 (foundations)
-**Platforms:** Windows + Linux (priority), macOS (in progress)
+**Platforms:** Windows, Linux and macOS (universal app)
 **Team:** Solo developer
 **License:** GPL-3.0-or-later
 
@@ -35,7 +35,7 @@ view, git-based sync. No data loss on any real vault.
 **Explicit non-goals for v1:** own sync service, mobile, plugin marketplace, Canvas,
 publish/export, **Mermaid diagrams**.
 
-**Later:** WASM plugin model, query/Bases views, Mermaid, macOS, mobile.
+**Later:** WASM plugin model, query/Bases views, Mermaid, mobile.
 
 ---
 
@@ -192,12 +192,12 @@ optimize for shipping working code over schedule precision.
 
 | Phase | Duration | Contents | Milestone |
 |---|---|---|---|
-| **0 — Foundations** | 3–5 wk | repo + CI (Windows/Linux/macOS) ✅, `core` crate ✅, FS vault model ✅, **GPUI spike ✅** | GPUI builds on Windows ✅ and Linux ✅; macOS CI/bundle in progress; editor approach = build our own ✅ |
+| **0 — Foundations** | 3–5 wk | repo + CI (Windows/Linux/macOS) ✅, `core` crate ✅, FS vault model ✅, **GPUI spike ✅** | GPUI builds on Windows ✅, Linux ✅ and macOS ✅; editor approach = build our own ✅ |
 | **1 — Alpha** | 3–5 mo | rope buffer + undo/redo, editor element (source + live preview), file tree, tabs, quick switcher, full-text search, tags, wikilinks + backlinks, reading mode, **RaTeX math**, **git init/commit/push/pull** | dogfood on your own vault, zero data loss, git round-trip works |
 | **2 — Beta** | 3–4 mo | graph view, outline, daily notes, templates, properties, bookmarks, command palette, hotkeys, themes/CSS, embeds, attachments, file recovery, update prompt | feature-complete core |
 | **3 — Power** | 3–5 mo | WASM plugins, CLI, URI scheme, multi-window, workspaces, query/Bases views | public beta |
 | **4 — Ecosystem** | TBD | plugin/theme store, importers (Notion/Evernote/Roam), export/publish, MCP | ecosystem |
-| **5 — macOS** | in progress | CI + unsigned `.app`/DMG ✅, Cmd+Q save ✅; signing/notarization, Intel/universal, runtime polish | macOS parity |
+| **5 — macOS** | done (unsigned) | universal build, `.app`/dmg packaging, Command shortcuts, menu bar, URL scheme ✅; Developer ID signing and notarization still open | runs on Apple Silicon and Intel |
 
 **Critical path:** Phase 0 → 1. Everything else is gated on a proven native editor.
 
@@ -208,8 +208,8 @@ optimize for shipping working code over schedule precision.
 - **Native text editing is the hard part** (IME, BiDi, selection, multi-cursor, undo,
   a11y). Mitigation: build on a rope buffer + GPUI text shaping, port Zed's GPL editor
   code for the fiddly parts, and grow it incrementally behind tests.
-- **GPUI on Windows+Linux** — validated: builds and opens a window on Windows; builds on
-  Linux (Wayland + X11 + Vulkan) in a container. CI covers both.
+- **GPUI on Windows+Linux+macOS** — validated: builds and opens a window on Windows and
+  macOS; builds on Linux (Wayland + X11 + Vulkan) in a container. CI covers all three.
 - **Solo bandwidth** — phases are sequential and cuttable; milestones are shippable.
 - **Scope creep** (Canvas, Bases, Dataview, Mermaid) — gated behind v1.
 - **Git on large vaults** (attachments, big repos) — debounced commits + LFS guidance;
@@ -226,7 +226,7 @@ optimize for shipping working code over schedule precision.
 1. **UI stack:** GPUI. ✅
 2. **Positioning:** compat-first — lossless Obsidian vault round-trip. ✅
 3. **Obsidian JS plugin compat:** not required; own plugins are a plus (post-v1). ✅
-4. **Platforms:** Windows + Linux priority; no mobile; macOS later. ✅
+4. **Platforms:** Windows, Linux and macOS; no mobile. ✅
 5. **Team:** solo. ✅
 6. **Sync:** git-based; drive the user's `git` binary (their credentials, SSH and merge
    behaviour). ✅
@@ -264,8 +264,8 @@ optimize for shipping working code over schedule precision.
 
 ## 10. Progress
 
-**Phase 0 — complete.** Workspace, CI (Windows + Linux, including the GPUI build), core
-engine, CLI, GPUI validated on both platforms.
+**Phase 0 — complete.** Workspace, CI (Windows + Linux + macOS, including the GPUI build),
+core engine, CLI, GPUI validated on all three platforms.
 
 **Phase 1 — complete except two items.** Vault open/round-trip, file tree, rope buffer with
 undo/redo, in-house GPUI editor (caret, mouse placement, drag selection, shift-extend,
@@ -284,20 +284,23 @@ vault, the way Obsidian does.
 
 ## 11. What is deliberately not done
 
-- **Phase 5 (macOS).** In progress and verified through CI. The macOS build, unsigned
-  `.app`/DMG bundler and launch smoke test pass on `macos-latest`, and `Info.plist` declares
-  the URL scheme and Markdown document types. Cmd+Q saves dirty buffers through an app-quit
-  observer. Signing/notarization, Intel/universal builds,
-  the native app menu and runtime testing (IME, VoiceOver, trackpad, Metal) still require a
-  Mac and an Apple Developer ID.
+- **Signed and notarized macOS builds.** The macOS app is built and packaged as a universal
+  (Apple Silicon + Intel) bundle, and the menu bar, Command shortcuts and `dragonglass://`
+  scheme are verified on Apple Silicon. The Intel slice builds and links but has not run on
+  Intel hardware. Releases are only ad-hoc signed: users clear Gatekeeper once. Notarization
+  needs an Apple Developer ID certificate and credentials.
+- **macOS polish.** Not blockers for v0.0.1: no About panel (GPUI has no standard one),
+  `Cmd+W` closes the tab rather than the window, the dmg has no custom layout, and a `.md`
+  opened from Finder while the app runs is dropped because GPUI has no open-file event.
+  The macOS CI bundle is manual-dispatch only to save runner minutes.
 - **Community/online theme and plugin store.** The locked decision is "no network by default";
   the local store covers installation from a directory. A network store would contradict that.
 - **End-to-end-encrypted sync.** Listed conditionally ("if pursued") and not pursued; git sync
   covers the sync requirement.
 - **Packaging.** In place: `register-uri`/`unregister-uri`, a release profile, a Windows icon
   and VERSIONINFO resource embedded at build time, a `.deb` builder, Inno Setup and winget
-  manifests, Flatpak and AppImage recipes, a macOS `.app`/DMG bundler, and a tag-triggered
-  release workflow (macOS artifacts are currently unsigned).
+  manifests, Flatpak and AppImage recipes, a universal macOS `.app`/dmg builder with icon and
+  `Info.plist` URL scheme, and a tag-triggered release workflow for all three platforms.
 - **Mobile.** Originally deferred. An Android shell now exists in `mobile/android` on top of
   the UniFFI bridge in `crates/dragonglass-ffi`; iOS can reuse the same bridge with Swift
   bindings. The first slice edits app-private vaults; SAF/USB-document access is next.
@@ -357,14 +360,12 @@ shift the cached tail instead of dropping it). Before this, every keystroke re-m
 re-shaped the whole note — noticeable on the 1,000+ line notes in the test vault. The view
 also follows the caret, and `Ctrl+Z` / `Ctrl+Shift+Z` / `Ctrl+Y` undo and redo.
 
-**Phase 5 — in progress.** macOS is in the CI matrix and releases get an unsigned `.app`
-and DMG from `packaging/macos/`. The `macos-bundle` job builds and launch-tests the app on
-`macos-latest`; the first full run produced a runnable arm64 bundle and DMG. The bundle declares the `dragonglass://` URL scheme
-and Markdown document types, Cmd+Q is wired to an app-quit save so unsaved tabs are not
-dropped, the vault registry already uses `~/Library/Application Support/DragonGlass`, and
-recent-vault deduplication is case-insensitive on macOS as well as Windows. Still required:
-Developer ID signing and notarization, Intel/universal binaries, a native app menu and
-runtime validation of IME, VoiceOver, trackpad gestures and Metal on a Mac.
+**Phase 5 — done, except signing.** macOS builds as a universal (Apple Silicon + Intel)
+`.app` with an icon and `Info.plist`, Command shortcuts, a menu bar, and `dragonglass://`
+registration through Launch Services. The `macos-bundle` CI job builds and launch-tests the
+bundle on `macos-latest`, on manual dispatch only so it does not spend runner minutes on
+every push. Still open: Developer ID signing and notarization, so Gatekeeper needs one
+manual approval per download.
 
 ### Editor tooling
 

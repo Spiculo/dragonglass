@@ -1,8 +1,8 @@
 //! Dragon Glass UI (Phase 0/1).
 //!
 //! Opens a vault, shows its directory tree, loads notes into the in-house editor, and
-//! provides a quick switcher (Ctrl+O), full-text search (Ctrl+Shift+F) and a git menu
-//! (Ctrl+G).
+//! provides a quick switcher (Ctrl+O / Cmd+O), full-text search (Ctrl+Shift+F /
+//! Cmd+Shift+F) and a git menu (Ctrl+G / Cmd+G).
 
 // Release builds are a normal GUI app on Windows: no console window behind the editor.
 #![cfg_attr(
@@ -14,12 +14,14 @@ mod editor;
 mod flow;
 mod graph_view;
 mod math_element;
+mod platform;
 mod preview_window;
 mod reading;
 mod theme;
 mod vault_picker;
 mod vim;
 
+use std::cell::RefCell;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -33,34 +35,41 @@ use dragonglass_core::{
 
 /// Actions the hotkey editor can rebind: `(action, default key, label)`.
 const HOTKEYS: &[(&str, &str, &str)] = &[
-    ("OpenCommands", "ctrl+p", "Command palette"),
-    ("OpenSettings", "ctrl-,", "Settings"),
-    ("OpenSwitcher", "ctrl+o", "Quick switcher"),
-    ("OpenSearch", "ctrl+shift+f", "Search"),
-    ("OpenGraph", "ctrl+shift+g", "Graph view"),
-    ("OpenRelations", "ctrl+shift+r", "Document relations"),
-    ("OpenDaily", "ctrl+shift+d", "Daily note"),
-    ("OpenWeekly", "ctrl+shift+w", "Weekly note"),
-    ("OpenMonthly", "ctrl+shift+m", "Monthly note"),
-    ("OpenProperties", "ctrl+shift+p", "Properties"),
-    ("ToggleBookmark", "ctrl+shift+b", "Toggle bookmark"),
-    ("OpenGit", "ctrl+g", "Git"),
-    ("ToggleTheme", "ctrl+shift+l", "Toggle theme"),
-    ("NewWindow", "ctrl+n", "New window"),
-    ("ToggleSideBySide", "ctrl-alt+1", "Read/write side by side"),
-    ("DetachTab", "ctrl-alt+n", "Move tab to new window"),
+    ("OpenCommands", "secondary+p", "Command palette"),
+    ("OpenSettings", "secondary-,", "Settings"),
+    ("OpenSwitcher", "secondary+o", "Quick switcher"),
+    ("OpenSearch", "secondary+shift+f", "Search"),
+    ("OpenGraph", "secondary+shift+g", "Graph view"),
+    ("OpenRelations", "secondary+shift+r", "Document relations"),
+    ("OpenDaily", "secondary+shift+d", "Daily note"),
+    ("OpenWeekly", "secondary+shift+w", "Weekly note"),
+    ("OpenMonthly", "secondary+shift+m", "Monthly note"),
+    ("OpenProperties", "secondary+shift+p", "Properties"),
+    ("ToggleBookmark", "secondary+shift+b", "Toggle bookmark"),
+    ("OpenGit", "secondary+g", "Git"),
+    ("ToggleTheme", "secondary+shift+l", "Toggle theme"),
+    ("NewWindow", "secondary+n", "New window"),
+    (
+        "ToggleSideBySide",
+        "secondary-alt+1",
+        "Read/write side by side",
+    ),
+    ("DetachTab", "secondary-alt+n", "Move tab to new window"),
     (
         "ToggleSplitEditor",
-        "ctrl-alt+2",
+        "secondary-alt+2",
         "Two editors side by side",
     ),
-    ("CloseTab", "ctrl+w", "Close tab"),
+    ("CloseTab", "secondary+w", "Close tab"),
     ("NextTab", "ctrl-tab", "Next tab"),
     ("PrevTab", "ctrl-shift-tab", "Previous tab"),
 ];
 
 /// Bind a saved override by action name.
 fn bind_named(cx: &mut App, key: &str, action: &str) {
+    // Accept both `ctrl+shift+g` and `ctrl-shift-g`; GPUI only understands `-`.
+    let key = platform::normalize(key);
+    let key = key.as_str();
     match action {
         "OpenCommands" => cx.bind_keys([KeyBinding::new(key, OpenCommands, None)]),
         "OpenSettings" => cx.bind_keys([KeyBinding::new(key, OpenSettings, None)]),
@@ -124,6 +133,9 @@ actions!(
         CloseTab,
         NextTab,
         PrevTab,
+        HideApp,
+        HideOthers,
+        ShowAll,
         Quit
     ]
 );
@@ -1641,10 +1653,10 @@ impl DragonGlassApp {
                 .iter()
                 .map(|(action, default, label)| SwitcherItem {
                     label: (*label).to_string(),
-                    detail: match keymap::key_for_action(&self.bindings, action) {
-                        Some(key) => key,
-                        None => platform_hint(default),
-                    },
+                    detail: platform::label(
+                        &keymap::key_for_action(&self.bindings, action)
+                            .unwrap_or_else(|| (*default).to_string()),
+                    ),
                     item: Item::Hotkey((*action).to_string()),
                 })
                 .collect(),
@@ -1848,21 +1860,33 @@ impl DragonGlassApp {
                 })
                 .collect(),
             SwitcherMode::CommandsMenu => vec![
-                command_item("Quick switcher", "ctrl+o", CommandId::QuickSwitch),
-                command_item("Search", "ctrl+shift+f", CommandId::Search),
-                command_item("Daily note", "ctrl+shift+d", CommandId::Daily),
-                command_item("Weekly note", "ctrl+shift+w", CommandId::Weekly),
-                command_item("Monthly note", "ctrl-shift-m", CommandId::Monthly),
-                command_item("Properties", "ctrl+shift+p", CommandId::Properties),
-                command_item("Toggle bookmark", "ctrl+shift+b", CommandId::Bookmark),
-                command_item("Git", "ctrl+g", CommandId::Git),
-                command_item("Toggle reading mode", "ctrl+e", CommandId::ToggleReading),
-                command_item("Find and replace", "ctrl+h", CommandId::FindReplace),
-                command_item("Toggle Vim mode", "ctrl-alt-v", CommandId::ToggleVim),
-                command_item("Fold/unfold heading", "ctrl-shift-[", CommandId::ToggleFold),
-                command_item("Save", "ctrl+s", CommandId::Save),
-                command_item("Toggle theme", "ctrl+shift+l", CommandId::ToggleTheme),
-                command_item("Settings", "", CommandId::Settings),
+                command_item("Quick switcher", "secondary+o", CommandId::QuickSwitch),
+                command_item("Search", "secondary+shift+f", CommandId::Search),
+                command_item("Daily note", "secondary+shift+d", CommandId::Daily),
+                command_item("Weekly note", "secondary+shift+w", CommandId::Weekly),
+                command_item("Monthly note", "secondary+shift+m", CommandId::Monthly),
+                command_item("Properties", "secondary+shift+p", CommandId::Properties),
+                command_item("Toggle bookmark", "secondary+shift+b", CommandId::Bookmark),
+                command_item("Git", "secondary+g", CommandId::Git),
+                command_item(
+                    "Toggle reading mode",
+                    "secondary+e",
+                    CommandId::ToggleReading,
+                ),
+                command_item(
+                    "Find and replace",
+                    "secondary-alt+f",
+                    CommandId::FindReplace,
+                ),
+                command_item("Toggle Vim mode", "secondary-alt+v", CommandId::ToggleVim),
+                command_item(
+                    "Fold/unfold heading",
+                    "secondary-shift+[",
+                    CommandId::ToggleFold,
+                ),
+                command_item("Save", "secondary+s", CommandId::Save),
+                command_item("Toggle theme", "secondary+shift+l", CommandId::ToggleTheme),
+                command_item("Settings", "secondary-,", CommandId::Settings),
                 command_item("New note", "", CommandId::NewNote),
                 command_item("New folder", "", CommandId::NewFolder),
                 command_item("Rename current note", "", CommandId::RenameNote),
@@ -1870,8 +1894,12 @@ impl DragonGlassApp {
                 command_item("Save note as", "", CommandId::SaveAs),
                 command_item("File recovery", "", CommandId::History),
                 command_item("Check for updates", "", CommandId::CheckUpdates),
-                command_item("Graph view", "ctrl+shift+g", CommandId::OpenGraph),
-                command_item("Document relations", "ctrl+shift+r", CommandId::Relations),
+                command_item("Graph view", "secondary+shift+g", CommandId::OpenGraph),
+                command_item(
+                    "Document relations",
+                    "secondary+shift+r",
+                    CommandId::Relations,
+                ),
                 command_item("Relation graph", "", CommandId::RelationGraph),
                 command_item("A/B versions", "", CommandId::Versions),
                 command_item("Save as version A", "", CommandId::SaveVersionA),
@@ -1887,10 +1915,10 @@ impl DragonGlassApp {
                 ),
                 command_item("Reload note from disk", "", CommandId::ReloadNote),
                 command_item("Review document", "", CommandId::ReviewDocument),
-                command_item("Move block up", "ctrl+shift+up", CommandId::MoveBlockUp),
+                command_item("Move block up", "ctrl-shift+up", CommandId::MoveBlockUp),
                 command_item(
                     "Move block down",
-                    "ctrl+shift+down",
+                    "ctrl-shift+down",
                     CommandId::MoveBlockDown,
                 ),
                 command_item("Duplicate block", "", CommandId::DuplicateBlock),
@@ -1904,22 +1932,26 @@ impl DragonGlassApp {
                 command_item("Toggle snippets", "", CommandId::ToggleSnippets),
                 command_item(
                     "Read and write side by side",
-                    "ctrl-alt+1",
+                    "secondary-alt+1",
                     CommandId::TogglePreview,
                 ),
                 command_item("Pop preview out to a window", "", CommandId::DetachPreview),
                 command_item("Load workspace", "", CommandId::LoadWorkspace),
                 command_item("Open vault", "", CommandId::OpenVault),
-                command_item("New window", "ctrl+n", CommandId::NewWindow),
-                command_item("Move tab to new window", "ctrl-alt+n", CommandId::DetachTab),
+                command_item("New window", "secondary+n", CommandId::NewWindow),
+                command_item(
+                    "Move tab to new window",
+                    "secondary-alt+n",
+                    CommandId::DetachTab,
+                ),
                 command_item(
                     "Two editors side by side",
-                    "ctrl-alt+2",
+                    "secondary-alt+2",
                     CommandId::ToggleSplitEditor,
                 ),
-                command_item("Close tab", "ctrl+w", CommandId::CloseTab),
-                command_item("Next tab", "ctrl+tab", CommandId::NextTab),
-                command_item("Previous tab", "ctrl+shift+tab", CommandId::PrevTab),
+                command_item("Close tab", "secondary+w", CommandId::CloseTab),
+                command_item("Next tab", "ctrl-tab", CommandId::NextTab),
+                command_item("Previous tab", "ctrl-shift-tab", CommandId::PrevTab),
             ]
             .into_iter()
             .chain(
@@ -2647,16 +2679,11 @@ impl DragonGlassApp {
             return;
         }
 
-        let handled = self.editor.update(cx, |editor, cx| {
-            let handled = editor.handle_escape();
-            if handled {
+        self.editor.update(cx, |editor, cx| {
+            if editor.handle_escape() {
                 cx.notify();
             }
-            handled
         });
-        if handled {
-            return;
-        }
     }
 
     fn new_window(&mut self, _: &NewWindow, window: &mut Window, cx: &mut Context<Self>) {
@@ -3189,7 +3216,7 @@ impl DragonGlassApp {
                 }
                 if !tabs.is_empty() {
                     if let Some(target) = target.upgrade() {
-                        let _ = target.update(cx, |app, cx| app.adopt_tabs(tabs, cx));
+                        target.update(cx, |app, cx| app.adopt_tabs(tabs, cx));
                     }
                 }
                 true
@@ -3655,12 +3682,28 @@ impl DragonGlassApp {
                         theme,
                     ))
                     .child(heading("Editor shortcuts", theme))
-                    .child(info("Bold", &platform_hint("Ctrl+B"), theme))
-                    .child(info("Italic", &platform_hint("Ctrl+I"), theme))
-                    .child(info("Strikethrough", &platform_hint("Ctrl+Shift+X"), theme))
-                    .child(info("Highlight", &platform_hint("Ctrl+Shift+H"), theme))
-                    .child(info("Inline code", &platform_hint("Ctrl+Shift+C"), theme))
-                    .child(info("Wikilink picker", &platform_hint("Ctrl+K"), theme))
+                    .child(info("Bold", &platform::label("secondary-b"), theme))
+                    .child(info("Italic", &platform::label("secondary-i"), theme))
+                    .child(info(
+                        "Strikethrough",
+                        &platform::label("secondary-shift-x"),
+                        theme,
+                    ))
+                    .child(info(
+                        "Highlight",
+                        &platform::label("secondary-shift-h"),
+                        theme,
+                    ))
+                    .child(info(
+                        "Inline code",
+                        &platform::label("secondary-shift-c"),
+                        theme,
+                    ))
+                    .child(info(
+                        "Wikilink picker",
+                        &platform::label("secondary-k"),
+                        theme,
+                    ))
                     .child(info("Link selected text", "type [[", theme))
                     .child(info("Autocomplete", "↑ / ↓ then Enter", theme))
                     .child(heading("Files", theme))
@@ -4402,11 +4445,7 @@ impl DragonGlassApp {
                                 CommandId::NewWindow => self.open_new_window(window, cx),
                                 CommandId::OpenVault => {
                                     self.close_panel(window, cx);
-                                    vault_picker::VaultPicker::open(
-                                        cx,
-                                        None,
-                                        Rc::new(open_vault_in_new_process),
-                                    );
+                                    open_vault_picker(cx, None, Rc::new(open_vault_in_new_process));
                                     return;
                                 }
                                 CommandId::DetachTab => {
@@ -5022,19 +5061,15 @@ fn git_item(label: &str, detail: &str, action: GitAction) -> SwitcherItem {
     }
 }
 
-/// Shortcut hints are written with Ctrl; macOS users see Cmd instead.
-fn platform_hint(hint: &str) -> String {
-    if cfg!(target_os = "macos") {
-        hint.replace("Ctrl", "Cmd").replace("ctrl", "cmd")
-    } else {
-        hint.to_string()
-    }
-}
-
 fn command_item(label: &str, hint: &str, command: CommandId) -> SwitcherItem {
     SwitcherItem {
         label: label.to_string(),
-        detail: platform_hint(hint),
+        // Hints are portable keystrokes; show them the way this platform writes them.
+        detail: if hint.is_empty() {
+            String::new()
+        } else {
+            platform::label(hint)
+        },
         item: Item::Command(command),
     }
 }
@@ -6211,6 +6246,145 @@ impl Render for DragonGlassApp {
     }
 }
 
+/// Build the macOS menu bar. The menu items dispatch the same actions as the shortcuts,
+/// so the two can never disagree.
+#[cfg(target_os = "macos")]
+fn install_menus(cx: &mut App) {
+    use gpui::{Menu, MenuItem, OsAction, SystemMenuType};
+
+    let menus = vec![
+        Menu {
+            name: "Dragon Glass".into(),
+            items: vec![
+                MenuItem::action("Settings\u{2026}", OpenSettings),
+                MenuItem::separator(),
+                MenuItem::os_submenu("Services", SystemMenuType::Services),
+                MenuItem::separator(),
+                MenuItem::action("Hide Dragon Glass", HideApp),
+                MenuItem::action("Hide Others", HideOthers),
+                MenuItem::action("Show All", ShowAll),
+                MenuItem::separator(),
+                MenuItem::action("Quit Dragon Glass", Quit),
+            ],
+        },
+        Menu {
+            name: "File".into(),
+            items: vec![
+                MenuItem::action("New Window", NewWindow),
+                MenuItem::action("Move Tab to New Window", DetachTab),
+                MenuItem::action("Close Tab", CloseTab),
+                MenuItem::separator(),
+                MenuItem::action("Save", editor::Save),
+            ],
+        },
+        Menu {
+            name: "Edit".into(),
+            items: vec![
+                MenuItem::os_action("Undo", editor::Undo, OsAction::Undo),
+                MenuItem::os_action("Redo", editor::Redo, OsAction::Redo),
+                MenuItem::separator(),
+                MenuItem::os_action("Cut", editor::Cut, OsAction::Cut),
+                MenuItem::os_action("Copy", editor::Copy, OsAction::Copy),
+                MenuItem::os_action("Paste", editor::Paste, OsAction::Paste),
+                MenuItem::os_action("Select All", editor::SelectAll, OsAction::SelectAll),
+                MenuItem::separator(),
+                MenuItem::action("Find", editor::OpenFind),
+                MenuItem::action("Find and Replace", editor::OpenFindReplace),
+            ],
+        },
+        Menu {
+            name: "View".into(),
+            items: vec![
+                MenuItem::action("Reading Mode", editor::ToggleReading),
+                MenuItem::action("Toggle Theme", ToggleTheme),
+                MenuItem::separator(),
+                MenuItem::action("Graph View", OpenGraph),
+                MenuItem::action("Document Relations", OpenRelations),
+                MenuItem::separator(),
+                MenuItem::action("Read and Write Side by Side", ToggleSideBySide),
+                MenuItem::action("Two Editors Side by Side", ToggleSplitEditor),
+            ],
+        },
+        Menu {
+            name: "Go".into(),
+            items: vec![
+                MenuItem::action("Command Palette", OpenCommands),
+                MenuItem::action("Quick Switcher", OpenSwitcher),
+                MenuItem::action("Search", OpenSearch),
+                MenuItem::separator(),
+                MenuItem::action("Daily Note", OpenDaily),
+                MenuItem::action("Weekly Note", OpenWeekly),
+                MenuItem::action("Monthly Note", OpenMonthly),
+            ],
+        },
+        Menu {
+            name: "Window".into(),
+            items: vec![
+                MenuItem::action("Next Tab", NextTab),
+                MenuItem::action("Previous Tab", PrevTab),
+            ],
+        },
+    ];
+
+    cx.set_menus(menus);
+}
+
+/// Handle `dragonglass://` URLs delivered by Launch Services while the app runs, and ask
+/// the system to route the scheme here when the app is installed as a bundle.
+#[cfg(target_os = "macos")]
+fn install_url_handler(cx: &mut App, urls: smol::channel::Receiver<Vec<String>>) {
+    // The platform callback has no app handle, so it feeds a channel and a foreground
+    // task does the work. Waiting on a channel costs nothing while idle.
+    cx.spawn(async move |cx: &mut gpui::AsyncApp| {
+        while let Ok(batch) = urls.recv().await {
+            for url in batch {
+                open_uri(&url, cx);
+            }
+        }
+    })
+    .detach();
+
+    // This fails for a binary run outside a bundle, which is fine: argv still works.
+    cx.register_url_scheme("dragonglass").detach();
+}
+
+/// Open the vault and note named by a `dragonglass://` URL.
+#[cfg(target_os = "macos")]
+fn open_uri(url: &str, app: &gpui::AsyncApp) {
+    let Some(parsed) = uri::parse(url) else {
+        return;
+    };
+    let vault = parsed.vault.map(PathBuf::from);
+    let note = parsed.note;
+
+    let _ = app.update(move |cx| {
+        // A cold launch through the URL scheme shows the chooser first; replace it.
+        close_vault_picker(cx);
+        open_request(vault, note, cx);
+    });
+}
+
+thread_local! {
+    /// The last "open a vault" window. A `dragonglass://` URL that arrives after launch
+    /// closes it, so the app shows the requested vault instead of two windows.
+    static VAULT_PICKER: RefCell<Option<gpui::WindowHandle<vault_picker::VaultPicker>>> =
+        const { RefCell::new(None) };
+}
+
+/// Show the vault chooser and remember its window.
+fn open_vault_picker(cx: &mut App, error: Option<String>, open: vault_picker::OpenVault) {
+    let window = vault_picker::VaultPicker::open(cx, error, open);
+    VAULT_PICKER.with(|slot| *slot.borrow_mut() = Some(window));
+}
+
+/// Close the chooser, if one is open.
+fn close_vault_picker(cx: &mut App) {
+    let Some(window) = VAULT_PICKER.with(|slot| slot.borrow_mut().take()) else {
+        return;
+    };
+    let _ = window.update(cx, |_picker, window, _cx| window.remove_window());
+}
+
 fn main() {
     // The first argument may be a vault path or a `dragonglass://` URI, so the app can be
     // registered as the OS handler for the scheme. Without one, reopen the last vault; on
@@ -6253,49 +6427,98 @@ fn main() {
         None => (None, None),
     };
 
-    Application::new().run(move |cx: &mut App| {
+    // URLs opened while the app runs arrive through a platform callback with no app
+    // handle. Feed a channel, then handle them on the foreground task in `run`.
+    #[cfg(target_os = "macos")]
+    let (url_tx, url_rx) = smol::channel::unbounded::<Vec<String>>();
+
+    let application = Application::new();
+    #[cfg(target_os = "macos")]
+    application.on_open_urls(move |urls| {
+        let _ = url_tx.try_send(urls);
+    });
+
+    application.run(move |cx: &mut App| {
+        cx.on_action(|_: &Quit, cx: &mut App| cx.quit());
+        // Standard application menu items on macOS. They are harmless elsewhere.
+        cx.on_action(|_: &HideApp, cx: &mut App| cx.hide());
+        cx.on_action(|_: &HideOthers, cx: &mut App| cx.hide_other_apps());
+        cx.on_action(|_: &ShowAll, cx: &mut App| cx.unhide_other_apps());
+
+        // Shortcuts are global; a vault's saved overrides replace them once it opens.
+        editor::init(cx);
+        // Defaults use `secondary`, which GPUI resolves to Command on macOS and Control
+        // elsewhere. Tab switching stays on Control everywhere: Command-Tab is the macOS
+        // application switcher.
+        for (action, default, _) in HOTKEYS {
+            bind_named(cx, &platform::normalize(default), action);
+        }
+        cx.bind_keys([
+            KeyBinding::new("escape", CloseOverlay, None),
+            KeyBinding::new("ctrl-pagedown", NextTab, None),
+            KeyBinding::new("ctrl-pageup", PrevTab, None),
+            KeyBinding::new("secondary-q", Quit, None),
+            KeyBinding::new("secondary-alt-v", ToggleVim, None),
+        ]);
+        // Command-H is Hide on macOS and Ctrl-H is find/replace elsewhere.
+        #[cfg(target_os = "macos")]
+        cx.bind_keys([
+            KeyBinding::new("cmd-h", HideApp, None),
+            KeyBinding::new("cmd-alt-h", HideOthers, None),
+        ]);
+
+        #[cfg(target_os = "macos")]
+        {
+            install_menus(cx);
+            install_url_handler(cx, url_rx);
+        }
+
         // An explicit path (a shortcut, the file manager, or a `dragonglass://` URI) wins.
         // If it cannot be opened, fall back to the chooser rather than exiting silently.
-        if let Some(vault_path) = requested_vault.clone() {
-            if !open_vault_window(vault_path.clone(), uri_note.clone(), cx) {
-                vault_picker::VaultPicker::open(
+        open_request(requested_vault.clone(), uri_note.clone(), cx);
+    });
+}
+
+/// Open the requested vault, or the last vault, or the chooser.
+fn open_request(vault: Option<PathBuf>, note: Option<String>, cx: &mut App) {
+    if let Some(vault) = vault {
+        if !open_vault_window(vault.clone(), note, cx) {
+            open_vault_picker(
+                cx,
+                Some(format!("Could not open {}.", vault.display())),
+                Rc::new(open_vault_at_startup),
+            );
+        }
+        return;
+    }
+
+    // A URI that names no vault still supplies a note.
+    match vaults::Registry::load().last().map(Path::to_path_buf) {
+        Some(last) if last.is_dir() => {
+            if !open_vault_window(last.clone(), note, cx) {
+                open_vault_picker(
                     cx,
-                    Some(format!("Could not open {}.", vault_path.display())),
+                    Some(format!("Could not open {}.", last.display())),
                     Rc::new(open_vault_at_startup),
                 );
             }
-            return;
         }
-
-        // Otherwise reopen the last vault. A URI that names no vault still supplies a note.
-        let last = vaults::Registry::load().last().map(Path::to_path_buf);
-        match last {
-            Some(last) if last.is_dir() => {
-                if !open_vault_window(last.clone(), uri_note.clone(), cx) {
-                    vault_picker::VaultPicker::open(
-                        cx,
-                        Some(format!("Could not open {}.", last.display())),
-                        Rc::new(open_vault_at_startup),
-                    );
-                }
-            }
-            Some(last) => vault_picker::VaultPicker::open(
-                cx,
-                Some(format!(
-                    "The last vault, {}, is no longer available.",
-                    last.display()
-                )),
-                Rc::new(open_vault_at_startup),
-            ),
-            None => vault_picker::VaultPicker::open(cx, None, Rc::new(open_vault_at_startup)),
-        }
-    });
+        Some(last) => open_vault_picker(
+            cx,
+            Some(format!(
+                "The last vault, {}, is no longer available.",
+                last.display()
+            )),
+            Rc::new(open_vault_at_startup),
+        ),
+        None => open_vault_picker(cx, None, Rc::new(open_vault_at_startup)),
+    }
 }
 
 /// Open a vault chosen in the startup picker, falling back to the picker on failure.
 fn open_vault_at_startup(vault_path: PathBuf, cx: &mut App) {
     if !open_vault_window(vault_path.clone(), None, cx) {
-        vault_picker::VaultPicker::open(
+        open_vault_picker(
             cx,
             Some(format!("Could not open {}.", vault_path.display())),
             Rc::new(open_vault_at_startup),
@@ -6311,7 +6534,7 @@ fn open_vault_in_new_process(vault_path: PathBuf, cx: &mut App) {
     let spawned = spawn_vault_process(&vault_path);
 
     if let Err(error) = spawned {
-        vault_picker::VaultPicker::open(
+        open_vault_picker(
             cx,
             Some(format!("Could not open {}: {error}", vault_path.display())),
             Rc::new(open_vault_in_new_process),
@@ -6349,83 +6572,6 @@ fn spawn_vault_process(vault_path: &Path) -> std::io::Result<()> {
         .arg(vault_path)
         .spawn()
         .map(|_| ())
-}
-
-/// Install a native macOS menu bar. GPUI's other backends ignore menus, so the same
-/// construction is safe to compile and call everywhere.
-fn install_macos_menu(cx: &mut App) {
-    if !cfg!(target_os = "macos") {
-        return;
-    }
-
-    // Handle Quit globally: the app menu must stay enabled even when focus is on the
-    // vault picker rather than a note window.
-    cx.on_action(|_: &Quit, cx| cx.quit());
-
-    use gpui::{Menu, MenuItem};
-
-    let app_menu = Menu {
-        name: "Dragon Glass".into(),
-        items: vec![
-            MenuItem::action("Settings\u{2026}", OpenSettings),
-            MenuItem::separator(),
-            MenuItem::action("Quit Dragon Glass", Quit),
-        ],
-    };
-
-    let file_menu = Menu {
-        name: "File".into(),
-        items: vec![
-            MenuItem::action("Save", editor::Save),
-            MenuItem::action("Close Tab", CloseTab),
-            MenuItem::separator(),
-            MenuItem::action("New Window", NewWindow),
-            MenuItem::action("Move Tab to New Window", DetachTab),
-            MenuItem::separator(),
-            MenuItem::action("Quit Dragon Glass", Quit),
-        ],
-    };
-
-    let edit_menu = Menu {
-        name: "Edit".into(),
-        items: vec![
-            MenuItem::action("Undo", editor::Undo),
-            MenuItem::action("Redo", editor::Redo),
-            MenuItem::separator(),
-            MenuItem::action("Cut", editor::Cut),
-            MenuItem::action("Copy", editor::Copy),
-            MenuItem::action("Paste", editor::Paste),
-            MenuItem::action("Select All", editor::SelectAll),
-            MenuItem::separator(),
-            MenuItem::action("Find", editor::OpenFind),
-            MenuItem::action("Find and Replace", editor::OpenFindReplace),
-        ],
-    };
-
-    let view_menu = Menu {
-        name: "View".into(),
-        items: vec![
-            MenuItem::action("Command Palette", OpenCommands),
-            MenuItem::action("Quick Switcher", OpenSwitcher),
-            MenuItem::action("Search", OpenSearch),
-            MenuItem::separator(),
-            MenuItem::action("Toggle Reading Mode", editor::ToggleReading),
-            MenuItem::action("Graph View", OpenGraph),
-            MenuItem::action("Document Relations", OpenRelations),
-            MenuItem::separator(),
-            MenuItem::action("Settings\u{2026}", OpenSettings),
-        ],
-    };
-
-    let window_menu = Menu {
-        name: "Window".into(),
-        items: vec![
-            MenuItem::action("Next Tab", NextTab),
-            MenuItem::action("Previous Tab", PrevTab),
-        ],
-    };
-
-    cx.set_menus(vec![app_menu, file_menu, edit_menu, view_menu, window_menu]);
 }
 
 /// Build the main window for `vault_path`. Returns false when the vault cannot be opened.
@@ -6534,62 +6680,10 @@ fn open_vault_window(vault_path: PathBuf, uri_note: Option<String>, cx: &mut App
         .or_else(|| first.map(|r| r.relative.clone()));
     let first_path = first_rel.as_ref().map(|relative| vault_root.join(relative));
 
-    editor::init(cx);
-    cx.bind_keys([
-        KeyBinding::new("ctrl-o", OpenSwitcher, None),
-        KeyBinding::new("cmd-o", OpenSwitcher, None),
-        KeyBinding::new("ctrl-shift-f", OpenSearch, None),
-        KeyBinding::new("cmd-shift-f", OpenSearch, None),
-        KeyBinding::new("ctrl-g", OpenGit, None),
-        KeyBinding::new("cmd-g", OpenGit, None),
-        KeyBinding::new("ctrl-shift-d", OpenDaily, None),
-        KeyBinding::new("cmd-shift-d", OpenDaily, None),
-        KeyBinding::new("ctrl-shift-w", OpenWeekly, None),
-        KeyBinding::new("cmd-shift-w", OpenWeekly, None),
-        KeyBinding::new("ctrl-shift-m", OpenMonthly, None),
-        KeyBinding::new("cmd-shift-m", OpenMonthly, None),
-        KeyBinding::new("ctrl-shift-p", OpenProperties, None),
-        KeyBinding::new("cmd-shift-p", OpenProperties, None),
-        KeyBinding::new("ctrl-shift-b", ToggleBookmark, None),
-        KeyBinding::new("cmd-shift-b", ToggleBookmark, None),
-        KeyBinding::new("ctrl-p", OpenCommands, None),
-        KeyBinding::new("cmd-p", OpenCommands, None),
-        KeyBinding::new("ctrl-,", OpenSettings, None),
-        KeyBinding::new("cmd-,", OpenSettings, None),
-        KeyBinding::new("ctrl-shift-l", ToggleTheme, None),
-        KeyBinding::new("cmd-shift-l", ToggleTheme, None),
-        KeyBinding::new("ctrl-alt-v", ToggleVim, None),
-        KeyBinding::new("cmd-alt-v", ToggleVim, None),
-        KeyBinding::new("ctrl-shift-g", OpenGraph, None),
-        KeyBinding::new("cmd-shift-g", OpenGraph, None),
-        KeyBinding::new("ctrl-shift-r", OpenRelations, None),
-        KeyBinding::new("cmd-shift-r", OpenRelations, None),
-        KeyBinding::new("escape", CloseOverlay, None),
-        KeyBinding::new("ctrl-n", NewWindow, None),
-        KeyBinding::new("cmd-n", NewWindow, None),
-        KeyBinding::new("ctrl-alt-n", DetachTab, None),
-        KeyBinding::new("ctrl-alt-1", ToggleSideBySide, None),
-        KeyBinding::new("ctrl-alt-2", ToggleSplitEditor, None),
-        KeyBinding::new("ctrl-w", CloseTab, None),
-        KeyBinding::new("cmd-w", CloseTab, None),
-        KeyBinding::new("ctrl-tab", NextTab, None),
-        KeyBinding::new("ctrl-shift-tab", PrevTab, None),
-        KeyBinding::new("ctrl-pagedown", NextTab, None),
-        KeyBinding::new("ctrl-pageup", PrevTab, None),
-    ]);
-
-    if cfg!(target_os = "macos") {
-        cx.bind_keys([KeyBinding::new("cmd-q", Quit, None)]);
-    }
-
     // Saved shortcut overrides win over the defaults registered above.
     for binding in &initial_bindings {
         bind_named(cx, &binding.key, &binding.action);
     }
-
-    // Native menu bar (a no-op outside macOS); build it after the keymap so menu items
-    // show their shortcuts.
-    install_macos_menu(cx);
 
     let editor = cx.new(Editor::new);
     editor.update(cx, |editor, _cx| {

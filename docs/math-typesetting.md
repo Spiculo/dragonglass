@@ -137,8 +137,8 @@ display formulas**. They exercise `\frac`, `\sqrt`, `\sum`, `\int`, `\mathcal`, 
 
 ### 5.3 Platforms
 
-Windows and Linux first (the existing targets), macOS when the app targets it. The painter is
-GPU-agnostic GPUI path/quads, so it inherits GPUI's platform support.
+Windows, Linux and macOS. The painter is GPU-agnostic GPUI path/quads, so it inherits
+GPUI's platform support.
 
 ---
 

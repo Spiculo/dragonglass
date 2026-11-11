@@ -10,9 +10,8 @@ webview, no account.
 Point Dragon Glass at an existing Obsidian vault. It reads and writes plain `.md`, preserves
 YAML frontmatter, and leaves `.obsidian/` alone. There is no import step.
 
-> **Status: v0.0.1, early.** Windows and Linux are the primary platforms. macOS now has a
-> CI-built, launch-tested unsigned `.app`/DMG; signed/notarized builds and deeper runtime
-> polish are still to come. Keep backups (git is a good one) and expect rough edges.
+> **Status: v0.0.1, early.** Windows, Linux and macOS (Apple Silicon and Intel, as a
+> universal app) are supported. Keep backups (git is a good one) and expect rough edges.
 
 ## Why another notes app?
 
@@ -65,7 +64,7 @@ A lot already works. This is a working application, not a mockup — but it is e
 - A local package store for themes and WASM plugins
 - A vault picker that remembers recent vaults and reopens the note you were last in
 
-**Not there yet:** signed/notarized macOS builds, Mermaid diagrams, a community (online)
+**Not there yet:** notarized macOS builds, Mermaid diagrams, a community (online)
 theme/plugin store, end-to-end-encrypted sync, and full mobile parity (an Android vertical
 slice and an assessed iOS path exist). See [`PLAN.md`](PLAN.md) for the full roadmap and
 the decisions behind it.
@@ -76,6 +75,10 @@ Requirements: Rust **1.85+** (stable) and `git`.
 
 On Windows, install the MSVC toolchain and Visual Studio Build Tools with the "Desktop
 development with C++" workload. No other system libraries are needed.
+
+On macOS, install the Xcode Command Line Tools (`xcode-select --install`). A full Xcode
+install is not required: the UI crate compiles GPUI's Metal shaders at startup
+(`runtime_shaders`), because the build-time shader compiler ships only with Xcode.
 
 On Linux, install the build and GPU/windowing dependencies:
 
@@ -101,20 +104,22 @@ On Windows, `packaging\windows\build.ps1` does the same and adds the Windows SDK
 `fxc.exe` directory to `PATH` first (GPUI's shader build step needs it even when the C++
 workload is installed).
 
-On macOS, install the Xcode command-line tools once (`xcode-select --install`), then build
-and bundle:
+On macOS, install the Xcode command-line tools once (`xcode-select --install`); a full
+Xcode install is not required, because GPUI compiles its Metal shaders at runtime. Build a
+universal (Apple Silicon + Intel) app bundle:
 
 ```bash
-cargo build --release -p dragonglass-ui -p dragonglass-cli
-chmod +x packaging/macos/build-app.sh
-packaging/macos/build-app.sh 0.0.1 dist
-open "dist/Dragon Glass.app"
+packaging/macos/build-universal.sh 0.0.1 dist
+open dist/DragonGlass.app
 ```
 
-The result is an unsigned Apple Silicon app. On main/PR CI runs, the same bundle is built,
-launched for eight seconds on a macOS runner, and uploaded as the
-`dragon-glass-macos-ci` artifact. Signing, notarization and Intel/universal builds are
-still pending; see [`packaging/macos/README.md`](packaging/macos/README.md).
+The bundle is ad-hoc signed. Move `DragonGlass.app` to `/Applications` before you rely on
+`dragonglass://` links: Launch Services ignores bundles in a temporary directory. The
+`macos-bundle` CI job runs the same script, launches the app for eight seconds and uploads
+the dmg and zip as the `dragon-glass-macos-ci` artifact; it runs only on manual dispatch
+(`gh workflow run ci.yml`) because a universal build costs about 30 runner minutes. Signing,
+notarization and the single-architecture path are covered in
+[`packaging/macos/README.md`](packaging/macos/README.md).
 
 `target/release/dragon-glass-app` is the app; `target/release/dragon-glass` is the CLI.
 The UI crate pulls in GPUI, so the workspace's default build (`cargo build`) deliberately
@@ -136,14 +141,20 @@ dragon-glass-app
 dragonglass://open?vault=/path/to/vault&note=notes/Index.md
 ```
 
+Finder's **Open With → Dragon Glass** opens a note on a cold start. While the app is
+running macOS delivers the file as an Apple Event, which GPUI does not surface yet, so use
+the `dragonglass://` form or quit the app first.
+
 ### Vaults
 
 The app remembers the vaults you open, outside any vault, in
-`%APPDATA%\DragonGlass\vaults.txt` on Windows or `~/.config/dragon-glass/vaults.txt`
-elsewhere (`$XDG_CONFIG_HOME` is respected, and `DRAGON_GLASS_CONFIG_DIR` overrides both).
+`%APPDATA%\DragonGlass\vaults.txt` on Windows,
+`~/Library/Application Support/DragonGlass/vaults.txt` on macOS, or
+`~/.config/dragon-glass/vaults.txt` on Linux (`$XDG_CONFIG_HOME` is respected, and
+`DRAGON_GLASS_CONFIG_DIR` overrides all of them).
 On launch it reopens the last vault and the note you were last in — stored per vault in
-`.dragon-glass/session.txt`. Use **Open vault** in the command palette (`Ctrl+P`) to open
-another vault in its own window, or remove stale entries in the picker.
+`.dragon-glass/session.txt`. Use **Open vault** in the command palette (`Ctrl+P`, `Cmd+P`
+on macOS) to open another vault in its own window, or remove stale entries in the picker.
 
 ## Editing shortcuts
 
@@ -164,8 +175,9 @@ another vault in its own window, or remove stale entries in the picker.
 | `Ctrl+K` | Start a wikilink from the selection or caret |
 | `Ctrl+,` | Settings |
 
-On macOS, use `Cmd` wherever the table says `Ctrl`; the palette and Settings show the
-platform-appropriate form.
+On macOS, use `Cmd` wherever the table says `Ctrl`, except find and replace, which is
+`Cmd+Alt+F` because `Cmd+H` hides the app. The menu bar carries the same commands with
+their shortcuts.
 
 With text selected, a **Format** bar appears above the status line with buttons for bold,
 italic, strikethrough, inline code, highlight, comments and a wikilink. Formatting toggles:
@@ -206,9 +218,9 @@ cargo fmt --all -- --check
 cargo clippy --all-targets --all-features
 ```
 
-CI runs exactly those checks on Windows, Linux and macOS, and builds the GPUI app on all
-three.
-See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the ground rules, and
+CI runs those checks on Windows, Linux and macOS. The GPUI app is built on Windows and
+Linux on every push; the macOS bundle runs on manual dispatch to save runner minutes. See
+[`CONTRIBUTING.md`](CONTRIBUTING.md) for the ground rules, and
 [`PLAN.md`](PLAN.md) for architecture, phases and settled design decisions.
 
 ## Project layout
