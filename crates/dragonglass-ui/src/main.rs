@@ -133,6 +133,9 @@ actions!(
         CloseTab,
         NextTab,
         PrevTab,
+        HideApp,
+        HideOthers,
+        ShowAll,
         Quit
     ]
 );
@@ -6257,6 +6260,10 @@ fn install_menus(cx: &mut App) {
                 MenuItem::separator(),
                 MenuItem::os_submenu("Services", SystemMenuType::Services),
                 MenuItem::separator(),
+                MenuItem::action("Hide Dragon Glass", HideApp),
+                MenuItem::action("Hide Others", HideOthers),
+                MenuItem::action("Show All", ShowAll),
+                MenuItem::separator(),
                 MenuItem::action("Quit Dragon Glass", Quit),
             ],
         },
@@ -6433,6 +6440,10 @@ fn main() {
 
     application.run(move |cx: &mut App| {
         cx.on_action(|_: &Quit, cx: &mut App| cx.quit());
+        // Standard application menu items on macOS. They are harmless elsewhere.
+        cx.on_action(|_: &HideApp, cx: &mut App| cx.hide());
+        cx.on_action(|_: &HideOthers, cx: &mut App| cx.hide_other_apps());
+        cx.on_action(|_: &ShowAll, cx: &mut App| cx.unhide_other_apps());
 
         // Shortcuts are global; a vault's saved overrides replace them once it opens.
         editor::init(cx);
@@ -6448,6 +6459,12 @@ fn main() {
             KeyBinding::new("ctrl-pageup", PrevTab, None),
             KeyBinding::new("secondary-q", Quit, None),
             KeyBinding::new("secondary-alt-v", ToggleVim, None),
+        ]);
+        // Command-H is Hide on macOS and Ctrl-H is find/replace elsewhere.
+        #[cfg(target_os = "macos")]
+        cx.bind_keys([
+            KeyBinding::new("cmd-h", HideApp, None),
+            KeyBinding::new("cmd-alt-h", HideOthers, None),
         ]);
 
         #[cfg(target_os = "macos")]

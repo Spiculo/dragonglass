@@ -170,8 +170,9 @@ on macOS) to open another vault in its own window, or remove stale entries in th
 | `Ctrl+K` | Start a wikilink from the selection or caret |
 | `Ctrl+,` | Settings |
 
-On macOS, use `Cmd` wherever the table says `Ctrl`; the palette and Settings show the
-platform-appropriate form.
+On macOS, use `Cmd` wherever the table says `Ctrl`, except find and replace, which is
+`Cmd+Alt+F` because `Cmd+H` hides the app. The menu bar carries the same commands with
+their shortcuts.
 
 With text selected, a **Format** bar appears above the status line with buttons for bold,
 italic, strikethrough, inline code, highlight, comments and a wikilink. Formatting toggles:
