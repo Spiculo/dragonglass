@@ -21,6 +21,10 @@ pub struct Config {
     pub vim_mode: bool,
     /// Editor text size in points, persisted so the setting follows the vault.
     pub font_size: u16,
+    /// Optional git commit name. Empty means "use the user's git config".
+    pub git_name: Option<String>,
+    /// Optional git commit email. Empty means "use the user's git config".
+    pub git_email: Option<String>,
 }
 
 impl Default for Config {
@@ -35,6 +39,8 @@ impl Default for Config {
             snippets: true,
             vim_mode: false,
             font_size: 14,
+            git_name: None,
+            git_email: None,
         }
     }
 }
@@ -53,6 +59,12 @@ impl Config {
         out.push_str(&format!("snippets={}\n", self.snippets));
         out.push_str(&format!("vim_mode={}\n", self.vim_mode));
         out.push_str(&format!("font_size={}\n", self.font_size));
+        if let Some(name) = &self.git_name {
+            out.push_str(&format!("git_name={name}\n"));
+        }
+        if let Some(email) = &self.git_email {
+            out.push_str(&format!("git_email={email}\n"));
+        }
         out
     }
 
@@ -90,6 +102,8 @@ impl Config {
                         config.font_size = size.clamp(9, 32);
                     }
                 }
+                "git_name" => config.git_name = Some(value),
+                "git_email" => config.git_email = Some(value),
                 _ => {}
             }
         }
@@ -126,6 +140,23 @@ mod tests {
         assert_eq!(config.accent, None);
         assert!(!config.vim_mode);
         assert_eq!(config.font_size, 14);
+        assert_eq!(config.git_name, None);
+        assert_eq!(config.git_email, None);
+    }
+
+    #[test]
+    fn git_identity_roundtrips() {
+        let config = Config {
+            git_name: Some("Ada Lovelace".to_string()),
+            git_email: Some("ada@example.com".to_string()),
+            ..Config::default()
+        };
+        let parsed = Config::from_text(&config.to_text());
+        assert_eq!(parsed, config);
+        assert_eq!(
+            Config::from_text("git_name=Ada\ngit_email=ada@example.com\n").git_email,
+            Some("ada@example.com".to_string())
+        );
     }
 
     #[test]

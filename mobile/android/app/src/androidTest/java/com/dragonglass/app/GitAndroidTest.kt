@@ -25,7 +25,14 @@ class GitAndroidTest {
             val vault = File(root, "vault").apply { mkdirs() }
             File(vault, "Note.md").writeText("# Note\n")
 
-            val manager = GitSyncManager(vault, remote.toURI().toString(), "main", null)
+            val manager = GitSyncManager(
+                vault,
+                remote.toURI().toString(),
+                "main",
+                null,
+                "Test User",
+                "test@example.com",
+            )
             manager.initRemote()
 
             assertTrue(File(remote, "refs/heads/main").exists())

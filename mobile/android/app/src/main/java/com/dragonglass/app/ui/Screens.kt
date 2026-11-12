@@ -920,6 +920,8 @@ private fun Muted(text: String) {
 private fun GitSyncSheet(vm: DragonGlassViewModel, onDismiss: () -> Unit) {
     var remote by remember { mutableStateOf(vm.gitRemote) }
     var branch by remember { mutableStateOf(vm.gitBranch) }
+    var authorName by remember { mutableStateOf(vm.gitAuthorName) }
+    var authorEmail by remember { mutableStateOf(vm.gitAuthorEmail) }
     var token by remember { mutableStateOf("") }
     var confirmClone by remember { mutableStateOf(false) }
     val status = vm.gitStatus
@@ -964,6 +966,33 @@ private fun GitSyncSheet(vm: DragonGlassViewModel, onDismiss: () -> Unit) {
                     .padding(top = 12.dp),
             )
             OutlinedTextField(
+                value = authorName,
+                onValueChange = { authorName = it },
+                label = { Text("Your name") },
+                placeholder = { Text("Ada Lovelace") },
+                singleLine = true,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(top = 12.dp),
+            )
+            OutlinedTextField(
+                value = authorEmail,
+                onValueChange = { authorEmail = it },
+                label = { Text("Your email") },
+                placeholder = { Text("ada@example.com") },
+                singleLine = true,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(top = 12.dp),
+            )
+            Text(
+                text = "Commits use this name and email, not a Dragon Glass identity. " +
+                    "They are stored on this device.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(top = 6.dp),
+            )
+            OutlinedTextField(
                 value = token,
                 onValueChange = { token = it },
                 label = { Text("Personal access token") },
@@ -1003,7 +1032,7 @@ private fun GitSyncSheet(vm: DragonGlassViewModel, onDismiss: () -> Unit) {
             ) {
                 Button(
                     onClick = {
-                        vm.saveGitSettings(remote, branch, token)
+                        vm.saveGitSettings(remote, branch, token, authorName, authorEmail)
                         token = ""
                     },
                     enabled = !vm.gitBusy,
@@ -1011,7 +1040,7 @@ private fun GitSyncSheet(vm: DragonGlassViewModel, onDismiss: () -> Unit) {
 
                 Button(
                     onClick = {
-                        vm.saveGitSettings(remote, branch, token)
+                        vm.saveGitSettings(remote, branch, token, authorName, authorEmail)
                         token = ""
                         vm.syncGit()
                     },
@@ -1039,7 +1068,7 @@ private fun GitSyncSheet(vm: DragonGlassViewModel, onDismiss: () -> Unit) {
                     ) { Text("Link existing") }
                     Button(
                         onClick = {
-                            vm.saveGitSettings(remote, branch, token)
+                            vm.saveGitSettings(remote, branch, token, authorName, authorEmail)
                             token = ""
                             vm.initGitRepository()
                         },
@@ -1100,7 +1129,7 @@ private fun GitSyncSheet(vm: DragonGlassViewModel, onDismiss: () -> Unit) {
                 TextButton(
                     onClick = {
                         confirmClone = false
-                        vm.saveGitSettings(remote, branch, token)
+                        vm.saveGitSettings(remote, branch, token, authorName, authorEmail)
                         token = ""
                         vm.cloneGitRepository()
                     },

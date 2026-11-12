@@ -11,8 +11,34 @@ use std::process::Command;
 
 use crate::{Error, Result};
 
-pub const DEFAULT_NAME: &str = "Dragon Glass";
-pub const DEFAULT_EMAIL: &str = "dragon-glass@localhost";
+/// Commit identity override. Each field is optional: a missing field falls back to the
+/// user's own `git config` (`user.name` / `user.email`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Author {
+    pub name: Option<String>,
+    pub email: Option<String>,
+}
+
+impl Author {
+    /// Build an author from the per-vault settings, ignoring blank values.
+    ///
+    /// Returns `None` when neither field is set, so `git` uses the user's own config.
+    pub fn new(name: Option<&str>, email: Option<&str>) -> Option<Self> {
+        let name = name
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+        let email = email
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+        if name.is_none() && email.is_none() {
+            None
+        } else {
+            Some(Self { name, email })
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Status {
@@ -125,7 +151,10 @@ fn parse_numstat(output: &str) -> Option<DiffStat> {
 }
 
 /// Stage everything and commit. Returns `false` when there was nothing to commit.
-pub fn commit_all(root: &Path, message: &str) -> Result<bool> {
+///
+/// `author` overrides `user.name` / `user.email` for this commit only. When `None`, `git`
+/// uses the user's own configuration, so desktop commits keep the user's normal identity.
+pub fn commit_all(root: &Path, message: &str, author: Option<&Author>) -> Result<bool> {
     run(root, &["add", "-A"])?;
 
     let staged = run(root, &["diff", "--cached", "--name-only"])?;
@@ -133,19 +162,36 @@ pub fn commit_all(root: &Path, message: &str) -> Result<bool> {
         return Ok(false);
     }
 
-    run(
-        root,
-        &[
-            "-c",
-            &format!("user.name={DEFAULT_NAME}"),
-            "-c",
-            &format!("user.email={DEFAULT_EMAIL}"),
-            "commit",
-            "-m",
-            message,
-        ],
-    )?;
+    let mut args: Vec<String> = Vec::new();
+    if let Some(author) = author {
+        if let Some(name) = &author.name {
+            args.push("-c".to_string());
+            args.push(format!("user.name={name}"));
+        }
+        if let Some(email) = &author.email {
+            args.push("-c".to_string());
+            args.push(format!("user.email={email}"));
+        }
+    }
+    args.push("commit".to_string());
+    args.push("-m".to_string());
+    args.push(message.to_string());
+
+    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    run(root, &refs)?;
     Ok(true)
+}
+
+/// Update remote-tracking refs without touching the working tree.
+///
+/// This is the safe half of a sync: it never changes notes, so it can run even when the
+/// vault has uncommitted work.
+pub fn fetch(root: &Path) -> Result<Outcome> {
+    if !has_remote(root)? {
+        return Ok(Outcome::NoRemote);
+    }
+    run(root, &["fetch"])?;
+    Ok(Outcome::Updated)
 }
 
 /// `git pull --ff-only`. Diverged histories are reported, not auto-merged.
@@ -273,6 +319,13 @@ mod tests {
         dir
     }
 
+    fn test_author() -> Author {
+        Author {
+            name: Some("Test User".to_string()),
+            email: Some("test@example.com".to_string()),
+        }
+    }
+
     #[test]
     fn init_status_and_commit_roundtrip() {
         let dir = temp_repo("roundtrip");
@@ -290,13 +343,60 @@ mod tests {
         assert_eq!(dirty.untracked, 1);
         assert!(!dirty.is_clean());
 
-        assert!(commit_all(&dir, "first").unwrap());
+        assert!(commit_all(&dir, "first", Some(&test_author())).unwrap());
         assert!(status(&dir).unwrap().is_clean());
 
         // Nothing changed: no empty commit.
-        assert!(!commit_all(&dir, "second").unwrap());
+        assert!(!commit_all(&dir, "second", Some(&test_author())).unwrap());
 
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn commit_uses_the_given_author() {
+        let dir = temp_repo("author");
+        init(&dir).unwrap();
+        std::fs::write(dir.join("note.md"), "# hello\n").unwrap();
+
+        let author = Author {
+            name: Some("Ada Lovelace".to_string()),
+            email: Some("ada@example.com".to_string()),
+        };
+        commit_all(&dir, "first", Some(&author)).unwrap();
+
+        let log = run(&dir, &["log", "-1", "--format=%an <%ae>"]).unwrap();
+        assert_eq!(log.trim(), "Ada Lovelace <ada@example.com>");
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn commit_falls_back_to_git_config_without_an_author() {
+        let dir = temp_repo("config-author");
+        init(&dir).unwrap();
+        run(&dir, &["config", "user.name", "Config User"]).unwrap();
+        run(&dir, &["config", "user.email", "config@example.com"]).unwrap();
+        std::fs::write(dir.join("note.md"), "# hello\n").unwrap();
+
+        commit_all(&dir, "first", None).unwrap();
+
+        let log = run(&dir, &["log", "-1", "--format=%an <%ae>"]).unwrap();
+        assert_eq!(log.trim(), "Config User <config@example.com>");
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn author_ignores_blank_fields() {
+        assert_eq!(Author::new(None, None), None);
+        assert_eq!(Author::new(Some("  "), Some("")), None);
+        assert_eq!(
+            Author::new(Some(" Ada "), None),
+            Some(Author {
+                name: Some("Ada".to_string()),
+                email: None,
+            })
+        );
     }
 
     #[test]
@@ -312,7 +412,7 @@ mod tests {
             }
         );
 
-        commit_all(&dir, "first").unwrap();
+        commit_all(&dir, "first", Some(&test_author())).unwrap();
         assert_eq!(file_diff(&dir, "note.md").unwrap(), DiffStat::default());
 
         std::fs::write(dir.join("note.md"), "one\nthree\nfour\n").unwrap();
@@ -331,9 +431,38 @@ mod tests {
     fn pull_without_remote_reports_no_remote() {
         let dir = temp_repo("noremote");
         init(&dir).unwrap();
+        assert_eq!(fetch(&dir).unwrap(), Outcome::NoRemote);
         assert_eq!(pull(&dir).unwrap(), Outcome::NoRemote);
         assert_eq!(push(&dir).unwrap(), Outcome::NoRemote);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn fetch_and_pull_fast_forward_remote_work() {
+        let remote = temp_repo("ff-remote");
+        run(&remote, &["init", "--bare"]).unwrap();
+
+        let root = temp_repo("ff-local");
+        init(&root).unwrap();
+        std::fs::write(root.join("a.md"), "a\n").unwrap();
+        commit_all(&root, "first", Some(&test_author())).unwrap();
+        let url = remote.to_string_lossy().to_string();
+        run(&root, &["remote", "add", "origin", &url]).unwrap();
+        run(&root, &["push", "-u", "origin", "main"]).unwrap();
+
+        let other = temp_repo("ff-other");
+        run(&other, &["clone", "-b", "main", &url, "."]).unwrap();
+        std::fs::write(other.join("b.md"), "b\n").unwrap();
+        commit_all(&other, "second", Some(&test_author())).unwrap();
+        run(&other, &["push"]).unwrap();
+
+        assert_eq!(fetch(&root).unwrap(), Outcome::Updated);
+        assert_eq!(pull(&root).unwrap(), Outcome::Updated);
+        assert!(root.join("b.md").exists());
+
+        std::fs::remove_dir_all(&root).unwrap();
+        std::fs::remove_dir_all(&other).unwrap();
+        std::fs::remove_dir_all(&remote).unwrap();
     }
 
     #[test]

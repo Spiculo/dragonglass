@@ -57,7 +57,9 @@ A lot already works. This is a working application, not a mockup — but it is e
 - Recovery snapshots, browsable and restorable from **File recovery** in the palette
 
 **Around the editor**
-- Git sync by driving your own `git` binary (your credentials, SSH config and hooks)
+- Git sync by driving your own `git` binary (your credentials, SSH config, hooks and commit
+  identity; set a name/email in Settings to override it), with a fetch + fast-forward when a
+  vault opens if the working tree is clean
 - HTML and PDF export
 - Read-only local HTTP API and an MCP server over stdio for AI tooling
 - Importers for Evernote (`.enex`) and Roam exports
@@ -192,6 +194,14 @@ and **Cancel** instead of discarding the edits.
 Vim mode is per vault (`.dragon-glass/config.txt`, `vim_mode=true`) and supports
 normal/visual/insert modes, counts, the common motions and `d/y/c` operators, `/` search
 with `n`/`N`, `:w`, and `:s/…/…/` / `:%s/…/…/g`.
+
+Git commits use the identity from your own `git config`. To override it for one vault, set
+**Settings → Git → Commit name / Commit email** (stored as `git_name=` and `git_email=` in
+`.dragon-glass/config.txt`). Leave them unset to keep using your normal git identity.
+
+Opening a vault fetches from origin and fast-forwards the local branch. Auto-pull is skipped
+when the working tree has uncommitted changes or when local and remote have diverged, so it
+never pulls over your edits.
 
 ## CLI
 

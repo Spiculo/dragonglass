@@ -51,7 +51,7 @@ publish/export, **Mermaid diagrams**.
 | UI | **GPUI** (Zed's framework, Apache-2.0) | GPU-rendered, truly native, single codebase |
 | Editor | **Own, on GPUI** | rope buffer + GPUI text shaping + own tokenizer; port Zed's (GPL) editor code where useful |
 | Math | **RaTeX** (KaTeX-compatible, pure Rust) + GPUI vector painter | `$` / `$$`, native display list; see `docs/math-typesetting.md` |
-| Git | the user's `git` binary | init/status/commit/pull/push; reuses their credentials and SSH config; conflicts surfaced as terminal instructions |
+| Git | the user's `git` binary | init/status/commit/pull/push; reuses their credentials, SSH config and commit identity (Settings can override the name/email); conflicts surfaced as terminal instructions |
 | Plugins | `wasmtime` (WASM sandbox) | sandboxed, language-agnostic — **post-v1** |
 
 **Rejected:** Tauri and any webview stack — still a browser engine, fails the "not
@@ -155,6 +155,7 @@ the vault** at `.dragon-glass/` and is a **rebuildable cache** (auto-added to th
 **Sync (git-based)**
 - Init / connect to a git remote
 - Auto-commit with debounce; manual commit
+- Fetch + fast-forward on vault open when the working tree is clean
 - Pull / push; on conflict, print copy-paste `git` resolution instructions (no native merge UI)
 - `.gitignore` defaults for `.dragon-glass/`
 - Later: git LFS guidance for large attachments
