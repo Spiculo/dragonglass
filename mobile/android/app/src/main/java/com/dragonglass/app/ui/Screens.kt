@@ -1731,11 +1731,13 @@ private fun MarkdownWebView(
     onScroll: (Int) -> Unit = {},
 ) {
     val dark = isSystemInDarkTheme()
+    // Comfortable defaults for a phone or tablet, plus the dark palette when needed.
     val themed = remember(html, dark) {
+        val base = html.replace("</head>", "<style>$PREVIEW_CSS</style></head>")
         if (dark) {
-            html.replace("</head>", "<style>$DARK_PREVIEW_CSS</style></head>")
+            base.replace("</head>", "<style>$DARK_PREVIEW_CSS</style></head>")
         } else {
-            html
+            base
         }
     }
 
@@ -1748,6 +1750,9 @@ private fun MarkdownWebView(
                 settings.allowContentAccess = true
                 settings.loadWithOverviewMode = true
                 settings.useWideViewPort = true
+                // Pinch to zoom without the floating +/- buttons.
+                settings.builtInZoomControls = true
+                settings.displayZoomControls = false
                 setBackgroundColor(android.graphics.Color.TRANSPARENT)
                 webViewClient = object : WebViewClient() {
                     override fun onPageFinished(view: WebView?, url: String?) {
@@ -1841,6 +1846,15 @@ private fun handlePreviewLink(
     // Unknown scheme or off-vault target: never navigate the preview away from the note.
     return true
 }
+
+/// Reading defaults for the preview: a comfortable measure and type size on phones and
+/// tablets, and images that never overflow the page.
+private const val PREVIEW_CSS = """
+body{max-width:44rem;margin:0 auto;padding:16px;font-size:16px;line-height:1.65;
+  -webkit-text-size-adjust:100%}
+img{max-width:100%;height:auto}
+pre,table{max-width:100%;overflow-x:auto}
+"""
 
 /// The engine's export CSS targets light pages, so dark mode overrides the few colors that
 /// would otherwise be dark-on-dark. Math is drawn as black SVG, hence the invert.

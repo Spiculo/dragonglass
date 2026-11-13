@@ -726,6 +726,13 @@ the WebView on every recomposition.
 **Done when:** text is comfortable on a phone and tablet; zoom and theme survive mode
 switches.
 
+**Landed:** the preview injects a reading stylesheet (44 rem measure, 16 px body, 1.65 line
+height, images capped at the page width, scrollable code/tables) on top of the export CSS and
+the existing dark overrides; pinch-to-zoom is enabled without the floating zoom buttons; and
+the WebView only reloads when the rendered document changes, so mode switches keep the page.
+**Remaining:** the shared `ReaderSettings` values are not editable on Android yet; size and
+theme come from the stylesheet and the system theme.
+
 #### P2 — polish (schedule after P0/P1)
 - Mobile: graph layout off the main thread, pan/zoom, share/deep-link entry, vault
   remove/rename, swipe gestures, pull-to-refresh, `![[image]]` subfolder fixes, tablet
