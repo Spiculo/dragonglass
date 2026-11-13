@@ -26,6 +26,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
+use dragonglass_core::assets::Attachments;
 use dragonglass_core::fingerprint::SaveReport;
 use dragonglass_core::frontmatter::{Property, PropertyValue};
 use dragonglass_core::{
@@ -764,7 +765,21 @@ impl DragonGlassApp {
                     })
                     .unwrap_or(false);
                 if is_asset {
-                    self.set_status(StatusKind::Error, format!("unresolved link: {note}"));
+                    // Attachments are not notes: hand them to the OS instead of failing.
+                    let direct = self.vault_root.join(note);
+                    let resolved = if direct.is_file() {
+                        Some(direct)
+                    } else {
+                        Attachments::index(&self.vault_root)
+                            .resolve(note)
+                            .map(|relative| self.vault_root.join(relative))
+                    };
+                    if let Some(path) = resolved {
+                        cx.open_url(&format!("file://{}", path.display()));
+                        self.set_status(StatusKind::Info, format!("opened {note}"));
+                    } else {
+                        self.set_status(StatusKind::Error, format!("unresolved link: {note}"));
+                    }
                     cx.notify();
                     return;
                 }

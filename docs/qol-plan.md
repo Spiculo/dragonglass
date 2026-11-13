@@ -432,6 +432,19 @@ Add a lightbox with Escape/click-outside. On Android, pass an attachment index i
 **Done when:** a note containing a local image, a sized image, a PDF and an audio file is
 usable in reading mode on both platforms; no "not previewed" dead ends for supported types.
 
+**Landed:** `Block::Embed` carries `width` and `alt`, parsed from `![[img|300]]`,
+`![[img|alt text]]` and `![alt](src)`; the reading view sizes the picture, shows the alt as
+a caption, and the HTML export writes `width`/`alt` attributes. Clicking a standalone image
+opens a lightbox (backdrop click or Escape closes). PDF/audio/video embeds render an
+attachment card with **Open**, which hands the file to the OS instead of showing "not
+previewed", and an unresolved inline asset link opens the file with the OS too. Android's
+preview uses the new FFI `render_html_from_vault(source, root)`, which builds the vault
+attachment index so `![[shot.png]]` resolves to its subfolder path; the Kotlin bindings were
+regenerated and `:app:compileDebugKotlin` passes.
+**Remaining:** images inside running text are still rendered as their link label (the flow
+layout needs image pieces); remote image URLs are deliberately not fetched because the app
+is offline by default; PDF/audio/video use the OS viewer rather than an embedded player.
+
 #### Q2.7 Code, tables and callouts — D · S–M
 Add a copy button to code fences, horizontal scroll plus sticky headers for wide tables,
 and collapsible callouts (remember per-note state). Do not let wide tables widen the page.

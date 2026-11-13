@@ -11,6 +11,7 @@ use std::io::Write as _;
 use std::path::PathBuf;
 use std::sync::{Mutex, MutexGuard};
 
+use dragonglass_core::assets::Attachments;
 use dragonglass_core::graph::{self, EdgeKind, Graph};
 use dragonglass_core::relations::{self, NoteRelations};
 use dragonglass_core::{
@@ -670,7 +671,19 @@ pub fn properties(source: String) -> Vec<PropertyInfo> {
 /// Render markdown to a complete HTML document, including the engine's export CSS.
 #[uniffi::export]
 pub fn render_html(source: String) -> String {
-    let body = html::render_body(&source);
+    wrap_html(html::render_body(&source))
+}
+
+/// Render markdown with the vault's attachment index, so `![[shot.png]]` resolves to a
+/// subfolder path the WebView can load relative to the vault root.
+#[uniffi::export]
+pub fn render_html_from_vault(source: String, root: String) -> String {
+    let index = Attachments::index(std::path::Path::new(&root));
+    let body = html::render_body_with(&source, Some(&index), &mut Vec::new());
+    wrap_html(body)
+}
+
+fn wrap_html(body: String) -> String {
     format!(
         "<!doctype html><html><head><meta charset=\"utf-8\">\
          <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\

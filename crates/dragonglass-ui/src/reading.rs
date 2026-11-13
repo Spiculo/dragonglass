@@ -66,6 +66,12 @@ impl gpui::Global for ReaderSettings {}
 /// Writes text to the clipboard for the reading view's copy buttons.
 pub type CopyHandler = Rc<dyn Fn(&str, &mut Window, &mut App)>;
 
+/// Opens an image in the reading lightbox.
+pub type ImageOpener = Rc<dyn Fn(&str, &mut Window, &mut App)>;
+
+/// Opens a non-image attachment with the operating system's default application.
+pub type FileOpener = Rc<dyn Fn(&str, &mut Window, &mut App)>;
+
 /// A point in the reading view: a block and a byte offset into its display text.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ReadPoint {
@@ -184,6 +190,10 @@ struct RenderCtx<'a> {
     copy: Option<&'a CopyHandler>,
     /// In-page find, so matches can be painted behind the text.
     find: Option<&'a ReadingFind>,
+    /// Opens a clicked image in the lightbox.
+    on_image: Option<&'a ImageOpener>,
+    /// Opens a PDF/audio/video attachment with the OS.
+    open_file: Option<&'a FileOpener>,
     /// The reading list, so dragging past the viewport can scroll it.
     list_state: Option<&'a ListState>,
     /// How many blocks the list holds, to clamp drag auto-scroll.
@@ -452,6 +462,8 @@ pub struct ReadingCache {
     /// In-page find over block display text. `Rc` so the virtualized list can borrow it
     /// without copying the match list every frame.
     find: Rc<ReadingFind>,
+    /// Image shown in the lightbox overlay, if any.
+    lightbox: Rc<RefCell<Option<PathBuf>>>,
 }
 
 impl ReadingCache {
@@ -471,6 +483,7 @@ impl ReadingCache {
             spans: Rc::new(Vec::new()),
             spans_valid: false,
             find: Rc::new(ReadingFind::default()),
+            lightbox: Rc::new(RefCell::new(None)),
             footnote_popup: None,
             folded: HashSet::new(),
         }
@@ -607,6 +620,11 @@ impl ReadingCache {
     /// The first source line of the top visible block.
     pub fn top_block_line(&self) -> Option<usize> {
         self.block_start_line(self.top_block())
+    }
+
+    /// Close the image lightbox. Returns whether one was open.
+    pub fn close_lightbox(&mut self) -> bool {
+        self.lightbox.borrow_mut().take().is_some()
     }
 
     pub fn find_open(&self) -> bool {
@@ -1112,6 +1130,18 @@ impl ReadingCache {
             window.refresh();
         });
         let find = self.find.clone();
+        let lightbox = self.lightbox.clone();
+        let on_image: ImageOpener = {
+            let lightbox = lightbox.clone();
+            Rc::new(move |path, window, _cx| {
+                *lightbox.borrow_mut() = Some(PathBuf::from(path));
+                window.refresh();
+            })
+        };
+        let open_file: FileOpener = Rc::new(|path, window, cx| {
+            cx.open_url(&format!("file://{path}"));
+            window.refresh();
+        });
         let hidden = Rc::new(hidden_blocks(self.blocks.as_slice(), &self.folded));
         let folded = self.folded.clone();
         let list_state = self.list_state.clone();
@@ -1144,6 +1174,8 @@ impl ReadingCache {
                             on_fold: on_fold.as_ref(),
                             copy: Some(&copy),
                             find: Some(&find),
+                            on_image: Some(&on_image),
+                            open_file: Some(&open_file),
                             list_state: Some(&list_state),
                             block_count: blocks.len(),
                             blocks: blocks.as_slice(),
@@ -1178,6 +1210,34 @@ impl ReadingCache {
                     .top(px(96.0))
                     .left(px(24.0))
                     .child(popup)
+                    .into_any_element()
+            }))
+            .children(self.lightbox.borrow().as_ref().map(|path| {
+                let close = lightbox.clone();
+                div()
+                    .id("lightbox")
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .right_0()
+                    .bottom_0()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .bg(gpui::hsla(0.0, 0.0, 0.0, 0.82))
+                    .on_mouse_down(MouseButton::Left, move |_event, window, _cx| {
+                        // Clicking the backdrop (not the image) closes the viewer.
+                        *close.borrow_mut() = None;
+                        window.refresh();
+                    })
+                    .child(
+                        div()
+                            .p_4()
+                            .on_mouse_down(MouseButton::Left, |_event, _window, cx| {
+                                cx.stop_propagation();
+                            })
+                            .child(img(path.clone()).max_w(px(1200.0)).max_h(px(900.0))),
+                    )
                     .into_any_element()
             }))
     }
@@ -1243,6 +1303,8 @@ fn reading_column(src: &str, ctx: &RenderCtx) -> impl IntoElement {
         on_fold: None,
         copy: ctx.copy,
         find: ctx.find,
+        on_image: ctx.on_image,
+        open_file: ctx.open_file,
         list_state: ctx.list_state,
         block_count: ctx.block_count,
         blocks: &[],
@@ -1449,7 +1511,7 @@ fn render_block(block: Block, block_index: Option<usize>, ctx: &RenderCtx) -> An
             headers,
             rows,
         } => render_table(&align, &headers, &rows, block_index, ctx),
-        Block::Embed { target } => render_embed(&target, ctx),
+        Block::Embed { target, width, alt } => render_embed(&target, width, alt.as_deref(), ctx),
     }
 }
 
@@ -1481,6 +1543,8 @@ impl<'a> RenderCtx<'a> {
             on_fold: self.on_fold,
             copy: self.copy,
             find: self.find,
+            on_image: self.on_image,
+            open_file: self.open_file,
             list_state: self.list_state,
             block_count: self.block_count,
             blocks: self.blocks,
@@ -2162,7 +2226,12 @@ fn table_row(
     row.children(rendered).into_any_element()
 }
 
-fn render_embed(target: &str, ctx: &RenderCtx) -> AnyElement {
+fn render_embed(
+    target: &str,
+    width: Option<u32>,
+    alt: Option<&str>,
+    ctx: &RenderCtx,
+) -> AnyElement {
     let theme = ctx.theme;
     let Some(root) = ctx.vault_root else {
         return placeholder(target, "no vault root", theme);
@@ -2170,20 +2239,113 @@ fn render_embed(target: &str, ctx: &RenderCtx) -> AnyElement {
     let attachments = ctx.attachments;
 
     if is_image(target) {
+        if target.starts_with("http://") || target.starts_with("https://") {
+            // The app is offline by default, so remote images are not fetched.
+            return placeholder(target, "remote image (network is off)", theme);
+        }
         return match resolve_file(root, attachments, target) {
-            Some(path) => img(path)
-                .max_w(px(480.0))
-                .max_h(px(360.0))
-                .into_any_element(),
+            Some(path) => {
+                let requested = width.map(|width| width as f32);
+                let mut picture = img(path.clone()).max_w(px(requested.unwrap_or(480.0)));
+                if requested.is_none() {
+                    picture = picture.max_h(px(360.0));
+                }
+                let picture = picture.into_any_element();
+                let on_image = ctx.on_image.cloned();
+                let path_string = path.to_string_lossy().to_string();
+                let caption = alt.map(str::to_string);
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(
+                        div()
+                            .id(ElementId::Name(
+                                format!("embed-image-{}", path_string).into(),
+                            ))
+                            .cursor_pointer()
+                            .on_mouse_down(MouseButton::Left, move |_event, window, cx| {
+                                if let Some(on_image) = &on_image {
+                                    on_image(&path_string, window, cx);
+                                }
+                            })
+                            .child(picture),
+                    )
+                    .when_some(caption, |d, caption| {
+                        d.child(div().text_xs().text_color(theme.muted).child(caption))
+                    })
+                    .into_any_element()
+            }
             None => placeholder(target, "image not found", theme),
         };
     }
 
     if is_attachment(target) {
-        return match resolve_file(root, attachments, target) {
-            Some(_) => placeholder(target, "attachment â€” not previewed", theme),
-            None => placeholder(target, "attachment not found", theme),
+        let Some(path) = resolve_file(root, attachments, target) else {
+            return placeholder(target, "attachment not found", theme);
         };
+        let kind = Path::new(target)
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .map(|extension| extension.to_ascii_uppercase())
+            .unwrap_or_else(|| "FILE".to_string());
+        let name = Path::new(target)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or(target)
+            .to_string();
+        let open_file = ctx.open_file.cloned();
+        let path_string = path.to_string_lossy().to_string();
+        return div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2()
+            .p_3()
+            .rounded_md()
+            .border_1()
+            .border_color(theme.border)
+            .bg(theme.panel_alt)
+            .child(
+                div()
+                    .px_2()
+                    .py_1()
+                    .rounded_sm()
+                    .bg(theme.chip)
+                    .text_xs()
+                    .text_color(theme.muted)
+                    .child(kind),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .overflow_hidden()
+                    .text_sm()
+                    .text_color(theme.text)
+                    .child(name),
+            )
+            .child(
+                div()
+                    .id(ElementId::Name(
+                        format!("embed-open-{}", path_string).into(),
+                    ))
+                    .px_2()
+                    .py_1()
+                    .rounded_md()
+                    .bg(theme.chip)
+                    .text_xs()
+                    .text_color(theme.text_dim)
+                    .cursor_pointer()
+                    .hover(move |style| style.bg(theme.hover))
+                    .child("Open")
+                    .on_mouse_down(MouseButton::Left, move |_event, window, cx| {
+                        if let Some(open_file) = &open_file {
+                            open_file(&path_string, window, cx);
+                        }
+                    }),
+            )
+            .into_any_element();
     }
 
     if ctx.depth >= MAX_EMBED_DEPTH {

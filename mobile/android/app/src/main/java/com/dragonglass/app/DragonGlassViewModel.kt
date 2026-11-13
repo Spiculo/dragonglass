@@ -34,7 +34,7 @@ import uniffi.dragonglass.TreeRow
 import uniffi.dragonglass.documentStats
 import uniffi.dragonglass.headings as parseHeadings
 import uniffi.dragonglass.properties as parseProperties
-import uniffi.dragonglass.renderHtml
+import uniffi.dragonglass.renderHtmlFromVault
 import java.io.File
 
 private data class OpenNote(
@@ -475,7 +475,7 @@ class DragonGlassViewModel(application: Application) : AndroidViewModel(applicat
                         headings = parseHeadings(text),
                         properties = parseProperties(text),
                         relations = loaded.relations(relative),
-                        html = if (keepPreview) renderHtml(text) else "",
+                        html = if (keepPreview) renderHtmlFromVault(text, vaultDirectory.absolutePath) else "",
                     )
                 }
             }
@@ -560,7 +560,7 @@ class DragonGlassViewModel(application: Application) : AndroidViewModel(applicat
         val text = source
         viewModelScope.launch {
             val result = runCatching {
-                withContext(Dispatchers.IO) { renderHtml(text) }
+                withContext(Dispatchers.IO) { renderHtmlFromVault(text, vaultDirectory.absolutePath) }
             }
             result
                 .onSuccess {

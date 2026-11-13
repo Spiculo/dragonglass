@@ -3748,6 +3748,9 @@ impl Editor {
     /// Escape closes the find bar, leaves Vim insert/visual mode, or drops extra carets.
     /// Returns whether the editor consumed the key.
     pub fn handle_escape(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.reading && self.reading_content.close_lightbox() {
+            return true;
+        }
         if self.reading && self.reading_content.find_open() {
             self.reading_content.close_find();
             return true;

@@ -160,7 +160,7 @@ fn layout(src: &str, title: &str) -> Vec<Line> {
                 }
                 lines.push(Line::Blank);
             }
-            Block::Embed { target } => lines.push(Line::Text {
+            Block::Embed { target, .. } => lines.push(Line::Text {
                 text: format!("[embed: {target}]"),
                 size: 10.0,
             }),

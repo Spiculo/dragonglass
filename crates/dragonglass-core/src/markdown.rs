@@ -32,6 +32,10 @@ pub enum Block {
     /// A standalone `![[target]]` or `![alt](target)` embed.
     Embed {
         target: String,
+        /// Requested width in pixels, from `![[image.png|300]]`.
+        width: Option<u32>,
+        /// Alt text, from `![alt](src)` or `![[image.png|alt text]]`.
+        alt: Option<String>,
     },
     /// An Obsidian callout: a blockquote starting with `[!kind] Title`.
     Callout {
@@ -487,13 +491,17 @@ fn flush_paragraph(
     }
 
     if paragraph.lines.len() == 1 {
-        if let Some(target) = standalone_embed(paragraph.lines[0]) {
+        if let Some(spec) = standalone_embed(paragraph.lines[0]) {
             let (first, last) = paragraph.span();
             paragraph.clear();
             push_block(
                 blocks,
                 spans,
-                Block::Embed { target },
+                Block::Embed {
+                    target: spec.target,
+                    width: spec.width,
+                    alt: spec.alt,
+                },
                 offset + first,
                 offset + last,
             );
@@ -514,22 +522,49 @@ fn flush_paragraph(
 }
 
 /// A line that is nothing but an embed, as Obsidian writes embedded images and notes.
-fn standalone_embed(line: &str) -> Option<String> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EmbedSpec {
+    target: String,
+    width: Option<u32>,
+    alt: Option<String>,
+}
+
+fn standalone_embed(line: &str) -> Option<EmbedSpec> {
     let trimmed = line.trim();
 
     if trimmed.starts_with("![[") && trimmed.ends_with("]]") {
         let inner = &trimmed[3..trimmed.len() - 2];
-        let target = inner
-            .split('|')
-            .next()
-            .unwrap_or(inner)
+        let mut parts = inner.split('|');
+        let raw_target = parts.next().unwrap_or(inner);
+        let target = raw_target
             .split('#')
             .next()
-            .unwrap_or(inner)
-            .trim();
-        if !target.is_empty() {
-            return Some(target.to_string());
+            .unwrap_or(raw_target)
+            .trim()
+            .to_string();
+        if target.is_empty() {
+            return None;
         }
+
+        // `![[image.png|300]]` sets a width; `![[image.png|Alt text]]` sets alt text.
+        let mut width = None;
+        let mut alt = None;
+        for part in parts {
+            let part = part.trim();
+            if part.is_empty() {
+                continue;
+            }
+            if part.chars().all(|ch| ch.is_ascii_digit()) {
+                width = part
+                    .parse::<u32>()
+                    .ok()
+                    .filter(|width| *width > 0)
+                    .map(|width| width.min(2000));
+            } else {
+                alt = Some(part.to_string());
+            }
+        }
+        return Some(EmbedSpec { target, width, alt });
     }
 
     if let Some(rest) = trimmed.strip_prefix("![") {
@@ -537,7 +572,12 @@ fn standalone_embed(line: &str) -> Option<String> {
             if let Some(source) = rest[end + 2..].strip_suffix(')') {
                 let source = source.trim();
                 if !source.is_empty() {
-                    return Some(source.to_string());
+                    let alt = rest[..end].trim();
+                    return Some(EmbedSpec {
+                        target: source.to_string(),
+                        width: None,
+                        alt: (!alt.is_empty()).then(|| alt.to_string()),
+                    });
                 }
             }
         }
@@ -1037,7 +1077,9 @@ mod tests {
             blocks,
             vec![
                 Block::Embed {
-                    target: "image.png".into()
+                    target: "image.png".into(),
+                    width: None,
+                    alt: None
                 },
                 Block::Paragraph("text".into()),
             ]
@@ -1050,7 +1092,9 @@ mod tests {
         assert_eq!(
             blocks,
             vec![Block::Embed {
-                target: "attachments/pic.png".into()
+                target: "attachments/pic.png".into(),
+                width: None,
+                alt: Some("alt".into())
             }]
         );
     }
@@ -1061,8 +1105,39 @@ mod tests {
         assert_eq!(
             blocks,
             vec![Block::Embed {
-                target: "Note".into()
+                target: "Note".into(),
+                width: None,
+                alt: Some("Alias".into())
             }]
+        );
+    }
+
+    #[test]
+    fn an_embed_keeps_its_width_and_alt_text() {
+        assert_eq!(
+            parse_blocks("![[shot.png|300]]")[0],
+            Block::Embed {
+                target: "shot.png".into(),
+                width: Some(300),
+                alt: None
+            }
+        );
+        assert_eq!(
+            parse_blocks("![[shot.png|A screenshot]]")[0],
+            Block::Embed {
+                target: "shot.png".into(),
+                width: None,
+                alt: Some("A screenshot".into())
+            }
+        );
+        // Widths are clamped to something sane.
+        assert_eq!(
+            parse_blocks("![[shot.png|999999]]")[0],
+            Block::Embed {
+                target: "shot.png".into(),
+                width: Some(2000),
+                alt: None
+            }
         );
     }
 

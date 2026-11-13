@@ -65,7 +65,9 @@ A lot already works. This is a working application, not a mockup — but it is e
   (right-click a row), plus the quick switcher and full-text search
 - Wikilinks, backlinks, tags, outline, document relations and a graph view
 - Daily/weekly/monthly notes, templates, properties, bookmarks
-- Embeds and attachments (images, PDF, audio), transclusion, shared blocks
+- Embeds and attachments (images, PDF, audio), transclusion, shared blocks; images honor
+  `![[img|300]]` width and alt text, click opens a lightbox, and other attachments open in
+  the OS viewer from a card
 - A/B versions with a line diff, document review, block move/duplicate/delete/extract
 - Recovery snapshots, browsable and restorable from **File recovery** in the palette
 - Conflict-safe saves: a save never overwrites a file that changed on disk; the app offers

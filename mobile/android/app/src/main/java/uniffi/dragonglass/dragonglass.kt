@@ -685,6 +685,8 @@ internal object IntegrityCheckingUniffiLib {
     ): Int
     external fun uniffi_dragonglass_ffi_checksum_func_render_html(
     ): Int
+    external fun uniffi_dragonglass_ffi_checksum_func_render_html_from_vault(
+    ): Int
     external fun uniffi_dragonglass_ffi_checksum_method_mobilevault_bookmarks(
     ): Int
     external fun uniffi_dragonglass_ffi_checksum_method_mobilevault_create_folder(
@@ -831,6 +833,8 @@ internal object UniffiLib {
     ): RustBuffer.ByValue
     external fun uniffi_dragonglass_ffi_fn_func_render_html(`source`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
+    external fun uniffi_dragonglass_ffi_fn_func_render_html_from_vault(`source`: RustBuffer.ByValue,`root`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
     external fun ffi_dragonglass_ffi_rustbuffer_alloc(`size`: Long,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
     external fun ffi_dragonglass_ffi_rustbuffer_from_bytes(`bytes`: ForeignBytes.ByValue,uniffi_out_err: UniffiRustCallStatus, 
@@ -963,6 +967,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if ((lib.uniffi_dragonglass_ffi_checksum_func_render_html() and 0xFFFF) != 22921) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if ((lib.uniffi_dragonglass_ffi_checksum_func_render_html_from_vault() and 0xFFFF) != 6224) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if ((lib.uniffi_dragonglass_ffi_checksum_method_mobilevault_bookmarks() and 0xFFFF) != 6789) {
@@ -3347,6 +3354,22 @@ public object FfiConverterSequenceTypeTreeRow: FfiConverterRustBuffer<List<TreeR
     
         
         FfiConverterString.lower(`source`),_status)
+}
+    )
+    }
+    
+
+        /**
+         * Render markdown with the vault's attachment index, so `![[shot.png]]` resolves to a
+         * subfolder path the WebView can load relative to the vault root.
+         */ fun `renderHtmlFromVault`(`source`: kotlin.String, `root`: kotlin.String): kotlin.String {
+            return FfiConverterString.lift(
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_dragonglass_ffi_fn_func_render_html_from_vault(
+    
+        
+        FfiConverterString.lower(`source`),
+        FfiConverterString.lower(`root`),_status)
 }
     )
     }
