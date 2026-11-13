@@ -396,6 +396,25 @@ Escape closes, in order: the quit prompt, a sidebar menu, the switcher or input 
 settings page, the diff, query and graph views, the relations pane, the footnote popover, the
 editor's autocomplete/find/Vim state, and finally the status line.
 
+### Live preview in the editor
+
+Display math is the first block type the source editor renders in place. A `$$…$$` block
+(or a one-line `$$tex$$`) is typeset with the same RaTeX scene the reading view uses, centred
+and scaled to the text column, whenever the caret is outside the block. The moment the caret
+enters it — a click, an arrow key, a search hit — the LaTeX source is shown again for
+editing, and leaving it restores the render. Empty, unclosed or invalid formulas keep their
+source instead of leaving a blank gap.
+
+The drawing is geometry-neutral on purpose: the block keeps its rows and its shaped source
+lines, only the glyphs are skipped. Scroll offsets, click-to-caret placement, selection and
+find matches therefore keep working exactly as before, and a click on the formula simply
+reveals the source under the pointer.
+
+The rest of Obsidian's live preview — hiding `**`/`==`/`[[…]]` markers and rendering images,
+tables and callouts for the blocks the caret is not in — needs a per-line display-to-source
+column map first, so clicks, selection, wrapping and IME all survive the substitution. That
+is tracked as Q2.12 in [`docs/qol-plan.md`](docs/qol-plan.md).
+
 ### Editor tooling
 
 The editor now has an in-note find/replace bar (`Ctrl+F`, `Ctrl+H` for replace) with

@@ -13,9 +13,10 @@ transitions between them.
 > Preview to Edit (Q0.5/Q1.8), Android search clear/IME-Search/Back-to-clear (Q4.1), joined
 > soft line breaks (Q2.10), clickable tag chips and frontmatter links (Q4.5/P2), the window
 > title as note + dirty marker (Q3.12), Vim `:wq` close, redo and failed-search reporting
-> (Q3.12), the code-fence copy button (Q2.7), and the Escape order audit. Everything else in
-> this document is still open. The Android changes compile with `:app:compileDebugKotlin` but
-> have not been run on a device yet.
+> (Q3.12), the code-fence copy button (Q2.7), the Escape order audit, and the first slice of
+> live preview: `$$…$$` blocks typeset in the editor while the caret is outside them
+> (Q2.12). Everything else in this document is still open. The Android changes compile with
+> `:app:compileDebugKotlin` but have not been run on a device yet.
 
 **Basis:** audit of the current working tree (commit `1cb0ec2` plus local session/mobile
 work). Line references are approximate and should be re-checked before implementation.
@@ -341,6 +342,19 @@ Debounce full re-parse/re-typeset of split preview and the stats/outline computa
 every revision; cache by buffer revision. Optionally add scroll sync with a toggle.
 **Done when:** typing in a 5k-line note does not drop frames or re-typeset every formula on
 each keystroke; preview catches up within ~150 ms of typing stopping.
+
+#### Q2.12 Live preview inside the source editor — D · M–L
+Obsidian-style: the block holding the caret stays raw source and the rest of the note
+renders. **Landed:** display `$$…$$` blocks are typeset in place with the reading view's
+RaTeX scene whenever the caret is outside them, scaled to the column and centred; the source
+returns while editing; empty, unclosed and invalid formulas keep their source instead of
+leaving a gap; rows keep their geometry so clicks, scroll, selection and find are unchanged.
+**Remaining:** a per-line display↔source column map before markers can be hidden
+(`**`, `==`, `[[…]]`) or images, tables, callouts and rules rendered in place, because
+clicks, selection, wrapping and IME all have to survive the substitution. Then render the
+formula live while it is being typed (today it appears when the caret leaves the block).
+**Done when:** a note with emphasis, an image and a table shows the caret's line as source
+and the rest as preview, and every click lands on the source column the user aimed at.
 
 ---
 

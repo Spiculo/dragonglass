@@ -7,7 +7,7 @@
 //! The editor also owns the in-note find/replace bar, optional Vim mode, and multi-cursor
 //! state. Selections and extra carets live here; the buffer only stores the primary caret.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -17,7 +17,7 @@ use dragonglass_core::format as text_format;
 use dragonglass_core::frontmatter::{self, Property, PropertyValue};
 use dragonglass_core::inline;
 use dragonglass_core::markdown;
-use dragonglass_core::math::{self, MathOptions, MathStyle};
+use dragonglass_core::math::{self, MathOptions, MathScene, MathStyle};
 use dragonglass_core::{blocks, git, history, stats, storage, syntax, templates, wrap, Buffer};
 use gpui::{
     actions, div, fill, point, prelude::*, px, relative, size, AnyElement, App, Bounds,
@@ -28,7 +28,7 @@ use gpui::{
     SharedString, Style, TextRun, UTF16Selection, Window,
 };
 
-use crate::math_element::MathElement;
+use crate::math_element::{paint_scene, MathElement};
 use crate::reading::{LinkOpener, ReadingCache};
 use crate::theme::Theme;
 use crate::vim::{Mode as VimMode, Vim};
@@ -312,6 +312,15 @@ pub struct Editor {
     doc_generation: u64,
     /// Virtualized reading-mode content.
     reading_content: ReadingCache,
+    /// Display-math blocks in the current document, with the rows they occupy.
+    display_math: Rc<Vec<DisplayMathLayout>>,
+    /// The buffer revision `display_math` was parsed from.
+    display_math_revision: u64,
+    /// Typeset display formulas, keyed by TeX source. `None` records a failed formula.
+    math_scenes: HashMap<String, Option<Rc<MathScene>>>,
+    /// The document text for one revision, shared by the heading and math parsers so a
+    /// keystroke copies the note once rather than once per consumer.
+    doc_text: ((u64, u64), Rc<String>),
     /// True while a splitter is being dragged: the text keeps its old wrap width so a
     /// resize does not re-shape the whole document on every mouse tick.
     resizing: bool,
@@ -462,6 +471,82 @@ struct RowMeta {
     end: usize,
 }
 
+/// A `$$…$$` block in the source, before its rows are known.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DisplayMathSource {
+    first_line: usize,
+    last_line: usize,
+    tex: String,
+}
+
+/// A display-math block plus the rows it occupies in the laid-out document.
+#[derive(Debug, Clone)]
+struct DisplayMathLayout {
+    first_line: usize,
+    last_line: usize,
+    tex: String,
+    first_row: usize,
+    row_count: usize,
+}
+
+/// Find display-math blocks (`$$…$$`) by source line.
+///
+/// A block opens on a line that is exactly `$$` and closes on the next such line, or is a
+/// complete `$$tex$$` on one line. Fenced code and inline `$…$` are ignored. An unclosed
+/// block is not returned, so its source stays visible while it is being written.
+fn display_math_blocks(text: &str) -> Vec<DisplayMathSource> {
+    let mut blocks = Vec::new();
+    let mut in_fence = false;
+    let mut open: Option<(usize, Vec<&str>)> = None;
+
+    for (index, line) in text.lines().enumerate() {
+        let trimmed = line.trim();
+
+        if let Some((first_line, body)) = &mut open {
+            if trimmed == "$$" {
+                let tex = body.join("\n");
+                if !tex.trim().is_empty() {
+                    blocks.push(DisplayMathSource {
+                        first_line: *first_line,
+                        last_line: index,
+                        tex,
+                    });
+                }
+                open = None;
+            } else {
+                body.push(line);
+            }
+            continue;
+        }
+
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            in_fence = !in_fence;
+            continue;
+        }
+        if in_fence {
+            continue;
+        }
+
+        if trimmed == "$$" {
+            open = Some((index, Vec::new()));
+            continue;
+        }
+
+        if trimmed.len() > 4 && trimmed.starts_with("$$") && trimmed.ends_with("$$") {
+            let tex = trimmed[2..trimmed.len() - 2].trim();
+            if !tex.is_empty() {
+                blocks.push(DisplayMathSource {
+                    first_line: index,
+                    last_line: index,
+                    tex: tex.to_string(),
+                });
+            }
+        }
+    }
+
+    blocks
+}
+
 /// The shaped rows of one logical line, reused across frames.
 ///
 /// Shaping (measuring, wrapping and laying out glyphs) is by far the most expensive part
@@ -507,6 +592,10 @@ impl Editor {
             properties_revision: u64::MAX,
             doc_generation: 0,
             reading_content: ReadingCache::new(),
+            display_math: Rc::new(Vec::new()),
+            display_math_revision: u64::MAX,
+            math_scenes: HashMap::new(),
+            doc_text: ((u64::MAX, u64::MAX), Rc::new(String::new())),
             resizing: false,
             attachments_folder: "attachments".to_string(),
             link_opener: None,
@@ -825,6 +914,7 @@ impl Editor {
         self.scroll_handle = ScrollHandle::new();
         self.properties_revision = u64::MAX;
         self.doc_generation = self.doc_generation.wrapping_add(1);
+        self.math_scenes.clear();
         self.path = Some(path.to_path_buf());
         Ok(())
     }
@@ -886,6 +976,7 @@ impl Editor {
         self.scroll_handle = ScrollHandle::new();
         self.properties_revision = u64::MAX;
         self.doc_generation = self.doc_generation.wrapping_add(1);
+        self.math_scenes.clear();
         self.reading_content.invalidate_attachments();
         Ok(())
     }
@@ -1092,10 +1183,19 @@ impl Editor {
     fn document_headings(&mut self) -> Rc<Vec<markdown::Heading>> {
         let key = (self.doc_generation, self.buffer.revision());
         if self.heading_cache.0 != key.0 || self.heading_cache.1 != key.1 {
-            let text = self.buffer.text();
+            let text = self.document_text();
             self.heading_cache = (key.0, key.1, Rc::new(markdown::headings(&text)));
         }
         self.heading_cache.2.clone()
+    }
+
+    /// The document text, copied at most once per revision and shared by its consumers.
+    fn document_text(&mut self) -> Rc<String> {
+        let key = (self.doc_generation, self.buffer.revision());
+        if self.doc_text.0 != key {
+            self.doc_text = (key, Rc::new(self.buffer.text()));
+        }
+        self.doc_text.1.clone()
     }
 
     /// Whether a heading has at least one heading nested under it.
@@ -1311,6 +1411,41 @@ impl Editor {
         }
         let markers = Self::fold_markers(&headings, &self.folded, count);
 
+        // `$$…$$` blocks are drawn as typeset formulas whenever the caret is outside them.
+        // Blocks are re-parsed only when the text changes; their row spans are rebuilt on
+        // every full layout because folds and wrapping move rows.
+        let sources: Vec<DisplayMathSource> = if self.display_math_revision == revision {
+            self.display_math
+                .iter()
+                .map(|block| DisplayMathSource {
+                    first_line: block.first_line,
+                    last_line: block.last_line,
+                    tex: block.tex.clone(),
+                })
+                .collect()
+        } else {
+            let text = self.document_text();
+            display_math_blocks(text.as_str())
+        };
+        self.display_math_revision = revision;
+
+        let mut blocks: Vec<DisplayMathLayout> = sources
+            .into_iter()
+            .map(|source| DisplayMathLayout {
+                first_line: source.first_line,
+                last_line: source.last_line,
+                tex: source.tex,
+                first_row: usize::MAX,
+                row_count: 0,
+            })
+            .collect();
+        let mut block_start: HashMap<usize, usize> = HashMap::new();
+        let mut block_end: HashMap<usize, usize> = HashMap::new();
+        for (index, block) in blocks.iter().enumerate() {
+            block_start.insert(block.first_line, index);
+            block_end.insert(block.last_line, index);
+        }
+
         let mut in_code = false;
         let mut language = String::new();
         let mut rows: Vec<Rc<ShapedLine>> = Vec::new();
@@ -1351,6 +1486,9 @@ impl Editor {
                 in_code = !in_code;
             }
 
+            if let Some(&block) = block_start.get(&line_index) {
+                blocks[block].first_row = rows.len();
+            }
             for span in layout.spans.iter() {
                 metas.push(RowMeta {
                     line: line_index,
@@ -1359,6 +1497,12 @@ impl Editor {
                 });
             }
             rows.extend(layout.rows.iter().cloned());
+            if let Some(&block) = block_end.get(&line_index) {
+                let first_row = blocks[block].first_row;
+                if first_row != usize::MAX {
+                    blocks[block].row_count = rows.len().saturating_sub(first_row);
+                }
+            }
 
             if line_index < self.line_cache.len() {
                 self.line_cache[line_index] = Some(layout);
@@ -1368,6 +1512,7 @@ impl Editor {
         }
         self.line_cache.truncate(count);
 
+        self.display_math = Rc::new(blocks);
         self.last_rows = Rc::new(metas);
         self.last_shaped = Rc::new(rows);
         self.cache_revision = revision;
@@ -1492,6 +1637,41 @@ impl Editor {
             let head = self.buffer.slice(0..end);
             self.properties = frontmatter::properties(&head).unwrap_or_default();
             self.properties_revision = revision;
+        }
+    }
+
+    /// Typeset every display block that will be drawn and has no scene yet.
+    ///
+    /// This runs per frame rather than per edit, because moving the caret changes which
+    /// block is drawn without changing the buffer revision. Successful and failed results
+    /// are both cached, so each formula is typeset once.
+    fn ensure_math_scenes(&mut self, caret_line: usize) {
+        let blocks = self.display_math.clone();
+        for block in blocks.iter() {
+            if caret_line >= block.first_line && caret_line <= block.last_line {
+                continue;
+            }
+            if self.math_scenes.contains_key(&block.tex) {
+                continue;
+            }
+            let scene = math::typeset(
+                &block.tex,
+                &MathOptions {
+                    style: MathStyle::Display,
+                    color: [0.0, 0.0, 0.0, 1.0],
+                },
+            )
+            .ok()
+            .map(Rc::new);
+            self.math_scenes.insert(block.tex.clone(), scene);
+        }
+
+        // A formula edited in place produces one cache entry per keystroke; drop the ones
+        // no block references any more so the cache stays bounded.
+        if self.math_scenes.len() > blocks.len() * 2 + 16 {
+            let live: HashSet<&str> = blocks.iter().map(|block| block.tex.as_str()).collect();
+            self.math_scenes
+                .retain(|tex, _| live.contains(tex.as_str()));
         }
     }
 
@@ -4992,6 +5172,8 @@ struct Prepaint {
     extra_cursors: Vec<PaintQuad>,
     /// Rows intersecting the viewport; only these are painted.
     visible: Range<usize>,
+    /// Source lines whose text is replaced by a rendered formula.
+    hidden_lines: HashSet<usize>,
 }
 
 impl Element for EditorText {
@@ -5045,12 +5227,39 @@ impl Element for EditorText {
         let editor_entity = self.editor.clone();
         editor_entity.update(cx, |editor, _cx| {
             editor.lay_out(window, theme, available, color);
+            let caret_line = editor.buffer.line_col().0;
+            editor.ensure_math_scenes(caret_line);
         });
 
         let editor = self.editor.read(cx);
         let line_height = editor.line_height;
         let rows = editor.last_shaped.clone();
         let metas = editor.last_rows.clone();
+
+        // A block renders only while the caret is outside it, so editing a formula always
+        // shows its source. Every line of a rendered block loses its glyphs; the rows keep
+        // their height, which is what keeps scroll, click and caret geometry unchanged.
+        let caret_line = editor.buffer.line_col().0;
+        let mut hidden_lines: HashSet<usize> = HashSet::new();
+        for block in editor.display_math.iter() {
+            if block.row_count == 0 {
+                continue;
+            }
+            if caret_line >= block.first_line && caret_line <= block.last_line {
+                continue;
+            }
+            // Nothing is hidden unless there is a formula to put in its place, so a
+            // formula the typesetter rejects stays visible as source instead of leaving
+            // a blank gap.
+            if !editor
+                .math_scenes
+                .get(&block.tex)
+                .is_some_and(|scene| scene.is_some())
+            {
+                continue;
+            }
+            hidden_lines.extend(block.first_line..=block.last_line);
+        }
 
         // Only the rows inside the scroll viewport need quads and glyphs. On a long note
         // this turns each scroll frame from "paint the whole document" into "paint a
@@ -5071,6 +5280,9 @@ impl Element for EditorText {
         for selection in editor.selection_ranges() {
             for row_index in visible.clone() {
                 let meta = metas[row_index];
+                if hidden_lines.contains(&meta.line) {
+                    continue;
+                }
                 let line_start = editor.buffer.char_index_at(meta.line, 0);
                 let start = selection.start.max(line_start + meta.start);
                 let end = selection.end.min(line_start + meta.end);
@@ -5105,6 +5317,9 @@ impl Element for EditorText {
             };
             for row_index in visible.clone() {
                 let meta = metas[row_index];
+                if hidden_lines.contains(&meta.line) {
+                    continue;
+                }
                 let line_start = editor.buffer.char_index_at(meta.line, 0);
                 let start = matched.start.max(line_start + meta.start);
                 let end = matched.end.min(line_start + meta.end);
@@ -5196,6 +5411,7 @@ impl Element for EditorText {
             cursor,
             extra_cursors: extra_cursor_quads,
             visible,
+            hidden_lines,
         }
     }
 
@@ -5232,12 +5448,57 @@ impl Element for EditorText {
 
         let visible = prepaint.visible.clone();
         let rows = prepaint.rows.clone();
-        for i in visible {
+        let metas = prepaint.metas.clone();
+        for i in visible.clone() {
             let Some(row) = rows.get(i) else {
                 continue;
             };
+            if metas
+                .get(i)
+                .is_some_and(|meta| prepaint.hidden_lines.contains(&meta.line))
+            {
+                continue;
+            }
             let origin = point(bounds.left(), bounds.top() + line_height * i as f32);
             let _ = row.paint(origin, line_height, window, cx);
+        }
+
+        // Draw each rendered `$$…$$` block over the blank rows it owns.
+        {
+            let editor = self.editor.read(cx);
+            let theme = *cx.global::<Theme>();
+            let column_width = f32::from(bounds.size.width);
+            for block in editor.display_math.iter() {
+                if block.row_count == 0 || prepaint.hidden_lines.contains(&block.first_line) {
+                    continue;
+                }
+                let first_row = block.first_row;
+                let last_row = first_row + block.row_count;
+                if last_row <= visible.start || first_row >= visible.end {
+                    continue;
+                }
+                let Some(Some(scene)) = editor.math_scenes.get(&block.tex) else {
+                    continue;
+                };
+
+                // Display size, scaled down when the formula is wider than the text column.
+                let natural = 18.0f32;
+                let scene_width = scene.width() as f32;
+                let font_size = if scene_width > 0.0 && scene_width * natural > column_width - 24.0
+                {
+                    ((column_width - 24.0) / scene_width).clamp(9.0, natural)
+                } else {
+                    natural
+                };
+                let width = px(scene_width * font_size);
+                let height = px(scene.total_height() as f32 * font_size);
+                let block_height = line_height * block.row_count as f32;
+                let left = bounds.left() + px(((column_width - f32::from(width)) / 2.0).max(0.0));
+                let top = bounds.top()
+                    + line_height * first_row as f32
+                    + px(((f32::from(block_height) - f32::from(height)) / 2.0).max(0.0));
+                paint_scene(window, scene, font_size, theme.text, point(left, top));
+            }
         }
 
         if focus_handle.is_focused(window) {
@@ -5310,6 +5571,48 @@ fn visible_row_range(
 mod tests {
     use super::*;
     use gpui::{point, size};
+
+    #[test]
+    fn display_math_blocks_span_their_lines() {
+        let blocks = display_math_blocks("before\n$$\na + b\n$$\nafter");
+        assert_eq!(
+            blocks,
+            vec![DisplayMathSource {
+                first_line: 1,
+                last_line: 3,
+                tex: "a + b".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn a_single_line_display_block_counts() {
+        let blocks = display_math_blocks("x\n$$e^{i\\pi}$$\n");
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].first_line, 1);
+        assert_eq!(blocks[0].last_line, 1);
+        assert_eq!(blocks[0].tex, "e^{i\\pi}");
+    }
+
+    #[test]
+    fn inline_math_is_not_a_block() {
+        assert!(display_math_blocks("a $x$ b\n$$\n").is_empty());
+        assert!(display_math_blocks("price $$ 5").is_empty());
+    }
+
+    #[test]
+    fn fenced_code_hides_its_dollars() {
+        let text = "```\n$$\nnot math\n$$\n```\n$$\ny = x\n$$";
+        let blocks = display_math_blocks(text);
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].first_line, 5);
+        assert_eq!(blocks[0].tex, "y = x");
+    }
+
+    #[test]
+    fn an_unclosed_block_stays_source() {
+        assert!(display_math_blocks("$$\nx + y\n").is_empty());
+    }
 
     #[test]
     fn a_selection_becomes_the_wikilink_alias() {

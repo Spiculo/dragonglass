@@ -39,7 +39,9 @@ A lot already works. This is a working application, not a mockup — but it is e
 - Syntax highlighting, code fences, tables, task lists, footnotes, callouts and
   `==highlights==`
 - KaTeX-compatible math (`$…$` / `$$…$$`) via [RaTeX](https://github.com/erweixin/RaTeX),
-  rendered natively and exported as vector SVG
+  rendered natively and exported as vector SVG; display `$$…$$` blocks are typeset in the
+  editor itself whenever the caret is outside the block, and show their LaTeX source again
+  while you edit them
 - Tabs, split panes, detached windows, multiple windows per vault; the window title shows
   the active note and a dirty marker
 - Find and replace with regex, capture groups, case and whole-word toggles, keyboard-only
