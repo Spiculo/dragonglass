@@ -6497,7 +6497,7 @@ impl Render for DragonGlassApp {
             // while typing: the first stale frame arms a timer, the timer repaints once the
             // window has passed, and continuous typing cannot recompute on every keystroke.
             let now = std::time::Instant::now();
-            let due = self.derived_at.map_or(true, |last| {
+            let due = self.derived_at.is_none_or(|last| {
                 now.duration_since(last) >= std::time::Duration::from_millis(150)
             });
             if due {

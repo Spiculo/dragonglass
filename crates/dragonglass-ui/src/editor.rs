@@ -2153,7 +2153,7 @@ impl Editor {
         let revision = self.buffer.revision();
         if self.stats_cache.0 != revision {
             let now = std::time::Instant::now();
-            let due = self.stats_at.map_or(true, |last| {
+            let due = self.stats_at.is_none_or(|last| {
                 now.duration_since(last) >= std::time::Duration::from_millis(150)
             });
             if due {

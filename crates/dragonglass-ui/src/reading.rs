@@ -705,20 +705,6 @@ impl ReadingCache {
         self.list_state.scroll_to_reveal_item(block);
     }
 
-    /// Matches in one block, as `(range, is_current)`.
-    fn find_matches_for(&self, block: usize) -> Vec<(Range<usize>, bool)> {
-        if !self.find.open || self.find.pattern.is_empty() {
-            return Vec::new();
-        }
-        self.find
-            .matches
-            .iter()
-            .enumerate()
-            .filter(|(_, found)| found.block == block)
-            .map(|(index, found)| (found.range.clone(), index == self.find.current))
-            .collect()
-    }
-
     fn recompute_find(&mut self) {
         let top = self.top_block();
         let find = Rc::make_mut(&mut self.find);
@@ -758,7 +744,6 @@ impl ReadingCache {
         }
         if let Some(found) = find.matches.get(find.current) {
             let block = found.block;
-            drop(find);
             self.list_state.scroll_to_reveal_item(block);
         }
     }
@@ -2938,8 +2923,8 @@ mod tests {
         let (current, total) = cache.find_position();
         assert_eq!(total, 2);
         assert_eq!(current, 1);
-        assert_eq!(cache.find_matches_for(0).len(), 1);
-        assert_eq!(cache.find_matches_for(1).len(), 1);
+        assert!(cache.find.matches.iter().any(|found| found.block == 0));
+        assert!(cache.find.matches.iter().any(|found| found.block == 1));
 
         cache.find_next(false);
         assert_eq!(cache.find_position().0, 2);
