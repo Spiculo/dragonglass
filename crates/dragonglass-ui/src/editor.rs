@@ -879,35 +879,55 @@ impl Editor {
         match kind {
             SuggestionKind::Link => {
                 let alias = self.pending_link_alias.clone();
+                // Rank prefix matches ahead of substring matches, so typing `da` offers
+                // `Daily` before `Monday`.
+                let mut ranked: Vec<(u8, Suggestion)> = Vec::new();
                 for (target, label) in self.note_suggestions.iter() {
-                    if needle.is_empty()
-                        || label.to_lowercase().contains(&needle)
-                        || target.to_lowercase().contains(&needle)
-                    {
-                        items.push(Suggestion {
+                    let label_lower = label.to_lowercase();
+                    let target_lower = target.to_lowercase();
+                    let rank = if needle.is_empty() || label_lower.starts_with(&needle) {
+                        0
+                    } else if target_lower.starts_with(&needle) {
+                        1
+                    } else if label_lower.contains(&needle) || target_lower.contains(&needle) {
+                        2
+                    } else {
+                        continue;
+                    };
+                    ranked.push((
+                        rank,
+                        Suggestion {
                             label: label.clone(),
                             detail: target.clone(),
                             insert: link_text(target, label, alias.as_deref()),
-                        });
-                        if items.len() == 8 {
-                            break;
-                        }
-                    }
+                        },
+                    ));
                 }
+                ranked.sort_by_key(|(rank, _)| *rank);
+                items = ranked.into_iter().take(8).map(|(_, item)| item).collect();
             }
             SuggestionKind::Tag => {
+                let mut ranked: Vec<(u8, Suggestion)> = Vec::new();
                 for tag in self.tag_suggestions.iter() {
-                    if needle.is_empty() || tag.to_lowercase().contains(&needle) {
-                        items.push(Suggestion {
+                    let lower = format!("#{}", tag).to_lowercase();
+                    let rank = if needle.is_empty() || lower.starts_with(&needle) {
+                        0
+                    } else if lower.contains(&needle) {
+                        1
+                    } else {
+                        continue;
+                    };
+                    ranked.push((
+                        rank,
+                        Suggestion {
                             label: format!("#{tag}"),
                             detail: "tag".to_string(),
                             insert: format!("#{tag}"),
-                        });
-                        if items.len() == 8 {
-                            break;
-                        }
-                    }
+                        },
+                    ));
                 }
+                ranked.sort_by_key(|(rank, _)| *rank);
+                items = ranked.into_iter().take(8).map(|(_, item)| item).collect();
             }
             SuggestionKind::Slash => {
                 for (insert, description) in SLASH_COMMANDS {
@@ -4648,9 +4668,27 @@ impl Render for Editor {
                 ),
             )
             .when_some(find_bar, |d, bar| d.child(bar))
-            .child(body)
+            .child(
+                // The autocomplete list floats over the bottom of the text instead of
+                // pushing it up, so opening it never moves the document under the caret.
+                div()
+                    .relative()
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .min_h(px(0.0))
+                    .child(body)
+                    .children(autocomplete_bar.map(|bar| {
+                        div()
+                            .absolute()
+                            .left_0()
+                            .right_0()
+                            .bottom_0()
+                            .child(bar)
+                            .into_any_element()
+                    })),
+            )
             .when_some(format_bar, |d, bar| d.child(bar))
-            .when_some(autocomplete_bar, |d, bar| d.child(bar))
             .child(status)
     }
 }
