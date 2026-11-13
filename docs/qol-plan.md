@@ -269,12 +269,21 @@ open in the OS, not as bogus notes.
 **Done when:** reading a note and clicking a wikilink opens the target in reading mode at
 the right position; quick-switch from reading remains in reading; edit mode remains edit.
 
+**Landed:** `open_note` reads the current tab's mode and applies it to the editor it loads
+into, so following a wikilink or quick-switching from reading stays in reading, and edit
+stays edit. External URLs and assets already go to the OS.
+
 #### Q1.6 Search hits open at the hit line — D · A · S
 Preserve `hit.line_number` through `Item::Note` (desktop) and `pendingLine` (mobile), focus
 the editor, select the match and scroll it into view. Show the matching line/context in the
 result list instead of only the title.
 **Done when:** every search result opens with the hit visible and selected; Back returns to
 the results with the query and scroll intact.
+
+**Landed (desktop):** search results carry the line number (`Item::NoteAt`), list the line
+text next to the path, and opening one focuses the editor with the query text selected on
+that line; the caret-follow scroll brings it into view. Mobile already passed `pendingLine`;
+its results list shows the hit text.
 
 #### Q1.7 Mobile scroll retention — A · M
 Remember the note-list `LazyListState`, editor selection/scroll and WebView scroll position
@@ -414,6 +423,14 @@ markers), and preserve Tab-to-accept when autocomplete is open. Never let Tab si
 focus out of the editor.
 **Done when:** Tab indents a multi-line selection, Shift+Tab outdents, list markers continue
 correctly, and autocomplete still accepts with Tab/Enter.
+
+**Landed:** `Tab` indents every selected line by four spaces (the selection maps through the
+edit and stays selected); with a bare caret it inserts an indent at the caret. `Shift+Tab`
+removes one tab or up to four leading spaces from each selected line, or from the caret's
+line. `Tab` still accepts an autocomplete suggestion first, and Tab never leaves the editor.
+Enter at the end of a bullet, task, numbered or quoted line continues its marker
+(`3.` becomes `4.`, `- [x]` becomes `- [ ]`, indentation kept); an empty item does not
+continue. Unit tests cover the marker rules.
 
 #### Q3.3 Save As is discoverable — D · S
 Bind Ctrl/Cmd+Shift+S. When Ctrl+S or Ctrl+W hits an Untitled note, open Save As immediately

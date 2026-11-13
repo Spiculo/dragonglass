@@ -110,7 +110,9 @@ actions!(
         ToggleHighlight,
         ToggleInlineCode,
         ToggleComment,
-        InsertWikilink
+        InsertWikilink,
+        Indent,
+        Outdent
     ]
 );
 
@@ -208,6 +210,9 @@ pub fn init(cx: &mut App) {
         // Start a wikilink from the caret, or from the selected text.
         KeyBinding::new("ctrl-k", InsertWikilink, None),
         KeyBinding::new("cmd-k", InsertWikilink, None),
+        // Tab indents; Shift+Tab outdents. Autocomplete still accepts with Tab.
+        KeyBinding::new("tab", Indent, None),
+        KeyBinding::new("shift-tab", Outdent, None),
     ]);
 
     // macOS conventions: Command jumps to the line or document edge, Option works by word.
@@ -483,6 +488,55 @@ struct Autocomplete {
     query: String,
     items: Vec<Suggestion>,
     selected: usize,
+}
+
+/// The marker a new line continues, when Enter is pressed at the end of a list item.
+fn list_continuation(line: &str, col: usize) -> Option<String> {
+    if col != line.chars().count() {
+        return None;
+    }
+    let trimmed = line.trim_start();
+    let indent = &line[..line.len() - trimmed.len()];
+
+    // Bullets and task items.
+    for marker in ["- ", "* ", "+ "] {
+        if let Some(rest) = trimmed.strip_prefix(marker) {
+            if rest.trim().is_empty() {
+                return None;
+            }
+            if rest.starts_with("[ ] ") || rest.starts_with("[x] ") || rest.starts_with("[X] ") {
+                return Some(format!("{indent}{marker}[ ] "));
+            }
+            return Some(format!("{indent}{marker}"));
+        }
+    }
+
+    // Ordered items keep their delimiter and increment.
+    let digits: String = trimmed
+        .chars()
+        .take_while(|ch| ch.is_ascii_digit())
+        .collect();
+    if !digits.is_empty() {
+        let rest = &trimmed[digits.len()..];
+        if let Some(after) = rest.strip_prefix(". ").or_else(|| rest.strip_prefix(") ")) {
+            if after.trim().is_empty() {
+                return None;
+            }
+            let next = digits.parse::<u64>().ok()?.saturating_add(1);
+            let delimiter = if rest.starts_with(") ") { ")" } else { "." };
+            return Some(format!("{indent}{next}{delimiter} "));
+        }
+    }
+
+    // Blockquotes.
+    if let Some(rest) = trimmed.strip_prefix("> ") {
+        if rest.trim().is_empty() {
+            return None;
+        }
+        return Some(format!("{indent}> "));
+    }
+
+    None
 }
 
 /// A wrapped visual row: `[start, end)` character columns of logical line `line`.
@@ -1147,6 +1201,30 @@ impl Editor {
         self.buffer.set_cursor(self.buffer.char_index_at(line, 0));
         self.anchor = None;
         self.extra_cursors.clear();
+    }
+
+    /// Put the caret on a source line and select `needle` when it appears there.
+    ///
+    /// Search results use this so the match is already selected when the note opens.
+    pub fn select_line_text(&mut self, line: usize, needle: &str) {
+        let line = line.min(self.buffer.line_count().saturating_sub(1));
+        self.buffer.set_cursor(self.buffer.char_index_at(line, 0));
+        self.anchor = None;
+        self.extra_cursors.clear();
+        if needle.is_empty() {
+            return;
+        }
+        let text = self.buffer.line(line);
+        let Some(byte) = text.find(needle) else {
+            return;
+        };
+        let start_col = text[..byte].chars().count();
+        let start = self.buffer.char_index_at(line, start_col);
+        let end = self
+            .buffer
+            .char_index_at(line, start_col + needle.chars().count());
+        self.anchor = Some(start);
+        self.buffer.set_cursor(end);
     }
 
     /// The selected text, if there is a non-empty selection.
@@ -2871,6 +2949,15 @@ impl Editor {
             cx.notify();
             return;
         }
+        // Enter at the end of a list item continues its marker (and increments numbers).
+        if self.selection().is_none() && self.extra_cursors.is_empty() {
+            let (line, col) = self.buffer.line_col();
+            if let Some(prefix) = list_continuation(&self.buffer.line(line), col) {
+                self.insert_text(&format!("\n{prefix}"));
+                cx.notify();
+                return;
+            }
+        }
         self.delete_selections();
         self.insert_text("\n");
         cx.notify();
@@ -3126,6 +3213,109 @@ impl Editor {
     ) {
         self.start_wikilink();
         cx.notify();
+    }
+
+    /// Tab: accept an autocomplete suggestion, otherwise indent the selection or caret.
+    fn indent(&mut self, _: &Indent, _window: &mut Window, cx: &mut Context<Self>) {
+        if !self.can_mutate() || self.find.open {
+            return;
+        }
+        if self.accept_autocomplete() {
+            cx.notify();
+            return;
+        }
+        self.indent_selection(false);
+        cx.notify();
+    }
+
+    /// Shift+Tab: remove one indent step from the selected lines or the caret's line.
+    fn outdent(&mut self, _: &Outdent, _window: &mut Window, cx: &mut Context<Self>) {
+        if !self.can_mutate() || self.find.open {
+            return;
+        }
+        self.indent_selection(true);
+        cx.notify();
+    }
+
+    /// Add or remove one indent step (four spaces) for every line the selection touches.
+    ///
+    /// With a bare caret, Tab inserts at the caret and Shift+Tab removes the line's leading
+    /// whitespace, which is what a plain text editor does.
+    fn indent_selection(&mut self, outdent: bool) {
+        const STEP: usize = 4;
+
+        let Some(range) = self.selection() else {
+            if outdent {
+                let (line, _) = self.buffer.line_col();
+                let line_start = self.buffer.char_index_at(line, 0);
+                let leading: Vec<char> = self.buffer.line(line).chars().take(STEP).collect();
+                let remove = if leading.first() == Some(&'\t') {
+                    1
+                } else {
+                    leading.iter().take_while(|ch| **ch == ' ').count()
+                };
+                if remove > 0 {
+                    self.buffer.replace(line_start..line_start + remove, "");
+                    self.buffer
+                        .set_cursor(self.buffer.cursor().saturating_sub(remove).max(line_start));
+                    self.anchor = None;
+                }
+            } else {
+                self.insert_text(&" ".repeat(STEP));
+            }
+            return;
+        };
+
+        let (start_line, _) = self.buffer.line_col_at(range.start);
+        let (end_line, end_col) = self.buffer.line_col_at(range.end);
+        // A selection that ends at column 0 of a line does not include that line.
+        let last_line = if end_col == 0 && end_line > start_line {
+            end_line - 1
+        } else {
+            end_line
+        };
+
+        let mut edits: Vec<(Range<usize>, String)> = Vec::new();
+        for line in start_line..=last_line {
+            let line_start = self.buffer.char_index_at(line, 0);
+            if outdent {
+                let leading: Vec<char> = self.buffer.line(line).chars().take(STEP).collect();
+                let remove = if leading.first() == Some(&'\t') {
+                    1
+                } else {
+                    leading.iter().take_while(|ch| **ch == ' ').count()
+                };
+                if remove > 0 {
+                    edits.push((line_start..line_start + remove, String::new()));
+                }
+            } else {
+                edits.push((line_start..line_start, " ".repeat(STEP)));
+            }
+        }
+        if edits.is_empty() {
+            return;
+        }
+
+        // Map the selection through the edits so the same text stays selected.
+        let map = |position: usize| -> usize {
+            let mut mapped = position as isize;
+            for (range, text) in &edits {
+                if range.start <= position {
+                    let inserted = text.chars().count() as isize;
+                    let removed = (range.end - range.start) as isize;
+                    mapped += inserted - removed;
+                }
+            }
+            mapped.max(0) as usize
+        };
+        let anchor = map(range.start);
+        let head = map(range.end);
+
+        self.buffer.replace_many(edits);
+        self.anchor = Some(anchor);
+        self.buffer.set_cursor(head);
+        self.extra_cursors.clear();
+        self.refresh_autocomplete();
     }
 
     fn toggle_reading(&mut self, _: &ToggleReading, _window: &mut Window, cx: &mut Context<Self>) {
@@ -5913,6 +6103,28 @@ fn visible_row_range(
 mod tests {
     use super::*;
     use gpui::{point, size};
+
+    #[test]
+    fn lists_continue_on_enter() {
+        assert_eq!(list_continuation("- item", 6).as_deref(), Some("- "));
+        assert_eq!(list_continuation("  - item", 8).as_deref(), Some("  - "));
+        assert_eq!(
+            list_continuation("- [x] done", 10).as_deref(),
+            Some("- [ ] ")
+        );
+        assert_eq!(list_continuation("3. three", 8).as_deref(), Some("4. "));
+        assert_eq!(list_continuation("1) one", 6).as_deref(), Some("2) "));
+        assert_eq!(list_continuation("> quote", 7).as_deref(), Some("> "));
+    }
+
+    #[test]
+    fn list_continuation_stops_where_it_should() {
+        // Plain text, an empty item, and a caret that is not at the end.
+        assert_eq!(list_continuation("plain text", 10), None);
+        assert_eq!(list_continuation("- ", 2), None);
+        assert_eq!(list_continuation("- item", 2), None);
+        assert_eq!(list_continuation("# heading", 9), None);
+    }
 
     #[test]
     fn display_math_blocks_span_their_lines() {

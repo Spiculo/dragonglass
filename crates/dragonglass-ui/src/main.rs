@@ -258,15 +258,29 @@ enum GitAction {
 }
 
 enum Item {
-    Note { relative: String },
+    Note {
+        relative: String,
+    },
+    /// A full-text search hit: open the note at a 1-based line and select the match.
+    NoteAt {
+        relative: String,
+        line: usize,
+    },
     Git(GitAction),
-    Property { key: Option<String> },
-    DeleteProperty { key: String },
+    Property {
+        key: Option<String>,
+    },
+    DeleteProperty {
+        key: String,
+    },
     Command(CommandId),
     Workspace(String),
     Hotkey(String),
     VersionSave(String),
-    VersionCompare { left: Option<String>, right: String },
+    VersionCompare {
+        left: Option<String>,
+        right: String,
+    },
     VersionPromote(String),
     VersionDelete(String),
     Template(String),
@@ -1556,6 +1570,9 @@ impl DragonGlassApp {
             (tab.relative.is_none() && !tab.editor.read(cx).is_dirty()).then_some(index)
         });
 
+        // Following a link keeps the current mode: a reader stays a reader.
+        let reading = self.editor.read(cx).is_reading();
+
         let title = tab_title(relative);
         if let Some(index) = empty {
             let editor = self.tabs[index].editor.clone();
@@ -1564,6 +1581,10 @@ impl DragonGlassApp {
                 cx.notify();
                 return;
             }
+            editor.update(cx, |editor, cx| {
+                editor.set_reading_mode(reading);
+                cx.notify();
+            });
             self.tabs[index].relative = Some(relative.to_string());
             self.tabs[index].title = title;
             self.tabs[index].conflict = false;
@@ -1575,6 +1596,10 @@ impl DragonGlassApp {
                 cx.notify();
                 return;
             }
+            editor.update(cx, |editor, cx| {
+                editor.set_reading_mode(reading);
+                cx.notify();
+            });
             self.tabs.push(Tab {
                 relative: Some(relative.to_string()),
                 editor: editor.clone(),
@@ -1947,8 +1972,9 @@ impl DragonGlassApp {
                 .map(|hit| SwitcherItem {
                     label: format!("{}:{}", hit.relative, hit.line_number),
                     detail: hit.line,
-                    item: Item::Note {
+                    item: Item::NoteAt {
                         relative: hit.relative,
+                        line: hit.line_number,
                     },
                 })
                 .collect(),
@@ -4847,6 +4873,22 @@ impl DragonGlassApp {
                             let relative = relative.clone();
                             self.open_note(&relative, window, cx);
                             self.close_panel(window, cx);
+                            return;
+                        }
+                        Item::NoteAt { relative, line } => {
+                            let relative = relative.clone();
+                            let line = *line;
+                            let query = panel.query.clone();
+                            self.open_note(&relative, window, cx);
+                            self.close_panel(window, cx);
+                            let editor = self.editor.clone();
+                            editor.update(cx, |editor, cx| {
+                                // A search hit is an editing target: show the source line.
+                                editor.set_reading_mode(false);
+                                editor.select_line_text(line.saturating_sub(1), &query);
+                                cx.notify();
+                            });
+                            self.set_status(StatusKind::Info, format!("{relative}:{line}"));
                             return;
                         }
                         Item::Git(action) => {
