@@ -84,6 +84,8 @@ A lot already works. This is a working application, not a mockup — but it is e
 **Not there yet:** notarized macOS builds, Mermaid diagrams, a community (online)
 theme/plugin store, end-to-end-encrypted sync, and full mobile parity (an Android vertical
 slice and an assessed iOS path exist). See [`PLAN.md`](PLAN.md) for the full roadmap and
+[`docs/ux-contract.md`](docs/ux-contract.md) for the edit/read invariants every client must
+keep.
 the decisions behind it.
 
 ## Build from source

@@ -668,6 +668,10 @@ background work to the FFI.
 of state transitions (open, edit, save, close, read, follow, back). Desktop and Android
 should both point tests at it; iOS implements it rather than copying Android screens.
 
+**Landed:** [`docs/ux-contract.md`](ux-contract.md) exists: the eight invariants with the
+code that enforces each and the tests that cover it, the state-transition table, the
+`DocumentFingerprint`/`SaveReport` save contract, and an explicit list of what is still open.
+
 **CLI:** no separate edit/read flow, but `export`/search should reuse the same link-fragment
 resolution and reader settings so exported HTML matches the in-app reader. Deep-link/URI
 handling should also resolve fragments, not just notes.
