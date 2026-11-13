@@ -61,6 +61,8 @@ const HOTKEYS: &[(&str, &str, &str)] = &[
         "Two editors side by side",
     ),
     ("CloseTab", "secondary+w", "Close tab"),
+    ("ReopenClosedTab", "secondary+shift+t", "Reopen closed tab"),
+    ("SaveAs", "secondary+shift+s", "Save note as"),
     ("NextTab", "ctrl-tab", "Next tab"),
     ("PrevTab", "ctrl-shift-tab", "Previous tab"),
 ];
@@ -89,6 +91,8 @@ fn bind_named(cx: &mut App, key: &str, action: &str) {
         "ToggleSideBySide" => cx.bind_keys([KeyBinding::new(key, ToggleSideBySide, None)]),
         "ToggleSplitEditor" => cx.bind_keys([KeyBinding::new(key, ToggleSplitEditor, None)]),
         "CloseTab" => cx.bind_keys([KeyBinding::new(key, CloseTab, None)]),
+        "ReopenClosedTab" => cx.bind_keys([KeyBinding::new(key, ReopenClosedTab, None)]),
+        "SaveAs" => cx.bind_keys([KeyBinding::new(key, SaveAs, None)]),
         "NextTab" => cx.bind_keys([KeyBinding::new(key, NextTab, None)]),
         "PrevTab" => cx.bind_keys([KeyBinding::new(key, PrevTab, None)]),
         _ => {}
@@ -99,7 +103,7 @@ use editor::Editor;
 use gpui::{
     actions, div, prelude::*, px, size, uniform_list, AnyElement, App, Application, Bounds,
     Context, CursorStyle, ElementId, Entity, FocusHandle, Focusable, KeyBinding, KeyDownEvent,
-    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Render, WeakEntity, Window,
+    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Render, Timer, WeakEntity, Window,
     WindowBounds, WindowOptions,
 };
 use graph_view::GraphView;
@@ -131,6 +135,8 @@ actions!(
         DetachTab,
         ToggleSplitEditor,
         CloseTab,
+        ReopenClosedTab,
+        SaveAs,
         NextTab,
         PrevTab,
         HideApp,
@@ -341,6 +347,48 @@ struct Tab {
     conflict: bool,
 }
 
+/// How the status line is styled, and whether it expires.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum StatusKind {
+    Info,
+    Success,
+    Warn,
+    Error,
+}
+
+impl StatusKind {
+    /// Errors stay until they are replaced or dismissed; everything else is transient.
+    fn expires(self) -> bool {
+        !matches!(self, StatusKind::Error)
+    }
+
+    fn lifetime(self) -> std::time::Duration {
+        match self {
+            StatusKind::Success => std::time::Duration::from_secs(3),
+            StatusKind::Info => std::time::Duration::from_secs(6),
+            StatusKind::Warn => std::time::Duration::from_secs(10),
+            StatusKind::Error => std::time::Duration::from_secs(0),
+        }
+    }
+}
+
+/// One line of feedback, with the moment it was set so it can expire.
+#[derive(Clone)]
+struct Status {
+    kind: StatusKind,
+    text: String,
+    at: std::time::Instant,
+}
+
+/// A tab the user closed, kept so Ctrl/Cmd+Shift+T can bring it back.
+#[derive(Clone)]
+struct ClosedTab {
+    relative: Option<String>,
+    title: String,
+    reading: bool,
+    line: usize,
+}
+
 /// The value carried while dragging a tab between the tab bar, editor panes and windows.
 #[derive(Clone)]
 struct TabDrag {
@@ -460,6 +508,8 @@ struct DragonGlassApp {
     editor: gpui::Entity<Editor>,
     /// All open notes; `editor` is always the active tab's editor.
     tabs: Vec<Tab>,
+    /// Recently closed notes, newest last, so a close can be undone with the keyboard.
+    closed_tabs: Vec<ClosedTab>,
     active_tab: usize,
     /// Additional tabs shown beside the active editor, in layout order.
     split_tabs: Vec<usize>,
@@ -471,6 +521,8 @@ struct DragonGlassApp {
     close_requested: bool,
     /// The tab currently being dragged, if any.
     dragging: Option<TabDrag>,
+    /// The platform window title last set, so it is only pushed when it changes.
+    shown_title: String,
     /// Bumped when the active editor changes so document-derived caches invalidate even
     /// when two editors share the same buffer revision.
     cache_epoch: u64,
@@ -540,7 +592,10 @@ struct DragonGlassApp {
     notes: usize,
     links: usize,
     git_status: Option<git::Status>,
-    status_message: Option<String>,
+    /// The one-line feedback in the header. Expires on its own unless it is an error.
+    status: Option<Status>,
+    /// True while a one-shot task is waiting to expire the current status line.
+    status_timer_armed: bool,
     switcher: Option<Switcher>,
     switcher_focus: FocusHandle,
     focus_handle: FocusHandle,
@@ -575,6 +630,14 @@ impl DragonGlassApp {
 
     /// Open a link target: a note (by path, stem, slug or alias) or an external URL.
     fn open_target(&mut self, target: &str, window: &mut Window, cx: &mut Context<Self>) {
+        // A tag chip in the metadata header searches the vault for that tag.
+        if let Some(tag) = target.strip_prefix("tag:") {
+            let query = tag.trim().to_string();
+            if !query.is_empty() {
+                self.open_search_for(&query, window, cx);
+                return;
+            }
+        }
         if target.starts_with("http://")
             || target.starts_with("https://")
             || target.starts_with("mailto:")
@@ -603,7 +666,7 @@ impl DragonGlassApp {
                     })
                     .unwrap_or(false);
                 if is_asset {
-                    self.status_message = Some(format!("unresolved link: {target}"));
+                    self.set_status(StatusKind::Error, format!("unresolved link: {target}"));
                     cx.notify();
                     return;
                 }
@@ -664,11 +727,11 @@ impl DragonGlassApp {
         match storage::write_atomic(&path, &content) {
             Ok(()) => {
                 self.refresh_vault(cx);
-                self.status_message = Some(format!("created note: {relative}"));
+                self.set_status(StatusKind::Success, format!("created note: {relative}"));
                 self.open_note(&relative, window, cx);
             }
             Err(error) => {
-                self.status_message = Some(format!("could not create note: {error}"));
+                self.set_status(StatusKind::Error, format!("could not create note: {error}"));
                 cx.notify();
             }
         }
@@ -685,7 +748,7 @@ impl DragonGlassApp {
     ) {
         let name = name.trim();
         if name.is_empty() {
-            self.status_message = Some("a note needs a name".to_string());
+            self.set_status(StatusKind::Error, "a note needs a name".to_string());
             cx.notify();
             return;
         }
@@ -703,7 +766,7 @@ impl DragonGlassApp {
         }
         let relative = sanitize_relative(&relative);
         if relative.is_empty() {
-            self.status_message = Some("a note needs a name".to_string());
+            self.set_status(StatusKind::Error, "a note needs a name".to_string());
             cx.notify();
             return;
         }
@@ -718,11 +781,11 @@ impl DragonGlassApp {
         match vaultfs::create_note(&self.vault_root, &relative, &content) {
             Ok(_) => {
                 self.refresh_vault(cx);
-                self.status_message = Some(format!("created note: {relative}"));
+                self.set_status(StatusKind::Success, format!("created note: {relative}"));
                 self.open_note(&relative, window, cx);
             }
             Err(error) => {
-                self.status_message = Some(format!("could not create note: {error}"));
+                self.set_status(StatusKind::Error, format!("could not create note: {error}"));
                 cx.notify();
             }
         }
@@ -732,7 +795,7 @@ impl DragonGlassApp {
     fn save_active_as(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) {
         let name = name.trim();
         if name.is_empty() {
-            self.status_message = Some("a note needs a name".to_string());
+            self.set_status(StatusKind::Error, "a note needs a name".to_string());
             cx.notify();
             return;
         }
@@ -742,12 +805,31 @@ impl DragonGlassApp {
         }
         let relative = sanitize_relative(&relative);
         if relative.is_empty() {
-            self.status_message = Some("a note needs a name".to_string());
+            self.set_status(StatusKind::Error, "a note needs a name".to_string());
             cx.notify();
             return;
         }
+
+        // Saving under the same name is just a save; keep the tab and its history.
+        let current = self
+            .tabs
+            .get(self.active_tab)
+            .and_then(|tab| tab.relative.clone());
+        if current.as_deref() == Some(relative.as_str()) {
+            let result = self.editor.update(cx, |editor, _cx| editor.save());
+            match result {
+                Ok(()) => self.set_status(StatusKind::Success, format!("saved {relative}")),
+                Err(error) => {
+                    self.set_status(StatusKind::Error, format!("could not save note: {error}"))
+                }
+            }
+            window.focus(&self.editor.focus_handle(cx));
+            cx.notify();
+            return;
+        }
+
         if self.vault_root.join(&relative).exists() {
-            self.status_message = Some(format!("{relative} already exists"));
+            self.set_status(StatusKind::Error, format!("{relative} already exists"));
             cx.notify();
             return;
         }
@@ -770,11 +852,11 @@ impl DragonGlassApp {
                 self.show_settings = false;
                 self.refresh_vault(cx);
                 self.remember_session(cx);
-                self.status_message = Some(format!("saved as {relative}"));
+                self.set_status(StatusKind::Success, format!("saved as {relative}"));
                 window.focus(&self.editor.focus_handle(cx));
             }
             Err(error) => {
-                self.status_message = Some(format!("could not save note: {error}"));
+                self.set_status(StatusKind::Error, format!("could not save note: {error}"));
             }
         }
         cx.notify();
@@ -783,7 +865,7 @@ impl DragonGlassApp {
     fn create_folder_in(&mut self, dir: Option<&str>, name: &str, cx: &mut Context<Self>) {
         let name = name.trim();
         if name.is_empty() {
-            self.status_message = Some("a folder needs a name".to_string());
+            self.set_status(StatusKind::Error, "a folder needs a name".to_string());
             cx.notify();
             return;
         }
@@ -794,11 +876,16 @@ impl DragonGlassApp {
         match vaultfs::create_folder(&self.vault_root, &relative) {
             Ok(_) => {
                 self.refresh_vault(cx);
-                self.status_message =
-                    Some(format!("created folder: {}", sanitize_relative(&relative)));
+                self.set_status(
+                    StatusKind::Success,
+                    format!("created folder: {}", sanitize_relative(&relative)),
+                );
             }
             Err(error) => {
-                self.status_message = Some(format!("could not create folder: {error}"));
+                self.set_status(
+                    StatusKind::Error,
+                    format!("could not create folder: {error}"),
+                );
             }
         }
         cx.notify();
@@ -808,7 +895,7 @@ impl DragonGlassApp {
     fn rename_entry(&mut self, from: &str, to: &str, cx: &mut Context<Self>) {
         let mut to = sanitize_relative(to);
         if to.is_empty() {
-            self.status_message = Some("a name is required".to_string());
+            self.set_status(StatusKind::Error, "a name is required".to_string());
             cx.notify();
             return;
         }
@@ -818,7 +905,7 @@ impl DragonGlassApp {
         }
 
         if let Err(error) = vaultfs::rename(&self.vault_root, from, &to) {
-            self.status_message = Some(format!("could not rename: {error}"));
+            self.set_status(StatusKind::Error, format!("could not rename: {error}"));
             cx.notify();
             return;
         }
@@ -850,7 +937,7 @@ impl DragonGlassApp {
             .and_then(|tab| tab.relative.clone());
         self.refresh_vault(cx);
         self.remember_session(cx);
-        self.status_message = Some(format!("renamed {from} to {to}"));
+        self.set_status(StatusKind::Success, format!("renamed {from} to {to}"));
         cx.notify();
     }
 
@@ -875,7 +962,10 @@ impl DragonGlassApp {
             let editor = self.tabs[*index].editor.clone();
             if editor.read(cx).is_dirty() {
                 if let Err(error) = editor.update(cx, |editor, _| editor.save()) {
-                    self.status_message = Some(format!("could not save before delete: {error}"));
+                    self.set_status(
+                        StatusKind::Error,
+                        format!("could not save before delete: {error}"),
+                    );
                     cx.notify();
                     return;
                 }
@@ -888,10 +978,10 @@ impl DragonGlassApp {
         match vaultfs::trash(&self.vault_root, relative) {
             Ok(_) => {
                 self.refresh_vault(cx);
-                self.status_message = Some(format!("moved to trash: {relative}"));
+                self.set_status(StatusKind::Success, format!("moved to trash: {relative}"));
             }
             Err(error) => {
-                self.status_message = Some(format!("could not delete: {error}"));
+                self.set_status(StatusKind::Error, format!("could not delete: {error}"));
             }
         }
         cx.notify();
@@ -916,7 +1006,10 @@ impl DragonGlassApp {
         let snapshot = match history::read(&self.vault_root, &relative, id) {
             Ok(text) => text,
             Err(error) => {
-                self.status_message = Some(format!("could not read snapshot: {error}"));
+                self.set_status(
+                    StatusKind::Error,
+                    format!("could not read snapshot: {error}"),
+                );
                 cx.notify();
                 return;
             }
@@ -930,7 +1023,10 @@ impl DragonGlassApp {
         self.show_graph = false;
         self.show_query = false;
         self.show_settings = false;
-        self.status_message = Some(format!("snapshot diff: {}", self.diff_summary));
+        self.set_status(
+            StatusKind::Info,
+            format!("snapshot diff: {}", self.diff_summary),
+        );
         cx.notify();
     }
 
@@ -943,7 +1039,10 @@ impl DragonGlassApp {
         let snapshot = match history::read(&self.vault_root, &relative, id) {
             Ok(text) => text,
             Err(error) => {
-                self.status_message = Some(format!("could not read snapshot: {error}"));
+                self.set_status(
+                    StatusKind::Error,
+                    format!("could not read snapshot: {error}"),
+                );
                 cx.notify();
                 return;
             }
@@ -953,7 +1052,10 @@ impl DragonGlassApp {
         let _ = history::record(&self.vault_root, &relative, &current);
         let path = self.vault_root.join(&relative);
         if let Err(error) = storage::write_atomic(&path, &snapshot) {
-            self.status_message = Some(format!("could not restore snapshot: {error}"));
+            self.set_status(
+                StatusKind::Error,
+                format!("could not restore snapshot: {error}"),
+            );
             cx.notify();
             return;
         }
@@ -964,7 +1066,7 @@ impl DragonGlassApp {
         self.cache_epoch = self.cache_epoch.wrapping_add(1);
         self.refresh_properties(cx);
         self.refresh_git();
-        self.status_message = Some(format!("restored snapshot {id}"));
+        self.set_status(StatusKind::Success, format!("restored snapshot {id}"));
         window.focus(&self.editor.focus_handle(cx));
         cx.notify();
     }
@@ -1046,15 +1148,53 @@ impl DragonGlassApp {
         let opener = self.link_opener(cx);
         let notes = (*self.note_suggestions).clone();
         let tags = (*self.tag_suggestions).clone();
+        let save_as_weak = cx.entity().downgrade();
+        let save_as: editor::SaveAsHandler = Rc::new(move |window, cx| {
+            let _ = save_as_weak.update(cx, |app, cx| app.open_save_as(window, cx));
+        });
+        let close_weak = cx.entity().downgrade();
+        let close_tab: editor::CloseTabHandler = Rc::new(move |window, cx| {
+            let _ = close_weak.update(cx, |app, cx| {
+                let index = app.active_tab;
+                app.close_tab(index, window, cx);
+            });
+        });
         editor.update(cx, |editor, _cx| {
             editor.set_vault_root(&root);
             editor.set_attachments_folder(&folder);
             editor.set_link_opener(opener);
+            editor.set_save_as(save_as);
+            editor.set_close_tab(close_tab);
             editor.set_vim_enabled(self.config.vim_mode);
             editor.set_font_size(px(self.config.font_size as f32));
             editor.set_suggestions(notes, tags);
         });
         editor
+    }
+
+    /// Open the name prompt that turns the active buffer into a file on disk.
+    fn open_save_as(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.clear_pending_inputs();
+        self.pending_save_as = true;
+        self.switcher = Some(Switcher {
+            mode: SwitcherMode::NewNoteName,
+            query: self.active.clone().unwrap_or_default(),
+            results: Vec::new(),
+            selected: 0,
+            property_key: None,
+            capture_action: None,
+        });
+        self.show_settings = false;
+        window.focus(&self.switcher_focus);
+        self.set_status(StatusKind::Info, "name this note to save it");
+        cx.notify();
+    }
+
+    fn save_as_action(&mut self, _: &SaveAs, window: &mut Window, cx: &mut Context<Self>) {
+        if self.switcher.is_some() {
+            return;
+        }
+        self.open_save_as(window, cx);
     }
 
     /// Load `relative` into an existing editor. Returns false if the file could not be read.
@@ -1082,6 +1222,68 @@ impl DragonGlassApp {
             reading: self.editor.read(cx).is_reading(),
         };
         let _ = session::save(&self.vault_root, &saved);
+    }
+
+    /// Show a one-line status message. Errors stay until replaced; the rest expire.
+    fn set_status(&mut self, kind: StatusKind, text: impl Into<String>) {
+        self.status = Some(Status {
+            kind,
+            text: text.into(),
+            at: std::time::Instant::now(),
+        });
+    }
+
+    /// Remove the status line (used when the action it described is cancelled).
+    fn clear_status(&mut self) {
+        self.status = None;
+    }
+
+    /// The title the OS should show: the active note, a dirty marker and the app name.
+    fn desired_window_title(&self, cx: &Context<Self>) -> String {
+        let Some(tab) = self.tabs.get(self.active_tab) else {
+            return "Dragon Glass".to_string();
+        };
+        let dirty = tab.editor.read(cx).is_dirty();
+        let marker = if dirty { " \u{25CF}" } else { "" };
+        let name = tab.title.as_str();
+        if self.minimal {
+            format!("{name}{marker}")
+        } else {
+            format!("{name}{marker} — Dragon Glass")
+        }
+    }
+
+    /// Drop a status line that has outlived its kind, and arm one shot to do it later.
+    ///
+    /// The timer is only created while a message is visible, so a quiet window stays idle.
+    fn expire_status(&mut self, cx: &mut Context<Self>) {
+        let Some(status) = &self.status else {
+            return;
+        };
+        if !status.kind.expires() {
+            return;
+        }
+        let lifetime = status.kind.lifetime();
+        let elapsed = status.at.elapsed();
+        if elapsed >= lifetime {
+            self.status = None;
+            return;
+        }
+        if self.status_timer_armed {
+            return;
+        }
+
+        self.status_timer_armed = true;
+        let wait = lifetime - elapsed;
+        cx.spawn(async move |this, cx| {
+            Timer::after(wait).await;
+            let _ = this.update(cx, |app, cx| {
+                app.status_timer_armed = false;
+                app.expire_status(cx);
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     /// Save every dirty tab, returning how many were written. All tabs are attempted even
@@ -1146,10 +1348,13 @@ impl DragonGlassApp {
         }
 
         self.quit_prompt = true;
-        self.status_message = Some(format!(
-            "{dirty} open {} unsaved changes",
-            if dirty == 1 { "note has" } else { "notes have" }
-        ));
+        self.set_status(
+            StatusKind::Warn,
+            format!(
+                "{dirty} open {} unsaved changes",
+                if dirty == 1 { "note has" } else { "notes have" }
+            ),
+        );
         cx.notify();
         false
     }
@@ -1160,11 +1365,11 @@ impl DragonGlassApp {
                 self.allow_close = true;
                 self.quit_prompt = false;
                 self.close_requested = true;
-                self.status_message = Some(format!("saved {saved} note(s)"));
+                self.set_status(StatusKind::Success, format!("saved {saved} note(s)"));
                 cx.notify();
             }
             Err(error) => {
-                self.status_message = Some(format!("could not save: {error}"));
+                self.set_status(StatusKind::Error, format!("could not save: {error}"));
                 cx.notify();
             }
         }
@@ -1179,7 +1384,7 @@ impl DragonGlassApp {
 
     fn cancel_quit(&mut self, cx: &mut Context<Self>) {
         self.quit_prompt = false;
-        self.status_message = None;
+        self.clear_status();
         cx.notify();
     }
 
@@ -1251,7 +1456,7 @@ impl DragonGlassApp {
         if let Some(index) = empty {
             let editor = self.tabs[index].editor.clone();
             if !self.load_into(&editor, relative, cx) {
-                self.status_message = Some(format!("could not open {relative}"));
+                self.set_status(StatusKind::Error, format!("could not open {relative}"));
                 cx.notify();
                 return;
             }
@@ -1262,7 +1467,7 @@ impl DragonGlassApp {
         } else {
             let editor = self.new_editor(cx);
             if !self.load_into(&editor, relative, cx) {
-                self.status_message = Some(format!("could not open {relative}"));
+                self.set_status(StatusKind::Error, format!("could not open {relative}"));
                 cx.notify();
                 return;
             }
@@ -1299,6 +1504,18 @@ impl DragonGlassApp {
             return;
         }
 
+        // Ctrl+W on an untitled note asks for a name instead of refusing the close.
+        let untitled_dirty = {
+            let editor = self.tabs[index].editor.read(cx);
+            !editor.has_path() && editor.is_dirty()
+        };
+        if untitled_dirty {
+            self.activate_tab(index, cx);
+            self.set_status(StatusKind::Info, "name this note, then close it again");
+            self.open_save_as(window, cx);
+            return;
+        }
+
         let save_result = self.tabs[index].editor.update(cx, |editor, _cx| {
             if editor.is_dirty() {
                 editor.save()
@@ -1307,13 +1524,30 @@ impl DragonGlassApp {
             }
         });
         if let Err(error) = save_result {
-            self.status_message = Some(format!("could not save before closing: {error}"));
+            self.set_status(
+                StatusKind::Error,
+                format!("could not save before closing: {error}"),
+            );
             cx.notify();
             return;
         }
 
         let was_active = index == self.active_tab;
         let title = self.tabs[index].title.clone();
+        let closed = {
+            let tab = &self.tabs[index];
+            ClosedTab {
+                relative: tab.relative.clone(),
+                title: tab.title.clone(),
+                reading: tab.editor.read(cx).is_reading(),
+                line: tab.editor.read(cx).cursor_line(),
+            }
+        };
+        self.closed_tabs.push(closed);
+        // A small stack, not a history: the last ten closes are undoable.
+        if self.closed_tabs.len() > 10 {
+            self.closed_tabs.remove(0);
+        }
         self.tabs.remove(index);
         self.reindex_splits_after_remove(index);
 
@@ -1334,7 +1568,10 @@ impl DragonGlassApp {
         }
 
         self.normalize_splits();
-        self.status_message = Some(format!("closed {title}"));
+        self.set_status(
+            StatusKind::Info,
+            format!("closed {title} — Ctrl+Shift+T to reopen"),
+        );
         window.focus(&self.editor.focus_handle(cx));
         cx.notify();
     }
@@ -1409,13 +1646,21 @@ impl DragonGlassApp {
             self.cache_epoch = self.cache_epoch.wrapping_add(1);
             self.refresh_properties(cx);
             if self.conflict {
-                self.status_message =
-                    Some("changed on disk - saving will overwrite the file".to_string());
+                self.set_status(
+                    StatusKind::Warn,
+                    "changed on disk - saving will overwrite the file".to_string(),
+                );
             } else if reloaded {
-                self.status_message = Some("reloaded from disk (changed externally)".to_string());
+                self.set_status(
+                    StatusKind::Warn,
+                    "reloaded from disk (changed externally)".to_string(),
+                );
             }
         } else if conflicted {
-            self.status_message = Some("a note changed on disk in another tab".to_string());
+            self.set_status(
+                StatusKind::Warn,
+                "a note changed on disk in another tab".to_string(),
+            );
         }
 
         cx.notify();
@@ -1548,7 +1793,7 @@ impl DragonGlassApp {
             };
 
             if let Err(e) = storage::write_atomic(&path, &content) {
-                self.status_message = Some(format!("could not create note: {e}"));
+                self.set_status(StatusKind::Error, format!("could not create note: {e}"));
                 cx.notify();
                 return;
             }
@@ -2024,6 +2269,23 @@ impl DragonGlassApp {
         self.open_panel(SwitcherMode::Search, window, cx);
     }
 
+    /// Open search with a query already typed (used by tag chips).
+    fn open_search_for(&mut self, query: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.clear_pending_inputs();
+        self.show_settings = false;
+        self.switcher = Some(Switcher {
+            mode: SwitcherMode::Search,
+            query: query.to_string(),
+            results: self.compute_results(SwitcherMode::Search, query),
+            selected: 0,
+            property_key: None,
+            capture_action: None,
+        });
+        window.focus(&self.switcher_focus);
+        self.set_status(StatusKind::Info, format!("search: tag {query}"));
+        cx.notify();
+    }
+
     fn open_git(&mut self, _: &OpenGit, window: &mut Window, cx: &mut Context<Self>) {
         self.refresh_git();
         self.open_panel(SwitcherMode::GitMenu, window, cx);
@@ -2067,10 +2329,13 @@ impl DragonGlassApp {
             },
         );
 
-        self.status_message = Some(match workspace::save(&self.vault_root, &self.workspaces) {
-            Ok(()) => format!("workspace saved: {name}"),
-            Err(e) => format!("could not save workspace: {e}"),
-        });
+        self.set_status(
+            StatusKind::Error,
+            match workspace::save(&self.vault_root, &self.workspaces) {
+                Ok(()) => format!("workspace saved: {name}"),
+                Err(e) => format!("could not save workspace: {e}"),
+            },
+        );
         cx.notify();
     }
 
@@ -2100,7 +2365,7 @@ impl DragonGlassApp {
             self.show_graph = false;
         }
 
-        self.status_message = Some(format!("workspace: {name}"));
+        self.set_status(StatusKind::Info, format!("workspace: {name}"));
         cx.notify();
     }
 
@@ -2116,7 +2381,7 @@ impl DragonGlassApp {
         let note = self.active.clone();
         let outcome = plugins::run_command(plugin, &command_id, &self.vault_root, note.as_deref());
 
-        self.status_message = Some({
+        self.set_status(StatusKind::Error, {
             let mut applied: Vec<&'static str> = Vec::new();
             let message = match outcome {
                 Ok(output) => {
@@ -2186,7 +2451,7 @@ impl DragonGlassApp {
         self.show_relations = !self.show_relations;
         if self.show_relations {
             self.relations = relations::build(&self.note_refs);
-            self.status_message = Some("document relations".to_string());
+            self.set_status(StatusKind::Info, "document relations".to_string());
         }
         cx.notify();
     }
@@ -2209,24 +2474,31 @@ impl DragonGlassApp {
             .iter()
             .filter(|edge| edge.is_relation())
             .count();
-        self.status_message = Some(format!(
-            "relation graph: {} notes / {} relations",
-            enriched.nodes.len(),
-            relations
-        ));
+        self.set_status(
+            StatusKind::Info,
+            format!(
+                "relation graph: {} notes / {} relations",
+                enriched.nodes.len(),
+                relations
+            ),
+        );
         window.focus(&view.focus_handle(cx));
         cx.notify();
     }
 
     fn save_version(&mut self, label: &str, cx: &mut Context<Self>) {
         let Some(relative) = self.active.clone() else {
-            self.status_message = Some("open a note before saving a version".to_string());
+            self.set_status(
+                StatusKind::Warn,
+                "open a note before saving a version".to_string(),
+            );
             cx.notify();
             return;
         };
 
         let content = self.editor.read(cx).text();
-        self.status_message = Some(
+        self.set_status(
+            StatusKind::Error,
             match versions::save(&self.vault_root, &relative, label, &content) {
                 Ok(version) => format!(
                     "saved version {} ({} bytes)",
@@ -2241,7 +2513,10 @@ impl DragonGlassApp {
 
     fn compare_version(&mut self, left: Option<String>, right: String, cx: &mut Context<Self>) {
         let Some(relative) = self.active.clone() else {
-            self.status_message = Some("open a note before comparing versions".to_string());
+            self.set_status(
+                StatusKind::Warn,
+                "open a note before comparing versions".to_string(),
+            );
             cx.notify();
             return;
         };
@@ -2254,7 +2529,10 @@ impl DragonGlassApp {
         let diff = match compared {
             Ok(diff) => diff,
             Err(error) => {
-                self.status_message = Some(format!("could not compare versions: {error}"));
+                self.set_status(
+                    StatusKind::Error,
+                    format!("could not compare versions: {error}"),
+                );
                 cx.notify();
                 return;
             }
@@ -2277,7 +2555,10 @@ impl DragonGlassApp {
         self.show_diff = true;
         self.show_graph = false;
         self.show_query = false;
-        self.status_message = Some(format!("version diff: {}", self.diff_summary));
+        self.set_status(
+            StatusKind::Info,
+            format!("version diff: {}", self.diff_summary),
+        );
         cx.notify();
     }
 
@@ -2293,7 +2574,7 @@ impl DragonGlassApp {
             }
         });
 
-        self.status_message = Some(match versions::promote(&self.vault_root, &relative, id) {
+        let (kind, message) = match versions::promote(&self.vault_root, &relative, id) {
             Ok(_) => {
                 self.editor.update(cx, |editor, cx| {
                     let _ = editor.reload();
@@ -2304,10 +2585,17 @@ impl DragonGlassApp {
                 if self.show_relations {
                     self.relations = relations::build(&self.note_refs);
                 }
-                format!("promoted version {id} to {relative}")
+                (
+                    StatusKind::Success,
+                    format!("promoted version {id} to {relative}"),
+                )
             }
-            Err(error) => format!("could not promote version: {error}"),
-        });
+            Err(error) => (
+                StatusKind::Error,
+                format!("could not promote version: {error}"),
+            ),
+        };
+        self.set_status(kind, message);
         window.focus(&self.editor.focus_handle(cx));
         cx.notify();
     }
@@ -2316,10 +2604,13 @@ impl DragonGlassApp {
         let Some(relative) = self.active.clone() else {
             return;
         };
-        self.status_message = Some(match versions::remove(&self.vault_root, &relative, id) {
-            Ok(()) => format!("deleted version {id}"),
-            Err(error) => format!("could not delete version: {error}"),
-        });
+        self.set_status(
+            StatusKind::Error,
+            match versions::remove(&self.vault_root, &relative, id) {
+                Ok(()) => format!("deleted version {id}"),
+                Err(error) => format!("could not delete version: {error}"),
+            },
+        );
         cx.notify();
     }
 
@@ -2328,7 +2619,10 @@ impl DragonGlassApp {
         let template = match std::fs::read_to_string(&path) {
             Ok(template) => template,
             Err(error) => {
-                self.status_message = Some(format!("could not read template: {error}"));
+                self.set_status(
+                    StatusKind::Error,
+                    format!("could not read template: {error}"),
+                );
                 cx.notify();
                 return;
             }
@@ -2346,7 +2640,7 @@ impl DragonGlassApp {
             cx.notify();
         });
         window.focus(&self.editor.focus_handle(cx));
-        self.status_message = Some(format!("inserted template {relative}"));
+        self.set_status(StatusKind::Info, format!("inserted template {relative}"));
         cx.notify();
     }
 
@@ -2359,7 +2653,7 @@ impl DragonGlassApp {
     ) {
         let name = name.trim();
         if name.is_empty() {
-            self.status_message = Some("a note needs a name".to_string());
+            self.set_status(StatusKind::Error, "a note needs a name".to_string());
             cx.notify();
             return;
         }
@@ -2378,7 +2672,7 @@ impl DragonGlassApp {
         };
         let path = self.vault_root.join(&relative);
         if path.exists() {
-            self.status_message = Some(format!("{relative} already exists"));
+            self.set_status(StatusKind::Error, format!("{relative} already exists"));
             cx.notify();
             return;
         }
@@ -2386,7 +2680,10 @@ impl DragonGlassApp {
         let template_text = match std::fs::read_to_string(&template.path) {
             Ok(text) => text,
             Err(error) => {
-                self.status_message = Some(format!("could not read template: {error}"));
+                self.set_status(
+                    StatusKind::Error,
+                    format!("could not read template: {error}"),
+                );
                 cx.notify();
                 return;
             }
@@ -2394,14 +2691,17 @@ impl DragonGlassApp {
         let rendered = render_template(&template_text, &self.vault_root, Some(&relative), name);
 
         if let Err(error) = storage::write_atomic(&path, &rendered) {
-            self.status_message = Some(format!("could not create note: {error}"));
+            self.set_status(StatusKind::Error, format!("could not create note: {error}"));
             cx.notify();
             return;
         }
 
         self.refresh_vault(cx);
         self.open_note(&relative, window, cx);
-        self.status_message = Some(format!("created {relative} from {}", template.name));
+        self.set_status(
+            StatusKind::Success,
+            format!("created {relative} from {}", template.name),
+        );
         cx.notify();
     }
 
@@ -2412,7 +2712,7 @@ impl DragonGlassApp {
             cx.notify();
         });
         window.focus(&self.editor.focus_handle(cx));
-        self.status_message = Some(format!("inserted shared block {slug}"));
+        self.set_status(StatusKind::Info, format!("inserted shared block {slug}"));
         cx.notify();
     }
 
@@ -2424,32 +2724,37 @@ impl DragonGlassApp {
             .or_else(|| editor.read(cx).current_block_text());
 
         let Some(text) = text else {
-            self.status_message =
-                Some("select text or place the caret in a block first".to_string());
+            self.set_status(
+                StatusKind::Warn,
+                "select text or place the caret in a block first".to_string(),
+            );
             cx.notify();
             return;
         };
         if text.trim().is_empty() {
-            self.status_message = Some("nothing to extract".to_string());
+            self.set_status(StatusKind::Warn, "nothing to extract".to_string());
             cx.notify();
             return;
         }
 
         self.pending_shared = Some(text);
         self.open_panel(SwitcherMode::SharedName, window, cx);
-        self.status_message = Some("name the shared block".to_string());
+        self.set_status(StatusKind::Warn, "name the shared block".to_string());
     }
 
     fn review_document(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let text = self.editor.read(cx).text();
         self.review_issues = lint::review_with(&text, &self.note_index);
         if self.review_issues.is_empty() {
-            self.status_message = Some("review: no issues found".to_string());
+            self.set_status(StatusKind::Info, "review: no issues found".to_string());
             cx.notify();
             return;
         }
 
-        self.status_message = Some(format!("review: {} issue(s)", self.review_issues.len()));
+        self.set_status(
+            StatusKind::Info,
+            format!("review: {} issue(s)", self.review_issues.len()),
+        );
         self.open_panel(SwitcherMode::ReviewMenu, window, cx);
     }
 
@@ -2484,7 +2789,7 @@ impl DragonGlassApp {
 
         self.apply_properties(&properties, cx);
         self.relations = relations::build(&self.note_refs);
-        self.status_message = Some(format!("related: {target}"));
+        self.set_status(StatusKind::Info, format!("related: {target}"));
     }
 
     /// The centre pane: the graph, the query table, a diff, or the editor (optionally with
@@ -2639,6 +2944,13 @@ impl DragonGlassApp {
             return;
         }
 
+        // Menus and popups close before the panels they belong to.
+        if self.tree_menu.is_some() {
+            self.tree_menu = None;
+            cx.notify();
+            return;
+        }
+
         if self.switcher.is_some() {
             self.close_panel(window, cx);
             return;
@@ -2680,10 +2992,16 @@ impl DragonGlassApp {
         }
 
         self.editor.update(cx, |editor, cx| {
-            if editor.handle_escape() {
+            if editor.handle_escape(cx) {
                 cx.notify();
             }
         });
+
+        // Nothing else wanted the key: dismiss the stale status line, if there is one.
+        if self.status.is_some() {
+            self.clear_status();
+            cx.notify();
+        }
     }
 
     fn new_window(&mut self, _: &NewWindow, window: &mut Window, cx: &mut Context<Self>) {
@@ -2694,6 +3012,38 @@ impl DragonGlassApp {
         if self.switcher.is_none() {
             self.close_tab(self.active_tab, window, cx);
         }
+    }
+
+    /// Bring back the most recently closed note, with its mode and cursor line.
+    fn reopen_closed_tab_action(
+        &mut self,
+        _: &ReopenClosedTab,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(entry) = self.closed_tabs.pop() else {
+            self.set_status(StatusKind::Info, "no recently closed note");
+            cx.notify();
+            return;
+        };
+        let Some(relative) = entry.relative.clone() else {
+            self.set_status(
+                StatusKind::Warn,
+                "the closed tab was never saved, so there is no file to reopen",
+            );
+            cx.notify();
+            return;
+        };
+
+        self.open_note(&relative, window, cx);
+        let editor = self.editor.clone();
+        editor.update(cx, |editor, cx| {
+            editor.set_reading_mode(entry.reading);
+            editor.set_cursor_line(entry.line);
+            cx.notify();
+        });
+        self.set_status(StatusKind::Success, format!("reopened {}", entry.title));
+        cx.notify();
     }
 
     fn next_tab(&mut self, _: &NextTab, window: &mut Window, cx: &mut Context<Self>) {
@@ -2792,7 +3142,7 @@ impl DragonGlassApp {
         };
         let title = tab.title.clone();
         window.focus(&self.editor.focus_handle(cx));
-        self.status_message = Some(format!("moved {title} to its own window"));
+        self.set_status(StatusKind::Info, format!("moved {title} to its own window"));
         cx.notify();
         self.spawn_window_with_tabs(vec![tab], 0, true, cx);
     }
@@ -2815,7 +3165,10 @@ impl DragonGlassApp {
         let first = self.tabs.len();
         self.tabs.extend(tabs);
         self.activate_tab(first, cx);
-        self.status_message = Some(format!("returned {}", self.tabs[first].title));
+        self.set_status(
+            StatusKind::Info,
+            format!("returned {}", self.tabs[first].title),
+        );
         cx.notify();
     }
 
@@ -2848,7 +3201,7 @@ impl DragonGlassApp {
         match drop {
             TabDrop::Merge => {
                 self.activate_tab(target, cx);
-                self.status_message = Some(self.tabs[target].title.clone());
+                self.set_status(StatusKind::Info, self.tabs[target].title.clone());
             }
             TabDrop::Split(side) => {
                 let axis = match side {
@@ -2863,7 +3216,7 @@ impl DragonGlassApp {
                     self.split_axis = axis;
                 } else {
                     if !self.split_tabs.contains(&target) && self.split_tabs.len() >= 3 {
-                        self.status_message = Some("at most four editor panes".to_string());
+                        self.set_status(StatusKind::Warn, "at most four editor panes".to_string());
                         return;
                     }
 
@@ -2890,10 +3243,10 @@ impl DragonGlassApp {
                     SplitAxis::Horizontal => "horizontal",
                     SplitAxis::Vertical => "vertical",
                 };
-                self.status_message = Some(format!(
-                    "{axis_name} split: {} panes",
-                    self.split_tabs.len() + 1
-                ));
+                self.set_status(
+                    StatusKind::Info,
+                    format!("{axis_name} split: {} panes", self.split_tabs.len() + 1),
+                );
             }
             TabDrop::Detach => {
                 if same_window {
@@ -2901,7 +3254,7 @@ impl DragonGlassApp {
                     return;
                 }
                 self.activate_tab(target, cx);
-                self.status_message = Some(self.tabs[target].title.clone());
+                self.set_status(StatusKind::Info, self.tabs[target].title.clone());
             }
         }
 
@@ -3106,12 +3459,14 @@ impl DragonGlassApp {
             let app = DragonGlassApp {
                 editor: editor.clone(),
                 tabs,
+                closed_tabs: Vec::new(),
                 active_tab,
                 split_tabs: Vec::new(),
                 split_axis: SplitAxis::Horizontal,
                 minimal,
                 close_requested: false,
                 dragging: None,
+                shown_title: title.clone(),
                 cache_epoch: 1,
                 vault_root: self.vault_root.clone(),
                 tree: self.tree.clone(),
@@ -3133,7 +3488,8 @@ impl DragonGlassApp {
                 notes: self.notes,
                 links: self.links,
                 git_status: self.git_status.clone(),
-                status_message: None,
+                status: None,
+                status_timer_armed: false,
                 switcher: None,
                 switcher_focus: cx.focus_handle(),
                 focus_handle: cx.focus_handle(),
@@ -3190,6 +3546,24 @@ impl DragonGlassApp {
         sibling.update(cx, |app, cx| {
             app.graph_view = Some(graph_view);
             app.watch_vault(cx);
+            // Editors moved into this window must ask this window for Save As, not the parent.
+            let weak = cx.entity().downgrade();
+            let save_as: editor::SaveAsHandler = Rc::new(move |window, cx| {
+                let _ = weak.update(cx, |app, cx| app.open_save_as(window, cx));
+            });
+            let close_weak = cx.entity().downgrade();
+            let close_tab: editor::CloseTabHandler = Rc::new(move |window, cx| {
+                let _ = close_weak.update(cx, |app, cx| {
+                    let index = app.active_tab;
+                    app.close_tab(index, window, cx);
+                });
+            });
+            for tab in &app.tabs {
+                tab.editor.update(cx, |editor, _cx| {
+                    editor.set_save_as(save_as.clone());
+                    editor.set_close_tab(close_tab.clone());
+                });
+            }
         });
 
         let bounds = Bounds::centered(None, size(px(1000.0), px(640.0)), cx);
@@ -3272,15 +3646,21 @@ impl DragonGlassApp {
     fn toggle_split_editor(&mut self, cx: &mut Context<Self>) {
         if !self.split_tabs.is_empty() {
             self.split_tabs.clear();
-            self.status_message = Some("single editor".to_string());
+            self.set_status(StatusKind::Info, "single editor".to_string());
         } else if self.tabs.len() < 2 {
-            self.status_message = Some("open another note to use split editing".to_string());
+            self.set_status(
+                StatusKind::Warn,
+                "open another note to use split editing".to_string(),
+            );
         } else {
             let next = (self.active_tab + 1) % self.tabs.len();
             self.split_tabs.push(next);
             self.split_axis = SplitAxis::Horizontal;
             self.split_preview = false;
-            self.status_message = Some(format!("two editors: {}", self.tabs[next].title));
+            self.set_status(
+                StatusKind::Info,
+                format!("two editors: {}", self.tabs[next].title),
+            );
         }
         cx.notify();
     }
@@ -3296,10 +3676,13 @@ impl DragonGlassApp {
                 }
             });
         }
-        self.status_message = Some(format!(
-            "preview pane: {}",
-            if self.split_preview { "on" } else { "off" }
-        ));
+        self.set_status(
+            StatusKind::Info,
+            format!(
+                "preview pane: {}",
+                if self.split_preview { "on" } else { "off" }
+            ),
+        );
         cx.notify();
     }
 
@@ -3364,7 +3747,7 @@ impl DragonGlassApp {
             Err(e) => format!("snippets toggled (not saved: {e})"),
         };
         self.refresh_theme(cx);
-        self.status_message = Some(message);
+        self.set_status(StatusKind::Info, message);
         cx.notify();
     }
 
@@ -3382,7 +3765,7 @@ impl DragonGlassApp {
                 if enabled { "on" } else { "off" }
             ),
         };
-        self.status_message = Some(message);
+        self.set_status(StatusKind::Info, message);
         cx.notify();
     }
 
@@ -3414,8 +3797,10 @@ impl DragonGlassApp {
                     self.apply_font_size(cx);
                 }
                 Err(_) => {
-                    self.status_message =
-                        Some("font size must be a number from 9 to 32".to_string());
+                    self.set_status(
+                        StatusKind::Warn,
+                        "font size must be a number from 9 to 32".to_string(),
+                    );
                     cx.notify();
                     return;
                 }
@@ -3427,8 +3812,10 @@ impl DragonGlassApp {
                 } else if crate::theme::parse_hex(value).is_some() {
                     Some(value.to_string())
                 } else {
-                    self.status_message =
-                        Some("accent must be a hex colour such as 4ea1ff".to_string());
+                    self.set_status(
+                        StatusKind::Warn,
+                        "accent must be a hex colour such as 4ea1ff".to_string(),
+                    );
                     cx.notify();
                     return;
                 };
@@ -3467,10 +3854,13 @@ impl DragonGlassApp {
             }
         }
 
-        self.status_message = Some(match config::save(&self.vault_root, &self.config) {
-            Ok(()) => format!("{}: saved", key.label()),
-            Err(error) => format!("{}: not saved ({error})", key.label()),
-        });
+        self.set_status(
+            StatusKind::Error,
+            match config::save(&self.vault_root, &self.config) {
+                Ok(()) => format!("{}: saved", key.label()),
+                Err(error) => format!("{}: not saved ({error})", key.label()),
+            },
+        );
         cx.notify();
     }
 
@@ -3498,10 +3888,12 @@ impl DragonGlassApp {
             "weekly" => self.open_setting(SettingKey::WeeklyFolder, window, cx),
             "monthly" => self.open_setting(SettingKey::MonthlyFolder, window, cx),
             "save-all" => {
-                self.status_message = Some(match self.save_all(cx) {
-                    Ok(saved) => format!("saved {saved} note(s)"),
-                    Err(error) => format!("could not save: {error}"),
-                });
+                let result = self.save_all(cx);
+                let (kind, message) = match result {
+                    Ok(saved) => (StatusKind::Success, format!("saved {saved} note(s)")),
+                    Err(error) => (StatusKind::Error, format!("could not save: {error}")),
+                };
+                self.set_status(kind, message);
                 cx.notify();
             }
             "updates" => {
@@ -3792,10 +4184,11 @@ impl DragonGlassApp {
         self.base_theme = theme;
         cx.set_global(theme);
         self.refresh_theme(cx);
-        self.status_message = Some(match save_theme(&self.vault_root, theme, Some(&name)) {
-            Ok(()) => format!("theme: {name}"),
-            Err(e) => format!("theme: {name} (not saved: {e})"),
-        });
+        let (kind, message) = match save_theme(&self.vault_root, theme, Some(&name)) {
+            Ok(()) => (StatusKind::Success, format!("theme: {name}")),
+            Err(e) => (StatusKind::Error, format!("theme: {name} (not saved: {e})")),
+        };
+        self.set_status(kind, message);
         self.editor.update(cx, |_, cx| cx.notify());
         cx.notify();
     }
@@ -3810,20 +4203,24 @@ impl DragonGlassApp {
     }
 
     fn check_updates(&mut self) {
-        self.status_message = Some(match &self.update_source {
-            None => "update checks are not configured (set DRAGON_GLASS_UPDATE_URL)".to_string(),
-            Some(source) => match update::latest_if_newer(env!("CARGO_PKG_VERSION"), source) {
-                Ok(Some(latest)) => {
-                    self.update_available = Some(latest.clone());
-                    format!("update available: {latest}")
-                }
-                Ok(None) => {
-                    self.update_available = None;
-                    "up to date".to_string()
-                }
-                Err(e) => format!("update check failed: {e}"),
-            },
-        });
+        let Some(source) = self.update_source.clone() else {
+            self.set_status(
+                StatusKind::Warn,
+                "update checks are not configured (set DRAGON_GLASS_UPDATE_URL)",
+            );
+            return;
+        };
+        match update::latest_if_newer(env!("CARGO_PKG_VERSION"), &source) {
+            Ok(Some(latest)) => {
+                self.update_available = Some(latest.clone());
+                self.set_status(StatusKind::Info, format!("update available: {latest}"));
+            }
+            Ok(None) => {
+                self.update_available = None;
+                self.set_status(StatusKind::Info, "up to date");
+            }
+            Err(e) => self.set_status(StatusKind::Error, format!("update check failed: {e}")),
+        }
     }
 
     fn toggle_theme_now(&mut self, cx: &mut Context<Self>) {
@@ -3833,7 +4230,7 @@ impl DragonGlassApp {
             Ok(()) => format!("theme: {}", self.theme.name()),
             Err(e) => format!("theme: {} (not saved: {e})", self.theme.name()),
         };
-        self.status_message = Some(message);
+        self.set_status(StatusKind::Info, message);
         self.editor.update(cx, |_, cx| cx.notify());
         cx.notify();
     }
@@ -3857,11 +4254,14 @@ impl DragonGlassApp {
         };
 
         let added = bookmarks::toggle(&mut self.bookmarks, &active);
-        self.status_message = Some(match bookmarks::save(&self.vault_root, &self.bookmarks) {
-            Ok(()) if added => format!("bookmarked {active}"),
-            Ok(()) => format!("removed bookmark {active}"),
-            Err(e) => format!("could not save bookmarks: {e}"),
-        });
+        self.set_status(
+            StatusKind::Error,
+            match bookmarks::save(&self.vault_root, &self.bookmarks) {
+                Ok(()) if added => format!("bookmarked {active}"),
+                Ok(()) => format!("removed bookmark {active}"),
+                Err(e) => format!("could not save bookmarks: {e}"),
+            },
+        );
         cx.notify();
     }
 
@@ -3881,30 +4281,35 @@ impl DragonGlassApp {
             Ok(()) => {
                 self.properties = properties.to_vec();
                 self.cache_epoch = self.cache_epoch.wrapping_add(1);
-                self.status_message = Some("properties updated".to_string());
+                self.set_status(StatusKind::Info, "properties updated".to_string());
             }
-            Err(e) => self.status_message = Some(format!("could not save properties: {e}")),
+            Err(e) => {
+                self.set_status(StatusKind::Error, format!("could not save properties: {e}"));
+            }
         }
     }
 
     fn run_git_action(&mut self, action: GitAction) {
         let root = self.vault_root.clone();
-        self.status_message = Some(match action {
-            GitAction::Init => match git::init(&root) {
-                Ok(()) => "initialized git repository".to_string(),
-                Err(e) => format!("git init failed: {e}"),
+        self.set_status(
+            StatusKind::Error,
+            match action {
+                GitAction::Init => match git::init(&root) {
+                    Ok(()) => "initialized git repository".to_string(),
+                    Err(e) => format!("git init failed: {e}"),
+                },
+                GitAction::Pull => match git::pull(&root) {
+                    Ok(outcome) => describe_outcome(outcome),
+                    Err(e) => format!("git pull failed: {e}"),
+                },
+                GitAction::Push => match git::push(&root) {
+                    Ok(outcome) => describe_outcome(outcome),
+                    Err(e) => format!("git push failed: {e}"),
+                },
+                GitAction::Refresh => "status refreshed".to_string(),
+                GitAction::Commit => "unreachable".to_string(),
             },
-            GitAction::Pull => match git::pull(&root) {
-                Ok(outcome) => describe_outcome(outcome),
-                Err(e) => format!("git pull failed: {e}"),
-            },
-            GitAction::Push => match git::push(&root) {
-                Ok(outcome) => describe_outcome(outcome),
-                Err(e) => format!("git push failed: {e}"),
-            },
-            GitAction::Refresh => "status refreshed".to_string(),
-            GitAction::Commit => "unreachable".to_string(),
-        });
+        );
         self.refresh_git();
     }
 
@@ -3913,11 +4318,14 @@ impl DragonGlassApp {
         if message.is_empty() {
             return;
         }
-        self.status_message = Some(match git::commit_all(&self.vault_root, message) {
-            Ok(true) => format!("committed: {message}"),
-            Ok(false) => "nothing to commit".to_string(),
-            Err(e) => format!("git commit failed: {e}"),
-        });
+        self.set_status(
+            StatusKind::Error,
+            match git::commit_all(&self.vault_root, message) {
+                Ok(true) => format!("committed: {message}"),
+                Ok(false) => "nothing to commit".to_string(),
+                Err(e) => format!("git commit failed: {e}"),
+            },
+        );
         self.refresh_git();
     }
 
@@ -3951,10 +4359,14 @@ impl DragonGlassApp {
                 let saved = keymap::save(&self.vault_root, &self.bindings);
                 bind_named(cx, &key, &action);
 
-                self.status_message = Some(match saved {
-                    Ok(()) => format!("bound {key} to {action}"),
-                    Err(e) => format!("bound {key} to {action} (not saved: {e})"),
-                });
+                let (kind, message) = match saved {
+                    Ok(()) => (StatusKind::Success, format!("bound {key} to {action}")),
+                    Err(e) => (
+                        StatusKind::Warn,
+                        format!("bound {key} to {action} (not saved: {e})"),
+                    ),
+                };
+                self.set_status(kind, message);
             }
             self.close_panel(window, cx);
             return;
@@ -4003,7 +4415,10 @@ impl DragonGlassApp {
                     self.show_query = true;
                     self.show_graph = false;
                     self.show_diff = false;
-                    self.status_message = Some(format!("query: {} rows", self.query_results.len()));
+                    self.set_status(
+                        StatusKind::Info,
+                        format!("query: {} rows", self.query_results.len()),
+                    );
                     self.close_panel(window, cx);
                     return;
                 }
@@ -4024,7 +4439,7 @@ impl DragonGlassApp {
                             cx.notify();
                         });
                     }
-                    self.status_message = Some(format!("graph filter: {filter}"));
+                    self.set_status(StatusKind::Info, format!("graph filter: {filter}"));
                     self.close_panel(window, cx);
                     return;
                 }
@@ -4042,12 +4457,16 @@ impl DragonGlassApp {
                                     cx.notify();
                                 });
                                 window.focus(&self.editor.focus_handle(cx));
-                                self.status_message =
-                                    Some(format!("shared block created: {}", block.slug));
+                                self.set_status(
+                                    StatusKind::Success,
+                                    format!("shared block created: {}", block.slug),
+                                );
                             }
                             Err(error) => {
-                                self.status_message =
-                                    Some(format!("could not save shared block: {error}"));
+                                self.set_status(
+                                    StatusKind::Error,
+                                    format!("could not save shared block: {error}"),
+                                );
                             }
                         }
                     }
@@ -4491,7 +4910,10 @@ impl DragonGlassApp {
                                             view.set_depth(next);
                                             cx.notify();
                                         });
-                                        self.status_message = Some(format!("graph depth: {next}"));
+                                        self.set_status(
+                                            StatusKind::Info,
+                                            format!("graph depth: {next}"),
+                                        );
                                     }
                                     self.close_panel(window, cx);
                                     return;
@@ -4506,8 +4928,10 @@ impl DragonGlassApp {
                                         opener,
                                         cx,
                                     );
-                                    self.status_message =
-                                        Some("preview opened in its own window".to_string());
+                                    self.set_status(
+                                        StatusKind::Info,
+                                        "preview opened in its own window".to_string(),
+                                    );
                                     cx.notify();
                                 }
                                 CommandId::Hotkeys => {
@@ -4619,7 +5043,10 @@ impl DragonGlassApp {
                                     self.cache_epoch = self.cache_epoch.wrapping_add(1);
                                     self.refresh_properties(cx);
                                     self.close_panel(window, cx);
-                                    self.status_message = Some("reloaded from disk".to_string());
+                                    self.set_status(
+                                        StatusKind::Info,
+                                        "reloaded from disk".to_string(),
+                                    );
                                     return;
                                 }
                                 CommandId::ReviewDocument => {
@@ -4630,7 +5057,10 @@ impl DragonGlassApp {
                                     self.close_panel(window, cx);
                                     self.relations = relations::build(&self.note_refs);
                                     self.show_relations = true;
-                                    self.status_message = Some("document relations".to_string());
+                                    self.set_status(
+                                        StatusKind::Info,
+                                        "document relations".to_string(),
+                                    );
                                     cx.notify();
                                     return;
                                 }
@@ -4646,11 +5076,14 @@ impl DragonGlassApp {
                                         moved
                                     });
                                     self.close_panel(window, cx);
-                                    self.status_message = Some(if moved {
-                                        "block moved up".to_string()
-                                    } else {
-                                        "nothing to move up".to_string()
-                                    });
+                                    self.set_status(
+                                        StatusKind::Info,
+                                        if moved {
+                                            "block moved up".to_string()
+                                        } else {
+                                            "nothing to move up".to_string()
+                                        },
+                                    );
                                     return;
                                 }
                                 CommandId::MoveBlockDown => {
@@ -4660,11 +5093,14 @@ impl DragonGlassApp {
                                         moved
                                     });
                                     self.close_panel(window, cx);
-                                    self.status_message = Some(if moved {
-                                        "block moved down".to_string()
-                                    } else {
-                                        "nothing to move down".to_string()
-                                    });
+                                    self.set_status(
+                                        StatusKind::Info,
+                                        if moved {
+                                            "block moved down".to_string()
+                                        } else {
+                                            "nothing to move down".to_string()
+                                        },
+                                    );
                                     return;
                                 }
                                 CommandId::DuplicateBlock => {
@@ -4674,11 +5110,14 @@ impl DragonGlassApp {
                                         changed
                                     });
                                     self.close_panel(window, cx);
-                                    self.status_message = Some(if changed {
-                                        "block duplicated".to_string()
-                                    } else {
-                                        "no block here".to_string()
-                                    });
+                                    self.set_status(
+                                        StatusKind::Info,
+                                        if changed {
+                                            "block duplicated".to_string()
+                                        } else {
+                                            "no block here".to_string()
+                                        },
+                                    );
                                     return;
                                 }
                                 CommandId::DeleteBlock => {
@@ -4688,11 +5127,14 @@ impl DragonGlassApp {
                                         changed
                                     });
                                     self.close_panel(window, cx);
-                                    self.status_message = Some(if changed {
-                                        "block deleted".to_string()
-                                    } else {
-                                        "no block here".to_string()
-                                    });
+                                    self.set_status(
+                                        StatusKind::Info,
+                                        if changed {
+                                            "block deleted".to_string()
+                                        } else {
+                                            "no block here".to_string()
+                                        },
+                                    );
                                     return;
                                 }
                                 CommandId::AddRelation => {
@@ -4711,7 +5153,7 @@ impl DragonGlassApp {
                                     self.show_graph = false;
                                     self.show_query = false;
                                     self.show_diff = false;
-                                    self.status_message = Some("settings".to_string());
+                                    self.set_status(StatusKind::Info, "settings".to_string());
                                     window.focus(&self.settings_focus);
                                     cx.notify();
                                     return;
@@ -4766,8 +5208,10 @@ impl DragonGlassApp {
                                 CommandId::RenameNote => {
                                     let Some(relative) = self.active.clone() else {
                                         self.close_panel(window, cx);
-                                        self.status_message =
-                                            Some("open a note before renaming".to_string());
+                                        self.set_status(
+                                            StatusKind::Warn,
+                                            "open a note before renaming".to_string(),
+                                        );
                                         cx.notify();
                                         return;
                                     };
@@ -4784,8 +5228,10 @@ impl DragonGlassApp {
                                 CommandId::DeleteNote => {
                                     let Some(relative) = self.active.clone() else {
                                         self.close_panel(window, cx);
-                                        self.status_message =
-                                            Some("open a note before deleting".to_string());
+                                        self.set_status(
+                                            StatusKind::Warn,
+                                            "open a note before deleting".to_string(),
+                                        );
                                         cx.notify();
                                         return;
                                     };
@@ -5239,6 +5685,14 @@ impl Render for DragonGlassApp {
         if self.close_requested {
             window.remove_window();
             return div();
+        }
+
+        self.expire_status(cx);
+
+        let title = self.desired_window_title(cx);
+        if self.shown_title != title {
+            window.set_window_title(&title);
+            self.shown_title = title;
         }
 
         let theme = *cx.global::<Theme>();
@@ -6021,6 +6475,14 @@ impl Render for DragonGlassApp {
                 );
         }
 
+        // A conflict marker clears itself once the note is saved or reverted: the buffer
+        // then matches the disk again, so there is nothing left to warn about.
+        for tab in &mut self.tabs {
+            if tab.conflict && !tab.editor.read(cx).is_dirty() {
+                tab.conflict = false;
+            }
+        }
+
         let tab_bar = div()
             .id("tab-bar")
             .on_drop::<TabDrag>(cx.listener(Self::drop_on_tab_bar))
@@ -6074,6 +6536,9 @@ impl Render for DragonGlassApp {
                     .child(title.clone())
                     .when(dirty, |d| {
                         d.child(div().text_color(theme.warn).child("\u{25CF}"))
+                    })
+                    .when(tab.conflict, |d| {
+                        d.child(div().text_color(theme.error).child("\u{26A0}"))
                     })
                     .on_drag(
                         TabDrag {
@@ -6153,6 +6618,8 @@ impl Render for DragonGlassApp {
             .on_action(cx.listener(Self::detach_tab_action))
             .on_action(cx.listener(Self::toggle_split_editor_action))
             .on_action(cx.listener(Self::close_tab_action))
+            .on_action(cx.listener(Self::reopen_closed_tab_action))
+            .on_action(cx.listener(Self::save_as_action))
             .on_action(cx.listener(Self::next_tab))
             .on_action(cx.listener(Self::prev_tab))
             .child(
@@ -6204,11 +6671,26 @@ impl Render for DragonGlassApp {
                         )
                     })
                     .child(div().flex_1())
-                    .child(
-                        div()
-                            .text_color(theme.muted)
-                            .child(self.status_message.clone().unwrap_or_default()),
-                    ),
+                    .when_some(self.status.clone(), |d, status| {
+                        d.child(
+                            div()
+                                .id("status-line")
+                                .max_w(px(520.0))
+                                .overflow_hidden()
+                                .text_color(match status.kind {
+                                    StatusKind::Info => theme.muted,
+                                    StatusKind::Success => theme.text_dim,
+                                    StatusKind::Warn => theme.warn,
+                                    StatusKind::Error => theme.error,
+                                })
+                                .cursor_pointer()
+                                .on_click(cx.listener(|this, _event, _window, cx| {
+                                    this.clear_status();
+                                    cx.notify();
+                                }))
+                                .child(status.text),
+                        )
+                    }),
             )
             .children(panel)
             .children(quit_bar)
@@ -6739,12 +7221,14 @@ fn open_vault_window(vault_path: PathBuf, uri_note: Option<String>, cx: &mut App
         let app = DragonGlassApp {
             editor: editor.clone(),
             tabs: initial_tabs,
+            closed_tabs: Vec::new(),
             active_tab: 0,
             split_tabs: Vec::new(),
             split_axis: SplitAxis::Horizontal,
             minimal: false,
             close_requested: false,
             dragging: None,
+            shown_title: "Dragon Glass".to_string(),
             cache_epoch: initial_cache_epoch,
             vault_root: vault_root.clone(),
             tree: tree.clone(),
@@ -6766,7 +7250,8 @@ fn open_vault_window(vault_path: PathBuf, uri_note: Option<String>, cx: &mut App
             notes: note_count,
             links: link_count,
             git_status: initial_git.clone(),
-            status_message: None,
+            status: None,
+            status_timer_armed: false,
             switcher: None,
             switcher_focus: cx.focus_handle(),
             focus_handle: cx.focus_handle(),

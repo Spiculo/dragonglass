@@ -20,11 +20,11 @@ use dragonglass_core::shared;
 use dragonglass_core::syntax;
 
 use gpui::{
-    div, fill, img, list, point, prelude::*, px, relative, AnyElement, App, Bounds, CursorStyle,
-    DispatchPhase, Element, ElementId, Entity, FontStyle, GlobalElementId, Hitbox, HitboxBehavior,
-    InspectorElementId, IntoElement, LayoutId, ListAlignment, ListState, MouseButton,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point, StrikethroughStyle,
-    StyledText, TextLayout, TextRun, UnderlineStyle, Window,
+    div, fill, img, list, point, prelude::*, px, relative, AnyElement, App, Bounds, ClipboardItem,
+    CursorStyle, DispatchPhase, Element, ElementId, Entity, FontStyle, GlobalElementId, Hitbox,
+    HitboxBehavior, InspectorElementId, IntoElement, LayoutId, ListAlignment, ListState,
+    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point,
+    StrikethroughStyle, StyledText, TextLayout, TextRun, UnderlineStyle, Window,
 };
 
 use crate::flow::{FlowContent, FlowKind, FlowPiece, FlowText};
@@ -40,6 +40,9 @@ pub type LinkOpener = Rc<dyn Fn(&str, &mut Window, &mut App)>;
 
 /// Called when a heading's fold chevron is clicked. The index is the heading's block.
 pub type FoldToggle = Rc<dyn Fn(usize, &mut Window, &mut App)>;
+
+/// Writes text to the clipboard for the reading view's copy buttons.
+pub type CopyHandler = Rc<dyn Fn(&str, &mut Window, &mut App)>;
 
 /// A point in the reading view: a block and a byte offset into its display text.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -103,6 +106,8 @@ struct RenderCtx<'a> {
     folded: &'a HashSet<usize>,
     /// Called with a heading's block index when its fold chevron is clicked.
     on_fold: Option<&'a FoldToggle>,
+    /// Copies text to the clipboard (code fences have a copy button).
+    copy: Option<&'a CopyHandler>,
     /// All blocks, so a heading can tell whether it has a nested section.
     blocks: &'a [Block],
     depth: usize,
@@ -159,6 +164,10 @@ impl FootnotePopup {
 
     fn close(&mut self) {
         self.open = None;
+    }
+
+    fn is_open(&self) -> bool {
+        self.open.is_some()
     }
 }
 
@@ -540,6 +549,22 @@ impl ReadingCache {
         selection.moved = true;
     }
 
+    /// Close the footnote popup if it is open. Returns whether it was open, so Escape can
+    /// consume the key before falling through to the panels.
+    pub fn dismiss_popup(&mut self, cx: &mut App) -> bool {
+        let Some(popup) = &self.footnote_popup else {
+            return false;
+        };
+        if !popup.read(cx).is_open() {
+            return false;
+        }
+        popup.update(cx, |popup, cx| {
+            popup.close();
+            cx.notify();
+        });
+        true
+    }
+
     /// Scroll the reading view so the heading with this text is visible.
     pub fn scroll_to_heading(&self, text: &str) {
         if let Some(index) = self.blocks.iter().position(
@@ -628,6 +653,10 @@ impl ReadingCache {
         let attachments = self.attachments.clone();
         let selection = self.selection.clone();
         let math = self.math.clone();
+        let copy: CopyHandler = Rc::new(|text, window, cx| {
+            cx.write_to_clipboard(ClipboardItem::new_string(text.to_string()));
+            window.refresh();
+        });
         let hidden = Rc::new(hidden_blocks(self.blocks.as_slice(), &self.folded));
         let folded = self.folded.clone();
         div()
@@ -657,6 +686,7 @@ impl ReadingCache {
                             math: &math,
                             folded: &folded,
                             on_fold: on_fold.as_ref(),
+                            copy: Some(&copy),
                             blocks: blocks.as_slice(),
                             depth: 0,
                             theme,
@@ -745,6 +775,7 @@ fn reading_column(src: &str, ctx: &RenderCtx) -> impl IntoElement {
         math: ctx.math,
         folded: ctx.folded,
         on_fold: None,
+        copy: ctx.copy,
         blocks: &[],
         depth: ctx.depth + 1,
         theme: ctx.theme,
@@ -961,6 +992,7 @@ impl<'a> RenderCtx<'a> {
             math: self.math,
             folded: self.folded,
             on_fold: self.on_fold,
+            copy: self.copy,
             blocks: self.blocks,
             depth: self.depth,
             theme: self.theme,
@@ -1387,6 +1419,27 @@ fn code_block(text: &str, language: &str, block: Option<usize>, ctx: &RenderCtx)
     let id = format!("reading-code-{:x}", hasher.finish());
 
     let language = language.trim();
+    let copy_button = {
+        let content = content.to_string();
+        let copy = ctx.copy.cloned();
+        div()
+            .id(ElementId::Name(format!("{id}-copy").into()))
+            .px_2()
+            .py_1()
+            .rounded_sm()
+            .text_xs()
+            .text_color(theme.muted)
+            .bg(theme.chip)
+            .cursor_pointer()
+            .hover(move |style| style.bg(theme.hover).text_color(theme.text))
+            .child("copy")
+            .when_some(copy, |button, copy| {
+                button.on_mouse_down(MouseButton::Left, move |_event, window, cx| {
+                    copy(&content, window, cx);
+                })
+            })
+    };
+
     div()
         .id(ElementId::Name(id.clone().into()))
         .w_full()
@@ -1400,18 +1453,24 @@ fn code_block(text: &str, language: &str, block: Option<usize>, ctx: &RenderCtx)
         .text_color(theme.code_text)
         .flex()
         .flex_col()
-        .when(!language.is_empty(), |d| {
-            d.child(
-                div()
-                    .flex()
-                    .justify_between()
-                    .pb_2()
-                    .text_xs()
-                    .text_color(theme.muted)
-                    .child(language.to_string())
-                    .child(format!("{} lines", lines.len())),
-            )
-        })
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .pb_2()
+                .text_xs()
+                .text_color(theme.muted)
+                .child(language.to_string())
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(format!("{} lines", lines.len()))
+                        .child(copy_button),
+                ),
+        )
         .child(
             div()
                 .id(ElementId::Name(format!("{id}-scroll").into()))

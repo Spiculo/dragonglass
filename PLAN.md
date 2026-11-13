@@ -371,6 +371,31 @@ bundle on `macos-latest`, on manual dispatch only so it does not spend runner mi
 every push. Still open: Developer ID signing and notarization, so Gatekeeper needs one
 manual approval per download.
 
+### Editing and reading quality of life
+
+The first batch from [`docs/qol-plan.md`](docs/qol-plan.md) is in. Reading mode is now
+strictly read-only: every mutating action and both IME insert paths check one `can_mutate()`
+gate, so keyboard input, paste, cut, undo/redo and formatting leave the source untouched
+while selection and copy still work. Reading also joins soft line breaks into paragraphs and
+keeps the hard breaks (two trailing spaces or a backslash), and every code fence has a copy
+button.
+
+Feedback is typed and transient: the header status line carries a kind (info, success,
+warning, error), expires on its own with a one-shot timer, and errors stay until they are
+clicked or dismissed with Escape. A conflict marks every affected tab with a warning glyph,
+not just the active one, and clears once the note is saved.
+
+Tabs and shortcuts: the window title is the active note plus a dirty marker; `Ctrl+Shift+T`
+reopens the last closed tab (with its mode and cursor line, ten deep); `Ctrl+Shift+S` opens
+Save As and `Ctrl+S` on an untitled note opens it too instead of failing silently; searching
+for an existing name in Save As saves in place. The find bar is keyboard-complete
+(replace one/all, regex/case/word toggles, Tab between fields, Enter in replacement replaces,
+Shift+Enter finds backwards) and renders `find.message`. Vim `:wq`/`:x`/`:q` close the tab,
+`Ctrl+R` redoes, and a failed `/` search or bad pattern reports in the status line. Pressing
+Escape closes, in order: the quit prompt, a sidebar menu, the switcher or input panel, the
+settings page, the diff, query and graph views, the relations pane, the footnote popover, the
+editor's autocomplete/find/Vim state, and finally the status line.
+
 ### Editor tooling
 
 The editor now has an in-note find/replace bar (`Ctrl+F`, `Ctrl+H` for replace) with

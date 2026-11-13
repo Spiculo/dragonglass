@@ -5,6 +5,18 @@
 **Focus:** the two loops users repeat all day — **edit a note** and **read a note** — and the
 transitions between them.
 
+> **Landed so far (quick wins, §10):** the reading-mode mutation guard (Q0.1), find/replace
+> keyboard bindings and `find.message` (Q3.1), `Ctrl/Cmd+Shift+S` plus Save As from `Ctrl+S`
+> on an untitled note (Q3.3), typed/expiring status messages (Q3.4), a conflict marker on
+> every affected tab (Q3.5), undo-close with `Ctrl/Cmd+Shift+T` (Q3.6), Android IME insets and
+> caret-safe keyboard options (Q0.6), Android preview `WebViewClient` links and Back from
+> Preview to Edit (Q0.5/Q1.8), Android search clear/IME-Search/Back-to-clear (Q4.1), joined
+> soft line breaks (Q2.10), clickable tag chips and frontmatter links (Q4.5/P2), the window
+> title as note + dirty marker (Q3.12), Vim `:wq` close, redo and failed-search reporting
+> (Q3.12), the code-fence copy button (Q2.7), and the Escape order audit. Everything else in
+> this document is still open; the Android changes are not yet compiled on a device (there is
+> no Android SDK in the development container).
+
 **Basis:** audit of the current working tree (commit `1cb0ec2` plus local session/mobile
 work). Line references are approximate and should be re-checked before implementation.
 

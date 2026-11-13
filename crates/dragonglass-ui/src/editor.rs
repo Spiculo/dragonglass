@@ -37,6 +37,12 @@ use crate::vim::{Mode as VimMode, Vim};
 /// lines; the cap keeps property refresh from copying a large note.
 const FRONTMATTER_LINE_WINDOW: usize = 256;
 
+/// Runs the app's Save As flow for an editor that has no file name yet.
+pub type SaveAsHandler = Rc<dyn Fn(&mut Window, &mut App)>;
+
+/// Asks the app to close the tab that owns this editor (Vim `:wq`).
+pub type CloseTabHandler = Rc<dyn Fn(&mut Window, &mut App)>;
+
 actions!(
     editor_actions,
     [
@@ -146,6 +152,8 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("ctrl-shift-z", Redo, None),
         KeyBinding::new("cmd-shift-z", Redo, None),
         KeyBinding::new("ctrl-y", Redo, None),
+        // Vim's redo key; harmless outside Vim mode and the only Control binding left.
+        KeyBinding::new("ctrl-r", Redo, None),
         KeyBinding::new("enter", Enter, None),
         KeyBinding::new("ctrl-v", Paste, None),
         KeyBinding::new("cmd-v", Paste, None),
@@ -165,6 +173,13 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("cmd-alt-f", OpenFindReplace, None),
         KeyBinding::new("f3", FindNext, None),
         KeyBinding::new("shift-f3", FindPrev, None),
+        // Let the find bar be driven from the keyboard once it is open: replace one/all and
+        // the regex/case/word toggles. The handlers ignore the keys when the bar is closed.
+        KeyBinding::new("secondary-alt-enter", FindReplaceOne, None),
+        KeyBinding::new("secondary-alt-a", FindReplaceAll, None),
+        KeyBinding::new("secondary-alt-r", FindToggleRegex, None),
+        KeyBinding::new("secondary-alt-c", FindToggleCase, None),
+        KeyBinding::new("secondary-alt-w", FindToggleWord, None),
         KeyBinding::new("ctrl-d", SelectNextOccurrence, None),
         KeyBinding::new("cmd-d", SelectNextOccurrence, None),
         KeyBinding::new("ctrl-alt-up", AddCursorAbove, None),
@@ -302,6 +317,10 @@ pub struct Editor {
     resizing: bool,
     /// Opens a link clicked in reading mode.
     link_opener: Option<LinkOpener>,
+    /// Asks the app to run Save As when a save has no file name yet.
+    save_as: Option<SaveAsHandler>,
+    /// Asks the app to close this tab.
+    close_tab: Option<CloseTabHandler>,
     /// Cached document statistics, recomputed per buffer revision.
     stats_cache: (u64, stats::Stats),
     /// Git added/removed lines for the file, refreshed when the saved buffer changes.
@@ -491,6 +510,8 @@ impl Editor {
             resizing: false,
             attachments_folder: "attachments".to_string(),
             link_opener: None,
+            save_as: None,
+            close_tab: None,
             stats_cache: (u64::MAX, stats::Stats::default()),
             git_stat: None,
             git_stat_key: None,
@@ -518,9 +539,15 @@ impl Editor {
         self.tag_suggestions = Rc::new(tags);
     }
 
+    /// Whether editing actions may change the buffer. Reading mode is view-only: every
+    /// mutating action checks this gate, while scrolling, selecting and copying stay on.
+    fn can_mutate(&self) -> bool {
+        !self.reading
+    }
+
     /// Wrap or unwrap the current selection (or insert a marker pair at the caret).
     fn apply_style(&mut self, style: text_format::Style) {
-        if self.reading || self.find.open {
+        if !self.can_mutate() || self.find.open {
             return;
         }
         let range = self
@@ -906,6 +933,14 @@ impl Editor {
         self.buffer.line_col().0
     }
 
+    /// Put the caret at the start of a source line, clamped to the document.
+    pub fn set_cursor_line(&mut self, line: usize) {
+        let line = line.min(self.buffer.line_count().saturating_sub(1));
+        self.buffer.set_cursor(self.buffer.char_index_at(line, 0));
+        self.anchor = None;
+        self.extra_cursors.clear();
+    }
+
     /// The selected text, if there is a non-empty selection.
     pub fn selection_text(&self) -> Option<String> {
         self.selection().map(|range| self.buffer.slice(range))
@@ -990,6 +1025,9 @@ impl Editor {
     }
 
     fn apply_block_edit(&mut self, edit: blocks::BlockEdit) {
+        if !self.can_mutate() {
+            return;
+        }
         self.buffer.replace(0..self.buffer.len_chars(), &edit.text);
         self.buffer
             .set_cursor(self.buffer.char_index_at(edit.line, 0));
@@ -1361,6 +1399,33 @@ impl Editor {
     /// Tell the editor how to open a link clicked in reading mode.
     pub fn set_link_opener(&mut self, opener: LinkOpener) {
         self.link_opener = Some(opener);
+    }
+
+    /// Tell the editor how to run Save As when a note has no file name yet.
+    pub fn set_save_as(&mut self, save_as: SaveAsHandler) {
+        self.save_as = Some(save_as);
+    }
+
+    /// Tell the editor how to close its tab.
+    pub fn set_close_tab(&mut self, close_tab: CloseTabHandler) {
+        self.close_tab = Some(close_tab);
+    }
+
+    /// Save and/or close after a Vim `:` command asked for it.
+    fn run_vim_outcome(
+        &mut self,
+        outcome: &crate::vim::Outcome,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if outcome.save {
+            let _ = self.save();
+        }
+        if outcome.close {
+            if let Some(close) = self.close_tab.clone() {
+                close(window, cx);
+            }
+        }
     }
 
     /// Recompute word counts when the buffer changes, and git stats when it is saved.
@@ -1934,6 +1999,9 @@ impl Editor {
     }
 
     fn backspace(&mut self, _: &Backspace, _window: &mut Window, cx: &mut Context<Self>) {
+        if !self.can_mutate() {
+            return;
+        }
         if self.find.open {
             self.find_backspace();
             cx.notify();
@@ -1961,6 +2029,9 @@ impl Editor {
     }
 
     fn delete(&mut self, _: &Delete, _window: &mut Window, cx: &mut Context<Self>) {
+        if !self.can_mutate() {
+            return;
+        }
         if self.find.open {
             return;
         }
@@ -2061,6 +2132,9 @@ impl Editor {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !self.can_mutate() {
+            return;
+        }
         if self.extra_cursors.is_empty() {
             if !self.delete_selection() {
                 self.buffer.delete_word_left();
@@ -2077,6 +2151,9 @@ impl Editor {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !self.can_mutate() {
+            return;
+        }
         if self.extra_cursors.is_empty() {
             if !self.delete_selection() {
                 self.buffer.delete_word_right();
@@ -2228,6 +2305,9 @@ impl Editor {
     }
 
     fn cut(&mut self, _: &Cut, _window: &mut Window, cx: &mut Context<Self>) {
+        if !self.can_mutate() {
+            return;
+        }
         let ranges = self.selection_ranges();
         if ranges.is_empty() {
             return;
@@ -2243,6 +2323,9 @@ impl Editor {
     }
 
     fn undo(&mut self, _: &Undo, _window: &mut Window, cx: &mut Context<Self>) {
+        if !self.can_mutate() {
+            return;
+        }
         if self.buffer.undo() {
             self.anchor = None;
             self.extra_cursors.clear();
@@ -2253,6 +2336,9 @@ impl Editor {
     }
 
     fn redo(&mut self, _: &Redo, _window: &mut Window, cx: &mut Context<Self>) {
+        if !self.can_mutate() {
+            return;
+        }
         if self.buffer.redo() {
             self.anchor = None;
             self.extra_cursors.clear();
@@ -2262,24 +2348,30 @@ impl Editor {
         }
     }
 
-    fn enter(&mut self, _: &Enter, _window: &mut Window, cx: &mut Context<Self>) {
+    fn enter(&mut self, _: &Enter, window: &mut Window, cx: &mut Context<Self>) {
         if self.accept_autocomplete() {
             cx.notify();
             return;
         }
         if self.find.open {
-            self.find_next(false);
+            let backwards = window.modifiers().shift;
+            if self.find.field == FindField::Replacement && !backwards {
+                self.find_replace_one();
+            } else {
+                self.find_next(backwards);
+            }
             cx.notify();
+            return;
+        }
+        if !self.can_mutate() {
             return;
         }
         if self.vim.enabled() && self.vim.mode() != VimMode::Insert {
             let mut anchor = self.anchor;
             let outcome = self.vim.handle_key("enter", &mut self.buffer, &mut anchor);
             self.anchor = anchor;
-            self.vim.set_message(outcome.message);
-            if outcome.save {
-                let _ = self.save();
-            }
+            self.vim.set_message(outcome.message.clone());
+            self.run_vim_outcome(&outcome, window, cx);
             cx.notify();
             return;
         }
@@ -2289,6 +2381,9 @@ impl Editor {
     }
 
     fn paste(&mut self, _: &Paste, _window: &mut Window, cx: &mut Context<Self>) {
+        if !self.can_mutate() {
+            return;
+        }
         if self.paste_clipboard_image(cx) {
             cx.notify();
             return;
@@ -2386,6 +2481,9 @@ impl Editor {
     /// File dropped paths: images and other files are copied into the attachments folder and
     /// embedded, while markdown files are linked. One insertion per path, on its own line.
     pub fn drop_files(&mut self, paths: &[PathBuf], cx: &mut Context<Self>) {
+        if !self.can_mutate() {
+            return;
+        }
         let mut inserted = 0usize;
 
         for path in paths {
@@ -2444,7 +2542,15 @@ impl Editor {
         cx.notify();
     }
 
-    fn on_save(&mut self, _: &Save, _window: &mut Window, cx: &mut Context<Self>) {
+    fn on_save(&mut self, _: &Save, window: &mut Window, cx: &mut Context<Self>) {
+        // An untitled buffer has nowhere to write yet: ask for a name instead of failing
+        // with a message the user never sees.
+        if !self.has_path() {
+            if let Some(save_as) = self.save_as.clone() {
+                save_as(window, cx);
+            }
+            return;
+        }
         let _ = self.save();
         cx.notify();
     }
@@ -2545,7 +2651,10 @@ impl Editor {
 
     /// Escape closes the find bar, leaves Vim insert/visual mode, or drops extra carets.
     /// Returns whether the editor consumed the key.
-    pub fn handle_escape(&mut self) -> bool {
+    pub fn handle_escape(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.reading && self.reading_content.dismiss_popup(cx) {
+            return true;
+        }
         if self.autocomplete.open {
             self.dismiss_autocomplete();
             return true;
@@ -2661,6 +2770,9 @@ impl Editor {
     }
 
     fn find_replace_one(&mut self) {
+        if !self.can_mutate() {
+            return;
+        }
         if self.find.matches.is_empty() {
             self.refresh_find(true);
         }
@@ -2697,6 +2809,9 @@ impl Editor {
     }
 
     fn find_replace_all(&mut self) {
+        if !self.can_mutate() {
+            return;
+        }
         let text = self.buffer.text();
         match find_engine::replace_all(
             &text,
@@ -2752,6 +2867,9 @@ impl Editor {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !self.find.open {
+            return;
+        }
         self.find_replace_one();
         cx.notify();
     }
@@ -2762,6 +2880,9 @@ impl Editor {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !self.find.open {
+            return;
+        }
         self.find_replace_all();
         cx.notify();
     }
@@ -2772,6 +2893,9 @@ impl Editor {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !self.find.open {
+            return;
+        }
         self.find.regex = !self.find.regex;
         self.refresh_find(true);
         cx.notify();
@@ -2783,6 +2907,9 @@ impl Editor {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !self.find.open {
+            return;
+        }
         self.find.case_sensitive = !self.find.case_sensitive;
         self.refresh_find(true);
         cx.notify();
@@ -2794,6 +2921,9 @@ impl Editor {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !self.find.open {
+            return;
+        }
         self.find.whole_word = !self.find.whole_word;
         self.refresh_find(true);
         cx.notify();
@@ -2846,6 +2976,8 @@ impl Editor {
         let replacement_active = self.find.field == FindField::Replacement;
         let status = if let Some(error) = &self.find.error {
             error.clone()
+        } else if let Some(message) = &self.find.message {
+            message.clone()
         } else if !self.find.pattern.is_empty() && self.find.matches.is_empty() {
             "no matches".to_string()
         } else if !self.find.matches.is_empty() {
@@ -3157,9 +3289,22 @@ impl Editor {
         &mut self,
         event: &KeyDownEvent,
         _window: &mut Window,
-        _cx: &mut Context<Self>,
+        cx: &mut Context<Self>,
     ) {
-        if self.reading || self.find.open {
+        if self.reading {
+            return;
+        }
+        if self.find.open {
+            // Tab and Shift+Tab move between the pattern and the replacement field.
+            if event.keystroke.key == "tab" && self.find.replace {
+                self.find.field = if event.keystroke.modifiers.shift {
+                    FindField::Pattern
+                } else {
+                    FindField::Replacement
+                };
+                cx.stop_propagation();
+                cx.notify();
+            }
             return;
         }
         match event.keystroke.key_char.as_deref() {
@@ -3756,9 +3901,12 @@ impl EntityInputHandler for Editor {
         &mut self,
         range_utf16: Option<Range<usize>>,
         new_text: &str,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !self.can_mutate() {
+            return;
+        }
         if self.find.open {
             self.find_append(new_text);
             self.marked_range = None;
@@ -3771,10 +3919,8 @@ impl EntityInputHandler for Editor {
                 .vim
                 .handle_text(new_text, &mut self.buffer, &mut anchor);
             self.anchor = anchor;
-            self.vim.set_message(outcome.message);
-            if outcome.save {
-                let _ = self.save();
-            }
+            self.vim.set_message(outcome.message.clone());
+            self.run_vim_outcome(&outcome, window, cx);
             if outcome.handled {
                 self.marked_range = None;
                 cx.notify();
@@ -3831,6 +3977,9 @@ impl EntityInputHandler for Editor {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !self.can_mutate() {
+            return;
+        }
         if self.find.open {
             self.find_append(new_text);
             cx.notify();
@@ -4257,7 +4406,7 @@ pub(crate) fn metadata_panel(
         }
 
         let value = if key == "tags" {
-            metadata_tags(&property.value, theme)
+            metadata_tags(&property.value, theme, &opener)
         } else {
             metadata_value(&property.value, theme, &opener, reading)
         };
@@ -4393,7 +4542,7 @@ impl Render for MetadataView {
     }
 }
 
-fn metadata_tags(value: &PropertyValue, theme: Theme) -> AnyElement {
+fn metadata_tags(value: &PropertyValue, theme: Theme, opener: &Option<LinkOpener>) -> AnyElement {
     let items: Vec<String> = match value {
         PropertyValue::Scalar(text) => vec![text.clone()],
         PropertyValue::List(items) => items.clone(),
@@ -4401,6 +4550,12 @@ fn metadata_tags(value: &PropertyValue, theme: Theme) -> AnyElement {
     };
     let mut row = div().flex().flex_wrap().gap_1();
     for item in items {
+        let label = item.trim().trim_start_matches('#').to_string();
+        if label.is_empty() {
+            continue;
+        }
+        let tag = item.trim().to_string();
+        let opener = opener.clone();
         row = row.child(
             div()
                 .px_2()
@@ -4409,7 +4564,15 @@ fn metadata_tags(value: &PropertyValue, theme: Theme) -> AnyElement {
                 .bg(theme.chip)
                 .text_xs()
                 .text_color(theme.text_dim)
-                .child(item),
+                .cursor_pointer()
+                .hover(move |style| style.bg(theme.hover).text_color(theme.text))
+                .child(item)
+                .on_mouse_down(MouseButton::Left, move |_event, window, cx| {
+                    if let Some(opener) = &opener {
+                        // The app turns `tag:` into a search for that tag.
+                        opener(&format!("tag:{tag}"), window, cx);
+                    }
+                }),
         );
     }
     row.into_any_element()
@@ -4559,8 +4722,8 @@ fn metadata_inline(text: &str, theme: Theme, opener: &Option<LinkOpener>, size: 
             element = element.bg(theme.code_bg).text_color(theme.code_text);
         }
 
-        if style.wiki {
-            if let Some(href) = span.href.clone() {
+        if let Some(href) = span.href.clone() {
+            if style.wiki || style.link {
                 let opener = opener.clone();
                 let target = href.clone();
                 element = element
@@ -4573,7 +4736,6 @@ fn metadata_inline(text: &str, theme: Theme, opener: &Option<LinkOpener>, size: 
                     });
             }
         }
-        // `style.link && !style.wiki` deliberately falls through as plain text.
 
         row = row.child(element);
     }
