@@ -260,7 +260,13 @@ class DragonGlassViewModel(application: Application) : AndroidViewModel(applicat
     fun switchVault(vault: StoredVault) {
         if (vault.id == activeVault.id) return
         viewModelScope.launch {
-            runCatching { saveDirtyNote() }
+            // Never leave a dirty note behind when the vault changes.
+            val saved = runCatching { saveDirtyNote() }
+            if (saved.isFailure) {
+                error = saved.exceptionOrNull()?.message
+                    ?: "Could not save the note; the vault was not switched"
+                return@launch
+            }
             vaultStore.activate(if (vaultStore.isDefault(vault)) null else vault.id)
             applyActiveVault(vaultStore.activeVault())
             message = "Opened ${vault.name}"
@@ -493,18 +499,26 @@ class DragonGlassViewModel(application: Application) : AndroidViewModel(applicat
     }
 
     fun closeNote() {
-        val note = selected
+        val note = selected ?: return
         viewModelScope.launch {
-            if (note != null && dirty) {
-                runCatching { withContext(Dispatchers.IO) { ensureVault().saveNote(note, source) } }
-                    .onFailure { error = it.message ?: "Could not save the note" }
+            if (dirty) {
+                val text = source
+                val saved = runCatching {
+                    withContext(Dispatchers.IO) { ensureVault().saveNote(note, text) }
+                }
+                if (saved.isFailure) {
+                    // Keep the note open with its text: a failed save must not close it.
+                    error = saved.exceptionOrNull()?.message
+                        ?: "Could not save the note; it was left open"
+                    return@launch
+                }
+                dirty = false
                 mirrorNote(note)
             }
             selected = null
             source = ""
             preview = false
             previewHtml = ""
-            dirty = false
             refresh()
         }
     }
@@ -830,6 +844,14 @@ class DragonGlassViewModel(application: Application) : AndroidViewModel(applicat
             gitError = null
             gitMessage = null
             gitConflicts = emptyList()
+            // Commit what the user sees, and do not sync (or close the note) if that fails.
+            val saved = runCatching { saveDirtyNote() }
+            if (saved.isFailure) {
+                gitError = saved.exceptionOrNull()?.message
+                    ?: "Could not save the open note; git sync did not run"
+                gitBusy = false
+                return@launch
+            }
             val result = runCatching {
                 withContext(Dispatchers.IO) {
                     GitSyncManager(vaultDirectory, remote, branch, token).sync()

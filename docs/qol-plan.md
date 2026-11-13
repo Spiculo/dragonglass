@@ -225,6 +225,13 @@ before the write completes.
 **Done when:** a read-only or full vault leaves the note open with its text intact and a
 retry action; a fast reopen cannot race a pending save.
 
+**Landed:** `closeNote` and `switchVault` await the save and keep the note (and its text)
+open with an error when it fails; import, export and folder sync already aborted on a failed
+save; git sync now saves the open buffer first and refuses to sync or clear the editor when
+that save fails. `:app:compileDebugKotlin` passes.
+**Remaining:** a Retry/Discard/Cancel sheet (today the snackbar carries the error and the
+note stays open); lifecycle draft flush.
+
 ---
 
 ### P1 — flow continuity (the daily "where was I?" fixes)
