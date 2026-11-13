@@ -216,6 +216,14 @@ unknown keys. Cap state per tab and prune tabs that vanished.
 **Done when:** open 3 tabs at different positions/modes, quit, relaunch, and every tab is
 within one line/one block/16 px of its previous position.
 
+**Landed:** `session.txt` is versioned and human-readable (`tab=note|reading|line|col|scroll|block`),
+tolerant of unknown keys and malformed fields, capped at 32 tabs, and version 1 files still
+load. Each tab round-trips its mode, caret line and column, editor scroll offset and reading
+top block; startup reopens every saved tab whose file still exists, prunes missing files and
+restores the active tab. Tests cover round-trip, untitled tabs, v1 migration, malformed
+lines, caps and the restore filter.
+**Remaining:** selection ranges and fold state are not stored yet.
+
 #### Q1.2 Map edit position to read position (and back) — D · M
 Add source line spans to the block parser (`markdown::parse_blocks` returns blocks plus
 spans, without breaking the existing enum). On entering reading, reveal the block that

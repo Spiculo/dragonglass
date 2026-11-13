@@ -338,9 +338,11 @@ Launching the app with no argument now reopens the last vault instead of assumin
 lives outside any vault (`%APPDATA%\DragonGlass\vaults.txt`, `~/.config/dragon-glass/vaults.txt`,
 or `$DRAGON_GLASS_CONFIG_DIR` when set). On a first run, or when the last vault has moved, a
 chooser lists the recent vaults and offers a native folder picker; hovering a row highlights
-it, and stale entries can be removed without touching the folder. The active note and reading
-mode are remembered per vault in `.dragon-glass/session.txt`, so the app reopens the note you
-were last in. "Open vault" in the command palette opens the chooser while the app is running;
+it, and stale entries can be removed without touching the folder. The open tabs are
+remembered per vault in `.dragon-glass/session.txt` (version 2: note, mode, caret line and
+column, editor scroll and reading block per tab, plus the active tab), so the app reopens the
+tabs you left, at the same position. Tabs for notes that no longer exist are dropped; a
+version 1 session file still loads. "Open vault" in the command palette opens the chooser while the app is running;
 the chosen vault starts in its own process so each window keeps its vault, theme and keymap.
 An explicit path (a shortcut or a `dragonglass://` URI) still wins over the remembered vault.
 

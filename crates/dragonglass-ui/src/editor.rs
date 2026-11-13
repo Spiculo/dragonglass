@@ -19,7 +19,7 @@ use dragonglass_core::frontmatter::{self, Property, PropertyValue};
 use dragonglass_core::inline;
 use dragonglass_core::markdown;
 use dragonglass_core::math::{self, MathOptions, MathScene, MathStyle};
-use dragonglass_core::{blocks, git, history, stats, storage, syntax, templates, wrap, Buffer};
+use dragonglass_core::{blocks, git, history, stats, syntax, templates, wrap, Buffer};
 use gpui::{
     actions, div, fill, point, prelude::*, px, relative, size, AnyElement, App, Bounds,
     ClipboardEntry, ClipboardItem, Context, CursorStyle, ElementId, ElementInputHandler, Entity,
@@ -1083,6 +1083,40 @@ impl Editor {
         self.buffer.line_col().0
     }
 
+    /// Caret line and column, 0-based.
+    pub fn cursor_position(&self) -> (usize, usize) {
+        self.buffer.line_col()
+    }
+
+    /// Put the caret at a line and column, clamped to the document.
+    pub fn set_cursor_position(&mut self, line: usize, col: usize) {
+        let line = line.min(self.buffer.line_count().saturating_sub(1));
+        self.buffer.set_cursor(self.buffer.char_index_at(line, col));
+        self.anchor = None;
+        self.extra_cursors.clear();
+    }
+
+    /// The editor's vertical scroll offset, in pixels.
+    pub fn scroll_offset(&self) -> f32 {
+        f32::from(self.scroll_handle.offset().y)
+    }
+
+    /// Restore the editor's vertical scroll offset.
+    pub fn set_scroll_offset(&mut self, offset: f32) {
+        let x = self.scroll_handle.offset().x;
+        self.scroll_handle.set_offset(point(x, px(offset.max(0.0))));
+    }
+
+    /// The reading view's top block.
+    pub fn reading_block(&self) -> usize {
+        self.reading_content.top_block()
+    }
+
+    /// Restore the reading view's scroll position by block.
+    pub fn scroll_reading_to(&mut self, block: usize) {
+        self.reading_content.scroll_to_block(block);
+    }
+
     /// Put the caret at the start of a source line, clamped to the document.
     pub fn set_cursor_line(&mut self, line: usize) {
         let line = line.min(self.buffer.line_count().saturating_sub(1));
@@ -1623,11 +1657,6 @@ impl Editor {
     /// Tell the editor what to do when a save would overwrite an external change.
     pub fn set_conflict_handler(&mut self, handler: ConflictHandler) {
         self.conflict_handler = Some(handler);
-    }
-
-    /// The fingerprint of the version this buffer is based on.
-    pub fn fingerprint(&self) -> Option<&DocumentFingerprint> {
-        self.fingerprint.as_ref()
     }
 
     /// Report to the app's status bar, if one is wired up.

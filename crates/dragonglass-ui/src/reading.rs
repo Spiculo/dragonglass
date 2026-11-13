@@ -696,6 +696,24 @@ impl ReadingCache {
         (block + 1..self.blocks.len()).find(|index| self.block_len(*index) > 0)
     }
 
+    /// The block currently at the top of the reading view.
+    pub fn top_block(&self) -> usize {
+        if self.blocks.is_empty() {
+            0
+        } else {
+            self.list_state.logical_scroll_top().item_ix
+        }
+    }
+
+    /// Scroll the reading view so `index` is visible. Restoring a session uses this.
+    pub fn scroll_to_block(&mut self, index: usize) {
+        if self.blocks.is_empty() {
+            return;
+        }
+        self.list_state
+            .scroll_to_reveal_item(index.min(self.blocks.len() - 1));
+    }
+
     /// Close the footnote popup if it is open. Returns whether it was open, so Escape can
     /// consume the key before falling through to the panels.
     pub fn dismiss_popup(&mut self, cx: &mut App) -> bool {

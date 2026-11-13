@@ -342,6 +342,38 @@ struct Switcher {
     capture_action: Option<String>,
 }
 
+/// Pick the tabs to reopen: an explicit URI note, then the saved session's notes that still
+/// exist, then a fallback note. Untitled tabs are not restored.
+fn restored_tabs(
+    session: &session::Session,
+    uri_note: Option<&str>,
+    fallback: Option<&str>,
+    exists: impl Fn(&str) -> bool,
+) -> Vec<String> {
+    if let Some(note) = uri_note.filter(|note| exists(note)) {
+        return vec![note.to_string()];
+    }
+
+    let mut notes: Vec<String> = Vec::new();
+    for tab in &session.tabs {
+        if tab.note.is_empty() || !exists(&tab.note) {
+            continue;
+        }
+        if !notes.contains(&tab.note) {
+            notes.push(tab.note.clone());
+        }
+        if notes.len() >= 20 {
+            break;
+        }
+    }
+    if notes.is_empty() {
+        if let Some(fallback) = fallback {
+            notes.push(fallback.to_string());
+        }
+    }
+    notes
+}
+
 /// One open note. Each tab owns its editor, so cursor, scroll and unsaved edits are
 /// preserved when switching between notes.
 struct Tab {
@@ -1153,6 +1185,20 @@ impl DragonGlassApp {
         let opener = self.link_opener(cx);
         let notes = (*self.note_suggestions).clone();
         let tags = (*self.tag_suggestions).clone();
+        editor.update(cx, |editor, _cx| {
+            editor.set_vault_root(&root);
+            editor.set_attachments_folder(&folder);
+            editor.set_link_opener(opener);
+            editor.set_vim_enabled(self.config.vim_mode);
+            editor.set_font_size(px(self.config.font_size as f32));
+            editor.set_suggestions(notes, tags);
+        });
+        self.install_editor_callbacks(&editor, cx);
+        editor
+    }
+
+    /// Wire an editor to this app: Save As, close, status and conflict reporting.
+    fn install_editor_callbacks(&self, editor: &Entity<Editor>, cx: &mut Context<Self>) {
         let save_as_weak = cx.entity().downgrade();
         let save_as: editor::SaveAsHandler = Rc::new(move |window, cx| {
             let _ = save_as_weak.update(cx, |app, cx| app.open_save_as(window, cx));
@@ -1176,18 +1222,19 @@ impl DragonGlassApp {
             let _ = conflict_weak.update(cx, |app, cx| app.mark_conflict(cx));
         });
         editor.update(cx, |editor, _cx| {
-            editor.set_vault_root(&root);
-            editor.set_attachments_folder(&folder);
-            editor.set_link_opener(opener);
             editor.set_save_as(save_as);
             editor.set_close_tab(close_tab);
             editor.set_status_reporter(status);
             editor.set_conflict_handler(conflict);
-            editor.set_vim_enabled(self.config.vim_mode);
-            editor.set_font_size(px(self.config.font_size as f32));
-            editor.set_suggestions(notes, tags);
         });
-        editor
+    }
+
+    /// Wire every open tab, including the ones restored from the session file.
+    fn configure_editors(&mut self, cx: &mut Context<Self>) {
+        let editors: Vec<Entity<Editor>> = self.tabs.iter().map(|tab| tab.editor.clone()).collect();
+        for editor in editors {
+            self.install_editor_callbacks(&editor, cx);
+        }
     }
 
     /// Open the name prompt that turns the active buffer into a file on disk.
@@ -1235,9 +1282,26 @@ impl DragonGlassApp {
 
     /// Save the active note and reading mode, so the next launch reopens them.
     fn remember_session(&self, cx: &Context<Self>) {
+        let tabs: Vec<session::TabSession> = self
+            .tabs
+            .iter()
+            .map(|tab| {
+                let editor = tab.editor.read(cx);
+                let (line, col) = editor.cursor_position();
+                session::TabSession {
+                    note: tab.relative.clone().unwrap_or_default(),
+                    reading: editor.is_reading(),
+                    line,
+                    col,
+                    scroll: editor.scroll_offset(),
+                    reading_block: editor.reading_block(),
+                }
+            })
+            .collect();
         let saved = session::Session {
-            note: self.active.clone(),
-            reading: self.editor.read(cx).is_reading(),
+            version: 2,
+            active: self.active_tab.min(tabs.len().saturating_sub(1)),
+            tabs,
         };
         let _ = session::save(&self.vault_root, &saved);
     }
@@ -3704,36 +3768,7 @@ impl DragonGlassApp {
             app.graph_view = Some(graph_view);
             app.watch_vault(cx);
             // Editors moved into this window must ask this window for Save As, not the parent.
-            let weak = cx.entity().downgrade();
-            let save_as: editor::SaveAsHandler = Rc::new(move |window, cx| {
-                let _ = weak.update(cx, |app, cx| app.open_save_as(window, cx));
-            });
-            let close_weak = cx.entity().downgrade();
-            let close_tab: editor::CloseTabHandler = Rc::new(move |window, cx| {
-                let _ = close_weak.update(cx, |app, cx| {
-                    let index = app.active_tab;
-                    app.close_tab(index, window, cx);
-                });
-            });
-            let status_weak = cx.entity().downgrade();
-            let status: editor::StatusReporter = Rc::new(move |kind, message, cx| {
-                let _ = status_weak.update(cx, |app, cx| {
-                    app.set_status(kind, message.to_string());
-                    cx.notify();
-                });
-            });
-            let conflict_weak = cx.entity().downgrade();
-            let conflict: editor::ConflictHandler = Rc::new(move |cx| {
-                let _ = conflict_weak.update(cx, |app, cx| app.mark_conflict(cx));
-            });
-            for tab in &app.tabs {
-                tab.editor.update(cx, |editor, _cx| {
-                    editor.set_save_as(save_as.clone());
-                    editor.set_close_tab(close_tab.clone());
-                    editor.set_status_reporter(status.clone());
-                    editor.set_conflict_handler(conflict.clone());
-                });
-            }
+            app.configure_editors(cx);
         });
 
         let bounds = Bounds::centered(None, size(px(1000.0), px(640.0)), cx);
@@ -7395,63 +7430,83 @@ fn open_vault_window(vault_path: PathBuf, uri_note: Option<String>, cx: &mut App
     };
     let display_path = vaults::canonical(&vault_path).to_string_lossy().to_string();
 
-    // A URI note wins, then the note that was open last time, then the most linked note.
-    let first_rel = uri_note
-        .filter(|note| {
-            note_refs
-                .iter()
-                .any(|candidate| &candidate.relative == note)
-        })
-        .or_else(|| {
-            initial_session.note.clone().filter(|note| {
-                note_refs
-                    .iter()
-                    .any(|candidate| &candidate.relative == note)
-            })
-        })
-        .or_else(|| first.map(|r| r.relative.clone()));
-    let first_path = first_rel.as_ref().map(|relative| vault_root.join(relative));
+    // Tabs to reopen: an explicit URI note wins, then the saved session's notes that still
+    // exist, then the most linked note.
+    let wanted = restored_tabs(
+        &initial_session,
+        uri_note.as_deref(),
+        first.map(|note| note.relative.as_str()),
+        |note| note_refs.iter().any(|candidate| candidate.relative == note),
+    );
 
     // Saved shortcut overrides win over the defaults registered above.
     for binding in &initial_bindings {
         bind_named(cx, &binding.key, &binding.action);
     }
 
-    let editor = cx.new(Editor::new);
-    editor.update(cx, |editor, _cx| {
-        editor.set_suggestions((*initial_suggestions).clone(), (*initial_tags).clone());
-    });
-    if let Some(path) = &first_path {
+    let forced_reading = std::env::var("DRAGON_GLASS_READING").is_ok();
+    let mut initial_tabs: Vec<Tab> = Vec::new();
+    for relative in &wanted {
+        let editor = cx.new(Editor::new);
+        let saved = initial_session
+            .tabs
+            .iter()
+            .find(|tab| &tab.note == relative);
         editor.update(cx, |editor, _cx| {
-            let _ = editor.load(path);
-            // Handy for screenshots and for exercising the reading view.
-            let reading = std::env::var("DRAGON_GLASS_READING").is_ok() || initial_session.reading;
-            if reading {
+            editor.set_suggestions((*initial_suggestions).clone(), (*initial_tags).clone());
+            editor.set_vault_root(&vault_root);
+            editor.set_attachments_folder(&initial_config.attachments_folder);
+            editor.set_vim_enabled(initial_config.vim_mode);
+            editor.set_font_size(px(initial_config.font_size as f32));
+            let _ = editor.load(&vault_root.join(relative));
+            if forced_reading || saved.is_some_and(|tab| tab.reading) {
                 editor.set_reading_mode(true);
             }
+            if let Some(saved) = saved {
+                editor.set_cursor_position(saved.line, saved.col);
+                editor.set_scroll_offset(saved.scroll);
+                editor.scroll_reading_to(saved.reading_block);
+            }
+        });
+        initial_tabs.push(Tab {
+            relative: Some(relative.clone()),
+            editor,
+            title: tab_title(relative),
+            conflict: false,
         });
     }
+    if initial_tabs.is_empty() {
+        let editor = cx.new(Editor::new);
+        editor.update(cx, |editor, _cx| {
+            editor.set_suggestions((*initial_suggestions).clone(), (*initial_tags).clone());
+            editor.set_vault_root(&vault_root);
+            editor.set_attachments_folder(&initial_config.attachments_folder);
+            editor.set_vim_enabled(initial_config.vim_mode);
+            editor.set_font_size(px(initial_config.font_size as f32));
+        });
+        initial_tabs.push(Tab {
+            relative: None,
+            editor,
+            title: "Untitled".to_string(),
+            conflict: false,
+        });
+    }
+
+    // The saved active tab decides which note opens first. A URI note or a forced reading
+    // mode still opens its own tab.
+    let initial_active = if wanted.is_empty() {
+        0
+    } else {
+        initial_session.active.min(initial_tabs.len() - 1)
+    };
+    let editor = initial_tabs[initial_active].editor.clone();
+    let first_rel = initial_tabs[initial_active].relative.clone();
     let initial_properties = editor.update(cx, |editor, _cx| editor.properties());
     let initial_cache_epoch = 1u64;
     let initial_headings_version = (initial_cache_epoch, editor.read(cx).document_version().1);
     let initial_text = editor.read(cx).text();
     let initial_headings = Rc::new(markdown::headings(&initial_text));
     let initial_stats = stats::compute(&initial_text);
-    editor.update(cx, |editor, _cx| {
-        editor.set_vault_root(&vault_root);
-        editor.set_attachments_folder(&initial_config.attachments_folder);
-        editor.set_vim_enabled(initial_config.vim_mode);
-        editor.set_font_size(px(initial_config.font_size as f32));
-    });
-    let initial_tabs = vec![Tab {
-        relative: first_rel.clone(),
-        editor: editor.clone(),
-        title: first_rel
-            .as_deref()
-            .map(tab_title)
-            .unwrap_or_else(|| "Untitled".to_string()),
-        conflict: false,
-    }];
     let note_index = resolve::NoteIndex::new(&note_refs);
     cx.set_global(initial_theme);
 
@@ -7470,7 +7525,7 @@ fn open_vault_window(vault_path: PathBuf, uri_note: Option<String>, cx: &mut App
             editor: editor.clone(),
             tabs: initial_tabs,
             closed_tabs: Vec::new(),
-            active_tab: 0,
+            active_tab: initial_active,
             split_tabs: Vec::new(),
             split_axis: SplitAxis::Horizontal,
             minimal: false,
@@ -7556,6 +7611,8 @@ fn open_vault_window(vault_path: PathBuf, uri_note: Option<String>, cx: &mut App
         let opener = app.link_opener(cx);
         let editor = app.editor.clone();
         editor.update(cx, |editor, _| editor.set_link_opener(opener));
+        // Tabs restored from the session need the same callbacks as newly created ones.
+        app.configure_editors(cx);
     });
 
     app_view.update(cx, |this, cx| this.watch_vault(cx));
@@ -7585,6 +7642,53 @@ fn open_vault_window(vault_path: PathBuf, uri_note: Option<String>, cx: &mut App
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn tab(note: &str) -> session::TabSession {
+        session::TabSession {
+            note: note.to_string(),
+            ..session::TabSession::default()
+        }
+    }
+
+    #[test]
+    fn session_tabs_restore_only_notes_that_still_exist() {
+        let session = session::Session {
+            version: 2,
+            active: 0,
+            tabs: vec![
+                tab("a.md"),
+                tab(""),
+                tab("missing.md"),
+                tab("b.md"),
+                tab("a.md"),
+            ],
+        };
+        let tabs = restored_tabs(&session, None, Some("fallback.md"), |note| {
+            !note.is_empty() && note != "missing.md"
+        });
+        assert_eq!(tabs, vec!["a.md", "b.md"]);
+    }
+
+    #[test]
+    fn an_explicit_uri_note_wins_over_the_session() {
+        let session = session::Session {
+            version: 2,
+            active: 0,
+            tabs: vec![tab("a.md")],
+        };
+        let tabs = restored_tabs(&session, Some("uri.md"), Some("fallback.md"), |_| true);
+        assert_eq!(tabs, vec!["uri.md"]);
+    }
+
+    #[test]
+    fn an_empty_session_falls_back_to_one_note() {
+        let session = session::Session::default();
+        let tabs = restored_tabs(&session, None, Some("linked.md"), |_| true);
+        assert_eq!(tabs, vec!["linked.md"]);
+
+        let tabs = restored_tabs(&session, None, None, |_| true);
+        assert!(tabs.is_empty());
+    }
 
     fn heading(level: u8, line: usize) -> markdown::Heading {
         markdown::Heading {

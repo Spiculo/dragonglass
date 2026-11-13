@@ -164,8 +164,9 @@ The app remembers the vaults you open, outside any vault, in
 `~/Library/Application Support/DragonGlass/vaults.txt` on macOS, or
 `~/.config/dragon-glass/vaults.txt` on Linux (`$XDG_CONFIG_HOME` is respected, and
 `DRAGON_GLASS_CONFIG_DIR` overrides all of them).
-On launch it reopens the last vault and the note you were last in — stored per vault in
-`.dragon-glass/session.txt`. Use **Open vault** in the command palette (`Ctrl+P`, `Cmd+P`
+On launch it reopens the last vault and every tab that was open — with each tab's mode,
+caret and scroll position — stored per vault in `.dragon-glass/session.txt`. Tabs whose files
+have disappeared are dropped. Use **Open vault** in the command palette (`Ctrl+P`, `Cmd+P`
 on macOS) to open another vault in its own window, or remove stale entries in the picker.
 
 ## Editing shortcuts
