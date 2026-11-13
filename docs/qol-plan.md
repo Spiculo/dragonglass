@@ -458,6 +458,12 @@ inside a fold.
 **Done when:** every reference opens a readable popup that dismisses predictably and does
 not cover the reference itself.
 
+**Landed:** the popup lists every reference with its snippet and the definition link; Escape
+closes it; and a jump to a reference or definition that a folded heading hides first unfolds
+the section and reflows, so the page actually moves.
+**Remaining:** anchoring the popup at the clicked reference (it still opens at a fixed
+top-left position) and closing it by clicking outside.
+
 #### Q2.9 Transclusion fidelity — D · L
 Give embedded blocks synthetic ids so link hit-testing and selection work, cache parsed
 embeds by mtime, typeset math in embeds, honor `![[Note#Section]]`, and show a clear

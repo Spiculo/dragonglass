@@ -223,6 +223,8 @@ pub(crate) struct FootnotePopup {
     refs: Rc<RefCell<HashMap<String, Vec<FootnoteRef>>>>,
     defs: Rc<RefCell<HashMap<String, usize>>>,
     list_state: ListState,
+    /// Asking the reader to unfold whatever hides a block before scrolling to it.
+    reveal: Rc<RefCell<Option<usize>>>,
     open: Option<(String, Vec<FootnoteRef>, Option<usize>)>,
 }
 
@@ -231,12 +233,14 @@ impl FootnotePopup {
         refs: Rc<RefCell<HashMap<String, Vec<FootnoteRef>>>>,
         defs: Rc<RefCell<HashMap<String, usize>>>,
         list_state: ListState,
+        reveal: Rc<RefCell<Option<usize>>>,
     ) -> Self {
         Self {
             title: "This note".to_string(),
             refs,
             defs,
             list_state,
+            reveal,
             open: None,
         }
     }
@@ -326,7 +330,7 @@ impl Render for FootnotePopup {
             let snippet = reference.snippet.clone();
             let title = title.clone();
             let state = this.clone();
-            let list_state = self.list_state.clone();
+            let reveal = self.reveal.clone();
             panel = panel.child(
                 div()
                     .id(ElementId::Name(format!("footnote-ref-{index}").into()))
@@ -341,7 +345,8 @@ impl Render for FootnotePopup {
                     .child(div().child(format!("Title: {title}")))
                     .child(div().text_xs().text_color(theme.muted).child(snippet))
                     .on_mouse_down(MouseButton::Left, move |_ev, window, cx| {
-                        list_state.scroll_to_reveal_item(block);
+                        // The reader applies the unfold on its next render, then scrolls.
+                        *reveal.borrow_mut() = Some(block);
                         if let Some(this) = state.upgrade() {
                             this.update(cx, |this, cx| {
                                 this.close();
@@ -356,7 +361,7 @@ impl Render for FootnotePopup {
         if let Some(block) = definition {
             let block = *block;
             let state = this.clone();
-            let list_state = self.list_state.clone();
+            let reveal = self.reveal.clone();
             panel = panel.child(
                 div()
                     .id("footnote-definition")
@@ -368,7 +373,8 @@ impl Render for FootnotePopup {
                     .hover(move |style| style.bg(theme.hover))
                     .child("Go to footnote definition")
                     .on_mouse_down(MouseButton::Left, move |_ev, window, cx| {
-                        list_state.scroll_to_reveal_item(block);
+                        // The reader applies the unfold on its next render, then scrolls.
+                        *reveal.borrow_mut() = Some(block);
                         if let Some(this) = state.upgrade() {
                             this.update(cx, |this, cx| {
                                 this.close();
@@ -464,6 +470,8 @@ pub struct ReadingCache {
     find: Rc<ReadingFind>,
     /// Image shown in the lightbox overlay, if any.
     lightbox: Rc<RefCell<Option<PathBuf>>>,
+    /// A block a popup asked the reader to reveal on the next render.
+    reveal_block: Rc<RefCell<Option<usize>>>,
 }
 
 impl ReadingCache {
@@ -484,6 +492,7 @@ impl ReadingCache {
             spans_valid: false,
             find: Rc::new(ReadingFind::default()),
             lightbox: Rc::new(RefCell::new(None)),
+            reveal_block: Rc::new(RefCell::new(None)),
             footnote_popup: None,
             folded: HashSet::new(),
         }
@@ -1067,6 +1076,19 @@ impl ReadingCache {
         on_fold: Option<FoldToggle>,
         cx: &mut App,
     ) -> impl IntoElement {
+        // A popup can ask for a block hidden by a fold: unfold, reflow, then scroll to it.
+        if let Some(block) = self.reveal_block.borrow_mut().take() {
+            let hidden = hidden_blocks(&self.blocks, &self.folded);
+            if hidden.get(block).copied().unwrap_or(false) {
+                self.folded.clear();
+                let scroll = self.list_state.logical_scroll_top();
+                let count = self.blocks.len();
+                self.list_state.splice(0..count, count);
+                self.list_state.scroll_to(scroll);
+            }
+            self.list_state.scroll_to_reveal_item(block);
+        }
+
         if vault_root.as_deref() != self.attachments_root.as_deref() {
             self.attachments = vault_root
                 .as_deref()
@@ -1078,7 +1100,9 @@ impl ReadingCache {
             let refs = self.footnote_refs.clone();
             let defs = self.footnote_defs.clone();
             let list_state = self.list_state.clone();
-            self.footnote_popup = Some(cx.new(move |_| FootnotePopup::new(refs, defs, list_state)));
+            let reveal = self.reveal_block.clone();
+            self.footnote_popup =
+                Some(cx.new(move |_| FootnotePopup::new(refs, defs, list_state, reveal)));
         }
         let title = note_title(&self.properties, self.blocks.as_slice());
         if let Some(popup) = &self.footnote_popup {
@@ -2915,6 +2939,7 @@ mod tests {
             cache.footnote_refs.clone(),
             cache.footnote_defs.clone(),
             ListState::new(0, ListAlignment::Top, px(600.0)),
+            Rc::new(RefCell::new(None)),
         );
         popup.show("1");
         let (id, options, definition) = popup.open.as_ref().expect("picker opened");
