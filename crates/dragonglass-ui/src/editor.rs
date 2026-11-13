@@ -722,23 +722,87 @@ impl Editor {
         if !self.can_mutate() || self.find.open {
             return;
         }
-        let range = self
-            .selection()
-            .unwrap_or_else(|| self.buffer.cursor()..self.buffer.cursor());
-        let text = self.buffer.text();
-        let edit = text_format::toggle(&text, range, style);
-        let base = edit.range.start;
-        self.buffer.replace(edit.range, &edit.text);
 
-        let start = base + edit.selection.start;
-        let end = base + edit.selection.end;
-        if start == end {
-            self.anchor = None;
-            self.buffer.set_cursor(start);
-        } else {
-            self.anchor = Some(start);
-            self.buffer.set_cursor(end);
+        // Toggle around every selection, not just the primary one. Edits are computed
+        // against the original text and applied as one batch, so multi-cursor formatting
+        // is one undo step and every caret lands in its own formatted run.
+        let states = self.all_cursor_states();
+        let text = self.buffer.text();
+        let mut requests: Vec<Range<usize>> = states
+            .iter()
+            .map(|state| match state.anchor {
+                Some(anchor) if anchor != state.cursor => {
+                    anchor.min(state.cursor)..anchor.max(state.cursor)
+                }
+                _ => state.cursor..state.cursor,
+            })
+            .collect();
+        requests.sort_by_key(|range| (range.start, range.end));
+        requests.dedup();
+
+        // (range, replacement, selection inside the replacement in characters)
+        let mut edits: Vec<(Range<usize>, String, Range<usize>)> = Vec::new();
+        let mut last_end = 0usize;
+        for range in requests {
+            if range.start < last_end {
+                // Overlapping selections format once, at the outer range.
+                continue;
+            }
+            let edit = text_format::toggle(&text, range.clone(), style);
+            last_end = edit.range.end.max(range.end);
+            edits.push((edit.range, edit.text, edit.selection));
         }
+        if edits.is_empty() {
+            return;
+        }
+
+        // Where each edit starts in the new document.
+        let mut new_starts: Vec<usize> = Vec::with_capacity(edits.len());
+        let mut delta: isize = 0;
+        for (range, replacement, _) in &edits {
+            let start = (range.start as isize + delta).max(0) as usize;
+            new_starts.push(start);
+            delta += replacement.chars().count() as isize - (range.end - range.start) as isize;
+        }
+
+        let map = |position: usize| -> (usize, usize) {
+            for (index, (range, _, selection)) in edits.iter().enumerate() {
+                if range.start <= position && position <= range.end {
+                    let start = new_starts[index];
+                    return (start + selection.start, start + selection.end);
+                }
+            }
+            let shift: isize = edits
+                .iter()
+                .filter(|(range, _, _)| range.start < position)
+                .map(|(range, replacement, _)| {
+                    replacement.chars().count() as isize - (range.end - range.start) as isize
+                })
+                .sum();
+            let mapped = position.saturating_add_signed(shift);
+            (mapped, mapped)
+        };
+
+        let mapped: Vec<CursorState> = states
+            .iter()
+            .map(|state| {
+                let (start, end) = map(state.cursor);
+                CursorState {
+                    cursor: end,
+                    anchor: state
+                        .anchor
+                        .map(|anchor| map(anchor).0)
+                        .filter(|at| *at != end),
+                }
+            })
+            .collect();
+
+        let batch = edits
+            .into_iter()
+            .map(|(range, replacement, _)| (range, replacement))
+            .collect();
+        self.buffer.replace_many(batch);
+        self.set_cursor_states(mapped);
         self.autocomplete = Autocomplete::default();
         self.pending_link_alias = None;
         self.pending_link_start = false;

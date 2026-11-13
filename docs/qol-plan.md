@@ -528,6 +528,12 @@ undo/redo/Vim transitions, and coalesce a multi-cursor typing burst into one und
 **Done when:** formatting a multi-selection edits all ranges; one undo reverses the whole
 burst; carets never land at stale offsets.
 
+**Landed:** inline formatting toggles around every selection (overlaps format once), all
+edits go through one `replace_many` batch so a single undo reverses them, and every caret is
+remapped into its own formatted run instead of a stale offset. Typing, deleting and pasting
+at several carets were already batched this way, and undo/redo still clear the extra
+carets.
+
 #### Q3.8 Per-keystroke work is bounded — D · M
 Debounce/cache stats, outline headings, reading attachments index, and split preview by
 buffer revision. Build the attachments/alias index once per vault scan, not on first render.
