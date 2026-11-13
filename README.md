@@ -36,6 +36,9 @@ A lot already works. This is a working application, not a mockup — but it is e
   copy button
 - One-sentence-per-line notes read as paragraphs; `tags:` chips in the properties header
   open a vault search, and frontmatter links are clickable
+- Reading selection: double-click a word, triple-click a paragraph, Shift-click to extend,
+  Shift+arrows/Home/End for keyboard selection, drag past the edge to scroll, Escape to
+  clear, and a "copied N characters" confirmation
 - Syntax highlighting, code fences, tables, task lists, footnotes, callouts and
   `==highlights==`
 - KaTeX-compatible math (`$…$` / `$$…$$`) via [RaTeX](https://github.com/erweixin/RaTeX),

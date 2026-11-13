@@ -51,6 +51,19 @@ pub struct ReadPoint {
     pub offset: usize,
 }
 
+/// A keyboard motion that extends the reading selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SelectionMotion {
+    Left,
+    Right,
+    Up,
+    Down,
+    LineStart,
+    LineEnd,
+    DocumentStart,
+    DocumentEnd,
+}
+
 /// Character-level selection shared by every text piece in the reading view.
 #[derive(Debug, Default)]
 pub struct ReadSelection {
@@ -108,6 +121,10 @@ struct RenderCtx<'a> {
     on_fold: Option<&'a FoldToggle>,
     /// Copies text to the clipboard (code fences have a copy button).
     copy: Option<&'a CopyHandler>,
+    /// The reading list, so dragging past the viewport can scroll it.
+    list_state: Option<&'a ListState>,
+    /// How many blocks the list holds, to clamp drag auto-scroll.
+    block_count: usize,
     /// All blocks, so a heading can tell whether it has a nested section.
     blocks: &'a [Block],
     depth: usize,
@@ -549,6 +566,136 @@ impl ReadingCache {
         selection.moved = true;
     }
 
+    /// Drop the reading selection. Returns whether there was one to drop.
+    pub fn clear_selection(&mut self) -> bool {
+        let mut selection = self.selection.borrow_mut();
+        let had = selection.ordered().is_some();
+        if had {
+            selection.clear();
+        }
+        had
+    }
+
+    /// Extend (or start) the reading selection with a keyboard motion.
+    pub fn extend_selection(&mut self, motion: SelectionMotion) {
+        let start = {
+            let selection = self.selection.borrow();
+            selection.head.or(selection.anchor)
+        };
+        let Some(start) = start else {
+            return;
+        };
+        let target = self.move_point(start, motion);
+        let mut selection = self.selection.borrow_mut();
+        if selection.anchor.is_none() {
+            selection.anchor = Some(start);
+        }
+        selection.head = Some(target);
+        selection.dragging = false;
+        selection.moved = true;
+    }
+
+    /// The next point in the requested direction, walking across block boundaries.
+    fn move_point(&self, point: ReadPoint, motion: SelectionMotion) -> ReadPoint {
+        let len = self.block_len(point.block);
+        match motion {
+            SelectionMotion::Left => {
+                let text = self.block_text(point.block);
+                if point.offset > 0 {
+                    let offset = text.as_str()[..point.offset.min(text.len())]
+                        .char_indices()
+                        .next_back()
+                        .map(|(index, _)| index)
+                        .unwrap_or(0);
+                    ReadPoint {
+                        block: point.block,
+                        offset,
+                    }
+                } else if let Some(block) = self.previous_block(point.block) {
+                    ReadPoint {
+                        block,
+                        offset: self.block_len(block),
+                    }
+                } else {
+                    point
+                }
+            }
+            SelectionMotion::Right => {
+                let text = self.block_text(point.block);
+                if point.offset < len {
+                    let offset = text.as_str()[point.offset.min(text.len())..]
+                        .chars()
+                        .next()
+                        .map(|ch| point.offset + ch.len_utf8())
+                        .unwrap_or(len);
+                    ReadPoint {
+                        block: point.block,
+                        offset,
+                    }
+                } else if let Some(block) = self.next_block(point.block) {
+                    ReadPoint { block, offset: 0 }
+                } else {
+                    point
+                }
+            }
+            SelectionMotion::Up => {
+                let block = self.previous_block(point.block).unwrap_or(point.block);
+                ReadPoint {
+                    block,
+                    offset: point.offset.min(self.block_len(block)),
+                }
+            }
+            SelectionMotion::Down => {
+                let block = self.next_block(point.block).unwrap_or(point.block);
+                ReadPoint {
+                    block,
+                    offset: point.offset.min(self.block_len(block)),
+                }
+            }
+            SelectionMotion::LineStart => ReadPoint {
+                block: point.block,
+                offset: 0,
+            },
+            SelectionMotion::LineEnd => ReadPoint {
+                block: point.block,
+                offset: len,
+            },
+            SelectionMotion::DocumentStart => ReadPoint {
+                block: 0,
+                offset: 0,
+            },
+            SelectionMotion::DocumentEnd => {
+                let block = self.blocks.len().saturating_sub(1);
+                ReadPoint {
+                    block,
+                    offset: self.block_len(block),
+                }
+            }
+        }
+    }
+
+    fn block_text(&self, block: usize) -> String {
+        self.blocks
+            .get(block)
+            .map(block_display)
+            .unwrap_or_default()
+    }
+
+    fn block_len(&self, block: usize) -> usize {
+        self.blocks
+            .get(block)
+            .map(|block| block_display(block).len())
+            .unwrap_or(0)
+    }
+
+    fn previous_block(&self, block: usize) -> Option<usize> {
+        (0..block).rev().find(|index| self.block_len(*index) > 0)
+    }
+
+    fn next_block(&self, block: usize) -> Option<usize> {
+        (block + 1..self.blocks.len()).find(|index| self.block_len(*index) > 0)
+    }
+
     /// Close the footnote popup if it is open. Returns whether it was open, so Escape can
     /// consume the key before falling through to the panels.
     pub fn dismiss_popup(&mut self, cx: &mut App) -> bool {
@@ -659,6 +806,7 @@ impl ReadingCache {
         });
         let hidden = Rc::new(hidden_blocks(self.blocks.as_slice(), &self.folded));
         let folded = self.folded.clone();
+        let list_state = self.list_state.clone();
         div()
             .relative()
             .size_full()
@@ -670,7 +818,7 @@ impl ReadingCache {
             .children(metadata)
             .child(
                 div().flex_1().min_h(px(0.0)).child(
-                    list(self.list_state.clone(), move |index, _window, _cx| {
+                    list(list_state.clone(), move |index, _window, _cx| {
                         let Some(block) = blocks.get(index).cloned() else {
                             return div().into_any_element();
                         };
@@ -687,6 +835,8 @@ impl ReadingCache {
                             folded: &folded,
                             on_fold: on_fold.as_ref(),
                             copy: Some(&copy),
+                            list_state: Some(&list_state),
+                            block_count: blocks.len(),
                             blocks: blocks.as_slice(),
                             depth: 0,
                             theme,
@@ -776,6 +926,8 @@ fn reading_column(src: &str, ctx: &RenderCtx) -> impl IntoElement {
         folded: ctx.folded,
         on_fold: None,
         copy: ctx.copy,
+        list_state: ctx.list_state,
+        block_count: ctx.block_count,
         blocks: &[],
         depth: ctx.depth + 1,
         theme: ctx.theme,
@@ -993,6 +1145,8 @@ impl<'a> RenderCtx<'a> {
             folded: self.folded,
             on_fold: self.on_fold,
             copy: self.copy,
+            list_state: self.list_state,
+            block_count: self.block_count,
             blocks: self.blocks,
             depth: self.depth,
             theme: self.theme,
@@ -1224,12 +1378,15 @@ fn rich_text_styled(
         Some(block) => container
             .child(SelectableText {
                 text: styled,
+                display: Rc::new(display.clone()),
                 block,
                 base,
                 len: display.len(),
                 selection: ctx.selection.clone(),
                 links,
                 opener: ctx.opener.cloned(),
+                list_state: ctx.list_state.cloned(),
+                block_count: ctx.block_count,
             })
             .into_any_element(),
         None => container.child(styled).into_any_element(),
@@ -1398,12 +1555,15 @@ fn code_block(text: &str, language: &str, block: Option<usize>, ctx: &RenderCtx)
         let piece: AnyElement = match block {
             Some(block) => SelectableText {
                 text: styled,
+                display: Rc::new(display.clone()),
                 block,
                 base,
                 len: display.len(),
                 selection: ctx.selection.clone(),
                 links: Vec::new(),
                 opener: ctx.opener.cloned(),
+                list_state: ctx.list_state.cloned(),
+                block_count: ctx.block_count,
             }
             .into_any_element(),
             None => div().whitespace_nowrap().child(styled).into_any_element(),
@@ -1493,6 +1653,48 @@ fn code_font(base: &gpui::Font) -> gpui::Font {
         "monospace".to_string(),
     ])));
     font
+}
+
+/// Byte range of the word around `index`, for double-click selection.
+///
+/// Letters, digits and `_` form a word. Clicking on the space after a word selects that
+/// word; clicking between two non-word characters selects the character under the pointer,
+/// so a double click always selects something visible.
+fn word_range(text: &str, index: usize) -> Range<usize> {
+    let index = index.min(text.len());
+    let mut start = index;
+    let mut end = index;
+
+    while start > 0 {
+        let Some((previous, ch)) = text[..start].char_indices().next_back() else {
+            break;
+        };
+        if !is_word_char(ch) {
+            break;
+        }
+        start = previous;
+    }
+    while end < text.len() {
+        let ch = text[end..].chars().next().unwrap_or(' ');
+        if !is_word_char(ch) {
+            break;
+        }
+        end += ch.len_utf8();
+    }
+
+    if start == end {
+        if let Some(ch) = text[end..].chars().next() {
+            end += ch.len_utf8();
+        } else if let Some((previous, _)) = text[..start].char_indices().next_back() {
+            start = previous;
+        }
+    }
+
+    start..end
+}
+
+fn is_word_char(ch: char) -> bool {
+    ch.is_alphanumeric() || ch == '_'
 }
 
 /// A GFM pipe table, with the same inline math/highlight treatment as prose.
@@ -1768,12 +1970,17 @@ fn inline_display(text: &str) -> String {
 /// its block, which lets a selection run across wrapped code lines and callout titles.
 struct SelectableText {
     text: StyledText,
+    /// The display text this piece was shaped from, for word and paragraph selection.
+    display: Rc<String>,
     block: usize,
     base: usize,
     len: usize,
     selection: Rc<RefCell<ReadSelection>>,
     links: Vec<(Range<usize>, String)>,
     opener: Option<LinkOpener>,
+    /// The reading list and its size, so dragging past the viewport can scroll.
+    list_state: Option<ListState>,
+    block_count: usize,
 }
 
 impl IntoElement for SelectableText {
@@ -1837,6 +2044,9 @@ impl Element for SelectableText {
         // Mouse listeners must be registered during paint, not prepaint.
         let down_selection = self.selection.clone();
         let down_layout = layout.clone();
+        let down_text = self.display.clone();
+        let down_list = self.list_state.clone();
+        let down_blocks = self.block_count;
         window.on_mouse_event(
             move |event: &MouseDownEvent, phase, window: &mut Window, _cx: &mut App| {
                 if phase != DispatchPhase::Bubble || event.button != MouseButton::Left {
@@ -1848,23 +2058,78 @@ impl Element for SelectableText {
                 let Ok(index) = down_layout.index_for_position(event.position) else {
                     return;
                 };
+                let index = index.min(len);
                 let point = ReadPoint {
                     block,
-                    offset: base + index.min(len),
+                    offset: base + index,
                 };
                 let mut selection = down_selection.borrow_mut();
-                selection.anchor = Some(point);
-                selection.head = Some(point);
-                selection.down = Some(event.position);
-                selection.dragging = true;
-                selection.moved = false;
+
+                // Shift-click extends from the existing anchor; a double click selects the
+                // word under the pointer; a triple click selects the whole piece (the
+                // paragraph, cell, callout line or code line).
+                match event.click_count {
+                    _ if event.modifiers.shift && selection.anchor.is_some() => {
+                        selection.head = Some(point);
+                        selection.dragging = true;
+                        selection.moved = true;
+                    }
+                    2 => {
+                        let word = word_range(down_text.as_str(), index);
+                        selection.anchor = Some(ReadPoint {
+                            block,
+                            offset: base + word.start,
+                        });
+                        selection.head = Some(ReadPoint {
+                            block,
+                            offset: base + word.end,
+                        });
+                        selection.dragging = false;
+                        selection.moved = true;
+                        selection.down = None;
+                    }
+                    3 => {
+                        selection.anchor = Some(ReadPoint {
+                            block,
+                            offset: base,
+                        });
+                        selection.head = Some(ReadPoint {
+                            block,
+                            offset: base + len,
+                        });
+                        selection.dragging = false;
+                        selection.moved = true;
+                        selection.down = None;
+                    }
+                    _ => {
+                        selection.anchor = Some(point);
+                        selection.head = Some(point);
+                        selection.down = Some(event.position);
+                        selection.dragging = true;
+                        selection.moved = false;
+                    }
+                }
                 drop(selection);
+
+                // Keep the anchor block visible while dragging beyond the viewport.
+                if event.position.y < bounds.top() || event.position.y > bounds.bottom() {
+                    if let Some(list_state) = &down_list {
+                        let target = if event.position.y < bounds.top() {
+                            block.saturating_sub(1)
+                        } else {
+                            block + 1
+                        };
+                        list_state.scroll_to_reveal_item(target.min(down_blocks.saturating_sub(1)));
+                    }
+                }
                 window.refresh();
             },
         );
 
         let move_selection = self.selection.clone();
         let move_layout = layout.clone();
+        let move_list = self.list_state.clone();
+        let move_blocks = self.block_count;
         window.on_mouse_event(
             move |event: &MouseMoveEvent, phase, window: &mut Window, _cx: &mut App| {
                 if phase != DispatchPhase::Bubble {
@@ -1874,13 +2139,24 @@ impl Element for SelectableText {
                 if !selection.dragging {
                     return;
                 }
-                // Vertical hit-testing only: dragging past the end of a line still
-                // extends the selection to that line's end.
-                if event.position.y < bounds.top() - px(2.0)
-                    || event.position.y > bounds.bottom() + px(2.0)
-                {
+                // Dragging past the top or bottom scrolls the reading list one block per
+                // move event; the pointer no longer needs to stay on text.
+                if event.position.y < bounds.top() || event.position.y > bounds.bottom() {
+                    if let Some(list_state) = &move_list {
+                        let target = if event.position.y < bounds.top() {
+                            block.saturating_sub(1)
+                        } else {
+                            block + 1
+                        };
+                        list_state.scroll_to_reveal_item(target.min(move_blocks.saturating_sub(1)));
+                        selection.moved = true;
+                        drop(selection);
+                        window.refresh();
+                    }
                     return;
                 }
+                // Vertical hit-testing only: dragging past the end of a line still
+                // extends the selection to that line's end.
                 let index = match move_layout.index_for_position(event.position) {
                     Ok(index) | Err(index) => index,
                 };
@@ -2182,5 +2458,85 @@ mod tests {
         let hidden = hidden_blocks(&blocks, &folded);
 
         assert_eq!(hidden, vec![false, true, true, true, false]);
+    }
+
+    #[test]
+    fn double_click_selects_the_word_under_the_pointer() {
+        assert_eq!(word_range("hello world", 7), 6..11);
+        assert_eq!(word_range("hello world", 0), 0..5);
+        // On the space after a word, that word is selected.
+        assert_eq!(word_range("hello world", 5), 0..5);
+        // Punctuation still selects one visible character.
+        assert_eq!(word_range("a  b", 2), 2..3);
+        // Multi-byte text keeps byte boundaries.
+        assert_eq!(word_range("café au lait", 1), 0..5);
+        assert_eq!(word_range("café au lait", 6), 6..8);
+    }
+
+    #[test]
+    fn keyboard_selection_moves_between_characters_and_blocks() {
+        let mut cache = ReadingCache::new();
+        cache.update((1, 1), "alpha\n\nbeta", None);
+        {
+            let mut selection = cache.selection.borrow_mut();
+            selection.anchor = Some(ReadPoint {
+                block: 1,
+                offset: 0,
+            });
+            selection.head = Some(ReadPoint {
+                block: 1,
+                offset: 0,
+            });
+        }
+
+        cache.extend_selection(SelectionMotion::Right);
+        assert_eq!(
+            cache.selection.borrow().head,
+            Some(ReadPoint {
+                block: 1,
+                offset: 1
+            })
+        );
+        cache.extend_selection(SelectionMotion::LineEnd);
+        assert_eq!(
+            cache.selection.borrow().head,
+            Some(ReadPoint {
+                block: 1,
+                offset: 4
+            })
+        );
+        assert_eq!(cache.selected_text().as_deref(), Some("beta"));
+
+        // Walking left at the start of a block continues at the previous block's end.
+        cache.extend_selection(SelectionMotion::LineStart);
+        cache.extend_selection(SelectionMotion::Left);
+        assert_eq!(
+            cache.selection.borrow().head,
+            Some(ReadPoint {
+                block: 0,
+                offset: 5
+            })
+        );
+    }
+
+    #[test]
+    fn the_reading_selection_can_be_cleared() {
+        let mut cache = ReadingCache::new();
+        cache.update((1, 1), "alpha beta", None);
+        assert!(!cache.clear_selection());
+
+        {
+            let mut selection = cache.selection.borrow_mut();
+            selection.anchor = Some(ReadPoint {
+                block: 0,
+                offset: 0,
+            });
+            selection.head = Some(ReadPoint {
+                block: 0,
+                offset: 5,
+            });
+        }
+        assert!(cache.clear_selection());
+        assert!(cache.selection.borrow().ordered().is_none());
     }
 }

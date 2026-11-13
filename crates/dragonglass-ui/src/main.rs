@@ -1159,12 +1159,20 @@ impl DragonGlassApp {
                 app.close_tab(index, window, cx);
             });
         });
+        let status_weak = cx.entity().downgrade();
+        let status: editor::StatusReporter = Rc::new(move |kind, message, cx| {
+            let _ = status_weak.update(cx, |app, cx| {
+                app.set_status(kind, message.to_string());
+                cx.notify();
+            });
+        });
         editor.update(cx, |editor, _cx| {
             editor.set_vault_root(&root);
             editor.set_attachments_folder(&folder);
             editor.set_link_opener(opener);
             editor.set_save_as(save_as);
             editor.set_close_tab(close_tab);
+            editor.set_status_reporter(status);
             editor.set_vim_enabled(self.config.vim_mode);
             editor.set_font_size(px(self.config.font_size as f32));
             editor.set_suggestions(notes, tags);
@@ -3008,6 +3016,15 @@ impl DragonGlassApp {
         self.open_new_window(window, cx);
     }
 
+    /// Copy from the reading view even when focus sits on a panel (sidebar, outline, tabs).
+    fn copy_selection(&mut self, _: &editor::Copy, _window: &mut Window, cx: &mut Context<Self>) {
+        if !self.editor.read(cx).is_reading() {
+            return;
+        }
+        let editor = self.editor.clone();
+        editor.update(cx, |editor, cx| editor.copy_selection(cx));
+    }
+
     fn close_tab_action(&mut self, _: &CloseTab, window: &mut Window, cx: &mut Context<Self>) {
         if self.switcher.is_none() {
             self.close_tab(self.active_tab, window, cx);
@@ -3558,10 +3575,18 @@ impl DragonGlassApp {
                     app.close_tab(index, window, cx);
                 });
             });
+            let status_weak = cx.entity().downgrade();
+            let status: editor::StatusReporter = Rc::new(move |kind, message, cx| {
+                let _ = status_weak.update(cx, |app, cx| {
+                    app.set_status(kind, message.to_string());
+                    cx.notify();
+                });
+            });
             for tab in &app.tabs {
                 tab.editor.update(cx, |editor, _cx| {
                     editor.set_save_as(save_as.clone());
                     editor.set_close_tab(close_tab.clone());
+                    editor.set_status_reporter(status.clone());
                 });
             }
         });
@@ -6620,6 +6645,7 @@ impl Render for DragonGlassApp {
             .on_action(cx.listener(Self::close_tab_action))
             .on_action(cx.listener(Self::reopen_closed_tab_action))
             .on_action(cx.listener(Self::save_as_action))
+            .on_action(cx.listener(Self::copy_selection))
             .on_action(cx.listener(Self::next_tab))
             .on_action(cx.listener(Self::prev_tab))
             .child(

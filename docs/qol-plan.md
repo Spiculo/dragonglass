@@ -15,8 +15,10 @@ transitions between them.
 > title as note + dirty marker (Q3.12), Vim `:wq` close, redo and failed-search reporting
 > (Q3.12), the code-fence copy button (Q2.7), the Escape order audit, and the first slice of
 > live preview: `$$…$$` blocks typeset in the editor while the caret is outside them
-> (Q2.12). Everything else in this document is still open. The Android changes compile with
-> `:app:compileDebugKotlin` but have not been run on a device yet.
+> (Q2.12). Reading selection now has double/triple-click, Shift-click, keyboard extension,
+> drag auto-scroll and a copy confirmation (Q2.3). Everything else in this document is still
+> open. The Android changes compile with `:app:compileDebugKotlin` but have not been run on a
+> device yet.
 
 **Basis:** audit of the current working tree (commit `1cb0ec2` plus local session/mobile
 work). Line references are approximate and should be re-checked before implementation.
@@ -288,6 +290,13 @@ selection, auto-scroll while dragging past the viewport, focus-on-mouse-down, Es
 clear and a subtle "Copied" confirmation. Preserve the existing cross-block selection model.
 **Done when:** selecting across blocks with mouse or keyboard copies the visible text with
 math preserved; Ctrl+C works immediately after clicking a sidebar/outline row.
+
+**Landed:** double-click selects the word under the pointer (multi-byte safe), triple-click
+selects the whole paragraph/cell/callout line/code line, Shift-click extends from the anchor,
+Shift+arrows/Home/End/PageUp/Down and Ctrl+Shift+Home/End extend the selection from the
+keyboard across blocks, dragging past the top or bottom scrolls the list, Escape clears the
+selection before it closes panels, and copy reports "copied N character(s)" in the status
+bar (also when focus sits on a sidebar row, through the app-level Copy handler).
 
 #### Q2.4 Reading typography controls — D · A · S · M
 Move hardcoded sizes/width into persisted `ReaderSettings`: body size, line height, measure

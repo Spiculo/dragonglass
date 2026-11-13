@@ -43,6 +43,9 @@ pub type SaveAsHandler = Rc<dyn Fn(&mut Window, &mut App)>;
 /// Asks the app to close the tab that owns this editor (Vim `:wq`).
 pub type CloseTabHandler = Rc<dyn Fn(&mut Window, &mut App)>;
 
+/// Reports a one-line result to the app's status bar.
+pub type StatusReporter = Rc<dyn Fn(crate::StatusKind, &str, &mut App)>;
+
 actions!(
     editor_actions,
     [
@@ -330,6 +333,8 @@ pub struct Editor {
     save_as: Option<SaveAsHandler>,
     /// Asks the app to close this tab.
     close_tab: Option<CloseTabHandler>,
+    /// Reports one-line results (copy, save failures) to the app's status bar.
+    status_reporter: Option<StatusReporter>,
     /// Cached document statistics, recomputed per buffer revision.
     stats_cache: (u64, stats::Stats),
     /// Git added/removed lines for the file, refreshed when the saved buffer changes.
@@ -601,6 +606,7 @@ impl Editor {
             link_opener: None,
             save_as: None,
             close_tab: None,
+            status_reporter: None,
             stats_cache: (u64::MAX, stats::Stats::default()),
             git_stat: None,
             git_stat_key: None,
@@ -1556,6 +1562,18 @@ impl Editor {
         self.close_tab = Some(close_tab);
     }
 
+    /// Tell the editor where to report one-line results.
+    pub fn set_status_reporter(&mut self, reporter: StatusReporter) {
+        self.status_reporter = Some(reporter);
+    }
+
+    /// Report to the app's status bar, if one is wired up.
+    fn report(&self, kind: crate::StatusKind, message: &str, cx: &mut App) {
+        if let Some(reporter) = &self.status_reporter {
+            reporter(kind, message, cx);
+        }
+    }
+
     /// Save and/or close after a Vim `:` command asked for it.
     fn run_vim_outcome(
         &mut self,
@@ -2374,36 +2392,72 @@ impl Editor {
     }
 
     fn select_left(&mut self, _: &SelectLeft, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.reading {
+            self.reading_content
+                .extend_selection(crate::reading::SelectionMotion::Left);
+            cx.notify();
+            return;
+        }
         self.begin_selection();
         self.buffer.move_left();
         cx.notify();
     }
 
     fn select_right(&mut self, _: &SelectRight, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.reading {
+            self.reading_content
+                .extend_selection(crate::reading::SelectionMotion::Right);
+            cx.notify();
+            return;
+        }
         self.begin_selection();
         self.buffer.move_right();
         cx.notify();
     }
 
     fn select_up(&mut self, _: &SelectUp, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.reading {
+            self.reading_content
+                .extend_selection(crate::reading::SelectionMotion::Up);
+            cx.notify();
+            return;
+        }
         self.begin_selection();
         self.move_vertical(-1);
         cx.notify();
     }
 
     fn select_down(&mut self, _: &SelectDown, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.reading {
+            self.reading_content
+                .extend_selection(crate::reading::SelectionMotion::Down);
+            cx.notify();
+            return;
+        }
         self.begin_selection();
         self.move_vertical(1);
         cx.notify();
     }
 
     fn select_home(&mut self, _: &SelectHome, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.reading {
+            self.reading_content
+                .extend_selection(crate::reading::SelectionMotion::LineStart);
+            cx.notify();
+            return;
+        }
         self.begin_selection();
         self.buffer.move_home();
         cx.notify();
     }
 
     fn select_end(&mut self, _: &SelectEnd, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.reading {
+            self.reading_content
+                .extend_selection(crate::reading::SelectionMotion::LineEnd);
+            cx.notify();
+            return;
+        }
         self.begin_selection();
         self.buffer.move_end();
         cx.notify();
@@ -2437,6 +2491,12 @@ impl Editor {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.reading {
+            self.reading_content
+                .extend_selection(crate::reading::SelectionMotion::DocumentStart);
+            cx.notify();
+            return;
+        }
         self.begin_selection();
         self.buffer.move_document_start();
         cx.notify();
@@ -2448,6 +2508,12 @@ impl Editor {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.reading {
+            self.reading_content
+                .extend_selection(crate::reading::SelectionMotion::DocumentEnd);
+            cx.notify();
+            return;
+        }
         self.begin_selection();
         self.buffer.move_document_end();
         cx.notify();
@@ -2466,9 +2532,23 @@ impl Editor {
     }
 
     fn copy(&mut self, _: &Copy, _window: &mut Window, cx: &mut Context<Self>) {
+        self.copy_selection(cx);
+    }
+
+    /// Copy the current selection (reading or editing) and report what happened.
+    pub fn copy_selection(&mut self, cx: &mut Context<Self>) {
         if self.reading {
-            if let Some(text) = self.reading_content.selected_text() {
-                cx.write_to_clipboard(ClipboardItem::new_string(text));
+            match self.reading_content.selected_text() {
+                Some(text) => {
+                    let count = text.chars().count();
+                    cx.write_to_clipboard(ClipboardItem::new_string(text));
+                    self.report(
+                        crate::StatusKind::Info,
+                        &format!("copied {count} character(s)"),
+                        cx,
+                    );
+                }
+                None => self.report(crate::StatusKind::Warn, "nothing selected to copy", cx),
             }
             return;
         }
@@ -2481,7 +2561,13 @@ impl Editor {
             .map(|range| self.buffer.slice(range))
             .collect::<Vec<_>>()
             .join("\n");
+        let count = text.chars().count();
         cx.write_to_clipboard(ClipboardItem::new_string(text));
+        self.report(
+            crate::StatusKind::Info,
+            &format!("copied {count} character(s)"),
+            cx,
+        );
     }
 
     fn cut(&mut self, _: &Cut, _window: &mut Window, cx: &mut Context<Self>) {
@@ -2833,6 +2919,9 @@ impl Editor {
     /// Returns whether the editor consumed the key.
     pub fn handle_escape(&mut self, cx: &mut Context<Self>) -> bool {
         if self.reading && self.reading_content.dismiss_popup(cx) {
+            return true;
+        }
+        if self.reading && self.reading_content.clear_selection() {
             return true;
         }
         if self.autocomplete.open {
