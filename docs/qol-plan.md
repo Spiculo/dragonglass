@@ -481,6 +481,12 @@ every revision; cache by buffer revision. Optionally add scroll sync with a togg
 **Done when:** typing in a 5k-line note does not drop frames or re-typeset every formula on
 each keystroke; preview catches up within ~150 ms of typing stopping.
 
+**Landed:** the split preview re-parses and re-typesets at most once per 150 ms window while
+typing, with a trailing one-shot timer, instead of on every revision; it shows the previous
+render until then. Switching to another note (a new epoch) updates immediately instead of
+flashing the old note. Stats and the outline were already throttled in Q3.8.
+**Remaining:** scroll sync between editor and preview (the plan marks it optional).
+
 #### Q2.12 Live preview inside the source editor — D · M–L
 Obsidian-style: the block holding the caret stays raw source and the rest of the note
 renders. **Landed:** display `$$…$$` blocks are typeset in place with the reading view's

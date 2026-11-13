@@ -681,6 +681,11 @@ struct DragonGlassApp {
     /// When the throttled stats/outline pass last ran, and whether a timer is armed.
     derived_at: Option<std::time::Instant>,
     derived_armed: bool,
+    /// When the split preview last re-parsed, and whether a timer is armed.
+    preview_at: Option<std::time::Instant>,
+    preview_armed: bool,
+    /// Epoch (note) the preview was last built for.
+    preview_epoch: u64,
     /// True while a one-shot task is waiting to expire the current status line.
     status_timer_armed: bool,
     switcher: Option<Switcher>,
@@ -4191,6 +4196,9 @@ impl DragonGlassApp {
                 pending_draft: None,
                 derived_at: None,
                 derived_armed: false,
+                preview_at: None,
+                preview_armed: false,
+                preview_epoch: u64::MAX,
                 status_timer_armed: false,
                 switcher: None,
                 switcher_focus: cx.focus_handle(),
@@ -6555,9 +6563,38 @@ impl Render for DragonGlassApp {
         {
             let version = (self.cache_epoch, self.editor.read(cx).document_version().1);
             if self.preview_content.needs_update(version) {
-                let text = self.editor.read(cx).text();
-                let root = self.vault_root.clone();
-                self.preview_content.update(version, &text, Some(&root));
+                // Reparsing and re-typesetting the whole note on every keystroke is what
+                // makes a split preview stutter, so it catches up ~150 ms after typing
+                // stops. The preview shows the previous revision in the meantime.
+                let now = std::time::Instant::now();
+                // A different note updates at once; edits to the same note wait for the
+                // debounce so the previous render stays on screen instead of flickering.
+                let due = self.preview_epoch != version.0
+                    || self.preview_at.is_none_or(|last| {
+                        now.duration_since(last) >= std::time::Duration::from_millis(150)
+                    });
+                if due {
+                    let text = self.editor.read(cx).text();
+                    let root = self.vault_root.clone();
+                    self.preview_content.update(version, &text, Some(&root));
+                    self.preview_at = Some(now);
+                    self.preview_epoch = version.0;
+                } else if !self.preview_armed {
+                    self.preview_armed = true;
+                    let elapsed = self
+                        .preview_at
+                        .map(|last| now.duration_since(last))
+                        .unwrap_or_default();
+                    let wait = std::time::Duration::from_millis(150).saturating_sub(elapsed);
+                    cx.spawn(async move |this, cx| {
+                        Timer::after(wait).await;
+                        let _ = this.update(cx, |app, cx| {
+                            app.preview_armed = false;
+                            cx.notify();
+                        });
+                    })
+                    .detach();
+                }
             }
 
             let style = window.text_style();
@@ -8280,6 +8317,9 @@ fn open_vault_window(vault_path: PathBuf, uri_note: Option<String>, cx: &mut App
             pending_draft: None,
             derived_at: None,
             derived_armed: false,
+            preview_at: None,
+            preview_armed: false,
+            preview_epoch: u64::MAX,
             status_timer_armed: false,
             switcher: None,
             switcher_focus: cx.focus_handle(),
