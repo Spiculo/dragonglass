@@ -2561,18 +2561,29 @@ impl Editor {
     }
 
     fn left(&mut self, _: &Left, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.reading {
+            return;
+        }
         self.dismiss_autocomplete();
         self.move_all_cursors(|buffer| buffer.move_left());
         cx.notify();
     }
 
     fn right(&mut self, _: &Right, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.reading {
+            return;
+        }
         self.dismiss_autocomplete();
         self.move_all_cursors(|buffer| buffer.move_right());
         cx.notify();
     }
 
     fn up(&mut self, _: &Up, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.reading {
+            self.reading_content.scroll_blocks(-1);
+            cx.notify();
+            return;
+        }
         if self.autocomplete.open {
             self.move_autocomplete(-1);
             cx.notify();
@@ -2583,6 +2594,11 @@ impl Editor {
     }
 
     fn down(&mut self, _: &Down, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.reading {
+            self.reading_content.scroll_blocks(1);
+            cx.notify();
+            return;
+        }
         if self.autocomplete.open {
             self.move_autocomplete(1);
             cx.notify();
@@ -2593,41 +2609,77 @@ impl Editor {
     }
 
     fn home(&mut self, _: &Home, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.reading {
+            self.reading_content.scroll_blocks(isize::MIN / 2);
+            cx.notify();
+            return;
+        }
         self.move_all_cursors(|buffer| buffer.move_home());
         cx.notify();
     }
 
     fn end(&mut self, _: &End, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.reading {
+            self.reading_content.scroll_blocks(isize::MAX / 2);
+            cx.notify();
+            return;
+        }
         self.move_all_cursors(|buffer| buffer.move_end());
         cx.notify();
     }
 
     fn word_left(&mut self, _: &WordLeft, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.reading {
+            return;
+        }
         self.move_all_cursors(|buffer| buffer.move_word_left());
         cx.notify();
     }
 
     fn word_right(&mut self, _: &WordRight, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.reading {
+            return;
+        }
         self.move_all_cursors(|buffer| buffer.move_word_right());
         cx.notify();
     }
 
     fn paragraph_up(&mut self, _: &ParagraphUp, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.reading {
+            self.reading_content.scroll_blocks(-1);
+            cx.notify();
+            return;
+        }
         self.move_all_cursors(|buffer| buffer.move_paragraph_up());
         cx.notify();
     }
 
     fn paragraph_down(&mut self, _: &ParagraphDown, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.reading {
+            self.reading_content.scroll_blocks(1);
+            cx.notify();
+            return;
+        }
         self.move_all_cursors(|buffer| buffer.move_paragraph_down());
         cx.notify();
     }
 
     fn document_start(&mut self, _: &DocumentStart, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.reading {
+            self.reading_content.scroll_blocks(isize::MIN / 2);
+            cx.notify();
+            return;
+        }
         self.move_all_cursors(|buffer| buffer.move_document_start());
         cx.notify();
     }
 
     fn document_end(&mut self, _: &DocumentEnd, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.reading {
+            self.reading_content.scroll_blocks(isize::MAX / 2);
+            cx.notify();
+            return;
+        }
         self.move_all_cursors(|buffer| buffer.move_document_end());
         cx.notify();
     }
@@ -4630,6 +4682,20 @@ impl EntityInputHandler for Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.reading {
+            // Reading mode owns its own navigation: j/k and g/G scroll the view, and every
+            // other keystroke is swallowed so it cannot reach the hidden buffer.
+            match new_text {
+                "j" => self.reading_content.scroll_blocks(1),
+                "k" => self.reading_content.scroll_blocks(-1),
+                "g" => self.reading_content.scroll_blocks(isize::MIN / 2),
+                "G" => self.reading_content.scroll_blocks(isize::MAX / 2),
+                _ => return,
+            }
+            self.marked_range = None;
+            cx.notify();
+            return;
+        }
         if !self.can_mutate() {
             return;
         }

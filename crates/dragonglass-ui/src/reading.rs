@@ -730,6 +730,17 @@ impl ReadingCache {
         }
     }
 
+    /// Scroll the reading view by whole blocks, clamped to the document.
+    pub fn scroll_blocks(&mut self, delta: isize) {
+        if self.blocks.is_empty() {
+            return;
+        }
+        let top = self.top_block() as isize;
+        let last = self.blocks.len().saturating_sub(1) as isize;
+        let target = (top + delta).clamp(0, last) as usize;
+        self.list_state.scroll_to_reveal_item(target);
+    }
+
     /// Scroll the reading view so `index` is visible. Restoring a session uses this.
     pub fn scroll_to_block(&mut self, index: usize) {
         if self.blocks.is_empty() {

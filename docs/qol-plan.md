@@ -331,6 +331,12 @@ opens in-page find. Never move the hidden edit caret.
 **Done when:** a keyboard-only user can read an entire long note, follow links and return
 without touching the mouse; the source hash stays unchanged.
 
+**Landed:** in reading mode Up/Down and Ctrl+Up/Down scroll a block, Home/End and
+Ctrl+Home/End jump to the top/bottom, Left/Right and word motions do nothing (they can no
+longer move the hidden caret), and `j`/`k`/`g`/`G` scroll through the input handler with all
+other typing swallowed. Shift+arrows still extend the reading selection (Q2.3).
+**Remaining:** Enter on a focused link, Space/PageUp/PageDown, and Ctrl+F in-page find (Q2.2).
+
 #### Q2.2 In-page find — D · M
 Build a reading find bar over block display text: case/regex/whole-word reuse from
 `core::find`, match highlighting, Enter/F3 cycling, a count, and no mode switch. Reuse the
