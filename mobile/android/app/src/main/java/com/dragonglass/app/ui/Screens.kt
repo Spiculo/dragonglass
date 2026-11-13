@@ -225,6 +225,11 @@ private fun NotesScreen(
                     }
                 },
                 actions = {
+                    SyncChip(vm) {
+                        vm.clearGitMessages()
+                        vm.refreshGitStatus()
+                        showSync = true
+                    }
                     Box {
                         TextButton(onClick = { todayOpen = true }) { Text("Today") }
                         DropdownMenu(
@@ -550,6 +555,19 @@ private fun SearchHitRow(hit: SearchHit, onClick: () -> Unit) {
     )
 }
 
+/// A compact sync state, tappable to open the sync sheet.
+@Composable
+private fun SyncChip(vm: DragonGlassViewModel, onClick: () -> Unit) {
+    val color = when {
+        vm.gitError != null -> MaterialTheme.colorScheme.error
+        vm.syncNeedsAttention -> MaterialTheme.colorScheme.tertiary
+        else -> MaterialTheme.colorScheme.onSurfaceVariant
+    }
+    TextButton(onClick = onClick) {
+        Text(vm.syncLabel, color = color, maxLines = 1)
+    }
+}
+
 @Composable
 private fun SectionHeader(text: String) {
     Text(
@@ -642,6 +660,7 @@ private fun EditorScreen(vm: DragonGlassViewModel, relative: String) {
     var showOutline by remember { mutableStateOf(false) }
     var showDetails by remember { mutableStateOf(false) }
     var showRename by remember { mutableStateOf(false) }
+    var showSync by remember { mutableStateOf(false) }
     var editorValue by remember(relative) { mutableStateOf(TextFieldValue(vm.source)) }
     val focusRequester = remember { FocusRequester() }
     val title = relative.substringAfterLast('/').removeSuffix(".md")
@@ -676,6 +695,11 @@ private fun EditorScreen(vm: DragonGlassViewModel, relative: String) {
                     }
                     TextButton(onClick = { vm.save() }, enabled = vm.dirty) {
                         Text("Save")
+                    }
+                    SyncChip(vm) {
+                        vm.clearGitMessages()
+                        vm.refreshGitStatus()
+                        showSync = true
                     }
                     Box {
                         TextButton(onClick = { menuOpen = true }) { Text("•••") }
@@ -765,6 +789,9 @@ private fun EditorScreen(vm: DragonGlassViewModel, relative: String) {
         }
     }
 
+    if (showSync) {
+        GitSyncSheet(vm, onDismiss = { showSync = false })
+    }
     if (showOutline) {
         OutlineSheet(
             vm = vm,

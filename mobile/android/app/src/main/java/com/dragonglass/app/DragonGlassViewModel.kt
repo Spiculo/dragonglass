@@ -108,6 +108,30 @@ class DragonGlassViewModel(application: Application) : AndroidViewModel(applicat
     var previewScroll by mutableStateOf(0)
         private set
 
+    /// One-line sync state for the chrome.
+    val syncLabel: String
+        get() {
+            val status = gitStatus
+            return when {
+                gitBusy -> "Syncing…"
+                gitError != null -> "Sync failed"
+                status?.conflicts?.isNotEmpty() == true -> "Conflicts"
+                status?.isRepo == true && (status.hasLocalWork || status.ahead > 0) -> "Unsynced"
+                status?.isRepo == true && status.behind > 0 -> "Behind"
+                status?.isRepo == true -> "Synced"
+                canSyncWithFolder -> "Folder sync"
+                else -> "Git sync"
+            }
+        }
+
+    /// Whether the sync chip should stand out.
+    val syncNeedsAttention: Boolean
+        get() = gitError != null ||
+            gitStatus?.conflicts?.isNotEmpty() == true ||
+            gitStatus?.hasLocalWork == true ||
+            (gitStatus?.behind ?: 0) > 0 ||
+            (gitStatus?.ahead ?: 0) > 0
+
     /// Remember where the preview was scrolled when it is closed.
     fun rememberPreviewScroll(offset: Int) {
         previewScroll = offset

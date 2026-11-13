@@ -705,6 +705,13 @@ and never leak JGit error strings as the only explanation.
 **Done when:** a user always knows whether their work is local-only; a failed sync can be
 retried from where it failed.
 
+**Landed:** the note list and the editor both show a sync chip whose text is the current
+state — Syncing…, Sync failed, Conflicts, Unsynced, Behind, Synced, Folder sync, Git sync —
+tinted when work is local, behind or failed. Tapping it opens the sync sheet, so the editor
+can sync directly; `syncGit` saves the open note first and refuses to run when that save
+fails (Q0.7).
+**Remaining:** Retry/Abort buttons on individual conflict rows, and a last-sync timestamp.
+
 #### Q4.5 New note and row actions — A · S
 Prompt for title and folder on create (no root "Untitled"), add long-press row actions
 (rename/move/delete/bookmark), and make properties/tags/relations chips clickable.
