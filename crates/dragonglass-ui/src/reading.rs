@@ -331,6 +331,7 @@ impl Render for FootnotePopup {
             let title = title.clone();
             let state = this.clone();
             let reveal = self.reveal.clone();
+            let list_state = self.list_state.clone();
             panel = panel.child(
                 div()
                     .id(ElementId::Name(format!("footnote-ref-{index}").into()))
@@ -345,7 +346,9 @@ impl Render for FootnotePopup {
                     .child(div().child(format!("Title: {title}")))
                     .child(div().text_xs().text_color(theme.muted).child(snippet))
                     .on_mouse_down(MouseButton::Left, move |_ev, window, cx| {
-                        // The reader applies the unfold on its next render, then scrolls.
+                        // Scroll now when the target is visible; the reader unfolds and
+                        // scrolls again on the next render when a fold hides it.
+                        list_state.scroll_to_reveal_item(block);
                         *reveal.borrow_mut() = Some(block);
                         if let Some(this) = state.upgrade() {
                             this.update(cx, |this, cx| {
@@ -362,6 +365,7 @@ impl Render for FootnotePopup {
             let block = *block;
             let state = this.clone();
             let reveal = self.reveal.clone();
+            let list_state = self.list_state.clone();
             panel = panel.child(
                 div()
                     .id("footnote-definition")
@@ -373,7 +377,9 @@ impl Render for FootnotePopup {
                     .hover(move |style| style.bg(theme.hover))
                     .child("Go to footnote definition")
                     .on_mouse_down(MouseButton::Left, move |_ev, window, cx| {
-                        // The reader applies the unfold on its next render, then scrolls.
+                        // Scroll now when the target is visible; the reader unfolds and
+                        // scrolls again on the next render when a fold hides it.
+                        list_state.scroll_to_reveal_item(block);
                         *reveal.borrow_mut() = Some(block);
                         if let Some(this) = state.upgrade() {
                             this.update(cx, |this, cx| {
