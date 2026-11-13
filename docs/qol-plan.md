@@ -268,6 +268,14 @@ Back in mobile chrome without overloading "close note". Restore the exact readin
 **Done when:** read A → link B#H → link C → Back returns B at H → Back returns A at the
 original block; forward replays the path.
 
+**Landed (desktop):** `NavBack`/`NavForward` (Ctrl/Cmd+`[` / `]`, in the hotkey editor)
+walk a 100-entry history of `(note, mode, cursor line, reading block)` recorded on every
+note open — links, quick switcher, search hits, daily notes, reopen — and on back/forward
+restore the mode, caret and reading position. Visiting a new place after going back drops
+the forward tail; a status line shows the position in the history.
+**Remaining:** mouse back/forward buttons, the outline-jump entries, and the mobile Back
+chrome.
+
 #### Q1.4 Heading and block fragments — D · M
 Keep the `#fragment` in parsed inline links instead of stripping it (`inline.rs`), parse
 `^block-id` markers, and resolve after loading: heading → existing `scroll_to_heading_index`

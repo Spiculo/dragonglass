@@ -64,6 +64,8 @@ const HOTKEYS: &[(&str, &str, &str)] = &[
     ("CloseTab", "secondary+w", "Close tab"),
     ("ReopenClosedTab", "secondary+shift+t", "Reopen closed tab"),
     ("SaveAs", "secondary+shift+s", "Save note as"),
+    ("NavBack", "secondary+[", "Back"),
+    ("NavForward", "secondary+]", "Forward"),
     ("NextTab", "ctrl-tab", "Next tab"),
     ("PrevTab", "ctrl-shift-tab", "Previous tab"),
 ];
@@ -94,6 +96,8 @@ fn bind_named(cx: &mut App, key: &str, action: &str) {
         "CloseTab" => cx.bind_keys([KeyBinding::new(key, CloseTab, None)]),
         "ReopenClosedTab" => cx.bind_keys([KeyBinding::new(key, ReopenClosedTab, None)]),
         "SaveAs" => cx.bind_keys([KeyBinding::new(key, SaveAs, None)]),
+        "NavBack" => cx.bind_keys([KeyBinding::new(key, NavBack, None)]),
+        "NavForward" => cx.bind_keys([KeyBinding::new(key, NavForward, None)]),
         "NextTab" => cx.bind_keys([KeyBinding::new(key, NextTab, None)]),
         "PrevTab" => cx.bind_keys([KeyBinding::new(key, PrevTab, None)]),
         _ => {}
@@ -146,6 +150,8 @@ actions!(
         RecoverDraft,
         CompareDraft,
         DiscardDraft,
+        NavBack,
+        NavForward,
         NextTab,
         PrevTab,
         HideApp,
@@ -446,6 +452,15 @@ struct ClosedTab {
     line: usize,
 }
 
+/// One place the user visited, for back/forward navigation.
+#[derive(Clone)]
+struct NavEntry {
+    relative: String,
+    reading: bool,
+    line: usize,
+    reading_block: usize,
+}
+
 /// The value carried while dragging a tab between the tab bar, editor panes and windows.
 #[derive(Clone)]
 struct TabDrag {
@@ -567,6 +582,9 @@ struct DragonGlassApp {
     tabs: Vec<Tab>,
     /// Recently closed notes, newest last, so a close can be undone with the keyboard.
     closed_tabs: Vec<ClosedTab>,
+    /// Places visited in this window, and where the user currently sits in them.
+    nav_history: Vec<NavEntry>,
+    nav_index: usize,
     active_tab: usize,
     /// Additional tabs shown beside the active editor, in layout order.
     split_tabs: Vec<usize>,
@@ -1569,6 +1587,17 @@ impl DragonGlassApp {
     }
 
     fn open_note(&mut self, relative: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_note_impl(relative, window, cx, true);
+    }
+
+    /// Open a note. `record` is false while back/forward replays history.
+    fn open_note_impl(
+        &mut self,
+        relative: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        record: bool,
+    ) {
         self.show_settings = false;
         // Already open: just focus it.
         if let Some(index) = self
@@ -1643,6 +1672,88 @@ impl DragonGlassApp {
 
         window.focus(&self.editor.focus_handle(cx));
         self.check_recovery(cx);
+        if record {
+            self.remember_nav(cx);
+        }
+    }
+
+    /// Remember where the user is now, and drop any forward history.
+    fn remember_nav(&mut self, cx: &Context<Self>) {
+        let Some(relative) = self.active.clone() else {
+            return;
+        };
+        let (reading, line, reading_block) = {
+            let editor = self.editor.read(cx);
+            (
+                editor.is_reading(),
+                editor.cursor_position().0,
+                editor.reading_block(),
+            )
+        };
+        if let Some(current) = self.nav_history.get(self.nav_index) {
+            if current.relative == relative && current.line == line && current.reading == reading {
+                return;
+            }
+        }
+        if !self.nav_history.is_empty() {
+            self.nav_history.truncate(self.nav_index + 1);
+        }
+        self.nav_history.push(NavEntry {
+            relative,
+            reading,
+            line,
+            reading_block,
+        });
+        if self.nav_history.len() > 100 {
+            self.nav_history.remove(0);
+        }
+        self.nav_index = self.nav_history.len().saturating_sub(1);
+    }
+
+    /// Reopen the place at `nav_index`, restoring its mode and position.
+    fn navigate_to_current(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(entry) = self.nav_history.get(self.nav_index).cloned() else {
+            return;
+        };
+        self.open_note_impl(&entry.relative, window, cx, false);
+        let editor = self.editor.clone();
+        editor.update(cx, |editor, cx| {
+            editor.set_reading_mode(entry.reading);
+            editor.set_cursor_position(entry.line, 0);
+            editor.scroll_reading_to(entry.reading_block);
+            cx.notify();
+        });
+        self.set_status(
+            StatusKind::Info,
+            format!(
+                "{} ({} of {})",
+                entry.relative,
+                self.nav_index + 1,
+                self.nav_history.len()
+            ),
+        );
+    }
+
+    fn nav_back(&mut self, _: &NavBack, window: &mut Window, cx: &mut Context<Self>) {
+        if self.nav_history.is_empty() || self.nav_index == 0 {
+            self.set_status(StatusKind::Info, "no earlier note");
+            cx.notify();
+            return;
+        }
+        self.nav_index -= 1;
+        self.navigate_to_current(window, cx);
+        cx.notify();
+    }
+
+    fn nav_forward(&mut self, _: &NavForward, window: &mut Window, cx: &mut Context<Self>) {
+        if self.nav_index + 1 >= self.nav_history.len() {
+            self.set_status(StatusKind::Info, "no later note");
+            cx.notify();
+            return;
+        }
+        self.nav_index += 1;
+        self.navigate_to_current(window, cx);
+        cx.notify();
     }
 
     /// Close a tab. Dirty notes are saved first so closing never loses edits.
@@ -3943,6 +4054,8 @@ impl DragonGlassApp {
                 editor: editor.clone(),
                 tabs,
                 closed_tabs: Vec::new(),
+                nav_history: Vec::new(),
+                nav_index: 0,
                 active_tab,
                 split_tabs: Vec::new(),
                 split_axis: SplitAxis::Horizontal,
@@ -7330,6 +7443,8 @@ impl Render for DragonGlassApp {
             .on_action(cx.listener(Self::recover_draft))
             .on_action(cx.listener(Self::compare_draft))
             .on_action(cx.listener(Self::discard_draft))
+            .on_action(cx.listener(Self::nav_back))
+            .on_action(cx.listener(Self::nav_forward))
             .on_action(cx.listener(Self::copy_selection))
             .on_action(cx.listener(Self::next_tab))
             .on_action(cx.listener(Self::prev_tab))
@@ -7966,6 +8081,8 @@ fn open_vault_window(vault_path: PathBuf, uri_note: Option<String>, cx: &mut App
             editor: editor.clone(),
             tabs: initial_tabs,
             closed_tabs: Vec::new(),
+            nav_history: Vec::new(),
+            nav_index: 0,
             active_tab: initial_active,
             split_tabs: Vec::new(),
             split_axis: SplitAxis::Horizontal,
