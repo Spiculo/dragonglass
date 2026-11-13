@@ -486,6 +486,10 @@ editor, not always `active_tab`. Clicking a pane focuses it and updates the acti
 **Done when:** two side-by-side notes can be edited and closed independently with the
 keyboard; the tab bar highlights the focused pane.
 
+**Landed:** clicking a split pane activates its tab and focuses its editor, so Ctrl+W, Save,
+Find and formatting target the pane the user is looking at; the tab bar already marks
+secondary panes.
+
 #### Q3.10 Autocomplete belongs at the caret — D · M
 Replace the bottom bar with a caret-anchored popup (or a non-resizing overlay), keep it
 within the viewport, support Up/Down/Tab/Enter/Escape, and rank exact prefix matches before
@@ -498,6 +502,9 @@ Overlay the selection formatting bar near the selection (or reserve stable space
 appearing/disappearing bars do not change the editor viewport.
 **Done when:** selecting text at the top/bottom of the viewport does not scroll the
 document.
+
+**Landed:** the format bar reserves a fixed 30 px strip in edit mode (an empty bar when
+nothing is selected), so selecting or deselecting text never resizes the editor.
 
 #### Q3.12 Small editor gaps — D · S
 Vim: support redo, make `:wq` close the tab, surface failed searches. Window title: show
@@ -525,6 +532,11 @@ looking tab. Do not block window creation on loading every tab; load the active 
 and the rest lazily.
 **Done when:** a missing/locked file is visible and recoverable; 50 restored tabs still
 start under the cold-start budget.
+
+**Landed:** a restored tab whose file cannot be read records the failure, and the pane shows
+"… could not be opened", the path and reason, plus **Retry** and **Close tab** instead of an
+empty editor that silently accepts typing. Retry reloads in place.
+**Remaining:** tabs are still loaded eagerly at startup; lazy loading is open.
 
 ---
 

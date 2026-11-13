@@ -4287,7 +4287,12 @@ impl Render for Editor {
             None
         };
 
-        let format_bar = if !reading && self.selection().is_some() {
+        // The format bar keeps a fixed height whether or not it has buttons, so selecting
+        // text never resizes the editor underneath the caret.
+        const FORMAT_BAR_HEIGHT: f32 = 30.0;
+        let format_bar = if reading {
+            None
+        } else if self.selection().is_some() {
             let entity = cx.entity();
             let buttons: Vec<(&str, text_format::Style, &str)> = vec![
                 ("B", text_format::Style::Bold, "format-bold"),
@@ -4347,8 +4352,8 @@ impl Render for Editor {
                     .flex_row()
                     .items_center()
                     .gap_1()
+                    .h(px(FORMAT_BAR_HEIGHT))
                     .px_3()
-                    .py_1()
                     .flex_shrink_0()
                     .bg(theme.panel_alt)
                     .border_t_1()
@@ -4361,7 +4366,16 @@ impl Render for Editor {
                     .into_any_element(),
             )
         } else {
-            None
+            Some(
+                div()
+                    .id("format-bar-spacer")
+                    .h(px(FORMAT_BAR_HEIGHT))
+                    .flex_shrink_0()
+                    .bg(theme.panel_alt)
+                    .border_t_1()
+                    .border_color(theme.border)
+                    .into_any_element(),
+            )
         };
 
         let (line, column) = self.buffer.line_col();

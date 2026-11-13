@@ -399,6 +399,8 @@ struct Tab {
     title: String,
     /// Whether the file changed on disk while this tab has unsaved edits.
     conflict: bool,
+    /// Set when a restored tab could not be read, so the pane can offer Retry.
+    load_error: Option<String>,
 }
 
 /// How the status line is styled, and whether it expires.
@@ -1618,6 +1620,7 @@ impl DragonGlassApp {
                 editor: editor.clone(),
                 title,
                 conflict: false,
+                load_error: None,
             });
             self.active_tab = self.tabs.len() - 1;
             self.editor = editor;
@@ -1721,6 +1724,7 @@ impl DragonGlassApp {
                 editor,
                 title: "Untitled".to_string(),
                 conflict: false,
+                load_error: None,
             });
             self.activate_tab(0, cx);
         } else if was_active {
@@ -2983,6 +2987,13 @@ impl DragonGlassApp {
                 return view.clone().into_any_element();
             }
         }
+        if let Some(error) = self
+            .tabs
+            .get(self.active_tab)
+            .and_then(|tab| tab.load_error.clone())
+        {
+            return self.tab_error_view(error, theme, cx);
+        }
         if !self.split_tabs.is_empty() {
             return match self.split_axis {
                 SplitAxis::Horizontal => {
@@ -2992,10 +3003,28 @@ impl DragonGlassApp {
                         .size_full()
                         .child(div().flex_1().min_w(px(0.0)).child(self.editor.clone()));
                     for index in &self.split_tabs {
-                        if let Some(tab) = self.tabs.get(*index) {
+                        let index = *index;
+                        if let Some(tab) = self.tabs.get(index) {
                             row = row
                                 .child(div().w(px(1.0)).h_full().bg(theme.border).flex_shrink_0())
-                                .child(div().flex_1().min_w(px(0.0)).child(tab.editor.clone()));
+                                .child(
+                                    div()
+                                        .id(ElementId::Name(format!("split-pane-{index}").into()))
+                                        .flex_1()
+                                        .min_w(px(0.0))
+                                        // Clicking a pane focuses it and makes it the
+                                        // command target, so Ctrl+W and formatting apply
+                                        // to the note the user is looking at.
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(move |this, _event, window, cx| {
+                                                this.activate_tab(index, cx);
+                                                let handle = this.editor.focus_handle(cx);
+                                                window.focus(&handle);
+                                            }),
+                                        )
+                                        .child(tab.editor.clone()),
+                                );
                         }
                     }
                     row.into_any_element()
@@ -3007,10 +3036,25 @@ impl DragonGlassApp {
                         .size_full()
                         .child(div().flex_1().min_h(px(0.0)).child(self.editor.clone()));
                     for index in &self.split_tabs {
-                        if let Some(tab) = self.tabs.get(*index) {
+                        let index = *index;
+                        if let Some(tab) = self.tabs.get(index) {
                             column = column
                                 .child(div().h(px(1.0)).w_full().bg(theme.border).flex_shrink_0())
-                                .child(div().flex_1().min_h(px(0.0)).child(tab.editor.clone()));
+                                .child(
+                                    div()
+                                        .id(ElementId::Name(format!("split-pane-{index}").into()))
+                                        .flex_1()
+                                        .min_h(px(0.0))
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(move |this, _event, window, cx| {
+                                                this.activate_tab(index, cx);
+                                                let handle = this.editor.focus_handle(cx);
+                                                window.focus(&handle);
+                                            }),
+                                        )
+                                        .child(tab.editor.clone()),
+                                );
                         }
                     }
                     column.into_any_element()
@@ -3166,6 +3210,97 @@ impl DragonGlassApp {
             self.clear_status();
             cx.notify();
         }
+    }
+
+    /// The pane shown instead of a blank editor when a restored tab could not be read.
+    fn tab_error_view(&self, error: String, theme: Theme, cx: &mut Context<Self>) -> AnyElement {
+        let index = self.active_tab;
+        let title = self
+            .tabs
+            .get(index)
+            .map(|tab| tab.title.clone())
+            .unwrap_or_default();
+        let path = self
+            .tabs
+            .get(index)
+            .and_then(|tab| tab.relative.clone())
+            .unwrap_or_default();
+        let button = |id: &'static str, label: &'static str| {
+            div()
+                .id(id)
+                .px_3()
+                .py_1()
+                .rounded_md()
+                .bg(theme.chip)
+                .text_sm()
+                .text_color(theme.text)
+                .cursor_pointer()
+                .hover(move |style| style.bg(theme.hover))
+                .child(label)
+        };
+
+        div()
+            .id("tab-error")
+            .size_full()
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .gap_3()
+            .child(
+                div()
+                    .text_color(theme.error)
+                    .child(format!("{title} could not be opened")),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(theme.muted)
+                    .child(format!("{path} — {error}")),
+            )
+            .child(
+                div()
+                    .flex()
+                    .gap_2()
+                    .child(button("tab-retry", "Retry").on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _event, window, cx| {
+                            this.retry_tab(index, window, cx);
+                        }),
+                    ))
+                    .child(button("tab-close", "Close tab").on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _event, window, cx| {
+                            this.close_tab(index, window, cx);
+                        }),
+                    )),
+            )
+            .into_any_element()
+    }
+
+    /// Try a failed tab again without closing and reopening it.
+    fn retry_tab(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(relative) = self.tabs.get(index).and_then(|tab| tab.relative.clone()) else {
+            return;
+        };
+        let editor = self.tabs[index].editor.clone();
+        if self.load_into(&editor, &relative, cx) {
+            if let Some(tab) = self.tabs.get_mut(index) {
+                tab.load_error = None;
+            }
+            if index == self.active_tab {
+                self.refresh_properties(cx);
+                self.cache_epoch = self.cache_epoch.wrapping_add(1);
+            }
+            self.set_status(StatusKind::Success, format!("opened {relative}"));
+            window.focus(&self.editor.focus_handle(cx));
+        } else {
+            if let Some(tab) = self.tabs.get_mut(index) {
+                tab.load_error = Some("still could not read the file".to_string());
+            }
+            self.set_status(StatusKind::Error, format!("could not open {relative}"));
+        }
+        cx.notify();
     }
 
     fn new_window(&mut self, _: &NewWindow, window: &mut Window, cx: &mut Context<Self>) {
@@ -3428,6 +3563,7 @@ impl DragonGlassApp {
                 .map(tab_title)
                 .unwrap_or_else(|| "Untitled".to_string()),
             conflict: false,
+            load_error: None,
         };
         self.spawn_window_with_tabs(vec![sibling_tab], 0, false, cx);
     }
@@ -3463,6 +3599,7 @@ impl DragonGlassApp {
                 editor,
                 title: "Untitled".to_string(),
                 conflict: false,
+                load_error: None,
             });
             self.active_tab = 0;
             self.split_tabs.clear();
@@ -7677,13 +7814,13 @@ fn open_vault_window(vault_path: PathBuf, uri_note: Option<String>, cx: &mut App
             .tabs
             .iter()
             .find(|tab| &tab.note == relative);
-        editor.update(cx, |editor, _cx| {
+        let loaded = editor.update(cx, |editor, _cx| {
             editor.set_suggestions((*initial_suggestions).clone(), (*initial_tags).clone());
             editor.set_vault_root(&vault_root);
             editor.set_attachments_folder(&initial_config.attachments_folder);
             editor.set_vim_enabled(initial_config.vim_mode);
             editor.set_font_size(px(initial_config.font_size as f32));
-            let _ = editor.load(&vault_root.join(relative));
+            let loaded = editor.load(&vault_root.join(relative)).is_ok();
             if forced_reading || saved.is_some_and(|tab| tab.reading) {
                 editor.set_reading_mode(true);
             }
@@ -7692,12 +7829,18 @@ fn open_vault_window(vault_path: PathBuf, uri_note: Option<String>, cx: &mut App
                 editor.set_scroll_offset(saved.scroll);
                 editor.scroll_reading_to(saved.reading_block);
             }
+            loaded
         });
         initial_tabs.push(Tab {
             relative: Some(relative.clone()),
             editor,
             title: tab_title(relative),
             conflict: false,
+            load_error: if loaded {
+                None
+            } else {
+                Some("the file could not be read".to_string())
+            },
         });
     }
     if initial_tabs.is_empty() {
@@ -7714,6 +7857,7 @@ fn open_vault_window(vault_path: PathBuf, uri_note: Option<String>, cx: &mut App
             editor,
             title: "Untitled".to_string(),
             conflict: false,
+            load_error: None,
         });
     }
 
