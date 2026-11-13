@@ -190,6 +190,10 @@ the vault** at `.dragon-glass/` and is a **rebuildable cache** (auto-added to th
 Durations are honest solo estimates, not team estimates. Time budget is currently lax —
 optimize for shipping working code over schedule precision.
 
+The editing/reading flow quality pass is specified separately in
+[`docs/qol-plan.md`](docs/qol-plan.md): safety and continuity first, then reading,
+editing and mobile parity.
+
 | Phase | Duration | Contents | Milestone |
 |---|---|---|---|
 | **0 — Foundations** | 3–5 wk | repo + CI (Windows/Linux/macOS) ✅, `core` crate ✅, FS vault model ✅, **GPUI spike ✅** | GPUI builds on Windows ✅, Linux ✅ and macOS ✅; editor approach = build our own ✅ |
