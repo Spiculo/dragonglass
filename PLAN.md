@@ -391,6 +391,10 @@ the file offers **Recover / Compare / Discard**. Note autosave is a per-vault se
 matches, and stops at the conflict bar otherwise. It is off by default because silent writes
 interact with git commits.
 
+Cmd+Q and the window close button share one exit gate: a dirty buffer offers **Save and
+quit**, **Quit without saving** or **Cancel**, and a save that fails or conflicts keeps the
+app open with the error and the conflict bar.
+
 The first batch from [`docs/qol-plan.md`](docs/qol-plan.md) is in. Reading mode is now
 strictly read-only: every mutating action and both IME insert paths check one `can_mutate()`
 gate, so keyboard input, paste, cut, undo/redo and formatting leave the source untouched

@@ -196,6 +196,13 @@ not clear `selected/source` until the save has actually succeeded.
 **Done when:** disk-full / read-only / conflict each leave the editor open with a Retry
 path; no exit path can silently drop a dirty buffer; tests cover close, quit and background.
 
+**Landed (desktop):** Cmd+Q now goes through the same `request_close` gate as the window
+button: Save and quit / Quit without saving / Cancel, and a failed save keeps the app open
+with the error and the conflict bar instead of quitting. The macOS
+`applicationWillTerminate` observer remains only for system-initiated termination (logout,
+shutdown), where no window exists to ask. Window close and Cmd+Q share one code path.
+**Remaining:** Android lifecycle (Q0.7 covers the save-before-navigate half).
+
 #### Q0.5 Mobile preview is a real navigation surface — A · M
 Attach a `WebViewClient`: resolve internal `.html` links to `vm.openNote`, send external
 links to `ACTION_VIEW`, and block in-place navigation for local files. Preserve the current

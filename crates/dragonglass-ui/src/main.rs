@@ -657,6 +657,8 @@ struct DragonGlassApp {
     focus_handle: FocusHandle,
     /// Set while closing the window is waiting on the user's decision about unsaved notes.
     quit_prompt: bool,
+    /// True when Cmd+Q started the quit, so resolving the prompt also quits the app.
+    quit_after_prompt: bool,
     /// Set once the user has chosen to quit, so the close callback lets the window go.
     allow_close: bool,
     /// The settings page replaces the editor while it is open.
@@ -1434,8 +1436,9 @@ impl DragonGlassApp {
     }
 
     /// macOS quits through `applicationWillTerminate`, which does not call
-    /// `windowShouldClose`. Save dirty buffers from the app-quit observer so Cmd+Q cannot
-    /// drop edits. Other platforms keep their explicit window-close prompt.
+    /// `windowShouldClose`. Cmd+Q is handled by `quit_action`, which runs the normal
+    /// Save / Discard / Cancel contract; this observer is the last resort for a
+    /// system-initiated termination (logout, shutdown), where there is no window to ask.
     fn install_quit_saver(&self, cx: &mut Context<Self>) {
         if cfg!(target_os = "macos") {
             cx.on_app_quit(|app, cx| {
@@ -1482,9 +1485,14 @@ impl DragonGlassApp {
                 self.quit_prompt = false;
                 self.close_requested = true;
                 self.set_status(StatusKind::Success, format!("saved {saved} note(s)"));
+                if self.quit_after_prompt {
+                    self.quit_after_prompt = false;
+                    cx.quit();
+                }
                 cx.notify();
             }
             Err(error) => {
+                // Stay open so the user can resolve the conflict or the failure.
                 self.set_status(StatusKind::Error, format!("could not save: {error}"));
                 cx.notify();
             }
@@ -1495,11 +1503,16 @@ impl DragonGlassApp {
         self.allow_close = true;
         self.quit_prompt = false;
         self.close_requested = true;
+        if self.quit_after_prompt {
+            self.quit_after_prompt = false;
+            cx.quit();
+        }
         cx.notify();
     }
 
     fn cancel_quit(&mut self, cx: &mut Context<Self>) {
         self.quit_prompt = false;
+        self.quit_after_prompt = false;
         self.clear_status();
         cx.notify();
     }
@@ -3331,6 +3344,15 @@ impl DragonGlassApp {
         cx.notify();
     }
 
+    /// Cmd+Q: run the same Save / Discard / Cancel gate as closing the window, then quit.
+    fn quit_action(&mut self, _: &Quit, window: &mut Window, cx: &mut Context<Self>) {
+        if self.request_close(window, cx) {
+            cx.quit();
+        } else {
+            self.quit_after_prompt = true;
+        }
+    }
+
     fn close_tab_action(&mut self, _: &CloseTab, window: &mut Window, cx: &mut Context<Self>) {
         if self.switcher.is_none() {
             self.close_tab(self.active_tab, window, cx);
@@ -3818,6 +3840,7 @@ impl DragonGlassApp {
                 switcher_focus: cx.focus_handle(),
                 focus_handle: cx.focus_handle(),
                 quit_prompt: false,
+                quit_after_prompt: false,
                 // Popped-out windows hand their tabs back to the parent on close; the parent
                 // owns the save prompt, so this window can close immediately.
                 allow_close: true,
@@ -7092,6 +7115,7 @@ impl Render for DragonGlassApp {
             .on_action(cx.listener(Self::detach_tab_action))
             .on_action(cx.listener(Self::toggle_split_editor_action))
             .on_action(cx.listener(Self::close_tab_action))
+            .on_action(cx.listener(Self::quit_action))
             .on_action(cx.listener(Self::reopen_closed_tab_action))
             .on_action(cx.listener(Self::save_as_action))
             .on_action(cx.listener(Self::reload_conflicted))
@@ -7761,6 +7785,7 @@ fn open_vault_window(vault_path: PathBuf, uri_note: Option<String>, cx: &mut App
             switcher_focus: cx.focus_handle(),
             focus_handle: cx.focus_handle(),
             quit_prompt: false,
+            quit_after_prompt: false,
             allow_close: false,
             show_settings: false,
             pending_setting: None,
