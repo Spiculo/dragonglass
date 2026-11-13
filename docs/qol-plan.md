@@ -328,6 +328,12 @@ reading status bar.
 **Done when:** scrolling a long note updates the active outline row; jumping to every
 heading (including folded ones) visibly moves the page.
 
+**Landed:** the reading view reports its nearest heading and progress; the outline row for
+that section is highlighted (and the reading status bar shows `Section · 42%` instead of
+Ln/Col). An outline jump first unfolds every ancestor of the target, so a heading hidden by
+a folded parent is visible when the page moves.
+**Remaining:** scrolling the outline panel itself to keep the active row in view.
+
 ---
 
 ### P1 — reading craft
@@ -420,6 +426,10 @@ Show section name and percent read in the status bar (replace edit-mode Ln/Col),
 line breaks with spaces while preserving explicit hard breaks, and keep footnote/heading
 spacing consistent.
 **Done when:** reading status is meaningful; one-sentence-per-line notes read as paragraphs.
+
+**Landed:** the reading status bar shows the current section and percent read in place of
+Ln/Col, and soft line breaks are joined into spaces while two-space and backslash hard breaks
+are preserved.
 
 #### Q2.11 Split preview performance and sync — D · M
 Debounce full re-parse/re-typeset of split preview and the stats/outline computations on

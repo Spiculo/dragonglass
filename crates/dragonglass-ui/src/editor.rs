@@ -1195,6 +1195,14 @@ impl Editor {
         self.reading_content.scroll_to_block(block);
     }
 
+    /// The reading view's current section and progress, for the status bar and outline.
+    pub fn reading_outline_state(&self) -> (Option<String>, f32) {
+        (
+            self.reading_content.current_heading(),
+            self.reading_content.progress(),
+        )
+    }
+
     /// Put the caret at the start of a source line, clamped to the document.
     pub fn set_cursor_line(&mut self, line: usize) {
         let line = line.min(self.buffer.line_count().saturating_sub(1));
@@ -4433,6 +4441,13 @@ impl Render for Editor {
         let (line, column) = self.buffer.line_col();
         let line_count = self.buffer.line_count();
         let words = self.stats_cache.1.words;
+        // Reading replaces the line/column readout with the section and how far in it is.
+        let reading_status = if reading {
+            let (heading, progress) = self.reading_outline_state();
+            Some((heading, progress))
+        } else {
+            None
+        };
         let git_stat = self.git_stat;
         let selection = self.selection_stats();
         let vim_status = self.vim_enabled().then(|| self.vim_status());
@@ -4458,7 +4473,13 @@ impl Render for Editor {
             .border_color(theme.border)
             .text_xs()
             .text_color(theme.muted)
-            .child(format!("Ln {}, Col {}", line + 1, column + 1))
+            .child(match &reading_status {
+                Some((Some(heading), progress)) => {
+                    format!("{heading} · {:.0}%", progress * 100.0)
+                }
+                Some((None, progress)) => format!("{:.0}% read", progress * 100.0),
+                None => format!("Ln {}, Col {}", line + 1, column + 1),
+            })
             .child(format!("{line_count} lines"))
             .child(format!("{words} words"))
             .when_some(extra_cursors, |d, label| {

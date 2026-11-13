@@ -2007,6 +2007,27 @@ impl DragonGlassApp {
         cx.notify();
     }
 
+    /// Unfold every ancestor of `index` so an outline jump lands on a visible heading.
+    fn reveal_outline_heading(&mut self, index: usize) {
+        let mut level = self
+            .headings
+            .get(index)
+            .map(|heading| heading.level)
+            .unwrap_or(1);
+        for parent in (0..index).rev() {
+            let Some(heading) = self.headings.get(parent) else {
+                continue;
+            };
+            if heading.level < level {
+                self.collapsed_outline.remove(&parent);
+                level = heading.level;
+                if level == 1 {
+                    break;
+                }
+            }
+        }
+    }
+
     /// Open (or create) today's daily note, using `Templates/Daily.md` when present.
     fn open_daily(&mut self, _: &OpenDaily, window: &mut Window, cx: &mut Context<Self>) {
         self.create_periodic(Periodic::Daily, window, cx);
@@ -6681,6 +6702,12 @@ impl Render for DragonGlassApp {
             .child(file_list);
 
         let headings = self.headings.clone();
+        // Highlight the section the reader is in.
+        let reading_heading = if self.editor.read(cx).is_reading() {
+            self.editor.read(cx).reading_outline_state().0
+        } else {
+            None
+        };
 
         let outline: Option<AnyElement> = if headings.is_empty() {
             None
@@ -6698,6 +6725,7 @@ impl Render for DragonGlassApp {
                     })
                     .collect();
             let row_count = outline_rows.len();
+            let current_heading = reading_heading.clone();
             let rows = uniform_list("outline-list", row_count, move |range, _window, _cx| {
                 range
                     .filter_map(|i| outline_rows.get(i))
@@ -6708,6 +6736,7 @@ impl Render for DragonGlassApp {
                         let indent = px(8.0 + heading.level.saturating_sub(1) as f32 * 10.0);
                         let line = heading.line;
                         let heading_text = heading.text.clone();
+                        let is_current = current_heading.as_deref() == Some(heading.text.as_str());
                         let me = me.clone();
 
                         let mut chevron = div()
@@ -6750,7 +6779,12 @@ impl Render for DragonGlassApp {
                             .pr_2()
                             .text_sm()
                             .cursor_pointer()
-                            .text_color(theme.text)
+                            .text_color(if is_current {
+                                theme.accent_text
+                            } else {
+                                theme.text
+                            })
+                            .when(is_current, |row| row.bg(theme.chip))
                             .hover(move |style| style.bg(theme.hover))
                             .child(chevron)
                             .child(
@@ -6762,6 +6796,7 @@ impl Render for DragonGlassApp {
                             )
                             .on_mouse_down(MouseButton::Left, move |_ev, window, cx| {
                                 me.update(cx, |this, cx| {
+                                    this.reveal_outline_heading(index);
                                     this.editor.update(cx, |editor, cx| {
                                         editor.jump_to_heading(
                                             line.saturating_sub(1),

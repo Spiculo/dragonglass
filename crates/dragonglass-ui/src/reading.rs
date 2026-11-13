@@ -741,6 +741,29 @@ impl ReadingCache {
         self.list_state.scroll_to_reveal_item(target);
     }
 
+    /// The nearest heading at or above the top visible block.
+    pub fn current_heading(&self) -> Option<String> {
+        if self.blocks.is_empty() {
+            return None;
+        }
+        let top = self.top_block().min(self.blocks.len() - 1);
+        self.blocks[..=top]
+            .iter()
+            .rev()
+            .find_map(|block| match block {
+                Block::Heading { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+    }
+
+    /// How far down the document the viewport sits, from 0.0 to 1.0.
+    pub fn progress(&self) -> f32 {
+        if self.blocks.len() <= 1 {
+            return 0.0;
+        }
+        (self.top_block() as f32 / (self.blocks.len() - 1) as f32).clamp(0.0, 1.0)
+    }
+
     /// Scroll the reading view so `index` is visible. Restoring a session uses this.
     pub fn scroll_to_block(&mut self, index: usize) {
         if self.blocks.is_empty() {
