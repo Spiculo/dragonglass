@@ -14,8 +14,8 @@ transitions between them.
 > soft line breaks (Q2.10), clickable tag chips and frontmatter links (Q4.5/P2), the window
 > title as note + dirty marker (Q3.12), Vim `:wq` close, redo and failed-search reporting
 > (Q3.12), the code-fence copy button (Q2.7), and the Escape order audit. Everything else in
-> this document is still open; the Android changes are not yet compiled on a device (there is
-> no Android SDK in the development container).
+> this document is still open. The Android changes compile with `:app:compileDebugKotlin` but
+> have not been run on a device yet.
 
 **Basis:** audit of the current working tree (commit `1cb0ec2` plus local session/mobile
 work). Line references are approximate and should be re-checked before implementation.
