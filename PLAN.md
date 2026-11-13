@@ -467,6 +467,9 @@ as `[[selected text]]` without opening the picker.
 mode, snippets and the daily/weekly/monthly/templates/attachments folders. Values are written
 to `.dragon-glass/config.txt`, so they remain plain text and per vault.
 
+It also carries the reading typography: text size and column width (`reader_size`,
+`reader_width`), applied to every open reader and the split preview as soon as they change.
+
 Vim mode is optional and per vault (`vim_mode=true` in `.dragon-glass/config.txt`, the
 command palette, or `Ctrl+Alt+V`). It covers normal/visual/visual-line/insert modes,
 counts, `h j k l w b e 0 ^ $ gg G`, `i a I A o O`, `x X s S D C J`, `d/y/c` operators,

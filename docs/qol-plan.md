@@ -352,6 +352,13 @@ body measure. Expose the same settings on mobile preview.
 **Done when:** changing size/width updates all open readers and split previews immediately
 and survives relaunch; no horizontal scroll appears at 320 px width.
 
+**Landed (desktop):** `reading::ReaderSettings` (body size, measure) is a GPUI global backed
+by `reader_size` and `reader_width` in `config.txt`, with Settings rows that cycle comfortable
+values. Body text, list items, quotes, callouts and the column width all read it, display
+math scales to the measure, and open readers plus the split preview repaint immediately.
+**Remaining:** line height, font family and zoom; metadata header alignment; the mobile
+preview.
+
 #### Q2.5 Zen / focus reading — D · M
 Add a distraction-free mode that hides the tab bar, sidebar, outline and relations, centers
 the page and optionally dims non-active paragraphs. Make every panel toggleable and persist

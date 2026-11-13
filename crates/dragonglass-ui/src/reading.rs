@@ -41,6 +41,27 @@ pub type LinkOpener = Rc<dyn Fn(&str, &mut Window, &mut App)>;
 /// Called when a heading's fold chevron is clicked. The index is the heading's block.
 pub type FoldToggle = Rc<dyn Fn(usize, &mut Window, &mut App)>;
 
+/// Typography for the reading view, stored as a GPUI global so open readers pick up a
+/// change on the next frame.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ReaderSettings {
+    /// Body text size in points.
+    pub body_size: f32,
+    /// Maximum width of the reading column, in pixels.
+    pub measure: f32,
+}
+
+impl Default for ReaderSettings {
+    fn default() -> Self {
+        Self {
+            body_size: 15.0,
+            measure: 780.0,
+        }
+    }
+}
+
+impl gpui::Global for ReaderSettings {}
+
 /// Writes text to the clipboard for the reading view's copy buttons.
 pub type CopyHandler = Rc<dyn Fn(&str, &mut Window, &mut App)>;
 
@@ -130,6 +151,10 @@ struct RenderCtx<'a> {
     depth: usize,
     theme: Theme,
     template: &'a TextRun,
+    /// Body text size for this reader.
+    body_size: f32,
+    /// Maximum width of the reading column.
+    measure: f32,
 }
 
 /// One place a footnote is referenced, used by the footnote picker.
@@ -813,6 +838,10 @@ impl ReadingCache {
             });
         }
 
+        let reader = cx
+            .try_global::<ReaderSettings>()
+            .copied()
+            .unwrap_or_default();
         let footnote_popup = self.footnote_popup.clone();
         let blocks = self.blocks.clone();
         let attachments = self.attachments.clone();
@@ -859,9 +888,16 @@ impl ReadingCache {
                             depth: 0,
                             theme,
                             template: &template,
+                            body_size: reader.body_size,
+                            measure: reader.measure,
                         };
 
-                        let mut item = div().w_full().max_w(px(780.0)).mx_auto().px_2().pb_3();
+                        let mut item = div()
+                            .w_full()
+                            .max_w(px(reader.measure))
+                            .mx_auto()
+                            .px_2()
+                            .pb_3();
                         // Display math is centred by the item itself: the list gives each
                         // item the full column width, but a shrink-to-fit child would
                         // otherwise sit at the left edge.
@@ -950,6 +986,8 @@ fn reading_column(src: &str, ctx: &RenderCtx) -> impl IntoElement {
         depth: ctx.depth + 1,
         theme: ctx.theme,
         template: &template,
+        body_size: ctx.body_size,
+        measure: ctx.measure,
     };
 
     div().flex().flex_col().gap_3().children(
@@ -1012,7 +1050,7 @@ fn render_block(block: Block, block_index: Option<usize>, ctx: &RenderCtx) -> An
                 )))
                 .into_any_element()
         }
-        Block::Paragraph(text) => rich_text(&text, 15.0, block_index, 0, ctx),
+        Block::Paragraph(text) => rich_text(&text, ctx.body_size, block_index, 0, ctx),
         Block::ListItem {
             depth,
             marker,
@@ -1048,7 +1086,7 @@ fn render_block(block: Block, block_index: Option<usize>, ctx: &RenderCtx) -> An
                 // reading column, and every later block loses the column's alignment.
                 .child(div().flex_1().min_w(px(0.0)).child(rich_text(
                     &text,
-                    15.0,
+                    ctx.body_size,
                     block_index,
                     0,
                     ctx,
@@ -1064,7 +1102,7 @@ fn render_block(block: Block, block_index: Option<usize>, ctx: &RenderCtx) -> An
                 .border_l_1()
                 .border_color(theme.border)
                 .pl_3()
-                .child(rich_text(&text, 15.0, block_index, 0, &muted_ctx))
+                .child(rich_text(&text, ctx.body_size, block_index, 0, &muted_ctx))
                 .into_any_element()
         }
         Block::Rule => div()
@@ -1131,7 +1169,7 @@ fn render_block(block: Block, block_index: Option<usize>, ctx: &RenderCtx) -> An
                 .gap_1()
                 .child(rich_text_styled(
                     &title,
-                    15.0,
+                    ctx.body_size,
                     block_index,
                     0,
                     &title_ctx,
@@ -1139,7 +1177,7 @@ fn render_block(block: Block, block_index: Option<usize>, ctx: &RenderCtx) -> An
                     1.3,
                 ))
                 .when(!text.trim().is_empty(), |d| {
-                    d.child(rich_text(&text, 15.0, block_index, body_base, ctx))
+                    d.child(rich_text(&text, ctx.body_size, block_index, body_base, ctx))
                 })
                 .into_any_element()
         }
@@ -1169,6 +1207,8 @@ impl<'a> RenderCtx<'a> {
             depth: self.depth,
             theme: self.theme,
             template,
+            body_size: self.body_size,
+            measure: self.measure,
         }
     }
 }
@@ -1214,8 +1254,8 @@ fn block_texts(block: &Block) -> Vec<&str> {
 /// A display formula, centred and scaled down when it is wider than the reading column.
 fn render_math(tex: &str, ctx: &RenderCtx) -> AnyElement {
     const FONT_SIZE: f32 = 17.0;
-    /// Usable width inside the reading column (780 max width, 8 px padding each side).
-    const MAX_WIDTH: f32 = 736.0;
+    /// Usable width inside the reading column.
+    let max_width: f32 = (ctx.measure - 44.0).max(320.0);
 
     let Some(scene) = ctx
         .math
@@ -1226,8 +1266,8 @@ fn render_math(tex: &str, ctx: &RenderCtx) -> AnyElement {
     };
 
     let width = scene.width() as f32 * FONT_SIZE;
-    let scale = if width > MAX_WIDTH {
-        (MAX_WIDTH / width).max(0.6)
+    let scale = if width > max_width {
+        (max_width / width).max(0.6)
     } else {
         1.0
     };

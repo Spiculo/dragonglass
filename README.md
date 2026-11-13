@@ -57,6 +57,8 @@ A lot already works. This is a working application, not a mockup — but it is e
 - Wikilink, tag and slash-command autocomplete while typing
 - Command palette, a settings page (`Ctrl+,`), configurable hotkeys, light/dark themes and
   snippets
+- Reading typography: text size and column width are settings, applied to every open reader
+  and the split preview immediately and stored per vault
 
 **Vault and knowledge**
 - File tree with new note/folder, rename, move and delete to a recoverable trash

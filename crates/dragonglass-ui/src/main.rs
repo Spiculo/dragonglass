@@ -108,6 +108,7 @@ use gpui::{
     WindowBounds, WindowOptions,
 };
 use graph_view::GraphView;
+use reading::ReaderSettings;
 use reading::ReadingCache;
 use theme::Theme;
 
@@ -4219,6 +4220,57 @@ impl DragonGlassApp {
         cx.notify();
     }
 
+    /// Apply the reading typography after the config changed, and repaint every reader.
+    fn refresh_reader_settings(&mut self, cx: &mut Context<Self>) {
+        cx.set_global(ReaderSettings {
+            body_size: self.config.reader_size as f32,
+            measure: self.config.reader_width as f32,
+        });
+        let editors: Vec<Entity<Editor>> = self.tabs.iter().map(|tab| tab.editor.clone()).collect();
+        for editor in editors {
+            editor.update(cx, |_, cx| cx.notify());
+        }
+        cx.notify();
+    }
+
+    /// Cycle the reading body size / measure through a short list of comfortable values.
+    fn cycle_reader_setting(&mut self, width: bool, cx: &mut Context<Self>) {
+        if width {
+            const STEPS: [u16; 5] = [640, 720, 780, 900, 1040];
+            let next = STEPS
+                .iter()
+                .position(|step| *step == self.config.reader_width)
+                .map(|index| STEPS[(index + 1) % STEPS.len()])
+                .unwrap_or(STEPS[0]);
+            self.config.reader_width = next;
+        } else {
+            const STEPS: [u16; 8] = [13, 14, 15, 16, 17, 18, 20, 22];
+            let next = STEPS
+                .iter()
+                .position(|step| *step == self.config.reader_size)
+                .map(|index| STEPS[(index + 1) % STEPS.len()])
+                .unwrap_or(STEPS[2]);
+            self.config.reader_size = next;
+        }
+        let (kind, message) = match config::save(&self.vault_root, &self.config) {
+            Ok(()) => (
+                StatusKind::Info,
+                if width {
+                    format!("reading width: {} px", self.config.reader_width)
+                } else {
+                    format!("reading text: {} px", self.config.reader_size)
+                },
+            ),
+            Err(error) => (
+                StatusKind::Warn,
+                format!("reader setting changed (not saved: {error})"),
+            ),
+        };
+        self.refresh_reader_settings(cx);
+        self.set_status(kind, message);
+        cx.notify();
+    }
+
     /// Turn note autosave on or off for this vault and every open editor.
     fn toggle_autosave(&mut self, cx: &mut Context<Self>) {
         self.config.autosave = !self.config.autosave;
@@ -4365,6 +4417,8 @@ impl DragonGlassApp {
             "vim" => self.toggle_vim(cx),
             "snippets" => self.toggle_snippets(cx),
             "autosave" => self.toggle_autosave(cx),
+            "reader-size" => self.cycle_reader_setting(false, cx),
+            "reader-width" => self.cycle_reader_setting(true, cx),
             "font" => self.open_setting(SettingKey::FontSize, window, cx),
             "accent" => self.open_setting(SettingKey::Accent, window, cx),
             "attachments" => self.open_setting(SettingKey::AttachmentsFolder, window, cx),
@@ -4563,6 +4617,20 @@ impl DragonGlassApp {
                         "Autosave notes",
                         if self.config.autosave { "on" } else { "off" }.to_string(),
                         "autosave",
+                        theme,
+                    ))
+                    .child(row(
+                        "setting-reader-size",
+                        "Reading text size",
+                        format!("{} px", self.config.reader_size),
+                        "reader-size",
+                        theme,
+                    ))
+                    .child(row(
+                        "setting-reader-width",
+                        "Reading width",
+                        format!("{} px", self.config.reader_width),
+                        "reader-width",
                         theme,
                     ))
                     .child(heading("Editor shortcuts", theme))
@@ -7878,6 +7946,10 @@ fn open_vault_window(vault_path: PathBuf, uri_note: Option<String>, cx: &mut App
     let initial_stats = stats::compute(&initial_text);
     let note_index = resolve::NoteIndex::new(&note_refs);
     cx.set_global(initial_theme);
+    cx.set_global(ReaderSettings {
+        body_size: initial_config.reader_size as f32,
+        measure: initial_config.reader_width as f32,
+    });
 
     let bounds = Bounds::centered(None, size(px(1000.0), px(640.0)), cx);
     let options = WindowOptions {

@@ -23,6 +23,10 @@ pub struct Config {
     pub autosave: bool,
     /// Editor text size in points, persisted so the setting follows the vault.
     pub font_size: u16,
+    /// Reading view body text size in points.
+    pub reader_size: u16,
+    /// Reading view column width in pixels.
+    pub reader_width: u16,
 }
 
 impl Default for Config {
@@ -38,6 +42,8 @@ impl Default for Config {
             vim_mode: false,
             autosave: false,
             font_size: 14,
+            reader_size: 15,
+            reader_width: 780,
         }
     }
 }
@@ -57,6 +63,8 @@ impl Config {
         out.push_str(&format!("vim_mode={}\n", self.vim_mode));
         out.push_str(&format!("autosave={}\n", self.autosave));
         out.push_str(&format!("font_size={}\n", self.font_size));
+        out.push_str(&format!("reader_size={}\n", self.reader_size));
+        out.push_str(&format!("reader_width={}\n", self.reader_width));
         out
     }
 
@@ -95,6 +103,16 @@ impl Config {
                 "font_size" => {
                     if let Ok(size) = value.parse::<u16>() {
                         config.font_size = size.clamp(9, 32);
+                    }
+                }
+                "reader_size" => {
+                    if let Ok(size) = value.parse::<u16>() {
+                        config.reader_size = size.clamp(11, 24);
+                    }
+                }
+                "reader_width" => {
+                    if let Ok(width) = value.parse::<u16>() {
+                        config.reader_width = width.clamp(480, 1200);
                     }
                 }
                 _ => {}
@@ -144,6 +162,22 @@ mod tests {
         assert_eq!(Config::from_text(&config.to_text()).font_size, 18);
         assert_eq!(Config::from_text("font_size=2").font_size, 9);
         assert_eq!(Config::from_text("font_size=99").font_size, 32);
+    }
+
+    #[test]
+    fn reader_typography_roundtrips_and_is_clamped() {
+        let config = Config {
+            reader_size: 18,
+            reader_width: 900,
+            ..Config::default()
+        };
+        let loaded = Config::from_text(&config.to_text());
+        assert_eq!(loaded.reader_size, 18);
+        assert_eq!(loaded.reader_width, 900);
+        assert_eq!(Config::from_text("reader_size=1").reader_size, 11);
+        assert_eq!(Config::from_text("reader_width=9999").reader_width, 1200);
+        assert_eq!(Config::default().reader_size, 15);
+        assert_eq!(Config::default().reader_width, 780);
     }
 
     #[test]
