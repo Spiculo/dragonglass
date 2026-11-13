@@ -190,6 +190,7 @@ on macOS) to open another vault in its own window, or remove stale entries in th
 | `Ctrl+Shift+S` | Save as (also offered by `Ctrl+S` on an untitled note) |
 | `Ctrl+Shift+T` | Reopen the last closed tab |
 | `Ctrl+[` / `Ctrl+]` | Back / forward through visited notes |
+| `Ctrl+Alt+Z` | Zen mode (hide the tab bar and side panels; Escape leaves) |
 | `Tab` / `Shift+Tab` | Indent / outdent the selection (or the caret's line) |
 | `Ctrl+D` | Select the word and then its next occurrence (multi-cursor) |
 | `Ctrl+Alt+Up/Down` | Add a cursor on the row above/below |

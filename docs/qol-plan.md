@@ -409,6 +409,11 @@ the choice.
 **Done when:** one shortcut/palette command enters and leaves zen mode; the document does
 not jump when panels hide.
 
+**Landed:** Zen mode (`Ctrl/Cmd+Alt+Z`, also in the palette) hides the tab bar, sidebar,
+outline and relations with one command; Escape leaves it. The reading column and editor
+keep their own width and scroll, so hiding the panels does not move the document.
+**Remaining:** dimming non-active paragraphs and remembering the panel choice per vault.
+
 #### Q2.6 Media actually renders — D · A · M–L
 Render inline images (not just standalone embeds), honor `![[img|300]]` width/alt, support
 remote image URLs, and provide a real viewer or OS-open fallback for PDF/audio/video.

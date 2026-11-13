@@ -64,6 +64,7 @@ const HOTKEYS: &[(&str, &str, &str)] = &[
     ("CloseTab", "secondary+w", "Close tab"),
     ("ReopenClosedTab", "secondary+shift+t", "Reopen closed tab"),
     ("SaveAs", "secondary+shift+s", "Save note as"),
+    ("ToggleZen", "secondary+alt+z", "Zen mode"),
     ("NavBack", "secondary+[", "Back"),
     ("NavForward", "secondary+]", "Forward"),
     ("NextTab", "ctrl-tab", "Next tab"),
@@ -96,6 +97,7 @@ fn bind_named(cx: &mut App, key: &str, action: &str) {
         "CloseTab" => cx.bind_keys([KeyBinding::new(key, CloseTab, None)]),
         "ReopenClosedTab" => cx.bind_keys([KeyBinding::new(key, ReopenClosedTab, None)]),
         "SaveAs" => cx.bind_keys([KeyBinding::new(key, SaveAs, None)]),
+        "ToggleZen" => cx.bind_keys([KeyBinding::new(key, ToggleZen, None)]),
         "NavBack" => cx.bind_keys([KeyBinding::new(key, NavBack, None)]),
         "NavForward" => cx.bind_keys([KeyBinding::new(key, NavForward, None)]),
         "NextTab" => cx.bind_keys([KeyBinding::new(key, NextTab, None)]),
@@ -143,6 +145,7 @@ actions!(
         CloseTab,
         ReopenClosedTab,
         SaveAs,
+        ToggleZen,
         ReloadConflicted,
         KeepMine,
         CompareConflicted,
@@ -253,6 +256,7 @@ enum CommandId {
     DeleteNote,
     SaveAs,
     History,
+    Zen,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -582,6 +586,8 @@ struct DragonGlassApp {
     tabs: Vec<Tab>,
     /// Recently closed notes, newest last, so a close can be undone with the keyboard.
     closed_tabs: Vec<ClosedTab>,
+    /// Hide the chrome (tab bar, sidebar, outline, relations) for distraction-free reading.
+    zen: bool,
     /// Places visited in this window, and where the user currently sits in them.
     nav_history: Vec<NavEntry>,
     nav_index: usize,
@@ -1771,6 +1777,19 @@ impl DragonGlassApp {
         );
     }
 
+    fn toggle_zen(&mut self, _: &ToggleZen, _window: &mut Window, cx: &mut Context<Self>) {
+        self.zen = !self.zen;
+        self.set_status(
+            StatusKind::Info,
+            if self.zen {
+                "zen mode — Escape to leave"
+            } else {
+                "zen mode off"
+            },
+        );
+        cx.notify();
+    }
+
     fn nav_back(&mut self, _: &NavBack, window: &mut Window, cx: &mut Context<Self>) {
         if self.nav_history.is_empty() || self.nav_index == 0 {
             self.set_status(StatusKind::Info, "no earlier note");
@@ -2475,6 +2494,7 @@ impl DragonGlassApp {
                 command_item("Rename current note", "", CommandId::RenameNote),
                 command_item("Delete current note", "", CommandId::DeleteNote),
                 command_item("Save note as", "", CommandId::SaveAs),
+                command_item("Toggle zen mode", "secondary-alt+z", CommandId::Zen),
                 command_item("File recovery", "", CommandId::History),
                 command_item("Check for updates", "", CommandId::CheckUpdates),
                 command_item("Graph view", "secondary+shift+g", CommandId::OpenGraph),
@@ -3322,6 +3342,12 @@ impl DragonGlassApp {
             return;
         }
 
+        if self.zen {
+            self.zen = false;
+            cx.notify();
+            return;
+        }
+
         // Menus and popups close before the panels they belong to.
         if self.tree_menu.is_some() {
             self.tree_menu = None;
@@ -4112,6 +4138,7 @@ impl DragonGlassApp {
                 editor: editor.clone(),
                 tabs,
                 closed_tabs: Vec::new(),
+                zen: false,
                 nav_history: Vec::new(),
                 nav_index: 0,
                 active_tab,
@@ -5573,6 +5600,15 @@ impl DragonGlassApp {
                                         cx.notify();
                                     });
                                     window.focus(&self.editor.focus_handle(cx));
+                                    return;
+                                }
+                                CommandId::Zen => {
+                                    self.zen = !self.zen;
+                                    self.set_status(
+                                        StatusKind::Info,
+                                        if self.zen { "zen mode" } else { "zen mode off" },
+                                    );
+                                    cx.notify();
                                     return;
                                 }
                                 CommandId::ToggleVim => {
@@ -7515,6 +7551,7 @@ impl Render for DragonGlassApp {
             .on_action(cx.listener(Self::recover_draft))
             .on_action(cx.listener(Self::compare_draft))
             .on_action(cx.listener(Self::discard_draft))
+            .on_action(cx.listener(Self::toggle_zen))
             .on_action(cx.listener(Self::nav_back))
             .on_action(cx.listener(Self::nav_forward))
             .on_action(cx.listener(Self::copy_selection))
@@ -7594,36 +7631,46 @@ impl Render for DragonGlassApp {
             .children(quit_bar)
             .children(conflict_bar)
             .children(draft_bar)
-            .child(tab_bar)
+            .when(!self.zen, |d| d.child(tab_bar))
             .child(
                 div()
                     .flex()
                     .flex_row()
                     .flex_1()
                     .min_h(px(0.0))
-                    .child(sidebar)
-                    .child(resize_handle(ResizePanel::Sidebar, theme, cx))
+                    .when(!self.zen, |d| {
+                        d.child(sidebar)
+                            .child(resize_handle(ResizePanel::Sidebar, theme, cx))
+                    })
                     .child(center)
-                    .children(outline.map(|panel| {
-                        let handle = resize_handle(ResizePanel::Outline, theme, cx);
-                        div()
-                            .flex()
-                            .flex_row()
-                            .h_full()
-                            .child(handle)
-                            .child(panel)
-                            .into_any_element()
-                    }))
-                    .children(relations_panel.map(|panel| {
-                        let handle = resize_handle(ResizePanel::Relations, theme, cx);
-                        div()
-                            .flex()
-                            .flex_row()
-                            .h_full()
-                            .child(handle)
-                            .child(panel)
-                            .into_any_element()
-                    })),
+                    .children(if self.zen {
+                        None
+                    } else {
+                        outline.map(|panel| {
+                            let handle = resize_handle(ResizePanel::Outline, theme, cx);
+                            div()
+                                .flex()
+                                .flex_row()
+                                .h_full()
+                                .child(handle)
+                                .child(panel)
+                                .into_any_element()
+                        })
+                    })
+                    .children(if self.zen {
+                        None
+                    } else {
+                        relations_panel.map(|panel| {
+                            let handle = resize_handle(ResizePanel::Relations, theme, cx);
+                            div()
+                                .flex()
+                                .flex_row()
+                                .h_full()
+                                .child(handle)
+                                .child(panel)
+                                .into_any_element()
+                        })
+                    }),
             )
     }
 }
@@ -8153,6 +8200,7 @@ fn open_vault_window(vault_path: PathBuf, uri_note: Option<String>, cx: &mut App
             editor: editor.clone(),
             tabs: initial_tabs,
             closed_tabs: Vec::new(),
+            zen: false,
             nav_history: Vec::new(),
             nav_index: 0,
             active_tab: initial_active,
