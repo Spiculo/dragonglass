@@ -104,7 +104,14 @@ class DragonGlassViewModel(application: Application) : AndroidViewModel(applicat
     var source by mutableStateOf("")
         private set
     var preview by mutableStateOf(false)
+    /// WebView scroll offset, kept when switching between Edit and Preview.
+    var previewScroll by mutableStateOf(0)
         private set
+
+    /// Remember where the preview was scrolled when it is closed.
+    fun rememberPreviewScroll(offset: Int) {
+        previewScroll = offset
+    }
     var previewHtml by mutableStateOf("")
         private set
     var dirty by mutableStateOf(false)
@@ -490,6 +497,7 @@ class DragonGlassViewModel(application: Application) : AndroidViewModel(applicat
                     // A link followed inside the preview keeps the preview open.
                     preview = keepPreview
                     previewHtml = opened.html
+                    previewScroll = 0
                     dirty = false
                     pendingLine = jumpToLine
                 }

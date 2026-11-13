@@ -29,7 +29,9 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.KeyboardActions
@@ -118,10 +120,16 @@ fun DragonGlassApp(vm: DragonGlassViewModel) {
         }
     }
 
+    // The note lists stay in these states across a note opening and closing, so Back
+    // returns to the same row instead of the top of the list.
+    val noteListState = rememberLazyListState()
+    val treeListState = rememberLazyListState()
+    val searchListState = rememberLazyListState()
+
     Box(Modifier.fillMaxSize()) {
         val selected = vm.selected
         if (selected == null) {
-            NotesScreen(vm)
+            NotesScreen(vm, noteListState, treeListState, searchListState)
         } else {
             EditorScreen(vm, selected)
         }
@@ -149,7 +157,12 @@ private enum class VaultAction { Import, Export }
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun NotesScreen(vm: DragonGlassViewModel) {
+private fun NotesScreen(
+    vm: DragonGlassViewModel,
+    noteListState: LazyListState,
+    treeListState: LazyListState,
+    searchListState: LazyListState,
+) {
     var showSync by remember { mutableStateOf(false) }
     var showGraph by remember { mutableStateOf(false) }
     var showTemplates by remember { mutableStateOf(false) }
@@ -356,13 +369,13 @@ private fun NotesScreen(vm: DragonGlassViewModel) {
             }
 
             when {
-                vm.query.isNotBlank() -> SearchResults(vm)
+                vm.query.isNotBlank() -> SearchResults(vm, searchListState)
                 vm.notes.isEmpty() && !vm.loading -> EmptyVault()
-                vm.browseMode == BrowseMode.Tree -> TreeList(vm)
+                vm.browseMode == BrowseMode.Tree -> TreeList(vm, treeListState)
                 vm.visibleNotes.isEmpty() -> MutedLine(
                     if (vm.bookmarksOnly) "No bookmarked notes yet." else "No notes here yet.",
                 )
-                else -> NoteList(vm)
+                else -> NoteList(vm, noteListState)
             }
         }
     }
@@ -430,8 +443,8 @@ private fun NotesScreen(vm: DragonGlassViewModel) {
 }
 
 @Composable
-private fun NoteList(vm: DragonGlassViewModel) {
-    LazyColumn(Modifier.fillMaxSize()) {
+private fun NoteList(vm: DragonGlassViewModel, state: LazyListState) {
+    LazyColumn(state = state, modifier = Modifier.fillMaxSize()) {
         items(vm.visibleNotes, key = { it.relative }) { note ->
             NoteRow(
                 note = note,
@@ -445,8 +458,8 @@ private fun NoteList(vm: DragonGlassViewModel) {
 }
 
 @Composable
-private fun TreeList(vm: DragonGlassViewModel) {
-    LazyColumn(Modifier.fillMaxSize()) {
+private fun TreeList(vm: DragonGlassViewModel, state: LazyListState) {
+    LazyColumn(state = state, modifier = Modifier.fillMaxSize()) {
         items(vm.visibleTreeRows, key = { it.path }) { row ->
             if (row.isDir) {
                 DirectoryRow(
@@ -486,12 +499,12 @@ private fun DirectoryRow(row: TreeRow, collapsed: Boolean, onClick: () -> Unit) 
 }
 
 @Composable
-private fun SearchResults(vm: DragonGlassViewModel) {
+private fun SearchResults(vm: DragonGlassViewModel, state: LazyListState) {
     if (vm.visibleNotes.isEmpty() && vm.visibleHits.isEmpty() && !vm.loading) {
         MutedLine("No notes or text match “${vm.query}”.")
         return
     }
-    LazyColumn(Modifier.fillMaxSize()) {
+    LazyColumn(state = state, modifier = Modifier.fillMaxSize()) {
         if (vm.visibleNotes.isNotEmpty()) {
             item { SectionHeader("Notes") }
             items(vm.visibleNotes, key = { "note:${it.relative}" }) { note ->
@@ -718,6 +731,8 @@ private fun EditorScreen(vm: DragonGlassViewModel, relative: String) {
                     baseUrl = vm.baseUrl,
                     modifier = Modifier.fillMaxSize(),
                     onOpenNote = { vm.openLinkedNote(it) },
+                    initialScroll = vm.previewScroll,
+                    onScroll = { vm.rememberPreviewScroll(it) },
                 )
             } else {
                 BasicTextField(
@@ -1712,6 +1727,8 @@ private fun MarkdownWebView(
     baseUrl: String,
     modifier: Modifier = Modifier,
     onOpenNote: (String) -> Unit = {},
+    initialScroll: Int = 0,
+    onScroll: (Int) -> Unit = {},
 ) {
     val dark = isSystemInDarkTheme()
     val themed = remember(html, dark) {
@@ -1733,6 +1750,11 @@ private fun MarkdownWebView(
                 settings.useWideViewPort = true
                 setBackgroundColor(android.graphics.Color.TRANSPARENT)
                 webViewClient = object : WebViewClient() {
+                    override fun onPageFinished(view: WebView?, url: String?) {
+                        // Restore the previous preview position after a reload.
+                        view?.post { view.scrollTo(0, initialScroll) }
+                    }
+
                     override fun shouldOverrideUrlLoading(
                         view: WebView?,
                         request: WebResourceRequest?,
@@ -1756,7 +1778,15 @@ private fun MarkdownWebView(
             }
         },
         update = { webView ->
-            webView.loadDataWithBaseURL(baseUrl, themed, "text/html", "utf-8", null)
+            // Reloading on every recomposition used to reset the scroll and re-lay out the
+            // page; only load when the rendered document actually changed.
+            if (webView.tag != themed) {
+                webView.tag = themed
+                webView.loadDataWithBaseURL(baseUrl, themed, "text/html", "utf-8", null)
+            }
+        },
+        onRelease = { webView ->
+            onScroll(webView.scrollY)
         },
     )
 }

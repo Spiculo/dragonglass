@@ -330,12 +330,26 @@ note opens. Preserve preview scroll across Edit ↔ Preview.
 **Done when:** open a note from row 80, read to the bottom, press Back, and return to row
 80; toggle Preview and return to the same paragraph.
 
+**Landed:** the note list, tree list and search results keep their `LazyListState` in
+`DragonGlassApp`, so opening a note and pressing Back returns to the same row and query. The
+preview WebView saves its scroll offset when Edit replaces it and restores it after the page
+finishes loading, and it only reloads when the rendered document actually changes (so a
+recomposition no longer resets the page).
+**Remaining:** the editor's own selection/scroll is still owned by `BasicTextField` and
+resets when the screen is rebuilt.
+
 #### Q1.8 Mobile back precedence — A · S
 Define one hierarchy: Preview → Edit; search results → list; sheet/dialog → dismiss; dirty
 note → save/discard prompt; clean note → list; list with a query → clear query; otherwise
 exit. Use one `BackHandler` per level, not competing handlers.
 **Done when:** every Back press is predictable and no screen is skipped; a scripted
 back-through-the-app test passes.
+
+**Landed:** Back goes Preview → Edit → list; sheets and dialogs dismiss themselves through
+Material; the editor's Back closes the note only after a successful save (a failed save
+keeps it open, Q0.7); the list clears the search query, then the bookmarks filter, before it
+leaves the screen. One `BackHandler` per level.
+**Remaining:** a dirty note closes by saving rather than offering a Save/Discard prompt.
 
 #### Q1.9 Outline follows the reader — D · S
 Highlight the current heading while scrolling, scroll the outline to it, and make outline
