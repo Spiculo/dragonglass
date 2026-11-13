@@ -227,7 +227,7 @@ pub fn parse_blocks(src: &str) -> Vec<Block> {
         // Setext headings: a paragraph line underlined with `===` or `---`.
         if !paragraph.is_empty() {
             if let Some(level) = setext_underline(trimmed) {
-                let text = paragraph.join(" ");
+                let text = join_soft_breaks(&paragraph);
                 paragraph.clear();
                 blocks.push(Block::Heading { level, text });
                 i += 1;
@@ -258,7 +258,8 @@ pub fn parse_blocks(src: &str) -> Vec<Block> {
             if let Some(callout) = parse_callout(&quoted) {
                 blocks.push(callout);
             } else {
-                blocks.push(Block::Quote(quoted.join("\n")));
+                let borrowed: Vec<&str> = quoted.iter().map(String::as_str).collect();
+                blocks.push(Block::Quote(join_soft_breaks(&borrowed)));
             }
             continue;
         }
@@ -276,7 +277,7 @@ pub fn parse_blocks(src: &str) -> Vec<Block> {
             continue;
         }
 
-        paragraph.push(trimmed);
+        paragraph.push(line);
         i += 1;
     }
 
@@ -312,9 +313,39 @@ fn flush_paragraph(paragraph: &mut Vec<&str>, blocks: &mut Vec<Block>) {
         }
     }
 
-    let text = paragraph.join("\n");
+    let text = join_soft_breaks(paragraph);
     paragraph.clear();
     blocks.push(Block::Paragraph(text));
+}
+
+/// Whether a source line ends with a hard break: two trailing spaces or a backslash.
+fn hard_break(line: &str) -> bool {
+    let trimmed = line.trim_end();
+    line.len() - trimmed.len() >= 2 || trimmed.ends_with('\\')
+}
+
+/// Join the source lines of one paragraph the way a reader shows them.
+///
+/// Obsidian writes one sentence or clause per line, so a soft line break renders as a
+/// space. A line that ends with two spaces or a backslash keeps an explicit line break.
+fn join_soft_breaks(lines: &[&str]) -> String {
+    let mut out = String::new();
+    for (index, line) in lines.iter().enumerate() {
+        if index > 0 {
+            out.push(if hard_break(lines[index - 1]) {
+                '\n'
+            } else {
+                ' '
+            });
+        }
+        let mut content = line.trim();
+        if content.ends_with('\\') {
+            // The backslash itself is markup, not text.
+            content = content.trim_end_matches('\\').trim_end();
+        }
+        out.push_str(content);
+    }
+    out
 }
 
 /// A line that is nothing but an embed, as Obsidian writes embedded images and notes.
@@ -692,9 +723,32 @@ mod tests {
         assert_eq!(
             blocks,
             vec![
-                Block::Paragraph("line one\nline two".into()),
+                Block::Paragraph("line one line two".into()),
                 Block::Paragraph("next".into()),
             ]
+        );
+    }
+
+    #[test]
+    fn soft_breaks_join_but_hard_breaks_stay() {
+        // Two trailing spaces and a trailing backslash are hard breaks; everything else is
+        // a soft break that reads as a space, as Obsidian and CommonMark render it.
+        let blocks = parse_blocks("one\ntwo  \nthree\\\nfour\n\nfive");
+        assert_eq!(
+            blocks,
+            vec![
+                Block::Paragraph("one two\nthree\nfour".into()),
+                Block::Paragraph("five".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn quotes_join_soft_breaks_too() {
+        let blocks = parse_blocks("> first\n> second\n> third  \n> fourth");
+        assert_eq!(
+            blocks,
+            vec![Block::Quote("first second third\nfourth".into())]
         );
     }
 
@@ -800,7 +854,7 @@ mod tests {
         assert_eq!(
             blocks,
             vec![
-                Block::Quote("one\ntwo".into()),
+                Block::Quote("one two".into()),
                 Block::Paragraph("after".into()),
             ]
         );
