@@ -596,6 +596,45 @@ class DragonGlassViewModel(application: Application) : AndroidViewModel(applicat
         }
     }
 
+    /// Create a note from a typed title: the title becomes the file name and the heading.
+    fun createNote(title: String) {
+        val trimmed = title.trim()
+        if (trimmed.isEmpty()) {
+            error = "A note needs a name"
+            return
+        }
+        val safe = trimmed
+            .map { ch -> if (ch in "/\\:*?\"<>|") '-' else ch }
+            .joinToString("")
+            .trim()
+        if (safe.isEmpty()) {
+            error = "A note needs a name"
+            return
+        }
+        viewModelScope.launch {
+            val result = runCatching {
+                withContext(Dispatchers.IO) {
+                    val loaded = ensureVault()
+                    var relative = "$safe.md"
+                    var index = 1
+                    while (File(vaultDirectory, relative).exists()) {
+                        index++
+                        relative = "$safe $index.md"
+                    }
+                    loaded.createNote(relative, "# $trimmed\n\n")
+                    relative
+                }
+            }
+            result
+                .onSuccess {
+                    refresh()
+                    openNote(it)
+                    mirrorNote(it)
+                }
+                .onFailure { error = it.message ?: "Could not create the note" }
+        }
+    }
+
     fun openDaily() = openPeriodic("daily") { it.openDaily() }
 
     fun openWeekly() = openPeriodic("weekly") { it.openWeekly() }

@@ -155,6 +155,7 @@ private fun NotesScreen(vm: DragonGlassViewModel) {
     var showTemplates by remember { mutableStateOf(false) }
     var showTrash by remember { mutableStateOf(false) }
     var showNewFolder by remember { mutableStateOf(false) }
+    var showNewNote by remember { mutableStateOf(false) }
     var showVaults by remember { mutableStateOf(false) }
     var pendingAction by remember { mutableStateOf<VaultAction?>(null) }
     var menuOpen by remember { mutableStateOf(false) }
@@ -310,7 +311,7 @@ private fun NotesScreen(vm: DragonGlassViewModel) {
         },
         floatingActionButton = {
             FloatingActionButton(
-                onClick = vm::newNote,
+                onClick = { showNewNote = true },
                 containerColor = MaterialTheme.colorScheme.primary,
                 contentColor = MaterialTheme.colorScheme.onPrimary,
             ) {
@@ -381,6 +382,20 @@ private fun NotesScreen(vm: DragonGlassViewModel) {
     }
     if (showTrash) {
         TrashSheet(vm, onDismiss = { showTrash = false })
+    }
+    if (showNewNote) {
+        TextInputDialog(
+            title = "New note",
+            label = "Title",
+            initial = "",
+            hint = "The title becomes the file name and the first heading.",
+            confirmLabel = "Create",
+            onDismiss = { showNewNote = false },
+            onConfirm = {
+                vm.createNote(it)
+                showNewNote = false
+            },
+        )
     }
     if (showNewFolder) {
         TextInputDialog(

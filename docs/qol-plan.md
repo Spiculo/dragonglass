@@ -645,6 +645,11 @@ Prompt for title and folder on create (no root "Untitled"), add long-press row a
 **Done when:** creating a note takes one intentional dialog; every chip in Details navigates
 or filters.
 
+**Landed (Android):** the floating button opens a **New note** dialog asking for a title;
+the title becomes the file name (sanitized, with ` 2`, ` 3` suffixes for duplicates) and the
+first heading, instead of an untyped `Untitled.md`.
+**Remaining:** folder selection, long-press row actions and clickable detail chips.
+
 #### Q4.6 Import/export progress — A · S
 Report file/byte progress, allow cancel, and keep the UI responsive for large vaults.
 **Done when:** importing 10k files shows progress and can be cancelled without corruption.
