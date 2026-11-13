@@ -402,6 +402,11 @@ pub struct ReadingCache {
     footnote_popup: Option<Entity<FootnotePopup>>,
     /// Heading blocks whose sections are folded.
     folded: HashSet<usize>,
+    /// Source lines for each block, so the editor can map caret ↔ reader.
+    spans: Rc<Vec<markdown::BlockSpan>>,
+    /// False when shared-block expansion rewrote the text, which moves the spans away
+    /// from the buffer's own line numbers.
+    spans_valid: bool,
 }
 
 impl ReadingCache {
@@ -418,6 +423,8 @@ impl ReadingCache {
             metadata: None,
             footnote_refs: Rc::new(RefCell::new(HashMap::new())),
             footnote_defs: Rc::new(RefCell::new(HashMap::new())),
+            spans: Rc::new(Vec::new()),
+            spans_valid: false,
             footnote_popup: None,
             folded: HashSet::new(),
         }
@@ -458,11 +465,13 @@ impl ReadingCache {
             self.folded.clear();
         }
 
+        let original = source.to_string();
         let source = match root {
             Some(root) => shared::expand(source, root),
             None => source.to_string(),
         };
-        let blocks = markdown::parse_blocks(&source);
+        let spans_valid = source == original;
+        let (blocks, spans) = markdown::parse_blocks_spanned(&source);
         self.properties = frontmatter::display_properties(&source);
 
         // Typeset every formula once per document version. Scenes are in em, so the painter
@@ -519,7 +528,39 @@ impl ReadingCache {
 
         self.selection.borrow_mut().clear();
         self.blocks = Rc::new(blocks);
+        self.spans = Rc::new(spans);
+        self.spans_valid = spans_valid;
         self.version = version;
+    }
+
+    /// The block that owns `line` (0-based), or the nearest block above it.
+    pub fn block_for_line(&self, line: usize) -> Option<usize> {
+        if !self.spans_valid {
+            return None;
+        }
+        let mut fallback = None;
+        for (index, span) in self.spans.iter().enumerate() {
+            if span.first_line <= line && line <= span.last_line {
+                return Some(index);
+            }
+            if span.first_line <= line {
+                fallback = Some(index);
+            }
+        }
+        fallback.or_else(|| (!self.blocks.is_empty()).then_some(0))
+    }
+
+    /// The first source line of a block, 0-based.
+    pub fn block_start_line(&self, index: usize) -> Option<usize> {
+        if !self.spans_valid {
+            return None;
+        }
+        self.spans.get(index).map(|span| span.first_line)
+    }
+
+    /// The first source line of the top visible block.
+    pub fn top_block_line(&self) -> Option<usize> {
+        self.block_start_line(self.top_block())
     }
 
     /// The selected reading text, with blocks joined by newlines.
@@ -2609,6 +2650,21 @@ mod tests {
                 offset: 5
             })
         );
+    }
+
+    #[test]
+    fn blocks_map_back_to_source_lines() {
+        let mut cache = ReadingCache::new();
+        cache.update((1, 1), "alpha\n\nbeta\n\ngamma", None);
+        assert_eq!(cache.block_for_line(0), Some(0));
+        assert_eq!(cache.block_for_line(2), Some(1));
+        assert_eq!(cache.block_for_line(4), Some(2));
+        assert_eq!(cache.block_start_line(1), Some(2));
+        assert_eq!(cache.block_start_line(2), Some(4));
+        // A blank line between blocks belongs to the block above it.
+        assert_eq!(cache.block_for_line(3), Some(1));
+        // Past the end is the last block.
+        assert_eq!(cache.block_for_line(99), Some(2));
     }
 
     #[test]

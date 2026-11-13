@@ -261,6 +261,15 @@ the first line of the top visible block and keep the edit scroll near it.
 paragraph; press Ctrl+E again and return to the same source area — repeated 20 times with
 no drift.
 
+**Landed:** `markdown::parse_blocks_spanned` returns a `BlockSpan { first_line, last_line }`
+for every block (frontmatter and comment lines included; `strip_comments` now preserves line
+breaks), with `parse_blocks` unchanged for existing callers. The reading cache stores the
+spans and answers "block for line" / "first line of block"; entering reading scrolls to the
+block holding the caret, leaving reading puts the caret on the top visible block's first
+line, a block-id jump maps the same way, and shared-block expansion disables the mapping
+rather than pointing at the wrong line. Tests cover paragraph/fence/table/setext spans,
+comment line preservation and the line-to-block lookup.
+
 #### Q1.3 Back/forward navigation stack — D · A · M
 Maintain `(note, mode, anchor/scroll)` entries for link clicks, quick-switch, search hits,
 outline jumps and daily notes. Bind Alt+Left/Right and mouse back/forward on desktop; expose
@@ -283,6 +292,13 @@ path; block → a block-id index with a source-line fallback. Same-note `[[#Head
 scroll without a reload.
 **Done when:** `[[Note#Heading]]`, `[[#Local]]` and `[[Note#^block]]` all land on the target
 in edit and reading mode; missing fragments show a clear message instead of doing nothing.
+
+**Landed:** `inline::split_wikilink` keeps the fragment (`[[#Local]]` renders as `#Local`),
+`open_target` splits note from fragment, and after opening it jumps with
+`jump_to_heading_text` (case-insensitive, works in reading through the heading index) or
+`jump_to_block_id` (finds a line ending in `^id`; in reading it maps the line back to its
+block through the new spans). Same-note fragments jump without a reload; a missing fragment
+reports "no heading or block named …". Tests cover fragment retention and the visible label.
 
 #### Q1.5 Opening a link keeps the mode — D · S
 Carry "opened from reader" (and the source tab's reading flag) into `open_note`; remember

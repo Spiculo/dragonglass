@@ -1145,9 +1145,16 @@ impl Editor {
 
     /// Toggle between edit and reading mode (used by the command palette).
     pub fn toggle_reading_mode(&mut self) {
-        self.reading = !self.reading;
-        if self.reading {
-            self.find.open = false;
+        self.set_reading_mode(!self.reading);
+    }
+
+    /// Make the reading view reflect the current buffer before mapping positions.
+    fn prepare_reading(&mut self) {
+        let version = self.document_version();
+        if self.reading_content.needs_update(version) {
+            let text = self.buffer.text();
+            let root = self.vault_root.clone();
+            self.reading_content.update(version, &text, root.as_deref());
         }
     }
 
@@ -1158,10 +1165,23 @@ impl Editor {
 
     /// Set reading mode explicitly (used when restoring a workspace).
     pub fn set_reading_mode(&mut self, reading: bool) {
-        self.reading = reading;
-        if reading {
-            self.find.open = false;
+        if reading == self.reading {
+            return;
         }
+        if reading {
+            // Enter reading at the block holding the caret.
+            self.prepare_reading();
+            let line = self.buffer.line_col().0;
+            if let Some(block) = self.reading_content.block_for_line(line) {
+                self.reading_content.scroll_to_block(block);
+            }
+            self.find.open = false;
+        } else if let Some(line) = self.reading_content.top_block_line() {
+            // Leave reading at the first line of the visible block; the render pass then
+            // scrolls the editor to the caret.
+            self.set_cursor_line(line);
+        }
+        self.reading = reading;
     }
 
     /// Insert text at the caret (used by plugins).
@@ -2058,6 +2078,54 @@ impl Editor {
         self.jump_to_line(line);
         if self.reading && !self.reading_content.scroll_to_heading_index(heading_index) {
             self.reading_content.scroll_to_heading(text);
+        }
+    }
+
+    /// Jump to the heading whose text matches `text` (case-insensitive).
+    ///
+    /// Returns false when the note has no such heading, so the caller can say so.
+    pub fn jump_to_heading_text(&mut self, text: &str) -> bool {
+        let wanted = text.trim().trim_start_matches('#').trim().to_lowercase();
+        if wanted.is_empty() {
+            return false;
+        }
+        let headings = self.document_headings();
+        let Some((index, heading)) = headings
+            .iter()
+            .enumerate()
+            .find(|(_, heading)| heading.text.trim().to_lowercase() == wanted)
+        else {
+            return false;
+        };
+        self.jump_to_heading(heading.line.saturating_sub(1), &heading.text, index);
+        true
+    }
+
+    /// Jump to the line carrying a `^block-id` marker. Returns false when it is absent.
+    pub fn jump_to_block_id(&mut self, id: &str) -> bool {
+        let id = id.trim().trim_start_matches('^').trim();
+        if id.is_empty() {
+            return false;
+        }
+        let marker = format!("^{id}");
+        for line in 0..self.buffer.line_count() {
+            if self.buffer.line(line).trim_end().ends_with(&marker) {
+                self.focus_source_line(line);
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Put the reader (or the editor) at a source line without changing the mode.
+    fn focus_source_line(&mut self, line: usize) {
+        if self.reading {
+            self.prepare_reading();
+            if let Some(block) = self.reading_content.block_for_line(line) {
+                self.reading_content.scroll_to_block(block);
+            }
+        } else {
+            self.set_cursor_line(line);
         }
     }
 
@@ -3394,7 +3462,7 @@ impl Editor {
     }
 
     fn toggle_reading(&mut self, _: &ToggleReading, _window: &mut Window, cx: &mut Context<Self>) {
-        self.reading = !self.reading;
+        self.toggle_reading_mode();
         cx.notify();
     }
 
@@ -4656,7 +4724,7 @@ impl Render for Editor {
                                 .on_mouse_down(
                                     MouseButton::Left,
                                     cx.listener(|this, _ev, _window, cx| {
-                                        this.reading = !this.reading;
+                                        this.toggle_reading_mode();
                                         cx.notify();
                                     }),
                                 )

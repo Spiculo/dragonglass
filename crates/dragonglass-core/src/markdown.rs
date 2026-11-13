@@ -73,7 +73,14 @@ pub fn strip_comments(src: &str) -> String {
         out.push_str(&rest[..start]);
         let after = &rest[start + 2..];
         match after.find("%%") {
-            Some(end) => rest = &after[end + 2..],
+            Some(end) => {
+                // Keep the comment's line breaks so block spans still point at the right
+                // source lines.
+                for _ in 0..after[..end].matches('\n').count() {
+                    out.push('\n');
+                }
+                rest = &after[end + 2..];
+            }
             // Unterminated comment: drop everything to the end.
             None => return out,
         }
@@ -91,7 +98,12 @@ fn strip_html_comments(src: &str) -> String {
         out.push_str(&rest[..start]);
         let after = &rest[start + 4..];
         match after.find("-->") {
-            Some(end) => rest = &after[end + 3..],
+            Some(end) => {
+                for _ in 0..after[..end].matches('\n').count() {
+                    out.push('\n');
+                }
+                rest = &after[end + 3..];
+            }
             None => return out,
         }
     }
@@ -127,15 +139,82 @@ pub fn split_highlights(text: &str) -> Vec<(String, bool)> {
     out
 }
 
+/// The source lines a block was parsed from, 0-based and inclusive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlockSpan {
+    pub first_line: usize,
+    pub last_line: usize,
+}
+
+/// One paragraph being collected: its lines and the source lines they came from.
+#[derive(Default)]
+struct ParagraphLines<'a> {
+    lines: Vec<&'a str>,
+    first: Option<usize>,
+    last: Option<usize>,
+}
+
+impl<'a> ParagraphLines<'a> {
+    fn is_empty(&self) -> bool {
+        self.lines.is_empty()
+    }
+
+    fn push(&mut self, line: &'a str, index: usize) {
+        if self.first.is_none() {
+            self.first = Some(index);
+        }
+        self.lines.push(line);
+        self.last = Some(index);
+    }
+
+    fn clear(&mut self) {
+        self.lines.clear();
+        self.first = None;
+        self.last = None;
+    }
+
+    fn span(&self) -> (usize, usize) {
+        (self.first.unwrap_or(0), self.last.unwrap_or(0))
+    }
+}
+
+fn push_block(
+    blocks: &mut Vec<Block>,
+    spans: &mut Vec<BlockSpan>,
+    block: Block,
+    first: usize,
+    last: usize,
+) {
+    blocks.push(block);
+    spans.push(BlockSpan {
+        first_line: first,
+        last_line: last,
+    });
+}
+
 /// Parse a document (frontmatter is skipped) into display blocks.
 pub fn parse_blocks(src: &str) -> Vec<Block> {
+    parse_blocks_spanned(src).0
+}
+
+/// Parse a document into blocks and the source lines each block came from.
+///
+/// Spans are absolute 0-based lines in `src`, so a block can be mapped back to the editor
+/// cursor and the reading view can scroll to the block under the caret.
+pub fn parse_blocks_spanned(src: &str) -> (Vec<Block>, Vec<BlockSpan>) {
     let cleaned = strip_comments(src);
     let body = frontmatter::split(&cleaned).body;
+    // `body` is a suffix of the cleaned text, so this counts the frontmatter lines that
+    // were skipped. Comment line breaks are preserved above, so these lines match `src`.
+    let offset = cleaned[..cleaned.len().saturating_sub(body.len())]
+        .matches('\n')
+        .count();
     let lines: Vec<&str> = body.lines().collect();
 
     let mut blocks = Vec::new();
-    let mut footnotes = Vec::new();
-    let mut paragraph: Vec<&str> = Vec::new();
+    let mut spans: Vec<BlockSpan> = Vec::new();
+    let mut footnotes: Vec<(Block, BlockSpan)> = Vec::new();
+    let mut paragraph = ParagraphLines::default();
     let mut i = 0;
 
     while i < lines.len() {
@@ -143,7 +222,8 @@ pub fn parse_blocks(src: &str) -> Vec<Block> {
         let trimmed = line.trim();
 
         if is_fence(trimmed) {
-            flush_paragraph(&mut paragraph, &mut blocks);
+            flush_paragraph(&mut paragraph, &mut blocks, &mut spans, offset);
+            let start = i;
 
             let fence_char = trimmed.chars().next().unwrap_or('`');
             let language = trimmed.trim_start_matches(fence_char).trim().to_string();
@@ -162,36 +242,56 @@ pub fn parse_blocks(src: &str) -> Vec<Block> {
             if i < lines.len() {
                 i += 1;
             }
+            let end = i.saturating_sub(1).min(lines.len().saturating_sub(1));
 
-            blocks.push(Block::Code {
-                language,
-                text: code,
-            });
+            push_block(
+                &mut blocks,
+                &mut spans,
+                Block::Code {
+                    language,
+                    text: code,
+                },
+                offset + start,
+                offset + end,
+            );
             continue;
         }
 
         if trimmed.is_empty() {
-            flush_paragraph(&mut paragraph, &mut blocks);
+            flush_paragraph(&mut paragraph, &mut blocks, &mut spans, offset);
             i += 1;
             continue;
         }
 
         if let Some((id, text)) = footnote_definition(trimmed) {
-            flush_paragraph(&mut paragraph, &mut blocks);
-            footnotes.push(Block::Footnote { id, text });
+            flush_paragraph(&mut paragraph, &mut blocks, &mut spans, offset);
+            footnotes.push((
+                Block::Footnote { id, text },
+                BlockSpan {
+                    first_line: offset + i,
+                    last_line: offset + i,
+                },
+            ));
             i += 1;
             continue;
         }
 
         if let Some(tex) = single_line_math(trimmed) {
-            flush_paragraph(&mut paragraph, &mut blocks);
-            blocks.push(Block::Math { tex });
+            flush_paragraph(&mut paragraph, &mut blocks, &mut spans, offset);
+            push_block(
+                &mut blocks,
+                &mut spans,
+                Block::Math { tex },
+                offset + i,
+                offset + i,
+            );
             i += 1;
             continue;
         }
 
         if trimmed == "$$" {
-            flush_paragraph(&mut paragraph, &mut blocks);
+            flush_paragraph(&mut paragraph, &mut blocks, &mut spans, offset);
+            let start = i;
             i += 1;
 
             let mut tex = String::new();
@@ -203,23 +303,37 @@ pub fn parse_blocks(src: &str) -> Vec<Block> {
             if i < lines.len() {
                 i += 1;
             }
+            let end = i.saturating_sub(1).min(lines.len().saturating_sub(1));
 
-            blocks.push(Block::Math {
-                tex: tex.trim_end().to_string(),
-            });
+            push_block(
+                &mut blocks,
+                &mut spans,
+                Block::Math {
+                    tex: tex.trim_end().to_string(),
+                },
+                offset + start,
+                offset + end,
+            );
             continue;
         }
 
         if let Some((table, consumed)) = table_at(&lines, i) {
-            flush_paragraph(&mut paragraph, &mut blocks);
-            blocks.push(table);
+            flush_paragraph(&mut paragraph, &mut blocks, &mut spans, offset);
+            let end = i + consumed.saturating_sub(1);
+            push_block(&mut blocks, &mut spans, table, offset + i, offset + end);
             i += consumed;
             continue;
         }
 
         if let Some((level, text)) = heading(trimmed) {
-            flush_paragraph(&mut paragraph, &mut blocks);
-            blocks.push(Block::Heading { level, text });
+            flush_paragraph(&mut paragraph, &mut blocks, &mut spans, offset);
+            push_block(
+                &mut blocks,
+                &mut spans,
+                Block::Heading { level, text },
+                offset + i,
+                offset + i,
+            );
             i += 1;
             continue;
         }
@@ -227,23 +341,31 @@ pub fn parse_blocks(src: &str) -> Vec<Block> {
         // Setext headings: a paragraph line underlined with `===` or `---`.
         if !paragraph.is_empty() {
             if let Some(level) = setext_underline(trimmed) {
-                let text = join_soft_breaks(&paragraph);
+                let text = join_soft_breaks(&paragraph.lines);
+                let (first, _) = paragraph.span();
                 paragraph.clear();
-                blocks.push(Block::Heading { level, text });
+                push_block(
+                    &mut blocks,
+                    &mut spans,
+                    Block::Heading { level, text },
+                    offset + first,
+                    offset + i,
+                );
                 i += 1;
                 continue;
             }
         }
 
         if is_rule(trimmed) {
-            flush_paragraph(&mut paragraph, &mut blocks);
-            blocks.push(Block::Rule);
+            flush_paragraph(&mut paragraph, &mut blocks, &mut spans, offset);
+            push_block(&mut blocks, &mut spans, Block::Rule, offset + i, offset + i);
             i += 1;
             continue;
         }
 
         if trimmed.starts_with('>') {
-            flush_paragraph(&mut paragraph, &mut blocks);
+            flush_paragraph(&mut paragraph, &mut blocks, &mut spans, offset);
+            let start = i;
 
             let mut quoted: Vec<String> = Vec::new();
             while i < lines.len() {
@@ -253,40 +375,64 @@ pub fn parse_blocks(src: &str) -> Vec<Block> {
                 quoted.push(rest.trim_start().to_string());
                 i += 1;
             }
+            let end = i.saturating_sub(1);
 
             // `> [!kind] Title` is a callout; everything else is a plain quote.
             if let Some(callout) = parse_callout(&quoted) {
-                blocks.push(callout);
+                push_block(
+                    &mut blocks,
+                    &mut spans,
+                    callout,
+                    offset + start,
+                    offset + end,
+                );
             } else {
                 let borrowed: Vec<&str> = quoted.iter().map(String::as_str).collect();
-                blocks.push(Block::Quote(join_soft_breaks(&borrowed)));
+                push_block(
+                    &mut blocks,
+                    &mut spans,
+                    Block::Quote(join_soft_breaks(&borrowed)),
+                    offset + start,
+                    offset + end,
+                );
             }
             continue;
         }
 
         if let Some((ordered, depth, marker, checked, text)) = list_item(line) {
-            flush_paragraph(&mut paragraph, &mut blocks);
-            blocks.push(Block::ListItem {
-                ordered,
-                depth,
-                marker,
-                checked,
-                text,
-            });
+            flush_paragraph(&mut paragraph, &mut blocks, &mut spans, offset);
+            push_block(
+                &mut blocks,
+                &mut spans,
+                Block::ListItem {
+                    ordered,
+                    depth,
+                    marker,
+                    checked,
+                    text,
+                },
+                offset + i,
+                offset + i,
+            );
             i += 1;
             continue;
         }
 
-        paragraph.push(line);
+        paragraph.push(line, i);
         i += 1;
     }
 
-    flush_paragraph(&mut paragraph, &mut blocks);
+    flush_paragraph(&mut paragraph, &mut blocks, &mut spans, offset);
     if !footnotes.is_empty() {
-        blocks.push(Block::Rule);
-        blocks.extend(footnotes);
+        // The separator is synthetic: pin it to the document's last line.
+        let last = offset + lines.len().saturating_sub(1);
+        push_block(&mut blocks, &mut spans, Block::Rule, last, last);
+        for (block, span) in footnotes {
+            blocks.push(block);
+            spans.push(span);
+        }
     }
-    blocks
+    (blocks, spans)
 }
 
 /// `[^id]: text` — a footnote definition.
@@ -298,24 +444,6 @@ fn footnote_definition(line: &str) -> Option<(String, String)> {
         return None;
     }
     Some((id.to_string(), rest[close + 2..].trim().to_string()))
-}
-
-fn flush_paragraph(paragraph: &mut Vec<&str>, blocks: &mut Vec<Block>) {
-    if paragraph.is_empty() {
-        return;
-    }
-
-    if paragraph.len() == 1 {
-        if let Some(target) = standalone_embed(paragraph[0]) {
-            paragraph.clear();
-            blocks.push(Block::Embed { target });
-            return;
-        }
-    }
-
-    let text = join_soft_breaks(paragraph);
-    paragraph.clear();
-    blocks.push(Block::Paragraph(text));
 }
 
 /// Whether a source line ends with a hard break: two trailing spaces or a backslash.
@@ -346,6 +474,43 @@ fn join_soft_breaks(lines: &[&str]) -> String {
         out.push_str(content);
     }
     out
+}
+
+fn flush_paragraph(
+    paragraph: &mut ParagraphLines,
+    blocks: &mut Vec<Block>,
+    spans: &mut Vec<BlockSpan>,
+    offset: usize,
+) {
+    if paragraph.is_empty() {
+        return;
+    }
+
+    if paragraph.lines.len() == 1 {
+        if let Some(target) = standalone_embed(paragraph.lines[0]) {
+            let (first, last) = paragraph.span();
+            paragraph.clear();
+            push_block(
+                blocks,
+                spans,
+                Block::Embed { target },
+                offset + first,
+                offset + last,
+            );
+            return;
+        }
+    }
+
+    let text = join_soft_breaks(&paragraph.lines);
+    let (first, last) = paragraph.span();
+    paragraph.clear();
+    push_block(
+        blocks,
+        spans,
+        Block::Paragraph(text),
+        offset + first,
+        offset + last,
+    );
 }
 
 /// A line that is nothing but an embed, as Obsidian writes embedded images and notes.
@@ -936,8 +1101,14 @@ mod tests {
 
     #[test]
     fn strip_comments_spans_lines_and_truncates_unterminated() {
-        assert_eq!(strip_comments("a %%x\ny%% b"), "a  b");
+        // Comment line breaks are preserved, so block spans keep pointing at the right
+        // source lines.
+        assert_eq!(strip_comments("a %%x\ny%% b"), "a \n b");
         assert_eq!(strip_comments("a %%never closed"), "a ");
+        assert_eq!(
+            strip_comments("%%one\ntwo\nthree%%\nbody").lines().count(),
+            4
+        );
     }
 
     #[test]
@@ -1117,7 +1288,10 @@ mod tests {
 
     #[test]
     fn html_comments_are_stripped() {
-        assert_eq!(strip_comments("a <!-- hidden\nstill hidden --> b"), "a  b");
+        assert_eq!(
+            strip_comments("a <!-- hidden\nstill hidden --> b"),
+            "a \n b"
+        );
         assert_eq!(
             parse_blocks("<!-- gone -->\n# Kept\n")[0],
             Block::Heading {
@@ -1134,5 +1308,119 @@ mod tests {
             panic!("expected table");
         };
         assert_eq!(headers, &vec!["$x^2$".to_string(), "**bold**".to_string()]);
+    }
+
+    #[test]
+    fn blocks_carry_their_source_lines() {
+        let text = "---\ntitle: x\n---\n# One\nalpha\nbeta\n\n```\ncode\n```\n- item\n> quote\n";
+        let (blocks, spans) = parse_blocks_spanned(text);
+        assert_eq!(blocks.len(), spans.len());
+
+        // Frontmatter lines are counted, so spans point at the buffer.
+        assert_eq!(
+            spans[0],
+            BlockSpan {
+                first_line: 3,
+                last_line: 3
+            }
+        );
+        assert!(matches!(blocks[0], Block::Heading { .. }));
+
+        // A paragraph spans both of its soft-wrapped lines.
+        assert_eq!(
+            spans[1],
+            BlockSpan {
+                first_line: 4,
+                last_line: 5
+            }
+        );
+
+        // A fence spans from the opening to the closing fence.
+        assert_eq!(
+            spans[2],
+            BlockSpan {
+                first_line: 7,
+                last_line: 9
+            }
+        );
+        assert!(matches!(blocks[2], Block::Code { .. }));
+
+        assert_eq!(
+            spans[3],
+            BlockSpan {
+                first_line: 10,
+                last_line: 10
+            }
+        );
+        assert_eq!(
+            spans[4],
+            BlockSpan {
+                first_line: 11,
+                last_line: 11
+            }
+        );
+    }
+
+    #[test]
+    fn a_multiline_table_and_rule_keep_their_lines() {
+        let text = "| a | b |\n|---|---|\n| 1 | 2 |\n---\n";
+        let (blocks, spans) = parse_blocks_spanned(text);
+        assert!(matches!(blocks[0], Block::Table { .. }));
+        assert_eq!(
+            spans[0],
+            BlockSpan {
+                first_line: 0,
+                last_line: 2
+            }
+        );
+        assert_eq!(blocks[1], Block::Rule);
+        assert_eq!(
+            spans[1],
+            BlockSpan {
+                first_line: 3,
+                last_line: 3
+            }
+        );
+    }
+
+    #[test]
+    fn setext_headings_span_the_paragraph_and_underline() {
+        let (blocks, spans) = parse_blocks_spanned("title\n=====\n\nbody\n");
+        assert!(matches!(blocks[0], Block::Heading { .. }));
+        assert_eq!(
+            spans[0],
+            BlockSpan {
+                first_line: 0,
+                last_line: 1
+            }
+        );
+        assert_eq!(
+            spans[1],
+            BlockSpan {
+                first_line: 3,
+                last_line: 3
+            }
+        );
+    }
+
+    #[test]
+    fn comment_lines_do_not_shift_block_spans() {
+        let text = "%%one\ntwo%%\n# After\nbody\n";
+        let (blocks, spans) = parse_blocks_spanned(text);
+        assert!(matches!(blocks[0], Block::Heading { .. }));
+        assert_eq!(
+            spans[0],
+            BlockSpan {
+                first_line: 2,
+                last_line: 2
+            }
+        );
+        assert_eq!(
+            spans[1],
+            BlockSpan {
+                first_line: 3,
+                last_line: 3
+            }
+        );
     }
 }

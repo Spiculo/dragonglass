@@ -300,17 +300,26 @@ fn split_wikilink(inner: &str) -> (String, String) {
         Some((target, alias)) => (target, Some(alias)),
         None => (inner, None),
     };
-    let target = raw_target
-        .split('#')
-        .next()
-        .unwrap_or(raw_target)
-        .trim()
-        .to_string();
+    // Keep `#heading` / `#^block` in the target: the opener resolves it after loading.
+    let target = raw_target.trim().to_string();
+    let (label_target, fragment) = match target.split_once('#') {
+        Some((note, fragment)) => (note.trim().to_string(), Some(fragment.trim())),
+        None => (target.clone(), None),
+    };
     let label = alias
         .map(str::trim)
         .filter(|label| !label.is_empty())
         .map(str::to_string)
-        .unwrap_or_else(|| target.clone());
+        .unwrap_or_else(|| {
+            if !label_target.is_empty() {
+                label_target
+            } else {
+                // `[[#Local]]` shows the fragment, since there is no note name.
+                fragment
+                    .map(|fragment| format!("#{fragment}"))
+                    .unwrap_or_default()
+            }
+        });
     (target, label)
 }
 
@@ -641,10 +650,10 @@ mod tests {
     }
 
     #[test]
-    fn wikilinks_drop_heading_anchors_from_the_target() {
+    fn wikilinks_keep_heading_anchors_in_the_target() {
         let spans = parse("[[Note#Section]]");
         assert_eq!(spans[0].text, "Note");
-        assert_eq!(spans[0].href.as_deref(), Some("Note"));
+        assert_eq!(spans[0].href.as_deref(), Some("Note#Section"));
     }
 
     #[test]
@@ -688,5 +697,24 @@ mod tests {
     fn plain_strips_markup_for_outlines() {
         assert_eq!(plain("**Bold** $x^2$ [[Note|Alias]]"), "Bold x² Alias");
         assert_eq!(plain("**Bold**"), "Bold");
+    }
+
+    #[test]
+    fn wikilink_targets_keep_their_fragment() {
+        let spans = parse("[[Note#Heading|label]]");
+        assert_eq!(spans[0].href.as_deref(), Some("Note#Heading"));
+        assert_eq!(spans[0].text, "label");
+
+        // Without an alias the visible text is the note name, without the fragment.
+        let spans = parse("[[Note#Heading]]");
+        assert_eq!(spans[0].href.as_deref(), Some("Note#Heading"));
+        assert_eq!(spans[0].text, "Note");
+
+        let spans = parse("[[#Local]]");
+        assert_eq!(spans[0].href.as_deref(), Some("#Local"));
+        assert_eq!(spans[0].text, "#Local");
+
+        let spans = parse("[[Note#^block-1]]");
+        assert_eq!(spans[0].href.as_deref(), Some("Note#^block-1"));
     }
 }

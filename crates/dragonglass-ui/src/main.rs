@@ -725,19 +725,29 @@ impl DragonGlassApp {
             return;
         }
 
-        let target = target.split('#').next().unwrap_or(target).trim();
-        if target.is_empty() {
+        let (note, fragment) = match target.split_once('#') {
+            Some((note, fragment)) => (note.trim(), Some(fragment.trim())),
+            None => (target.trim(), None),
+        };
+        if note.is_empty() {
+            // `[[#Local]]`: stay in this note and jump to the fragment.
+            if let Some(fragment) = fragment {
+                self.jump_to_fragment(fragment, window, cx);
+            }
             return;
         }
 
-        match self.note_index.resolve_relative(target) {
+        match self.note_index.resolve_relative(note) {
             Some(relative) => {
                 let relative = relative.to_string();
                 self.open_note(&relative, window, cx);
+                if let Some(fragment) = fragment {
+                    self.jump_to_fragment(fragment, window, cx);
+                }
             }
             None => {
                 // An unresolved wikilink creates the note, the way Obsidian does.
-                let is_asset = Path::new(target)
+                let is_asset = Path::new(note)
                     .extension()
                     .and_then(|ext| ext.to_str())
                     .map(|ext| {
@@ -745,13 +755,40 @@ impl DragonGlassApp {
                     })
                     .unwrap_or(false);
                 if is_asset {
-                    self.set_status(StatusKind::Error, format!("unresolved link: {target}"));
+                    self.set_status(StatusKind::Error, format!("unresolved link: {note}"));
                     cx.notify();
                     return;
                 }
-                self.create_linked_note(target, window, cx);
+                self.create_linked_note(note, window, cx);
             }
         }
+    }
+
+    /// Move to a `#heading` or `#^block` fragment in the active note.
+    fn jump_to_fragment(&mut self, fragment: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let fragment = fragment.trim();
+        if fragment.is_empty() {
+            return;
+        }
+        let editor = self.editor.clone();
+        let found = editor.update(cx, |editor, cx| {
+            let found = match fragment.strip_prefix('^') {
+                Some(id) => editor.jump_to_block_id(id),
+                None => editor.jump_to_heading_text(fragment),
+            };
+            cx.notify();
+            found
+        });
+        if found {
+            window.focus(&self.editor.focus_handle(cx));
+            self.set_status(StatusKind::Info, format!("jumped to {fragment}"));
+        } else {
+            self.set_status(
+                StatusKind::Warn,
+                format!("no heading or block named {fragment} in this note"),
+            );
+        }
+        cx.notify();
     }
 
     /// Create and open a note for an unresolved wikilink.
