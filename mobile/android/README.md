@@ -10,7 +10,13 @@ This is the first vertical slice, not full parity yet:
 - Bookmarks, stored in the vault's `.dragon-glass` folder, with a bookmarks-only filter
 - One-commit git sync with a GitHub HTTPS token
 - Edit markdown source and save atomically
-- Render markdown/HTML (headings, lists, tables, math, code) in a WebView
+- Render markdown/HTML (headings, lists, tables, math, code) in a WebView; tapping a
+  `[[link]]` in the preview opens that note, still in preview mode, and external links leave
+  for the system browser
+- Back always goes Preview → Edit → note list, and the search box clears on Back before the
+  screen changes
+- The editor keeps the caret and the status bar above the on-screen keyboard, with
+  autocorrect and smart capitalisation off for markdown
 - Outline, properties, stats, relations and tags from the shared engine
 - Daily, weekly and monthly notes from `Templates/`
 - A graph view of links, embeds and frontmatter relations

@@ -44,6 +44,8 @@ private data class OpenNote(
     val headings: List<HeadingInfo>,
     val properties: List<PropertyInfo>,
     val relations: List<RelationInfo>,
+    /// Rendered preview HTML when the link was followed from preview mode.
+    val html: String = "",
 )
 
 /// How the note list is presented: a flat, recent-first list or the vault tree.
@@ -422,11 +424,38 @@ class DragonGlassViewModel(application: Application) : AndroidViewModel(applicat
     /// Open a note and scroll the editor to a 1-based source line.
     fun openSearchHit(relative: String, line: Int) = openNote(relative, jumpToLine = line)
 
+    /// Open a note from a link tapped in the preview, staying in preview mode. Unsaved
+    /// edits are written first so following a link can never drop text.
+    fun openLinkedNote(relative: String) {
+        val current = selected
+        if (current == null || !dirty) {
+            openNote(relative, jumpToLine = null, keepPreview = true)
+            return
+        }
+        val text = source
+        viewModelScope.launch {
+            val saved = runCatching {
+                withContext(Dispatchers.IO) {
+                    ensureVault().saveNote(current, text)
+                }
+            }
+            saved
+                .onSuccess {
+                    dirty = false
+                    mirrorNote(current)
+                }
+                .onFailure { error = it.message ?: "Could not save the note" }
+            if (saved.isSuccess) {
+                openNote(relative, jumpToLine = null, keepPreview = true)
+            }
+        }
+    }
+
     fun consumePendingLine() {
         pendingLine = null
     }
 
-    private fun openNote(relative: String, jumpToLine: Int?) {
+    private fun openNote(relative: String, jumpToLine: Int?, keepPreview: Boolean = false) {
         viewModelScope.launch {
             loading = true
             val result = runCatching {
@@ -440,6 +469,7 @@ class DragonGlassViewModel(application: Application) : AndroidViewModel(applicat
                         headings = parseHeadings(text),
                         properties = parseProperties(text),
                         relations = loaded.relations(relative),
+                        html = if (keepPreview) renderHtml(text) else "",
                     )
                 }
             }
@@ -451,8 +481,9 @@ class DragonGlassViewModel(application: Application) : AndroidViewModel(applicat
                     headings = opened.headings
                     properties = opened.properties
                     relations = opened.relations
-                    preview = false
-                    previewHtml = ""
+                    // A link followed inside the preview keeps the preview open.
+                    preview = keepPreview
+                    previewHtml = opened.html
                     dirty = false
                     pendingLine = jumpToLine
                 }

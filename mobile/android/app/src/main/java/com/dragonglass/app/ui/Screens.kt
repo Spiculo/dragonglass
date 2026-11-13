@@ -1,6 +1,10 @@
 package com.dragonglass.app.ui
 
+import android.content.Intent
+import android.net.Uri
+import android.webkit.WebResourceRequest
 import android.webkit.WebView
+import android.webkit.WebViewClient
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -18,6 +22,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
@@ -27,6 +32,8 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.BasicTextField
+import androidx.compose.foundation.text.KeyboardActions
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
@@ -61,11 +68,15 @@ import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.TextRange
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.input.KeyboardCapitalization
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.text.style.TextOverflow
@@ -148,6 +159,17 @@ private fun NotesScreen(vm: DragonGlassViewModel) {
     var pendingAction by remember { mutableStateOf<VaultAction?>(null) }
     var menuOpen by remember { mutableStateOf(false) }
     var todayOpen by remember { mutableStateOf(false) }
+    val focusManager = LocalFocusManager.current
+
+    // Back clears the search before it leaves the screen, so a query is never lost by
+    // accident and never traps the user either.
+    BackHandler(enabled = vm.query.isNotEmpty() || vm.bookmarksOnly) {
+        if (vm.query.isNotEmpty()) {
+            vm.onQueryChange("")
+        } else {
+            vm.toggleBookmarksOnly()
+        }
+    }
 
     val vaultPicker = rememberLauncherForActivityResult(
         ActivityResultContracts.OpenDocumentTree(),
@@ -314,6 +336,13 @@ private fun NotesScreen(vm: DragonGlassViewModel) {
                         Text(if (vm.bookmarksOnly) "Search bookmarks" else "Search notes")
                     },
                     singleLine = true,
+                    keyboardOptions = KeyboardOptions(imeAction = ImeAction.Search),
+                    keyboardActions = KeyboardActions(onSearch = { focusManager.clearFocus() }),
+                    trailingIcon = {
+                        if (vm.query.isNotEmpty()) {
+                            TextButton(onClick = { vm.onQueryChange("") }) { Text("Clear") }
+                        }
+                    },
                     modifier = Modifier.weight(1f),
                 )
                 if (vm.bookmarksOnly) {
@@ -571,7 +600,15 @@ private fun NoteRow(
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun EditorScreen(vm: DragonGlassViewModel, relative: String) {
-    BackHandler { vm.closeNote() }
+    // Back goes Preview → Edit, then Edit → list. Sheets and dialogs handle their own
+    // Back before this handler sees it.
+    BackHandler {
+        if (vm.preview) {
+            vm.togglePreview()
+        } else {
+            vm.closeNote()
+        }
+    }
 
     var menuOpen by remember { mutableStateOf(false) }
     var showOutline by remember { mutableStateOf(false) }
@@ -595,6 +632,8 @@ private fun EditorScreen(vm: DragonGlassViewModel, relative: String) {
     }
 
     Scaffold(
+        // Keep the caret and the status bar above the on-screen keyboard.
+        modifier = Modifier.imePadding(),
         topBar = {
             TopAppBar(
                 navigationIcon = {
@@ -663,6 +702,7 @@ private fun EditorScreen(vm: DragonGlassViewModel, relative: String) {
                     html = vm.previewHtml,
                     baseUrl = vm.baseUrl,
                     modifier = Modifier.fillMaxSize(),
+                    onOpenNote = { vm.openLinkedNote(it) },
                 )
             } else {
                 BasicTextField(
@@ -680,6 +720,14 @@ private fun EditorScreen(vm: DragonGlassViewModel, relative: String) {
                         fontSize = 14.sp,
                         lineHeight = 22.sp,
                         color = MaterialTheme.colorScheme.onBackground,
+                    ),
+                    // Markdown is punctuation, not prose: no autocorrect, no smart
+                    // capitalisation, and a newline key instead of a search key.
+                    keyboardOptions = KeyboardOptions(
+                        capitalization = KeyboardCapitalization.None,
+                        autoCorrectEnabled = false,
+                        keyboardType = KeyboardType.Text,
+                        imeAction = ImeAction.Default,
                     ),
                     cursorBrush = SolidColor(MaterialTheme.colorScheme.primary),
                 )
@@ -1648,6 +1696,7 @@ private fun MarkdownWebView(
     html: String,
     baseUrl: String,
     modifier: Modifier = Modifier,
+    onOpenNote: (String) -> Unit = {},
 ) {
     val dark = isSystemInDarkTheme()
     val themed = remember(html, dark) {
@@ -1660,20 +1709,92 @@ private fun MarkdownWebView(
 
     AndroidView(
         modifier = modifier,
-        factory = { context ->
-            WebView(context).apply {
+        factory = { viewContext ->
+            WebView(viewContext).apply {
                 settings.javaScriptEnabled = false
                 settings.allowFileAccess = true
                 settings.allowContentAccess = true
                 settings.loadWithOverviewMode = true
                 settings.useWideViewPort = true
                 setBackgroundColor(android.graphics.Color.TRANSPARENT)
+                webViewClient = object : WebViewClient() {
+                    override fun shouldOverrideUrlLoading(
+                        view: WebView?,
+                        request: WebResourceRequest?,
+                    ): Boolean {
+                        val url = request?.url?.toString() ?: return false
+                        val handled = handlePreviewLink(
+                            url = url,
+                            baseUrl = baseUrl,
+                            onOpenNote = onOpenNote,
+                            openExternally = { external ->
+                                runCatching {
+                                    viewContext.startActivity(
+                                        Intent(Intent.ACTION_VIEW, Uri.parse(external)),
+                                    )
+                                }
+                            },
+                        )
+                        return handled
+                    }
+                }
             }
         },
         update = { webView ->
             webView.loadDataWithBaseURL(baseUrl, themed, "text/html", "utf-8", null)
         },
     )
+}
+
+/// Route a link tapped in the preview.
+///
+/// Internal `.html` pages map back to their `.md` note and open it in the app; external
+/// links leave for the system browser; anything else is blocked so the preview document
+/// is never replaced in place. Returns whether the navigation was handled.
+private fun handlePreviewLink(
+    url: String,
+    baseUrl: String,
+    onOpenNote: (String) -> Unit,
+    openExternally: (String) -> Unit,
+): Boolean {
+    if (url == "about:blank" || url.startsWith("data:")) {
+        return false
+    }
+
+    if (url.startsWith(baseUrl)) {
+        val relative = url
+            .removePrefix(baseUrl)
+            .substringBefore('#')
+            .substringBefore('?')
+        if (relative.isBlank()) {
+            // A same-page anchor: let the WebView scroll to it.
+            return false
+        }
+        val note = when {
+            relative.endsWith(".html", ignoreCase = true) ->
+                relative.dropLast(5) + ".md"
+            relative.endsWith(".htm", ignoreCase = true) ->
+                relative.dropLast(4) + ".md"
+            relative.endsWith(".md", ignoreCase = true) -> relative
+            // Attachments: leave the preview document alone.
+            else -> return true
+        }
+        onOpenNote(Uri.decode(note))
+        return true
+    }
+
+    // A file outside the vault must not replace the preview document.
+    if (url.startsWith("file:")) {
+        return true
+    }
+
+    if (url.startsWith("http://") || url.startsWith("https://") || url.startsWith("mailto:")) {
+        openExternally(url)
+        return true
+    }
+
+    // Unknown scheme or off-vault target: never navigate the preview away from the note.
+    return true
 }
 
 /// The engine's export CSS targets light pages, so dark mode overrides the few colors that
