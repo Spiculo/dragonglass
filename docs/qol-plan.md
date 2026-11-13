@@ -489,6 +489,12 @@ undo-after-save return to clean. Use this same signal for close prompts and tab 
 **Done when:** a property test of random edit/undo sequences only reports dirty when bytes
 differ from the saved revision.
 
+**Landed:** `Buffer` keeps the content hash of the saved version and derives `is_dirty` from
+the current text (FNV-1a over the rope, cached per revision), so typing and deleting, or
+undoing back to the saved bytes, reports clean again. A 200-step randomized edit/undo test
+asserts `is_dirty == (text != saved)` after every step; the tab dot, title marker and close
+prompt all read this one signal.
+
 #### Q3.14 Startup is honest — D · S
 If a restored tab fails to load, show an inline error with Retry/Locate instead of a blank
 looking tab. Do not block window creation on loading every tab; load the active tab first
