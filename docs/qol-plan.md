@@ -174,6 +174,20 @@ Recover / Compare / Discard. Keep drafts out of git (`.dragon-glass/` is already
 **Done when:** killing the process 2 seconds after typing recovers every character; a
 clean buffer writes no timer and no disk I/O; a conflicted buffer never auto-overwrites.
 
+**Landed (desktop + core):** `core::drafts` stores one human-readable file per note
+(metadata header, `---`, then the text verbatim), capped at 64 drafts, keyed by a stable hash
+of the note path. The editor arms a trailing 1.5 s timer only while the buffer is dirty, and
+writes the draft with its cursor and base content hash; a clean buffer arms nothing. A
+successful save deletes the draft. Opening a note (or a restored tab) with a draft that
+differs from the file shows a bar with Recover / Compare / Discard; Recover applies the text
+as one undoable edit.
+Note autosave is implemented behind `autosave=on` in `config.txt` (Settings → Autosave
+notes): after the same idle, if the fingerprint still matches it saves and drops the draft,
+and on a conflict it pauses and raises the conflict bar. It ships **off** by default rather
+than the on-by-default recommendation in §8.1, because silent writes interact with git-sync
+commits; that is the one deviation, and it is a per-vault toggle.
+**Remaining:** Android drafts (Q0.7 covers the save-before-navigate part).
+
 #### Q0.4 One exit contract for close/quit/background — D · A · M
 Desktop: dirty close and quit must use Save / Discard / Cancel (or auto-save + an
 immediately visible Undo). Fix the macOS quit-saver to respect save failures and keep the

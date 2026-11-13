@@ -19,6 +19,8 @@ pub struct Config {
     pub snippets: bool,
     /// Whether Vim-style modal editing is enabled for this vault.
     pub vim_mode: bool,
+    /// Save the note itself after idle, not just a recovery draft.
+    pub autosave: bool,
     /// Editor text size in points, persisted so the setting follows the vault.
     pub font_size: u16,
 }
@@ -34,6 +36,7 @@ impl Default for Config {
             accent: None,
             snippets: true,
             vim_mode: false,
+            autosave: false,
             font_size: 14,
         }
     }
@@ -52,6 +55,7 @@ impl Config {
         }
         out.push_str(&format!("snippets={}\n", self.snippets));
         out.push_str(&format!("vim_mode={}\n", self.vim_mode));
+        out.push_str(&format!("autosave={}\n", self.autosave));
         out.push_str(&format!("font_size={}\n", self.font_size));
         out
     }
@@ -84,6 +88,9 @@ impl Config {
                 }
                 "vim_mode" => {
                     config.vim_mode = !matches!(value.to_lowercase().as_str(), "false" | "0" | "no")
+                }
+                "autosave" => {
+                    config.autosave = matches!(value.to_lowercase().as_str(), "true" | "1" | "yes")
                 }
                 "font_size" => {
                     if let Ok(size) = value.parse::<u16>() {

@@ -11,6 +11,7 @@ pub mod buffer;
 pub mod config;
 pub mod conflict;
 pub mod diff;
+pub mod drafts;
 pub mod find;
 pub mod fingerprint;
 pub mod format;

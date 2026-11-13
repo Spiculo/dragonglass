@@ -68,6 +68,9 @@ A lot already works. This is a working application, not a mockup — but it is e
 - Recovery snapshots, browsable and restorable from **File recovery** in the palette
 - Conflict-safe saves: a save never overwrites a file that changed on disk; the app offers
   Reload / Keep mine / Compare / Save as copy instead
+- Crash-safe drafts: typing writes a debounced draft under `.dragon-glass/drafts/`, and the
+  next launch offers Recover / Compare / Discard; optional note autosave is a vault setting
+  (`autosave=on`)
 
 **Around the editor**
 - Git sync by driving your own `git` binary (your credentials, SSH config and hooks)

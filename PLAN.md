@@ -383,6 +383,14 @@ buffer and shows a bar with **Reload**, **Keep mine**, **Compare** (line diff) a
 copy**. Closing, quitting and Save all stop on a conflict instead of dropping or overwriting
 the note.
 
+Drafts cover the crash case. `core::drafts` keeps one readable file per note under
+`.dragon-glass/drafts/`; the editor writes it 1.5 s after the last keystroke, only while the
+buffer is dirty, and deletes it on a successful save. Opening a note whose draft differs from
+the file offers **Recover / Compare / Discard**. Note autosave is a per-vault setting
+(`autosave=on`, also in Settings): after the same idle it saves when the fingerprint still
+matches, and stops at the conflict bar otherwise. It is off by default because silent writes
+interact with git commits.
+
 The first batch from [`docs/qol-plan.md`](docs/qol-plan.md) is in. Reading mode is now
 strictly read-only: every mutating action and both IME insert paths check one `can_mutate()`
 gate, so keyboard input, paste, cut, undo/redo and formatting leave the source untouched

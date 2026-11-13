@@ -129,7 +129,7 @@ pub fn save_forced(path: &Path, text: &str) -> SaveReport {
 
 /// FNV-1a, 64 bit. Small, dependency-free and stable across processes and releases, so a
 /// fingerprint written to disk (a draft, for example) still means something next launch.
-fn hash_text(text: &str) -> u64 {
+pub(crate) fn hash_text(text: &str) -> u64 {
     let mut hash = 0xcbf2_9ce4_8422_2325u64;
     for byte in text.as_bytes() {
         hash ^= u64::from(*byte);

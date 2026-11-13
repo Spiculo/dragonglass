@@ -29,7 +29,7 @@ use std::rc::Rc;
 use dragonglass_core::fingerprint::SaveReport;
 use dragonglass_core::frontmatter::{Property, PropertyValue};
 use dragonglass_core::{
-    bookmarks, config, conflict, diff, git, graph, history, keymap, lint, markdown, query,
+    bookmarks, config, conflict, diff, drafts, git, graph, history, keymap, lint, markdown, query,
     relations, resolve, search, session, shared, stats, storage, store, tags, templates, tree,
     update, uri, vaultfs, vaults, versions, workspace, NodeKind, Note, NoteRef, TreeNode, Vault,
 };
@@ -142,6 +142,9 @@ actions!(
         KeepMine,
         CompareConflicted,
         SaveConflictCopy,
+        RecoverDraft,
+        CompareDraft,
+        DiscardDraft,
         NextTab,
         PrevTab,
         HideApp,
@@ -631,6 +634,8 @@ struct DragonGlassApp {
     git_status: Option<git::Status>,
     /// The one-line feedback in the header. Expires on its own unless it is an error.
     status: Option<Status>,
+    /// A recovered draft waiting for the user's decision.
+    pending_draft: Option<drafts::Draft>,
     /// True while a one-shot task is waiting to expire the current status line.
     status_timer_armed: bool,
     switcher: Option<Switcher>,
@@ -1226,6 +1231,7 @@ impl DragonGlassApp {
             editor.set_close_tab(close_tab);
             editor.set_status_reporter(status);
             editor.set_conflict_handler(conflict);
+            editor.set_autosave(self.config.autosave);
         });
     }
 
@@ -1507,6 +1513,8 @@ impl DragonGlassApp {
         }
         self.remember_session(cx);
         cx.notify();
+
+        self.check_recovery(cx);
     }
 
     fn normalize_splits(&mut self) {
@@ -1592,6 +1600,7 @@ impl DragonGlassApp {
         }
 
         window.focus(&self.editor.focus_handle(cx));
+        self.check_recovery(cx);
     }
 
     /// Close a tab. Dirty notes are saved first so closing never loses edits.
@@ -3229,6 +3238,73 @@ impl DragonGlassApp {
         self.open_save_as(window, cx);
     }
 
+    /// Look for a draft that differs from the note on disk and offer to recover it.
+    fn check_recovery(&mut self, cx: &mut Context<Self>) {
+        self.pending_draft = None;
+        let Some(relative) = self.active.clone() else {
+            return;
+        };
+        let Some(draft) = drafts::load(&self.vault_root, &relative) else {
+            return;
+        };
+        let disk = std::fs::read_to_string(self.vault_root.join(&relative)).unwrap_or_default();
+        if draft.text == disk {
+            // Nothing was lost: the note already holds the drafted text.
+            drafts::discard(&self.vault_root, &relative);
+            return;
+        }
+        self.pending_draft = Some(draft);
+        cx.notify();
+    }
+
+    fn recover_draft(&mut self, _: &RecoverDraft, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(draft) = self.pending_draft.take() else {
+            return;
+        };
+        let editor = self.editor.clone();
+        editor.update(cx, |editor, cx| {
+            editor.apply_recovery(&draft.text, draft.line, draft.col);
+            cx.notify();
+        });
+        drafts::discard(&self.vault_root, &draft.note);
+        self.set_status(
+            StatusKind::Info,
+            "recovered the draft — save the note to keep it",
+        );
+        window.focus(&self.editor.focus_handle(cx));
+        cx.notify();
+    }
+
+    fn compare_draft(&mut self, _: &CompareDraft, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(draft) = self.pending_draft.as_ref() else {
+            return;
+        };
+        let Some(relative) = self.active.clone() else {
+            return;
+        };
+        let disk = std::fs::read_to_string(self.vault_root.join(&relative)).unwrap_or_default();
+        let diff = diff::lines(&disk, &draft.text);
+        self.diff_title = format!("disk ↔ draft — {relative}");
+        self.diff_summary = diff.summary();
+        self.diff_rows = Rc::new(diff.lines);
+        self.show_diff = true;
+        self.set_status(
+            StatusKind::Info,
+            format!("draft diff: {}", self.diff_summary),
+        );
+        window.focus(&self.editor.focus_handle(cx));
+        cx.notify();
+    }
+
+    fn discard_draft(&mut self, _: &DiscardDraft, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(draft) = self.pending_draft.take() {
+            drafts::discard(&self.vault_root, &draft.note);
+            self.set_status(StatusKind::Info, "draft discarded");
+        }
+        window.focus(&self.editor.focus_handle(cx));
+        cx.notify();
+    }
+
     fn close_tab_action(&mut self, _: &CloseTab, window: &mut Window, cx: &mut Context<Self>) {
         if self.switcher.is_none() {
             self.close_tab(self.active_tab, window, cx);
@@ -3710,6 +3786,7 @@ impl DragonGlassApp {
                 links: self.links,
                 git_status: self.git_status.clone(),
                 status: None,
+                pending_draft: None,
                 status_timer_armed: false,
                 switcher: None,
                 switcher_focus: cx.focus_handle(),
@@ -3956,6 +4033,22 @@ impl DragonGlassApp {
         cx.notify();
     }
 
+    /// Turn note autosave on or off for this vault and every open editor.
+    fn toggle_autosave(&mut self, cx: &mut Context<Self>) {
+        self.config.autosave = !self.config.autosave;
+        let autosave = self.config.autosave;
+        let message = match config::save(&self.vault_root, &self.config) {
+            Ok(()) => format!("autosave: {}", if autosave { "on" } else { "off" }),
+            Err(e) => format!("autosave toggled (not saved: {e})"),
+        };
+        for tab in &self.tabs {
+            tab.editor
+                .update(cx, |editor, _| editor.set_autosave(autosave));
+        }
+        self.set_status(StatusKind::Info, message);
+        cx.notify();
+    }
+
     fn toggle_vim(&mut self, cx: &mut Context<Self>) {
         self.config.vim_mode = !self.config.vim_mode;
         let enabled = self.config.vim_mode;
@@ -4085,6 +4178,7 @@ impl DragonGlassApp {
             "theme" => self.toggle_theme_now(cx),
             "vim" => self.toggle_vim(cx),
             "snippets" => self.toggle_snippets(cx),
+            "autosave" => self.toggle_autosave(cx),
             "font" => self.open_setting(SettingKey::FontSize, window, cx),
             "accent" => self.open_setting(SettingKey::Accent, window, cx),
             "attachments" => self.open_setting(SettingKey::AttachmentsFolder, window, cx),
@@ -4276,6 +4370,13 @@ impl DragonGlassApp {
                         "Snippets",
                         if self.config.snippets { "on" } else { "off" }.to_string(),
                         "snippets",
+                        theme,
+                    ))
+                    .child(row(
+                        "setting-autosave",
+                        "Autosave notes",
+                        if self.config.autosave { "on" } else { "off" }.to_string(),
+                        "autosave",
                         theme,
                     ))
                     .child(heading("Editor shortcuts", theme))
@@ -6760,6 +6861,60 @@ impl Render for DragonGlassApp {
             None
         };
 
+        // A draft that differs from the note on disk is offered back rather than applied
+        // silently.
+        let draft_bar = self.pending_draft.as_ref().map(|_| {
+            let button = |id: &'static str, label: &'static str| {
+                div()
+                    .id(id)
+                    .px_2()
+                    .py_1()
+                    .rounded_md()
+                    .bg(theme.chip)
+                    .text_xs()
+                    .text_color(theme.text)
+                    .cursor_pointer()
+                    .hover(move |style| style.bg(theme.hover))
+                    .child(label)
+            };
+            div()
+                .id("draft-bar")
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_2()
+                .h(px(36.0))
+                .px_3()
+                .flex_shrink_0()
+                .bg(theme.panel)
+                .border_b_1()
+                .border_color(theme.warn)
+                .text_sm()
+                .child(
+                    div()
+                        .text_color(theme.warn)
+                        .child("An unsaved draft from an earlier session differs from this note."),
+                )
+                .child(button("draft-recover", "Recover").on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _event, window, cx| {
+                        this.recover_draft(&RecoverDraft, window, cx);
+                    }),
+                ))
+                .child(button("draft-compare", "Compare").on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _event, window, cx| {
+                        this.compare_draft(&CompareDraft, window, cx);
+                    }),
+                ))
+                .child(button("draft-discard", "Discard").on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _event, window, cx| {
+                        this.discard_draft(&DiscardDraft, window, cx);
+                    }),
+                ))
+        });
+
         let tab_bar = div()
             .id("tab-bar")
             .on_drop::<TabDrag>(cx.listener(Self::drop_on_tab_bar))
@@ -6901,6 +7056,9 @@ impl Render for DragonGlassApp {
             .on_action(cx.listener(Self::keep_mine))
             .on_action(cx.listener(Self::compare_conflicted))
             .on_action(cx.listener(Self::save_conflict_copy))
+            .on_action(cx.listener(Self::recover_draft))
+            .on_action(cx.listener(Self::compare_draft))
+            .on_action(cx.listener(Self::discard_draft))
             .on_action(cx.listener(Self::copy_selection))
             .on_action(cx.listener(Self::next_tab))
             .on_action(cx.listener(Self::prev_tab))
@@ -6977,6 +7135,7 @@ impl Render for DragonGlassApp {
             .children(panel)
             .children(quit_bar)
             .children(conflict_bar)
+            .children(draft_bar)
             .child(tab_bar)
             .child(
                 div()
@@ -7554,6 +7713,7 @@ fn open_vault_window(vault_path: PathBuf, uri_note: Option<String>, cx: &mut App
             links: link_count,
             git_status: initial_git.clone(),
             status: None,
+            pending_draft: None,
             status_timer_armed: false,
             switcher: None,
             switcher_focus: cx.focus_handle(),
@@ -7613,6 +7773,7 @@ fn open_vault_window(vault_path: PathBuf, uri_note: Option<String>, cx: &mut App
         editor.update(cx, |editor, _| editor.set_link_opener(opener));
         // Tabs restored from the session need the same callbacks as newly created ones.
         app.configure_editors(cx);
+        app.check_recovery(cx);
     });
 
     app_view.update(cx, |this, cx| this.watch_vault(cx));

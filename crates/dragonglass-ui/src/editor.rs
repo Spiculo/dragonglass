@@ -12,6 +12,7 @@ use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
+use dragonglass_core::drafts;
 use dragonglass_core::find as find_engine;
 use dragonglass_core::fingerprint::{self, DocumentFingerprint, SaveReport};
 use dragonglass_core::format as text_format;
@@ -26,7 +27,7 @@ use gpui::{
     EntityInputHandler, ExternalPaths, FocusHandle, Focusable, GlobalElementId, ImageFormat,
     InspectorElementId, KeyBinding, KeyDownEvent, LayoutId, MouseButton, MouseDownEvent,
     MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point, Render, ScrollHandle, ShapedLine,
-    SharedString, Style, TextRun, UTF16Selection, Window,
+    SharedString, Style, TextRun, Timer, UTF16Selection, Window,
 };
 
 use crate::math_element::{paint_scene, MathElement};
@@ -343,6 +344,14 @@ pub struct Editor {
     fingerprint: Option<DocumentFingerprint>,
     /// Tells the app when a save would overwrite an external change.
     conflict_handler: Option<ConflictHandler>,
+    /// Debounce generation for the draft writer; a newer edit invalidates an older timer.
+    draft_generation: u64,
+    /// True while a draft timer is waiting.
+    draft_armed: bool,
+    /// The buffer revision the last draft was written for.
+    draft_written: u64,
+    /// Whether the note may be saved automatically after idle, when the disk still matches.
+    autosave: bool,
     /// Cached document statistics, recomputed per buffer revision.
     stats_cache: (u64, stats::Stats),
     /// Git added/removed lines for the file, refreshed when the saved buffer changes.
@@ -617,6 +626,10 @@ impl Editor {
             status_reporter: None,
             fingerprint: None,
             conflict_handler: None,
+            draft_generation: 0,
+            draft_armed: false,
+            draft_written: u64::MAX,
+            autosave: false,
             stats_cache: (u64::MAX, stats::Stats::default()),
             git_stat: None,
             git_stat_key: None,
@@ -932,6 +945,8 @@ impl Editor {
         self.properties_revision = u64::MAX;
         self.doc_generation = self.doc_generation.wrapping_add(1);
         self.math_scenes.clear();
+        self.draft_written = u64::MAX;
+        self.draft_generation = self.draft_generation.wrapping_add(1);
         self.path = Some(path.to_path_buf());
         Ok(())
     }
@@ -966,6 +981,13 @@ impl Editor {
             }
             self.buffer.mark_saved();
             self.fingerprint = Some(fingerprint.clone());
+            // The note on disk is now the typed text, so its draft is obsolete.
+            if let (Some(root), Some(path)) = (self.vault_root.as_ref(), self.path.as_ref()) {
+                if let Ok(relative) = path.strip_prefix(root) {
+                    let note = relative.to_string_lossy().replace('\\', "/");
+                    drafts::discard(root, &note);
+                }
+            }
         }
 
         report
@@ -1036,6 +1058,8 @@ impl Editor {
         self.properties_revision = u64::MAX;
         self.doc_generation = self.doc_generation.wrapping_add(1);
         self.math_scenes.clear();
+        self.draft_written = u64::MAX;
+        self.draft_generation = self.draft_generation.wrapping_add(1);
         self.reading_content.invalidate_attachments();
         Ok(())
     }
@@ -1657,6 +1681,120 @@ impl Editor {
     /// Tell the editor what to do when a save would overwrite an external change.
     pub fn set_conflict_handler(&mut self, handler: ConflictHandler) {
         self.conflict_handler = Some(handler);
+    }
+
+    /// Enable saving the note itself after idle, not just its draft.
+    pub fn set_autosave(&mut self, autosave: bool) {
+        self.autosave = autosave;
+    }
+
+    /// Whether a note may be autosaved after idle.
+    pub fn autosave_enabled(&self) -> bool {
+        self.autosave
+    }
+
+    /// Replace the buffer with a recovered draft, as one undoable edit.
+    pub fn apply_recovery(&mut self, text: &str, line: usize, col: usize) {
+        self.buffer.replace(0..self.buffer.len_chars(), text);
+        self.set_cursor_position(line, col);
+        self.reset_layout_cache();
+        self.properties_revision = u64::MAX;
+        self.doc_generation = self.doc_generation.wrapping_add(1);
+        self.math_scenes.clear();
+    }
+
+    /// Arm the debounced draft writer when the buffer is dirty.
+    ///
+    /// Called from `render`, which already runs on every edit. Each change bumps the
+    /// generation, so an outstanding timer either writes the newest text or arms one more
+    /// wait, giving a trailing debounce. A clean buffer arms nothing.
+    fn schedule_draft(&mut self, cx: &mut Context<Self>) {
+        if !self.buffer.is_dirty() || self.path.is_none() || self.vault_root.is_none() {
+            return;
+        }
+        let revision = self.buffer.revision();
+        if self.draft_written == revision {
+            return;
+        }
+
+        self.draft_generation = self.draft_generation.wrapping_add(1);
+        if self.draft_armed {
+            return;
+        }
+        self.draft_armed = true;
+        self.spawn_draft_timer(cx);
+    }
+
+    fn spawn_draft_timer(&mut self, cx: &mut Context<Self>) {
+        let generation = self.draft_generation;
+        cx.spawn(async move |this, cx| {
+            Timer::after(std::time::Duration::from_millis(1500)).await;
+            let _ = this.update(cx, |editor, cx| {
+                if editor.draft_generation != generation {
+                    // Something changed while waiting: wait once more.
+                    editor.spawn_draft_timer(cx);
+                    return;
+                }
+                editor.draft_armed = false;
+                editor.write_draft(cx);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Write the pending draft, and autosave the note when that is enabled and safe.
+    fn write_draft(&mut self, cx: &mut Context<Self>) {
+        let (Some(root), Some(path)) = (self.vault_root.clone(), self.path.clone()) else {
+            return;
+        };
+        let Ok(relative) = path.strip_prefix(&root) else {
+            return;
+        };
+        let note = relative.to_string_lossy().replace('\\', "/");
+        let (line, col) = self.buffer.line_col();
+        let revision = self.buffer.revision();
+        let draft = drafts::Draft {
+            note: note.clone(),
+            line,
+            col,
+            at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_millis() as u64)
+                .unwrap_or(0),
+            base: self.fingerprint.as_ref().map(|fp| fp.content_hash),
+            text: self.buffer.text(),
+        };
+        if drafts::save(&root, &draft).is_ok() {
+            self.draft_written = revision;
+        }
+
+        if !self.autosave {
+            return;
+        }
+        match self.save_checked() {
+            SaveReport::Saved { .. } => {
+                drafts::discard(&root, &note);
+                self.report(crate::StatusKind::Success, "autosaved", cx);
+            }
+            SaveReport::Conflict { .. } => {
+                // The conflict bar takes over; stop writing until it is resolved.
+                self.autosave = false;
+                self.report(
+                    crate::StatusKind::Warn,
+                    "autosave paused: the note changed on disk",
+                    cx,
+                );
+                if let Some(handler) = self.conflict_handler.clone() {
+                    handler(cx);
+                }
+            }
+            SaveReport::Error { message } => self.report(
+                crate::StatusKind::Error,
+                &format!("autosave failed: {message}"),
+                cx,
+            ),
+        }
     }
 
     /// Report to the app's status bar, if one is wired up.
@@ -3791,6 +3929,7 @@ impl Render for Editor {
         // the bottom of a long note.
         self.unfold_cursor_section();
         self.keep_cursor_visible();
+        self.schedule_draft(cx);
 
         // Text style for rich runs (highlights) in reading mode.
         let style = window.text_style();
