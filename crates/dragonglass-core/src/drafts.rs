@@ -149,7 +149,7 @@ pub fn list(root: &Path) -> Vec<Draft> {
         .filter_map(|entry| std::fs::read_to_string(entry.path()).ok())
         .filter_map(|text| Draft::from_text(&text))
         .collect();
-    drafts.sort_by(|a, b| b.at.cmp(&a.at));
+    drafts.sort_by_key(|draft| std::cmp::Reverse(draft.at));
     drafts
 }
 

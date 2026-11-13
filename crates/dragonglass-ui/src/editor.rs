@@ -1794,11 +1794,6 @@ impl Editor {
         self.autosave = autosave;
     }
 
-    /// Whether a note may be autosaved after idle.
-    pub fn autosave_enabled(&self) -> bool {
-        self.autosave
-    }
-
     /// Replace the buffer with a recovered draft, as one undoable edit.
     pub fn apply_recovery(&mut self, text: &str, line: usize, col: usize) {
         self.buffer.replace(0..self.buffer.len_chars(), text);
@@ -4562,6 +4557,8 @@ impl Render for Editor {
             .on_action(cx.listener(Self::toggle_inline_code))
             .on_action(cx.listener(Self::toggle_comment))
             .on_action(cx.listener(Self::insert_wikilink))
+            .on_action(cx.listener(Self::indent))
+            .on_action(cx.listener(Self::outdent))
             .on_key_down(cx.listener(Self::on_pre_key_down))
             .on_action(cx.listener(Self::backspace))
             .on_action(cx.listener(Self::delete))

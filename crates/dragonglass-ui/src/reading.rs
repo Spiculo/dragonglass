@@ -1288,7 +1288,7 @@ fn block_texts(block: &Block) -> Vec<&str> {
 /// A display formula, centred and scaled down when it is wider than the reading column.
 fn render_math(tex: &str, ctx: &RenderCtx) -> AnyElement {
     const FONT_SIZE: f32 = 17.0;
-    /// Usable width inside the reading column.
+    // Usable width inside the reading column.
     let max_width: f32 = (ctx.measure - 44.0).max(320.0);
 
     let Some(scene) = ctx
