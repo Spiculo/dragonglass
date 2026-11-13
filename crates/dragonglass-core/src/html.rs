@@ -170,7 +170,9 @@ fn render_block(block: Block, attachments: Option<&Attachments>, used: &mut Vec<
                 body
             )
         }
-        Block::Embed { target, width, alt } => {
+        Block::Embed {
+            target, width, alt, ..
+        } => {
             if is_image(&target) {
                 let resolved = attachments.and_then(|index| index.resolve(&target));
                 let source = resolved.unwrap_or(target.as_str());

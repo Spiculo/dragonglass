@@ -471,6 +471,16 @@ missing-note placeholder. Do not re-read/re-parse the vault on every render.
 **Done when:** a note with 3 nested embeds scrolls smoothly, links inside embeds work, and
 editing the embedded note updates the host on the next render without a full vault scan.
 
+**Landed:** each transcluded note is parsed once per `(path, fragment)` and reused while its
+mtime is unchanged (shared blocks are expanded at parse time, not per frame). Embedded blocks
+get synthetic ids above the host block count, so links inside an embed are clickable and
+selection paints across its text. Math inside embeds is typeset lazily into a shared scene
+map and reused. `![[Note#Section]]` renders only that heading's section (it stops at the next
+same-or-higher heading), a missing section and a missing note each show a placeholder, and
+nested embeds stay depth-limited.
+**Remaining:** a selection that spans an embed copies only host text (the copy path walks the
+host block list); `#^block` transclusion renders the whole note.
+
 #### Q2.10 Reading progress and typography details — D · S
 Show section name and percent read in the status bar (replace edit-mode Ln/Col), join soft
 line breaks with spaces while preserving explicit hard breaks, and keep footnote/heading

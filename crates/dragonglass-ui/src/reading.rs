@@ -4,12 +4,13 @@
 //! Inline text goes through `dragonglass_core::inline`, so emphasis, code, links, math
 //! and highlights all render inside paragraphs, list items, headings and table cells.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::time::SystemTime;
 
 use dragonglass_core::assets::Attachments;
 use dragonglass_core::find as find_engine;
@@ -175,6 +176,14 @@ pub struct SelectionStats {
 }
 
 /// Everything a block needs to render, threaded through the recursive embed renderer.
+/// A parsed transcluded note, keyed by path and fragment and revalidated by mtime.
+struct EmbeddedNote {
+    modified: Option<SystemTime>,
+    blocks: Rc<Vec<Block>>,
+}
+
+type EmbedCache = Rc<RefCell<HashMap<(PathBuf, Option<String>), EmbeddedNote>>>;
+
 struct RenderCtx<'a> {
     vault_root: Option<&'a Path>,
     attachments: Option<&'a Attachments>,
@@ -194,6 +203,12 @@ struct RenderCtx<'a> {
     on_image: Option<&'a ImageOpener>,
     /// Opens a PDF/audio/video attachment with the OS.
     open_file: Option<&'a FileOpener>,
+    /// Parsed embedded notes, cached by path and mtime.
+    embeds: Option<&'a EmbedCache>,
+    /// Formulas typeset for embedded notes, filled lazily.
+    embed_math: Option<&'a RefCell<HashMap<(String, MathStyle), Rc<MathScene>>>>,
+    /// Allocator for synthetic block ids inside embeds.
+    next_block: Option<&'a Cell<usize>>,
     /// The reading list, so dragging past the viewport can scroll it.
     list_state: Option<&'a ListState>,
     /// How many blocks the list holds, to clamp drag auto-scroll.
@@ -478,6 +493,10 @@ pub struct ReadingCache {
     lightbox: Rc<RefCell<Option<PathBuf>>>,
     /// A block a popup asked the reader to reveal on the next render.
     reveal_block: Rc<RefCell<Option<usize>>>,
+    /// Parsed transcluded notes, revalidated by modification time.
+    embeds: EmbedCache,
+    /// Formulas typeset for transcluded notes.
+    embed_math: Rc<RefCell<HashMap<(String, MathStyle), Rc<MathScene>>>>,
 }
 
 impl ReadingCache {
@@ -499,6 +518,8 @@ impl ReadingCache {
             find: Rc::new(ReadingFind::default()),
             lightbox: Rc::new(RefCell::new(None)),
             reveal_block: Rc::new(RefCell::new(None)),
+            embeds: Rc::new(RefCell::new(HashMap::new())),
+            embed_math: Rc::new(RefCell::new(HashMap::new())),
             footnote_popup: None,
             folded: HashSet::new(),
         }
@@ -1161,6 +1182,9 @@ impl ReadingCache {
         });
         let find = self.find.clone();
         let lightbox = self.lightbox.clone();
+        let embeds = self.embeds.clone();
+        let embed_math = self.embed_math.clone();
+        let next_block = Cell::new(self.blocks.len());
         let on_image: ImageOpener = {
             let lightbox = lightbox.clone();
             Rc::new(move |path, window, _cx| {
@@ -1206,6 +1230,9 @@ impl ReadingCache {
                             find: Some(&find),
                             on_image: Some(&on_image),
                             open_file: Some(&open_file),
+                            embeds: Some(&embeds),
+                            embed_math: Some(&embed_math),
+                            next_block: Some(&next_block),
                             list_state: Some(&list_state),
                             block_count: blocks.len(),
                             blocks: blocks.as_slice(),
@@ -1316,40 +1343,61 @@ fn hidden_blocks(blocks: &[Block], folded: &HashSet<usize>) -> Vec<bool> {
 
 /// A non-virtualized column, used for nested `![[note]]` embeds where a second scroll
 /// container would be wrong.
-fn reading_column(src: &str, ctx: &RenderCtx) -> impl IntoElement {
-    let source = match ctx.vault_root {
-        Some(root) => shared::expand(src, root),
-        None => src.to_string(),
-    };
-    let blocks = markdown::parse_blocks(&source);
+/// Render a list of parsed blocks, giving each a synthetic id so links and selection work.
+fn render_blocks(blocks: &Rc<Vec<Block>>, ctx: &RenderCtx) -> AnyElement {
     let template = ctx.template.clone();
     let nested = RenderCtx {
         vault_root: ctx.vault_root,
-        attachments: ctx.attachments,
-        selection: ctx.selection,
-        opener: ctx.opener,
-        math: ctx.math,
-        folded: ctx.folded,
         on_fold: None,
-        copy: ctx.copy,
-        find: ctx.find,
-        on_image: ctx.on_image,
-        open_file: ctx.open_file,
-        list_state: ctx.list_state,
-        block_count: ctx.block_count,
         blocks: &[],
         depth: ctx.depth + 1,
-        theme: ctx.theme,
         template: &template,
-        body_size: ctx.body_size,
-        measure: ctx.measure,
+        ..*ctx
     };
 
-    div().flex().flex_col().gap_3().children(
-        blocks
-            .into_iter()
-            .map(move |block| render_block(block, None, &nested)),
-    )
+    div()
+        .flex()
+        .flex_col()
+        .gap_3()
+        .children(blocks.iter().cloned().map(|block| {
+            let id = ctx.next_block.map(|next| {
+                let value = next.get();
+                next.set(value + 1);
+                value
+            });
+            render_block(block, id, &nested)
+        }))
+        .into_any_element()
+}
+
+/// Only the blocks of one `#Heading` section, for `![[Note#Section]]`.
+fn section_blocks(blocks: Vec<Block>, fragment: &str) -> Option<Vec<Block>> {
+    let wanted = fragment
+        .trim()
+        .trim_start_matches('#')
+        .trim()
+        .to_lowercase();
+    if wanted.is_empty() {
+        return None;
+    }
+    let start = blocks.iter().position(|block| match block {
+        Block::Heading { text, .. } => text.trim().to_lowercase() == wanted,
+        _ => false,
+    })?;
+    let level = match &blocks[start] {
+        Block::Heading { level, .. } => *level,
+        _ => return None,
+    };
+    let mut end = blocks.len();
+    for (index, block) in blocks.iter().enumerate().skip(start + 1) {
+        if let Block::Heading { level: next, .. } = block {
+            if *next <= level {
+                end = index;
+                break;
+            }
+        }
+    }
+    Some(blocks[start..end].to_vec())
 }
 
 fn render_block(block: Block, block_index: Option<usize>, ctx: &RenderCtx) -> AnyElement {
@@ -1541,7 +1589,12 @@ fn render_block(block: Block, block_index: Option<usize>, ctx: &RenderCtx) -> An
             headers,
             rows,
         } => render_table(&align, &headers, &rows, block_index, ctx),
-        Block::Embed { target, width, alt } => render_embed(&target, width, alt.as_deref(), ctx),
+        Block::Embed {
+            target,
+            width,
+            alt,
+            fragment,
+        } => render_embed(&target, width, alt.as_deref(), fragment.as_deref(), ctx),
     }
 }
 
@@ -1562,6 +1615,29 @@ impl<'a> RenderCtx<'a> {
             .collect()
     }
 
+    /// A typeset scene: host formulas first, then lazily typeset embed formulas.
+    fn math_scene(&self, tex: &str, style: MathStyle) -> Option<Rc<MathScene>> {
+        let key = (tex.to_string(), style);
+        if let Some(scene) = self.math.get(&key) {
+            return Some(scene.clone());
+        }
+        let cache = self.embed_math?;
+        if let Some(scene) = cache.borrow().get(&key) {
+            return Some(scene.clone());
+        }
+        let scene = math::typeset(
+            tex,
+            &MathOptions {
+                style,
+                color: [0.0, 0.0, 0.0, 1.0],
+            },
+        )
+        .ok()
+        .map(Rc::new)?;
+        cache.borrow_mut().insert(key, scene.clone());
+        Some(scene)
+    }
+
     fn with_template<'b>(&'b self, template: &'b TextRun) -> RenderCtx<'b> {
         RenderCtx {
             vault_root: self.vault_root,
@@ -1575,6 +1651,9 @@ impl<'a> RenderCtx<'a> {
             find: self.find,
             on_image: self.on_image,
             open_file: self.open_file,
+            embeds: self.embeds,
+            embed_math: self.embed_math,
+            next_block: self.next_block,
             list_state: self.list_state,
             block_count: self.block_count,
             blocks: self.blocks,
@@ -1631,11 +1710,7 @@ fn render_math(tex: &str, ctx: &RenderCtx) -> AnyElement {
     // Usable width inside the reading column.
     let max_width: f32 = (ctx.measure - 44.0).max(320.0);
 
-    let Some(scene) = ctx
-        .math
-        .get(&(tex.to_string(), MathStyle::Display))
-        .cloned()
-    else {
+    let Some(scene) = ctx.math_scene(tex, MathStyle::Display) else {
         return math_error(tex, ctx.theme);
     };
 
@@ -1845,7 +1920,7 @@ fn flow_content(
     for span in spans {
         if span.style.math {
             if let Some(tex) = &span.math {
-                if let Some(scene) = ctx.math.get(&(tex.clone(), MathStyle::Inline)).cloned() {
+                if let Some(scene) = ctx.math_scene(tex, MathStyle::Inline) {
                     // `block_display` copies math as `$tex$`; keep the piece range in sync.
                     let display_len = tex.len() + 2;
                     pieces.push(FlowPiece {
@@ -2260,6 +2335,7 @@ fn render_embed(
     target: &str,
     width: Option<u32>,
     alt: Option<&str>,
+    fragment: Option<&str>,
     ctx: &RenderCtx,
 ) -> AnyElement {
     let theme = ctx.theme;
@@ -2382,15 +2458,56 @@ fn render_embed(
         return placeholder(target, "embed depth limit", theme);
     }
 
-    match std::fs::read_to_string(resolve_note(root, attachments, target)) {
-        Ok(text) => div()
-            .border_l_1()
-            .border_color(theme.border)
-            .pl_3()
-            .child(reading_column(&text, ctx))
-            .into_any_element(),
-        Err(_) => placeholder(target, "note not found", theme),
-    }
+    let path = resolve_note(root, attachments, target);
+    let Some(cache) = ctx.embeds else {
+        return placeholder(target, "embed cache unavailable", theme);
+    };
+    let modified = std::fs::metadata(&path)
+        .ok()
+        .and_then(|metadata| metadata.modified().ok());
+    let key = (path.clone(), fragment.map(str::to_string));
+
+    let blocks = {
+        let mut embeds = cache.borrow_mut();
+        match embeds.get(&key) {
+            Some(entry) if entry.modified == modified => entry.blocks.clone(),
+            _ => {
+                let Ok(text) = std::fs::read_to_string(&path) else {
+                    return placeholder(target, "note not found", theme);
+                };
+                // Shared blocks are expanded once per parse, not per frame.
+                let text = shared::expand(&text, root);
+                let (parsed, _) = markdown::parse_blocks_spanned(&text);
+                let parsed = match fragment {
+                    Some(fragment) if !fragment.starts_with('^') => {
+                        match section_blocks(parsed, fragment) {
+                            Some(section) => section,
+                            None => {
+                                return placeholder(target, "section not found", theme);
+                            }
+                        }
+                    }
+                    _ => parsed,
+                };
+                let blocks = Rc::new(parsed);
+                embeds.insert(
+                    key,
+                    EmbeddedNote {
+                        modified,
+                        blocks: blocks.clone(),
+                    },
+                );
+                blocks
+            }
+        }
+    };
+
+    div()
+        .border_l_1()
+        .border_color(theme.border)
+        .pl_3()
+        .child(render_blocks(&blocks, ctx))
+        .into_any_element()
 }
 
 /// Resolve a link target to a file: the direct path first, then the vault-wide name index.
@@ -3104,6 +3221,25 @@ mod tests {
         assert_eq!(cache.block_for_line(3), Some(1));
         // Past the end is the last block.
         assert_eq!(cache.block_for_line(99), Some(2));
+    }
+
+    #[test]
+    fn a_note_embed_section_stops_at_the_next_sibling_heading() {
+        let (blocks, _) = markdown::parse_blocks_spanned("# One\na\n## Sub\nb\n# Two\nc\n");
+        let section = section_blocks(blocks.clone(), "One").expect("section");
+        assert_eq!(section.len(), 4, "{section:?}");
+        assert!(matches!(section.last(), Some(Block::Paragraph(text)) if text == "b"));
+
+        let section = section_blocks(blocks, "Sub").expect("section");
+        assert_eq!(section.len(), 2);
+        assert!(matches!(&section[0], Block::Heading { text, .. } if text == "Sub"));
+    }
+
+    #[test]
+    fn a_missing_embed_section_is_reported() {
+        let (blocks, _) = markdown::parse_blocks_spanned("# One\ntext\n");
+        assert!(section_blocks(blocks, "Nope").is_none());
+        assert!(section_blocks(markdown::parse_blocks("# One\ntext\n"), "").is_none());
     }
 
     #[test]

@@ -36,6 +36,8 @@ pub enum Block {
         width: Option<u32>,
         /// Alt text, from `![alt](src)` or `![[image.png|alt text]]`.
         alt: Option<String>,
+        /// `#Section` / `#^block` in `![[Note#Section]]`, for note transclusion.
+        fragment: Option<String>,
     },
     /// An Obsidian callout: a blockquote starting with `[!kind] Title`.
     Callout {
@@ -501,6 +503,7 @@ fn flush_paragraph(
                     target: spec.target,
                     width: spec.width,
                     alt: spec.alt,
+                    fragment: spec.fragment,
                 },
                 offset + first,
                 offset + last,
@@ -527,6 +530,7 @@ struct EmbedSpec {
     target: String,
     width: Option<u32>,
     alt: Option<String>,
+    fragment: Option<String>,
 }
 
 fn standalone_embed(line: &str) -> Option<EmbedSpec> {
@@ -535,13 +539,14 @@ fn standalone_embed(line: &str) -> Option<EmbedSpec> {
     if trimmed.starts_with("![[") && trimmed.ends_with("]]") {
         let inner = &trimmed[3..trimmed.len() - 2];
         let mut parts = inner.split('|');
-        let raw_target = parts.next().unwrap_or(inner);
-        let target = raw_target
-            .split('#')
-            .next()
-            .unwrap_or(raw_target)
-            .trim()
-            .to_string();
+        let raw_target = parts.next().unwrap_or(inner).trim();
+        let (target, fragment) = match raw_target.split_once('#') {
+            Some((note, fragment)) => (
+                note.trim().to_string(),
+                (!fragment.trim().is_empty()).then(|| fragment.trim().to_string()),
+            ),
+            None => (raw_target.to_string(), None),
+        };
         if target.is_empty() {
             return None;
         }
@@ -564,7 +569,12 @@ fn standalone_embed(line: &str) -> Option<EmbedSpec> {
                 alt = Some(part.to_string());
             }
         }
-        return Some(EmbedSpec { target, width, alt });
+        return Some(EmbedSpec {
+            target,
+            width,
+            alt,
+            fragment,
+        });
     }
 
     if let Some(rest) = trimmed.strip_prefix("![") {
@@ -577,6 +587,7 @@ fn standalone_embed(line: &str) -> Option<EmbedSpec> {
                         target: source.to_string(),
                         width: None,
                         alt: (!alt.is_empty()).then(|| alt.to_string()),
+                        fragment: None,
                     });
                 }
             }
@@ -1079,7 +1090,8 @@ mod tests {
                 Block::Embed {
                     target: "image.png".into(),
                     width: None,
-                    alt: None
+                    alt: None,
+                    fragment: None
                 },
                 Block::Paragraph("text".into()),
             ]
@@ -1094,7 +1106,8 @@ mod tests {
             vec![Block::Embed {
                 target: "attachments/pic.png".into(),
                 width: None,
-                alt: Some("alt".into())
+                alt: Some("alt".into()),
+                fragment: None
             }]
         );
     }
@@ -1107,7 +1120,8 @@ mod tests {
             vec![Block::Embed {
                 target: "Note".into(),
                 width: None,
-                alt: Some("Alias".into())
+                alt: Some("Alias".into()),
+                fragment: Some("Section".into())
             }]
         );
     }
@@ -1119,7 +1133,8 @@ mod tests {
             Block::Embed {
                 target: "shot.png".into(),
                 width: Some(300),
-                alt: None
+                alt: None,
+                fragment: None
             }
         );
         assert_eq!(
@@ -1127,7 +1142,8 @@ mod tests {
             Block::Embed {
                 target: "shot.png".into(),
                 width: None,
-                alt: Some("A screenshot".into())
+                alt: Some("A screenshot".into()),
+                fragment: None
             }
         );
         // Widths are clamped to something sane.
@@ -1136,7 +1152,8 @@ mod tests {
             Block::Embed {
                 target: "shot.png".into(),
                 width: Some(2000),
-                alt: None
+                alt: None,
+                fragment: None
             }
         );
     }
