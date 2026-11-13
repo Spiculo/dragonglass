@@ -677,6 +677,9 @@ struct DragonGlassApp {
     status: Option<Status>,
     /// A recovered draft waiting for the user's decision.
     pending_draft: Option<drafts::Draft>,
+    /// When the throttled stats/outline pass last ran, and whether a timer is armed.
+    derived_at: Option<std::time::Instant>,
+    derived_armed: bool,
     /// True while a one-shot task is waiting to expire the current status line.
     status_timer_armed: bool,
     switcher: Option<Switcher>,
@@ -4171,6 +4174,8 @@ impl DragonGlassApp {
                 git_status: self.git_status.clone(),
                 status: None,
                 pending_draft: None,
+                derived_at: None,
+                derived_armed: false,
                 status_timer_armed: false,
                 switcher: None,
                 switcher_focus: cx.focus_handle(),
@@ -6488,14 +6493,39 @@ impl Render for DragonGlassApp {
         let stats_stale = stats_version != self.stats_version;
         let headings_stale = headings_version != self.headings_version;
         if stats_stale || headings_stale {
-            let text = self.editor.read(cx).text();
-            if stats_stale {
-                self.stats = stats::compute(&text);
-                self.stats_version = stats_version;
-            }
-            if headings_stale {
-                self.headings = Rc::new(markdown::headings(&text));
-                self.headings_version = headings_version;
+            // Whole-document work (word counts, outline) is throttled to ~7 times a second
+            // while typing: the first stale frame arms a timer, the timer repaints once the
+            // window has passed, and continuous typing cannot recompute on every keystroke.
+            let now = std::time::Instant::now();
+            let due = self.derived_at.map_or(true, |last| {
+                now.duration_since(last) >= std::time::Duration::from_millis(150)
+            });
+            if due {
+                let text = self.editor.read(cx).text();
+                if stats_stale {
+                    self.stats = stats::compute(&text);
+                    self.stats_version = stats_version;
+                }
+                if headings_stale {
+                    self.headings = Rc::new(markdown::headings(&text));
+                    self.headings_version = headings_version;
+                }
+                self.derived_at = Some(now);
+            } else if !self.derived_armed {
+                self.derived_armed = true;
+                let elapsed = self
+                    .derived_at
+                    .map(|last| now.duration_since(last))
+                    .unwrap_or_default();
+                let wait = std::time::Duration::from_millis(150).saturating_sub(elapsed);
+                cx.spawn(async move |this, cx| {
+                    Timer::after(wait).await;
+                    let _ = this.update(cx, |app, cx| {
+                        app.derived_armed = false;
+                        cx.notify();
+                    });
+                })
+                .detach();
             }
         }
 
@@ -8233,6 +8263,8 @@ fn open_vault_window(vault_path: PathBuf, uri_note: Option<String>, cx: &mut App
             git_status: initial_git.clone(),
             status: None,
             pending_draft: None,
+            derived_at: None,
+            derived_armed: false,
             status_timer_armed: false,
             switcher: None,
             switcher_focus: cx.focus_handle(),

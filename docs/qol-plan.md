@@ -555,6 +555,13 @@ buffer revision. Build the attachments/alias index once per vault scan, not on f
 **Done when:** a 1 MB note remains responsive while typing; idle CPU stays at zero; no
 full-vault walk on mode entry.
 
+**Landed:** the editor's word/character counts and the app's header stats and outline are
+throttled to ~7 passes a second with a trailing one-shot timer (no timer when the buffer is
+clean), instead of counting the whole note on every keystroke. The attachment index is still
+built once per vault/mode entry.
+**Remaining:** `document_headings` still re-parses the document on every revision because
+fold markers and layout depend on it; incremental heading updates are open.
+
 #### Q3.9 Focused split is the command target — D · S
 Track the focused pane/tab; Ctrl+W, Save, Find and format commands apply to the focused
 editor, not always `active_tab`. Clicking a pane focuses it and updates the active tab.

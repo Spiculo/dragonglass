@@ -355,6 +355,9 @@ pub struct Editor {
     draft_armed: bool,
     /// The buffer revision the last draft was written for.
     draft_written: u64,
+    /// When the throttled document stats last ran, and whether a timer is armed.
+    stats_at: Option<std::time::Instant>,
+    stats_armed: bool,
     /// Whether the note may be saved automatically after idle, when the disk still matches.
     autosave: bool,
     /// Cached document statistics, recomputed per buffer revision.
@@ -683,6 +686,8 @@ impl Editor {
             draft_generation: 0,
             draft_armed: false,
             draft_written: u64::MAX,
+            stats_at: None,
+            stats_armed: false,
             autosave: false,
             stats_cache: (u64::MAX, stats::Stats::default()),
             git_stat: None,
@@ -2140,10 +2145,36 @@ impl Editor {
     }
 
     /// Recompute word counts when the buffer changes, and git stats when it is saved.
-    fn refresh_stats(&mut self) {
+    ///
+    /// Counting the whole note on every keystroke is O(note) work for a number only the
+    /// status bar shows, so it is throttled to ~7 passes a second with a trailing timer.
+    /// The git stat still refreshes whenever the saved revision moves.
+    fn refresh_stats(&mut self, cx: &mut Context<Self>) {
         let revision = self.buffer.revision();
         if self.stats_cache.0 != revision {
-            self.stats_cache = (revision, stats::compute(&self.buffer.text()));
+            let now = std::time::Instant::now();
+            let due = self.stats_at.map_or(true, |last| {
+                now.duration_since(last) >= std::time::Duration::from_millis(150)
+            });
+            if due {
+                self.stats_cache = (revision, stats::compute(&self.buffer.text()));
+                self.stats_at = Some(now);
+            } else if !self.stats_armed {
+                self.stats_armed = true;
+                let elapsed = self
+                    .stats_at
+                    .map(|last| now.duration_since(last))
+                    .unwrap_or_default();
+                let wait = std::time::Duration::from_millis(150).saturating_sub(elapsed);
+                cx.spawn(async move |this, cx| {
+                    Timer::after(wait).await;
+                    let _ = this.update(cx, |editor, cx| {
+                        editor.stats_armed = false;
+                        cx.notify();
+                    });
+                })
+                .detach();
+            }
         }
 
         // `git diff` is only meaningful for the saved file, so skip it while dirty.
@@ -4538,7 +4569,7 @@ impl Render for Editor {
         let reading = self.reading;
 
         self.refresh_properties();
-        self.refresh_stats();
+        self.refresh_stats(cx);
 
         let body: AnyElement = if reading {
             let version = self.document_version();
