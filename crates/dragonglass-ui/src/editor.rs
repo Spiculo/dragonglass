@@ -1299,6 +1299,139 @@ impl Editor {
         self.reading_content.scroll_to_block(block);
     }
 
+    /// The reading view's in-page find bar.
+    fn render_reading_find_bar(&self, theme: Theme, cx: &mut Context<Self>) -> AnyElement {
+        let pattern = self.reading_content.find_pattern().to_string();
+        let (current, total) = self.reading_content.find_position();
+        let (regex, case, word) = self.reading_content.find_options();
+        let error = self.reading_content.find_error().map(str::to_string);
+        let (status, status_color) = if let Some(error) = error {
+            (error, theme.warn)
+        } else if pattern.is_empty() {
+            ("type to search this note".to_string(), theme.muted)
+        } else if total == 0 {
+            ("no matches".to_string(), theme.warn)
+        } else {
+            (format!("{current}/{total}"), theme.muted)
+        };
+        let button = |id: &'static str, label: &'static str| {
+            div()
+                .id(id)
+                .px_2()
+                .py_1()
+                .rounded_md()
+                .bg(theme.chip)
+                .text_xs()
+                .text_color(theme.text_dim)
+                .cursor_pointer()
+                .hover(move |style| style.bg(theme.hover))
+                .child(label)
+        };
+
+        div()
+            .id("reading-find")
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2()
+            .h(px(36.0))
+            .px_3()
+            .flex_shrink_0()
+            .bg(theme.panel)
+            .border_b_1()
+            .border_color(theme.border)
+            .child(div().text_xs().text_color(theme.muted).child("FIND"))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(120.0))
+                    .px_2()
+                    .py_1()
+                    .rounded_md()
+                    .bg(theme.input_bg)
+                    .border_1()
+                    .border_color(theme.accent)
+                    .text_sm()
+                    .text_color(if pattern.is_empty() {
+                        theme.muted
+                    } else {
+                        theme.text
+                    })
+                    .child(format!(
+                        "{}│",
+                        if pattern.is_empty() {
+                            "Find in note".to_string()
+                        } else {
+                            pattern
+                        }
+                    )),
+            )
+            .child(
+                div()
+                    .px_2()
+                    .py_1()
+                    .rounded_md()
+                    .text_xs()
+                    .text_color(if regex {
+                        theme.accent_text
+                    } else {
+                        theme.muted
+                    })
+                    .bg(if regex { theme.chip } else { theme.panel })
+                    .child(".*"),
+            )
+            .child(
+                div()
+                    .px_2()
+                    .py_1()
+                    .rounded_md()
+                    .text_xs()
+                    .text_color(if case { theme.accent_text } else { theme.muted })
+                    .bg(if case { theme.chip } else { theme.panel })
+                    .child("Aa"),
+            )
+            .child(
+                div()
+                    .px_2()
+                    .py_1()
+                    .rounded_md()
+                    .text_xs()
+                    .text_color(if word { theme.accent_text } else { theme.muted })
+                    .bg(if word { theme.chip } else { theme.panel })
+                    .child("W"),
+            )
+            .child(
+                div()
+                    .min_w(px(56.0))
+                    .text_xs()
+                    .text_color(status_color)
+                    .child(status),
+            )
+            .child(button("reading-find-prev", "prev").on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _event, _window, cx| {
+                    this.reading_content.find_next(true);
+                    cx.notify();
+                }),
+            ))
+            .child(button("reading-find-next", "next").on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _event, _window, cx| {
+                    this.reading_content.find_next(false);
+                    cx.notify();
+                }),
+            ))
+            .child(button("reading-find-close", "x").on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _event, window, cx| {
+                    this.reading_content.close_find();
+                    window.focus(&this.focus_handle);
+                    cx.notify();
+                }),
+            ))
+            .into_any_element()
+    }
+
     /// The reading view's current section and progress, for the status bar and outline.
     pub fn reading_outline_state(&self) -> (Option<String>, f32) {
         (
@@ -2660,6 +2793,13 @@ impl Editor {
     }
 
     fn backspace(&mut self, _: &Backspace, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.reading {
+            if self.reading_content.find_open() {
+                self.reading_content.find_backspace();
+                cx.notify();
+            }
+            return;
+        }
         if !self.can_mutate() {
             return;
         }
@@ -3130,6 +3270,14 @@ impl Editor {
     }
 
     fn enter(&mut self, _: &Enter, window: &mut Window, cx: &mut Context<Self>) {
+        if self.reading {
+            if self.reading_content.find_open() {
+                let backwards = window.modifiers().shift;
+                self.reading_content.find_next(backwards);
+                cx.notify();
+            }
+            return;
+        }
         if self.accept_autocomplete() {
             cx.notify();
             return;
@@ -3547,7 +3695,9 @@ impl Editor {
     /// Open the in-note find bar, optionally with the replacement field.
     pub fn open_find(&mut self, replace: bool) {
         if self.reading {
-            self.set_reading_mode(false);
+            // In-page find: it never leaves reading mode and never edits the note.
+            self.reading_content.open_find();
+            return;
         }
         if !self.find.open {
             let selection = self.selection().map(|range| self.buffer.slice(range));
@@ -3567,6 +3717,10 @@ impl Editor {
     /// Escape closes the find bar, leaves Vim insert/visual mode, or drops extra carets.
     /// Returns whether the editor consumed the key.
     pub fn handle_escape(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.reading && self.reading_content.find_open() {
+            self.reading_content.close_find();
+            return true;
+        }
         if self.reading && self.reading_content.dismiss_popup(cx) {
             return true;
         }
@@ -3770,11 +3924,25 @@ impl Editor {
     }
 
     fn find_next_action(&mut self, _: &FindNext, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.reading {
+            if self.reading_content.find_open() {
+                self.reading_content.find_next(false);
+                cx.notify();
+            }
+            return;
+        }
         self.find_next(false);
         cx.notify();
     }
 
     fn find_prev_action(&mut self, _: &FindPrev, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.reading {
+            if self.reading_content.find_open() {
+                self.reading_content.find_next(true);
+                cx.notify();
+            }
+            return;
+        }
         self.find_next(true);
         cx.notify();
     }
@@ -3811,6 +3979,13 @@ impl Editor {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.reading {
+            if self.reading_content.find_open() {
+                self.reading_content.find_toggle_regex();
+                cx.notify();
+            }
+            return;
+        }
         if !self.find.open {
             return;
         }
@@ -3825,6 +4000,13 @@ impl Editor {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.reading {
+            if self.reading_content.find_open() {
+                self.reading_content.find_toggle_case();
+                cx.notify();
+            }
+            return;
+        }
         if !self.find.open {
             return;
         }
@@ -3839,6 +4021,13 @@ impl Editor {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.reading {
+            if self.reading_content.find_open() {
+                self.reading_content.find_toggle_word();
+                cx.notify();
+            }
+            return;
+        }
         if !self.find.open {
             return;
         }
@@ -4359,9 +4548,17 @@ impl Render for Editor {
                 self.reading_content.update(version, &text, root.as_deref());
             }
 
+            let find_bar = self
+                .reading_content
+                .find_open()
+                .then(|| self.render_reading_find_bar(theme, cx));
+
             div()
                 .flex_1()
                 .min_h(px(0.0))
+                .flex()
+                .flex_col()
+                .children(find_bar)
                 .child({
                     let fold: crate::reading::FoldToggle = {
                         let weak = cx.entity().downgrade();
@@ -4871,6 +5068,12 @@ impl EntityInputHandler for Editor {
         cx: &mut Context<Self>,
     ) {
         if self.reading {
+            if self.reading_content.find_open() {
+                self.reading_content.find_append(new_text);
+                self.marked_range = None;
+                cx.notify();
+                return;
+            }
             // Reading mode owns its own navigation: j/k and g/G scroll the view, and every
             // other keystroke is swallowed so it cannot reach the hidden buffer.
             match new_text {

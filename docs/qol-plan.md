@@ -374,6 +374,16 @@ existing find-bar layout but target `ReadingCache` scroll positions.
 **Done when:** Ctrl+F in reading highlights and cycles matches, Escape restores the prior
 scroll, and the note is untouched.
 
+**Landed:** `Ctrl+F` in reading opens a find bar inside the reading view instead of switching
+to edit. It searches block display text with `core::find`, shows `current/total` (or "no
+matches"/the regex error), highlights every match behind the text with the current one in a
+stronger colour, cycles with Enter / Shift+Enter / F3 / Shift+F3, and toggles regex, case and
+whole word with the same `Ctrl+Alt+R/C/W` keys as the editor. Escape closes it and scrolls
+back to the block where it opened; the buffer is never touched. Tests cover counting,
+wrapping, backspace, option toggles, invalid regex and document immutability.
+**Remaining:** paragraphs that contain inline math use the flow layout, which does not paint
+the highlight quads yet (they are still counted and scrolled to).
+
 #### Q2.3 Selection and copy polish — D · M
 Add double-click word, triple-click paragraph/line, Shift-click extension, keyboard
 selection, auto-scroll while dragging past the viewport, focus-on-mouse-down, Escape to

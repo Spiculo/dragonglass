@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use dragonglass_core::assets::Attachments;
+use dragonglass_core::find as find_engine;
 use dragonglass_core::frontmatter::{self, Property};
 use dragonglass_core::inline;
 use dragonglass_core::markdown::{self, Align, Block};
@@ -70,6 +71,45 @@ pub type CopyHandler = Rc<dyn Fn(&str, &mut Window, &mut App)>;
 pub struct ReadPoint {
     pub block: usize,
     pub offset: usize,
+}
+
+/// One in-page find hit: a block and a byte range in its display text.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReadingMatch {
+    pub block: usize,
+    pub range: Range<usize>,
+}
+
+/// The reading view's own find state. It searches block display text, so the note is never
+/// touched and the mode never changes.
+#[derive(Clone, Debug)]
+struct ReadingFind {
+    open: bool,
+    pattern: String,
+    options: find_engine::Options,
+    matches: Vec<ReadingMatch>,
+    current: usize,
+    error: Option<String>,
+    /// Top block when the bar opened, restored by Escape.
+    return_block: usize,
+}
+
+impl Default for ReadingFind {
+    fn default() -> Self {
+        Self {
+            open: false,
+            pattern: String::new(),
+            options: find_engine::Options {
+                regex: false,
+                case_sensitive: false,
+                whole_word: false,
+            },
+            matches: Vec::new(),
+            current: 0,
+            error: None,
+            return_block: 0,
+        }
+    }
 }
 
 /// A keyboard motion that extends the reading selection.
@@ -142,6 +182,8 @@ struct RenderCtx<'a> {
     on_fold: Option<&'a FoldToggle>,
     /// Copies text to the clipboard (code fences have a copy button).
     copy: Option<&'a CopyHandler>,
+    /// In-page find, so matches can be painted behind the text.
+    find: Option<&'a ReadingFind>,
     /// The reading list, so dragging past the viewport can scroll it.
     list_state: Option<&'a ListState>,
     /// How many blocks the list holds, to clamp drag auto-scroll.
@@ -407,6 +449,9 @@ pub struct ReadingCache {
     /// False when shared-block expansion rewrote the text, which moves the spans away
     /// from the buffer's own line numbers.
     spans_valid: bool,
+    /// In-page find over block display text. `Rc` so the virtualized list can borrow it
+    /// without copying the match list every frame.
+    find: Rc<ReadingFind>,
 }
 
 impl ReadingCache {
@@ -425,6 +470,7 @@ impl ReadingCache {
             footnote_defs: Rc::new(RefCell::new(HashMap::new())),
             spans: Rc::new(Vec::new()),
             spans_valid: false,
+            find: Rc::new(ReadingFind::default()),
             footnote_popup: None,
             folded: HashSet::new(),
         }
@@ -561,6 +607,160 @@ impl ReadingCache {
     /// The first source line of the top visible block.
     pub fn top_block_line(&self) -> Option<usize> {
         self.block_start_line(self.top_block())
+    }
+
+    pub fn find_open(&self) -> bool {
+        self.find.open
+    }
+
+    pub fn find_pattern(&self) -> &str {
+        &self.find.pattern
+    }
+
+    pub fn find_error(&self) -> Option<&str> {
+        self.find.error.as_deref()
+    }
+
+    /// `(current, total)`, both 0 when there are no matches.
+    pub fn find_position(&self) -> (usize, usize) {
+        if self.find.matches.is_empty() {
+            (0, 0)
+        } else {
+            (self.find.current + 1, self.find.matches.len())
+        }
+    }
+
+    /// Start (or focus) in-page find, remembering where to return on Escape.
+    pub fn open_find(&mut self) {
+        let return_block = self.top_block();
+        let find = Rc::make_mut(&mut self.find);
+        find.return_block = return_block;
+        find.open = true;
+        self.recompute_find();
+    }
+
+    /// Close the bar and put the reader back where it was.
+    pub fn close_find(&mut self) {
+        let return_block = Rc::make_mut(&mut self.find).return_block;
+        Rc::make_mut(&mut self.find).open = false;
+        if !self.blocks.is_empty() {
+            let target = return_block.min(self.blocks.len().saturating_sub(1));
+            self.list_state.scroll_to_reveal_item(target);
+        }
+    }
+
+    pub fn find_append(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        Rc::make_mut(&mut self.find).pattern.push_str(text);
+        self.recompute_find();
+    }
+
+    pub fn find_backspace(&mut self) {
+        Rc::make_mut(&mut self.find).pattern.pop();
+        self.recompute_find();
+    }
+
+    pub fn find_toggle_regex(&mut self) {
+        let find = Rc::make_mut(&mut self.find);
+        find.options.regex = !find.options.regex;
+        self.recompute_find();
+    }
+
+    pub fn find_toggle_case(&mut self) {
+        let find = Rc::make_mut(&mut self.find);
+        find.options.case_sensitive = !find.options.case_sensitive;
+        self.recompute_find();
+    }
+
+    pub fn find_toggle_word(&mut self) {
+        let find = Rc::make_mut(&mut self.find);
+        find.options.whole_word = !find.options.whole_word;
+        self.recompute_find();
+    }
+
+    pub fn find_options(&self) -> (bool, bool, bool) {
+        (
+            self.find.options.regex,
+            self.find.options.case_sensitive,
+            self.find.options.whole_word,
+        )
+    }
+
+    pub fn find_next(&mut self, backwards: bool) {
+        let block = {
+            let find = Rc::make_mut(&mut self.find);
+            if find.matches.is_empty() {
+                return;
+            }
+            let len = find.matches.len();
+            find.current = if backwards {
+                (find.current + len - 1) % len
+            } else {
+                (find.current + 1) % len
+            };
+            find.matches[find.current].block
+        };
+        self.list_state.scroll_to_reveal_item(block);
+    }
+
+    /// Matches in one block, as `(range, is_current)`.
+    fn find_matches_for(&self, block: usize) -> Vec<(Range<usize>, bool)> {
+        if !self.find.open || self.find.pattern.is_empty() {
+            return Vec::new();
+        }
+        self.find
+            .matches
+            .iter()
+            .enumerate()
+            .filter(|(_, found)| found.block == block)
+            .map(|(index, found)| (found.range.clone(), index == self.find.current))
+            .collect()
+    }
+
+    fn recompute_find(&mut self) {
+        let top = self.top_block();
+        let find = Rc::make_mut(&mut self.find);
+        find.matches.clear();
+        find.current = 0;
+        find.error = None;
+        if find.pattern.is_empty() {
+            return;
+        }
+
+        let options = find.options;
+        let pattern = find.pattern.clone();
+        'blocks: for (index, block) in self.blocks.iter().enumerate() {
+            let text = block_display(block);
+            match find_engine::find_all(&text, &pattern, options) {
+                Ok(found) => {
+                    for found in found {
+                        find.matches.push(ReadingMatch {
+                            block: index,
+                            range: found.range,
+                        });
+                        if find.matches.len() >= 1000 {
+                            break 'blocks;
+                        }
+                    }
+                }
+                Err(error) => {
+                    find.error = Some(error);
+                    find.matches.clear();
+                    return;
+                }
+            }
+        }
+
+        if let Some(first) = find.matches.iter().position(|found| found.block >= top) {
+            find.current = first;
+        }
+        if let Some(found) = find.matches.get(find.current) {
+            let block = found.block;
+            drop(find);
+            self.list_state.scroll_to_reveal_item(block);
+        }
     }
 
     /// The selected reading text, with blocks joined by newlines.
@@ -926,6 +1126,7 @@ impl ReadingCache {
             cx.write_to_clipboard(ClipboardItem::new_string(text.to_string()));
             window.refresh();
         });
+        let find = self.find.clone();
         let hidden = Rc::new(hidden_blocks(self.blocks.as_slice(), &self.folded));
         let folded = self.folded.clone();
         let list_state = self.list_state.clone();
@@ -957,6 +1158,7 @@ impl ReadingCache {
                             folded: &folded,
                             on_fold: on_fold.as_ref(),
                             copy: Some(&copy),
+                            find: Some(&find),
                             list_state: Some(&list_state),
                             block_count: blocks.len(),
                             blocks: blocks.as_slice(),
@@ -1055,6 +1257,7 @@ fn reading_column(src: &str, ctx: &RenderCtx) -> impl IntoElement {
         folded: ctx.folded,
         on_fold: None,
         copy: ctx.copy,
+        find: ctx.find,
         list_state: ctx.list_state,
         block_count: ctx.block_count,
         blocks: &[],
@@ -1266,6 +1469,22 @@ fn render_block(block: Block, block_index: Option<usize>, ctx: &RenderCtx) -> An
 }
 
 impl<'a> RenderCtx<'a> {
+    /// In-page find matches in one block, as `(range, is_current)`.
+    fn find_matches(&self, block: Option<usize>) -> Vec<(Range<usize>, bool)> {
+        let (Some(block), Some(find)) = (block, self.find) else {
+            return Vec::new();
+        };
+        if !find.open || find.pattern.is_empty() {
+            return Vec::new();
+        }
+        find.matches
+            .iter()
+            .enumerate()
+            .filter(|(_, found)| found.block == block)
+            .map(|(index, found)| (found.range.clone(), index == find.current))
+            .collect()
+    }
+
     fn with_template<'b>(&'b self, template: &'b TextRun) -> RenderCtx<'b> {
         RenderCtx {
             vault_root: self.vault_root,
@@ -1276,6 +1495,7 @@ impl<'a> RenderCtx<'a> {
             folded: self.folded,
             on_fold: self.on_fold,
             copy: self.copy,
+            find: self.find,
             list_state: self.list_state,
             block_count: self.block_count,
             blocks: self.blocks,
@@ -1520,6 +1740,10 @@ fn rich_text_styled(
                 opener: ctx.opener.cloned(),
                 list_state: ctx.list_state.cloned(),
                 block_count: ctx.block_count,
+                find: ctx
+                    .find
+                    .map(|_| ctx.find_matches(Some(block)))
+                    .unwrap_or_default(),
             })
             .into_any_element(),
         None => container.child(styled).into_any_element(),
@@ -1697,6 +1921,10 @@ fn code_block(text: &str, language: &str, block: Option<usize>, ctx: &RenderCtx)
                 opener: ctx.opener.cloned(),
                 list_state: ctx.list_state.cloned(),
                 block_count: ctx.block_count,
+                find: ctx
+                    .find
+                    .map(|_| ctx.find_matches(Some(block)))
+                    .unwrap_or_default(),
             }
             .into_any_element(),
             None => div().whitespace_nowrap().child(styled).into_any_element(),
@@ -2114,6 +2342,8 @@ struct SelectableText {
     /// The reading list and its size, so dragging past the viewport can scroll.
     list_state: Option<ListState>,
     block_count: usize,
+    /// In-page find matches in this piece, as `(range, is_current)`.
+    find: Vec<(Range<usize>, bool)>,
 }
 
 impl IntoElement for SelectableText {
@@ -2345,6 +2575,37 @@ impl Element for SelectableText {
                 window.refresh();
             },
         );
+
+        // In-page find highlights sit behind the text and under the selection.
+        for (range, current) in &self.find {
+            let from = range.start.max(base);
+            let to = range.end.min(base + len);
+            if from >= to {
+                continue;
+            }
+            let color = if *current {
+                theme.star.opacity(0.55)
+            } else {
+                theme.accent.opacity(0.22)
+            };
+            for quad in selection_quads(
+                &layout,
+                self.block,
+                self.base,
+                self.len,
+                ReadPoint {
+                    block: self.block,
+                    offset: from,
+                },
+                ReadPoint {
+                    block: self.block,
+                    offset: to,
+                },
+                color,
+            ) {
+                window.paint_quad(quad);
+            }
+        }
 
         if let Some((start, end)) = self.selection.borrow().ordered() {
             for quad in selection_quads(
@@ -2665,6 +2926,72 @@ mod tests {
         assert_eq!(cache.block_for_line(3), Some(1));
         // Past the end is the last block.
         assert_eq!(cache.block_for_line(99), Some(2));
+    }
+
+    #[test]
+    fn an_in_page_find_counts_and_cycles_matches() {
+        let mut cache = ReadingCache::new();
+        cache.update((1, 1), "alpha beta\n\nbeta gamma", None);
+        cache.open_find();
+        cache.find_append("beta");
+
+        let (current, total) = cache.find_position();
+        assert_eq!(total, 2);
+        assert_eq!(current, 1);
+        assert_eq!(cache.find_matches_for(0).len(), 1);
+        assert_eq!(cache.find_matches_for(1).len(), 1);
+
+        cache.find_next(false);
+        assert_eq!(cache.find_position().0, 2);
+        // Wraps around.
+        cache.find_next(false);
+        assert_eq!(cache.find_position().0, 1);
+        cache.find_next(true);
+        assert_eq!(cache.find_position().0, 2);
+
+        // Backspace follows the pattern.
+        cache.find_backspace();
+        cache.find_backspace();
+        cache.find_backspace();
+        cache.find_backspace();
+        assert_eq!(cache.find_pattern(), "");
+        assert_eq!(cache.find_position(), (0, 0));
+
+        cache.close_find();
+        assert!(!cache.find_open());
+    }
+
+    #[test]
+    fn an_in_page_find_honours_regex_case_and_whole_word() {
+        let mut cache = ReadingCache::new();
+        cache.update((1, 1), "Beta beta betamax", None);
+        cache.open_find();
+        cache.find_append("beta");
+        assert_eq!(cache.find_position().1, 3);
+
+        cache.find_toggle_case();
+        assert_eq!(cache.find_position().1, 2);
+
+        cache.find_toggle_word();
+        assert_eq!(cache.find_position().1, 1);
+
+        // An invalid regex reports instead of panicking.
+        cache.find_toggle_word();
+        cache.find_toggle_regex();
+        cache.find_append("(");
+        assert!(cache.find_error().is_some());
+    }
+
+    #[test]
+    fn an_in_page_find_never_touches_the_document() {
+        let mut cache = ReadingCache::new();
+        cache.update((1, 1), "alpha beta", None);
+        let before: Vec<String> = cache.blocks.iter().map(block_display).collect();
+        cache.open_find();
+        cache.find_append("beta");
+        cache.find_next(false);
+        let after: Vec<String> = cache.blocks.iter().map(block_display).collect();
+        assert_eq!(before, after);
     }
 
     #[test]

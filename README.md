@@ -180,7 +180,7 @@ on macOS) to open another vault in its own window, or remove stale entries in th
 
 | Key | Action |
 |---|---|
-| `Ctrl+F` | Find in the current note |
+| `Ctrl+F` | Find in the current note (an in-page find while reading) |
 | `Ctrl+H` | Find and replace |
 | `F3` / `Shift+F3` | Next / previous match |
 | `Tab` / `Shift+Tab` (find bar) | Move between the pattern and replacement fields |
