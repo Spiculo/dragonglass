@@ -786,7 +786,7 @@ impl Editor {
         let mapped: Vec<CursorState> = states
             .iter()
             .map(|state| {
-                let (start, end) = map(state.cursor);
+                let (_, end) = map(state.cursor);
                 CursorState {
                     cursor: end,
                     anchor: state
