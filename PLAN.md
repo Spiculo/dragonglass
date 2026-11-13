@@ -373,6 +373,14 @@ manual approval per download.
 
 ### Editing and reading quality of life
 
+Saves are now conflict-safe. `core::fingerprint` defines `DocumentFingerprint` (FNV-1a
+content hash, with size and mtime as hints) and `SaveReport`, and `save_if_unchanged` refuses
+to write when the file changed underneath the editor, was deleted, or cannot be read. The
+editor captures a fingerprint on load, reload and save; `Ctrl+S` on a changed file keeps the
+buffer and shows a bar with **Reload**, **Keep mine**, **Compare** (line diff) and **Save as
+copy**. Closing, quitting and Save all stop on a conflict instead of dropping or overwriting
+the note.
+
 The first batch from [`docs/qol-plan.md`](docs/qol-plan.md) is in. Reading mode is now
 strictly read-only: every mutating action and both IME insert paths check one `can_mutate()`
 gate, so keyboard input, paste, cut, undo/redo and formatting leave the source untouched

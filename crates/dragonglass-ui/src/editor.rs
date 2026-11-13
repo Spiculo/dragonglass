@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use dragonglass_core::find as find_engine;
+use dragonglass_core::fingerprint::{self, DocumentFingerprint, SaveReport};
 use dragonglass_core::format as text_format;
 use dragonglass_core::frontmatter::{self, Property, PropertyValue};
 use dragonglass_core::inline;
@@ -45,6 +46,9 @@ pub type CloseTabHandler = Rc<dyn Fn(&mut Window, &mut App)>;
 
 /// Reports a one-line result to the app's status bar.
 pub type StatusReporter = Rc<dyn Fn(crate::StatusKind, &str, &mut App)>;
+
+/// Tells the app that a save hit a conflict, so it can show the resolution bar.
+pub type ConflictHandler = Rc<dyn Fn(&mut App)>;
 
 actions!(
     editor_actions,
@@ -335,6 +339,10 @@ pub struct Editor {
     close_tab: Option<CloseTabHandler>,
     /// Reports one-line results (copy, save failures) to the app's status bar.
     status_reporter: Option<StatusReporter>,
+    /// The version of the file this buffer was loaded from or last saved to.
+    fingerprint: Option<DocumentFingerprint>,
+    /// Tells the app when a save would overwrite an external change.
+    conflict_handler: Option<ConflictHandler>,
     /// Cached document statistics, recomputed per buffer revision.
     stats_cache: (u64, stats::Stats),
     /// Git added/removed lines for the file, refreshed when the saved buffer changes.
@@ -607,6 +615,8 @@ impl Editor {
             save_as: None,
             close_tab: None,
             status_reporter: None,
+            fingerprint: None,
+            conflict_handler: None,
             stats_cache: (u64::MAX, stats::Stats::default()),
             git_stat: None,
             git_stat_key: None,
@@ -906,6 +916,7 @@ impl Editor {
         let text = std::fs::read_to_string(path)?;
         self.buffer = Buffer::from_text(&text);
         self.buffer.mark_saved();
+        self.fingerprint = Some(DocumentFingerprint::of_text(&text));
         self.marked_range = None;
         self.anchor = None;
         self.selecting = false;
@@ -925,32 +936,72 @@ impl Editor {
         Ok(())
     }
 
-    /// Write the buffer back to its file, atomically.
-    pub fn save(&mut self) -> std::io::Result<()> {
+    /// Write the buffer back to its file, atomically and only if the file on disk is still
+    /// the version this buffer is based on. Returns a report so the caller can offer the
+    /// conflict choices instead of losing either side.
+    pub fn save_checked(&mut self) -> SaveReport {
         let Some(path) = self.path.clone() else {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "note has no file name yet (use Save note as)",
-            ));
+            return SaveReport::Error {
+                message: "note has no file name yet (use Save note as)".to_string(),
+            };
         };
 
         let new_content = self.buffer.text();
+        // Read the old version before the write, so the history snapshot is the one that
+        // is about to be replaced.
+        let previous = std::fs::read_to_string(&path).ok();
 
-        // Keep a snapshot of whatever is about to be overwritten.
-        if let (Some(root), Ok(existing)) =
-            (self.vault_root.as_ref(), std::fs::read_to_string(&path))
-        {
-            if existing != new_content {
-                if let Ok(relative) = path.strip_prefix(root) {
-                    let relative = relative.to_string_lossy().replace('\\', "/");
-                    let _ = history::record(root, &relative, &existing);
+        // Never overwrite a file that changed underneath the editor.
+        let report = fingerprint::save_if_unchanged(&path, &new_content, self.fingerprint.as_ref());
+
+        if let SaveReport::Saved { fingerprint } = &report {
+            // Keep a snapshot of whatever was overwritten.
+            if let (Some(root), Some(existing)) = (self.vault_root.as_ref(), previous) {
+                if existing != new_content {
+                    if let Ok(relative) = path.strip_prefix(root) {
+                        let relative = relative.to_string_lossy().replace('\\', "/");
+                        let _ = history::record(root, &relative, &existing);
+                    }
                 }
             }
+            self.buffer.mark_saved();
+            self.fingerprint = Some(fingerprint.clone());
         }
 
-        storage::write_atomic(&path, &new_content)?;
-        self.buffer.mark_saved();
-        Ok(())
+        report
+    }
+
+    /// Write the buffer over whatever is on disk. Only "keep mine" calls this, after the
+    /// user has seen both versions and chosen this one.
+    pub fn save_forced(&mut self) -> SaveReport {
+        let Some(path) = self.path.clone() else {
+            return SaveReport::Error {
+                message: "note has no file name yet (use Save note as)".to_string(),
+            };
+        };
+        let report = fingerprint::save_forced(&path, &self.buffer.text());
+        if let SaveReport::Saved { fingerprint } = &report {
+            self.buffer.mark_saved();
+            self.fingerprint = Some(fingerprint.clone());
+        }
+        report
+    }
+
+    /// Write the buffer back to its file, atomically. Conflicts surface as an error; use
+    /// [`Editor::save_checked`] when the caller wants to tell them apart.
+    pub fn save(&mut self) -> std::io::Result<()> {
+        match self.save_checked() {
+            SaveReport::Saved { .. } => Ok(()),
+            SaveReport::Conflict { disk } => Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                if disk.is_some() {
+                    "the note changed on disk since it was opened"
+                } else {
+                    "the note was deleted on disk"
+                },
+            )),
+            SaveReport::Error { message } => Err(std::io::Error::other(message)),
+        }
     }
 
     pub fn is_dirty(&self) -> bool {
@@ -972,10 +1023,12 @@ impl Editor {
         // change, which would reset the editor and preview scroll positions.
         if text == self.buffer.text() {
             self.buffer.mark_saved();
+            self.fingerprint = Some(DocumentFingerprint::of_text(&text));
             return Ok(());
         }
         self.buffer = Buffer::from_text(&text);
         self.buffer.mark_saved();
+        self.fingerprint = Some(DocumentFingerprint::of_text(&text));
         self.anchor = None;
         self.marked_range = None;
         self.reset_layout_cache();
@@ -1565,6 +1618,16 @@ impl Editor {
     /// Tell the editor where to report one-line results.
     pub fn set_status_reporter(&mut self, reporter: StatusReporter) {
         self.status_reporter = Some(reporter);
+    }
+
+    /// Tell the editor what to do when a save would overwrite an external change.
+    pub fn set_conflict_handler(&mut self, handler: ConflictHandler) {
+        self.conflict_handler = Some(handler);
+    }
+
+    /// The fingerprint of the version this buffer is based on.
+    pub fn fingerprint(&self) -> Option<&DocumentFingerprint> {
+        self.fingerprint.as_ref()
     }
 
     /// Report to the app's status bar, if one is wired up.
@@ -2817,7 +2880,29 @@ impl Editor {
             }
             return;
         }
-        let _ = self.save();
+
+        match self.save_checked() {
+            SaveReport::Saved { .. } => self.report(crate::StatusKind::Success, "saved", cx),
+            SaveReport::Conflict { disk } => {
+                self.report(
+                    crate::StatusKind::Error,
+                    if disk.is_some() {
+                        "the note changed on disk — reload it or keep mine"
+                    } else {
+                        "the note was deleted on disk — saving puts it back"
+                    },
+                    cx,
+                );
+                if let Some(handler) = self.conflict_handler.clone() {
+                    handler(cx);
+                }
+            }
+            SaveReport::Error { message } => self.report(
+                crate::StatusKind::Error,
+                &format!("could not save: {message}"),
+                cx,
+            ),
+        }
         cx.notify();
     }
 

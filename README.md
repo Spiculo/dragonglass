@@ -66,6 +66,8 @@ A lot already works. This is a working application, not a mockup — but it is e
 - Embeds and attachments (images, PDF, audio), transclusion, shared blocks
 - A/B versions with a line diff, document review, block move/duplicate/delete/extract
 - Recovery snapshots, browsable and restorable from **File recovery** in the palette
+- Conflict-safe saves: a save never overwrites a file that changed on disk; the app offers
+  Reload / Keep mine / Compare / Save as copy instead
 
 **Around the editor**
 - Git sync by driving your own `git` binary (your credentials, SSH config and hooks)

@@ -26,6 +26,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
+use dragonglass_core::fingerprint::SaveReport;
 use dragonglass_core::frontmatter::{Property, PropertyValue};
 use dragonglass_core::{
     bookmarks, config, conflict, diff, git, graph, history, keymap, lint, markdown, query,
@@ -137,6 +138,10 @@ actions!(
         CloseTab,
         ReopenClosedTab,
         SaveAs,
+        ReloadConflicted,
+        KeepMine,
+        CompareConflicted,
+        SaveConflictCopy,
         NextTab,
         PrevTab,
         HideApp,
@@ -1166,6 +1171,10 @@ impl DragonGlassApp {
                 cx.notify();
             });
         });
+        let conflict_weak = cx.entity().downgrade();
+        let conflict: editor::ConflictHandler = Rc::new(move |cx| {
+            let _ = conflict_weak.update(cx, |app, cx| app.mark_conflict(cx));
+        });
         editor.update(cx, |editor, _cx| {
             editor.set_vault_root(&root);
             editor.set_attachments_folder(&folder);
@@ -1173,6 +1182,7 @@ impl DragonGlassApp {
             editor.set_save_as(save_as);
             editor.set_close_tab(close_tab);
             editor.set_status_reporter(status);
+            editor.set_conflict_handler(conflict);
             editor.set_vim_enabled(self.config.vim_mode);
             editor.set_font_size(px(self.config.font_size as f32));
             editor.set_suggestions(notes, tags);
@@ -1301,8 +1311,8 @@ impl DragonGlassApp {
         let mut saved = 0;
         let mut first_error: Option<String> = None;
 
-        for tab in &self.tabs {
-            let editor = tab.editor.clone();
+        for index in 0..self.tabs.len() {
+            let editor = self.tabs[index].editor.clone();
             if !editor.read(cx).is_dirty() {
                 continue;
             }
@@ -1311,13 +1321,27 @@ impl DragonGlassApp {
                     .get_or_insert_with(|| "an untitled note has no file name yet".to_string());
                 continue;
             }
-            match editor.update(cx, |editor, _cx| editor.save()) {
-                Ok(()) => saved += 1,
-                Err(error) => {
-                    first_error.get_or_insert_with(|| error.to_string());
+            match editor.update(cx, |editor, _cx| editor.save_checked()) {
+                SaveReport::Saved { .. } => saved += 1,
+                SaveReport::Conflict { .. } => {
+                    if let Some(tab) = self.tabs.get_mut(index) {
+                        tab.conflict = true;
+                    }
+                    first_error.get_or_insert_with(|| {
+                        "a note changed on disk; resolve it before quitting".to_string()
+                    });
+                }
+                SaveReport::Error { message } => {
+                    first_error.get_or_insert(message);
                 }
             }
         }
+
+        let active_conflict = self
+            .tabs
+            .get(self.active_tab)
+            .is_some_and(|tab| tab.conflict);
+        self.conflict = active_conflict;
 
         match first_error {
             Some(error) => Err(error),
@@ -1526,18 +1550,38 @@ impl DragonGlassApp {
 
         let save_result = self.tabs[index].editor.update(cx, |editor, _cx| {
             if editor.is_dirty() {
-                editor.save()
+                editor.save_checked()
             } else {
-                Ok(())
+                SaveReport::Saved {
+                    fingerprint: dragonglass_core::fingerprint::DocumentFingerprint::of_text(""),
+                }
             }
         });
-        if let Err(error) = save_result {
-            self.set_status(
-                StatusKind::Error,
-                format!("could not save before closing: {error}"),
-            );
-            cx.notify();
-            return;
+        match save_result {
+            SaveReport::Saved { .. } => {}
+            SaveReport::Conflict { .. } => {
+                if let Some(tab) = self.tabs.get_mut(index) {
+                    tab.conflict = true;
+                }
+                if index == self.active_tab {
+                    self.conflict = true;
+                }
+                let title = self.tabs[index].title.clone();
+                self.set_status(
+                    StatusKind::Error,
+                    format!("{title} changed on disk; reload or keep mine before closing"),
+                );
+                cx.notify();
+                return;
+            }
+            SaveReport::Error { message } => {
+                self.set_status(
+                    StatusKind::Error,
+                    format!("could not save before closing: {message}"),
+                );
+                cx.notify();
+                return;
+            }
         }
 
         let was_active = index == self.active_tab;
@@ -3025,6 +3069,102 @@ impl DragonGlassApp {
         editor.update(cx, |editor, cx| editor.copy_selection(cx));
     }
 
+    /// Mark the active tab as changed on disk and show the resolution bar.
+    fn mark_conflict(&mut self, cx: &mut Context<Self>) {
+        let index = self.active_tab;
+        if let Some(tab) = self.tabs.get_mut(index) {
+            tab.conflict = true;
+        }
+        self.conflict = true;
+        cx.notify();
+    }
+
+    /// Resolve a conflict by dropping the buffer and taking the disk version.
+    fn reload_conflicted(
+        &mut self,
+        _: &ReloadConflicted,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let editor = self.editor.clone();
+        let result = editor.update(cx, |editor, cx| {
+            let result = editor.reload();
+            cx.notify();
+            result
+        });
+        match result {
+            Ok(()) => {
+                let index = self.active_tab;
+                if let Some(tab) = self.tabs.get_mut(index) {
+                    tab.conflict = false;
+                }
+                self.conflict = false;
+                self.set_status(StatusKind::Info, "reloaded from disk");
+                window.focus(&self.editor.focus_handle(cx));
+            }
+            Err(error) => {
+                self.set_status(StatusKind::Error, format!("could not reload: {error}"));
+            }
+        }
+        cx.notify();
+    }
+
+    /// Resolve a conflict by overwriting the disk version with the buffer.
+    fn keep_mine(&mut self, _: &KeepMine, window: &mut Window, cx: &mut Context<Self>) {
+        let editor = self.editor.clone();
+        let report = editor.update(cx, |editor, _cx| editor.save_forced());
+        match report {
+            SaveReport::Saved { .. } => {
+                let index = self.active_tab;
+                if let Some(tab) = self.tabs.get_mut(index) {
+                    tab.conflict = false;
+                }
+                self.conflict = false;
+                self.set_status(StatusKind::Success, "kept your version");
+                window.focus(&self.editor.focus_handle(cx));
+            }
+            SaveReport::Conflict { .. } => {
+                self.set_status(StatusKind::Error, "the note changed again while saving");
+            }
+            SaveReport::Error { message } => {
+                self.set_status(StatusKind::Error, format!("could not save: {message}"));
+            }
+        }
+        cx.notify();
+    }
+
+    /// Show the disk version next to the buffer, using the existing line diff.
+    fn compare_conflicted(
+        &mut self,
+        _: &CompareConflicted,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(relative) = self.active.clone() else {
+            return;
+        };
+        let disk = std::fs::read_to_string(self.vault_root.join(&relative)).unwrap_or_default();
+        let mine = self.editor.read(cx).text();
+        let diff = diff::lines(&disk, &mine);
+        self.diff_title = format!("disk ↔ mine — {relative} (unsaved)");
+        self.diff_summary = diff.summary();
+        self.diff_rows = Rc::new(diff.lines);
+        self.show_diff = true;
+        self.set_status(StatusKind::Warn, format!("compare: {}", self.diff_summary));
+        window.focus(&self.editor.focus_handle(cx));
+        cx.notify();
+    }
+
+    /// Resolve a conflict by writing the buffer to a new file.
+    fn save_conflict_copy(
+        &mut self,
+        _: &SaveConflictCopy,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_save_as(window, cx);
+    }
+
     fn close_tab_action(&mut self, _: &CloseTab, window: &mut Window, cx: &mut Context<Self>) {
         if self.switcher.is_none() {
             self.close_tab(self.active_tab, window, cx);
@@ -3582,11 +3722,16 @@ impl DragonGlassApp {
                     cx.notify();
                 });
             });
+            let conflict_weak = cx.entity().downgrade();
+            let conflict: editor::ConflictHandler = Rc::new(move |cx| {
+                let _ = conflict_weak.update(cx, |app, cx| app.mark_conflict(cx));
+            });
             for tab in &app.tabs {
                 tab.editor.update(cx, |editor, _cx| {
                     editor.set_save_as(save_as.clone());
                     editor.set_close_tab(close_tab.clone());
                     editor.set_status_reporter(status.clone());
+                    editor.set_conflict_handler(conflict.clone());
                 });
             }
         });
@@ -6508,6 +6653,78 @@ impl Render for DragonGlassApp {
             }
         }
 
+        // A dirty buffer whose file changed on disk gets an explicit choice instead of a
+        // silent overwrite: reload, keep mine, compare, or save a copy.
+        let dirty_active = self
+            .tabs
+            .get(self.active_tab)
+            .is_some_and(|tab| tab.editor.read(cx).is_dirty());
+        let conflict_bar = if self.conflict && dirty_active {
+            let button = |id: &'static str, label: &'static str| {
+                div()
+                    .id(id)
+                    .px_2()
+                    .py_1()
+                    .rounded_md()
+                    .bg(theme.chip)
+                    .text_xs()
+                    .text_color(theme.text)
+                    .cursor_pointer()
+                    .hover(move |style| style.bg(theme.hover))
+                    .child(label)
+            };
+            let deleted = self
+                .active
+                .as_ref()
+                .is_some_and(|relative| !self.vault_root.join(relative).exists());
+            Some(
+                div()
+                    .id("conflict-bar")
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .h(px(36.0))
+                    .px_3()
+                    .flex_shrink_0()
+                    .bg(theme.panel)
+                    .border_b_1()
+                    .border_color(theme.error)
+                    .text_sm()
+                    .child(div().text_color(theme.error).child(if deleted {
+                        "This note was deleted on disk."
+                    } else {
+                        "This note changed on disk."
+                    }))
+                    .child(button("conflict-reload", "Reload").on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _event, window, cx| {
+                            this.reload_conflicted(&ReloadConflicted, window, cx);
+                        }),
+                    ))
+                    .child(button("conflict-keep", "Keep mine").on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _event, window, cx| {
+                            this.keep_mine(&KeepMine, window, cx);
+                        }),
+                    ))
+                    .child(button("conflict-compare", "Compare").on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _event, window, cx| {
+                            this.compare_conflicted(&CompareConflicted, window, cx);
+                        }),
+                    ))
+                    .child(button("conflict-copy", "Save as copy").on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _event, window, cx| {
+                            this.save_conflict_copy(&SaveConflictCopy, window, cx);
+                        }),
+                    )),
+            )
+        } else {
+            None
+        };
+
         let tab_bar = div()
             .id("tab-bar")
             .on_drop::<TabDrag>(cx.listener(Self::drop_on_tab_bar))
@@ -6645,6 +6862,10 @@ impl Render for DragonGlassApp {
             .on_action(cx.listener(Self::close_tab_action))
             .on_action(cx.listener(Self::reopen_closed_tab_action))
             .on_action(cx.listener(Self::save_as_action))
+            .on_action(cx.listener(Self::reload_conflicted))
+            .on_action(cx.listener(Self::keep_mine))
+            .on_action(cx.listener(Self::compare_conflicted))
+            .on_action(cx.listener(Self::save_conflict_copy))
             .on_action(cx.listener(Self::copy_selection))
             .on_action(cx.listener(Self::next_tab))
             .on_action(cx.listener(Self::prev_tab))
@@ -6720,6 +6941,7 @@ impl Render for DragonGlassApp {
             )
             .children(panel)
             .children(quit_bar)
+            .children(conflict_bar)
             .child(tab_bar)
             .child(
                 div()

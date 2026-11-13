@@ -157,6 +157,15 @@ Reload / Compare / Keep mine bar; Android shows the same choice in a sheet. Reus
 **Done when:** an external edit followed by Ctrl+S never overwrites silently; the user can
 see both versions and choose; a test covers clean reload, dirty conflict and deleted file.
 
+**Landed (desktop + core):** `core::fingerprint` has `DocumentFingerprint` (FNV-1a content
+hash, size and mtime as hints) and `SaveReport`, and `save_if_unchanged` refuses to write
+when the on-disk hash moved, when the file was deleted, or when it cannot be read. The editor
+captures a fingerprint on load/reload/save, `Ctrl+S` reports the conflict, and a bar offers
+Reload / Keep mine / Compare (line diff in the existing diff view) / Save as copy. Close,
+quit and Save all stop on a conflict instead of dropping or overwriting the buffer. Tests
+cover clean save, external edit, deleted file, mtime-only change and write errors.
+**Remaining:** the Android sheet (Q0.7 covers the save-before-navigate part).
+
 #### Q0.3 Drafts, autosave and crash recovery — D · A · S · L
 Persist a debounced draft under `.dragon-glass/drafts/` (path, base fingerprint, timestamp,
 text, cursor). Autosave the note after idle only when the fingerprint still matches;
