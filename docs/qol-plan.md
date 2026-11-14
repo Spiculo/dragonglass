@@ -672,8 +672,10 @@ start under the cold-start budget.
 
 **Landed:** a restored tab whose file cannot be read records the failure, and the pane shows
 "… could not be opened", the path and reason, plus **Retry** and **Close tab** instead of an
-empty editor that silently accepts typing. Retry reloads in place.
-**Remaining:** tabs are still loaded eagerly at startup; lazy loading is open.
+empty editor that silently accepts typing. Retry reloads in place. Only the saved active tab
+is read when the window is created; every other restored tab is marked pending and loads
+(with its saved mode, caret and scroll applied) the first time it is activated, so a session
+with many tabs no longer blocks startup on reading all of them.
 
 ---
 

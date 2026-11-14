@@ -413,6 +413,8 @@ struct Tab {
     conflict: bool,
     /// Set when a restored tab could not be read, so the pane can offer Retry.
     load_error: Option<String>,
+    /// A restored tab whose file has not been read yet. The active tab loads first.
+    pending_load: bool,
 }
 
 /// How the status line is styled, and whether it expires.
@@ -1610,6 +1612,23 @@ impl DragonGlassApp {
             return;
         }
 
+        if self.tabs[index].pending_load {
+            if let Some(relative) = self.tabs[index].relative.clone() {
+                let editor = self.tabs[index].editor.clone();
+                let loaded = self.load_into(&editor, &relative, cx);
+                if let Some(tab) = self.tabs.get_mut(index) {
+                    tab.pending_load = false;
+                    tab.load_error = if loaded {
+                        None
+                    } else {
+                        Some("the file could not be read".to_string())
+                    };
+                }
+            } else {
+                self.tabs[index].pending_load = false;
+            }
+        }
+
         self.active_tab = index;
         self.editor = self.tabs[index].editor.clone();
         self.active = self.tabs[index].relative.clone();
@@ -1717,6 +1736,7 @@ impl DragonGlassApp {
                 title,
                 conflict: false,
                 load_error: None,
+                pending_load: false,
             });
             self.active_tab = self.tabs.len() - 1;
             self.editor = editor;
@@ -1916,6 +1936,7 @@ impl DragonGlassApp {
                 title: "Untitled".to_string(),
                 conflict: false,
                 load_error: None,
+                pending_load: false,
             });
             self.activate_tab(0, cx);
         } else if was_active {
@@ -3783,6 +3804,7 @@ impl DragonGlassApp {
                 .unwrap_or_else(|| "Untitled".to_string()),
             conflict: false,
             load_error: None,
+            pending_load: false,
         };
         self.spawn_window_with_tabs(vec![sibling_tab], 0, false, cx);
     }
@@ -3819,6 +3841,7 @@ impl DragonGlassApp {
                 title: "Untitled".to_string(),
                 conflict: false,
                 load_error: None,
+                pending_load: false,
             });
             self.active_tab = 0;
             self.split_tabs.clear();
@@ -8191,29 +8214,42 @@ fn open_vault_window(vault_path: PathBuf, uri_note: Option<String>, cx: &mut App
     }
 
     let forced_reading = std::env::var("DRAGON_GLASS_READING").is_ok();
+    // The saved active tab decides which note opens first; the others load when activated,
+    // so a session with many tabs does not read every file before the window appears.
+    let initial_active = if wanted.is_empty() {
+        0
+    } else {
+        initial_session.active.min(wanted.len() - 1)
+    };
     let mut initial_tabs: Vec<Tab> = Vec::new();
-    for relative in &wanted {
+    for (index, relative) in wanted.iter().enumerate() {
         let editor = cx.new(Editor::new);
         let saved = initial_session
             .tabs
             .iter()
             .find(|tab| &tab.note == relative);
+        let active = index == initial_active;
         let loaded = editor.update(cx, |editor, _cx| {
             editor.set_suggestions((*initial_suggestions).clone(), (*initial_tags).clone());
             editor.set_vault_root(&vault_root);
             editor.set_attachments_folder(&initial_config.attachments_folder);
             editor.set_vim_enabled(initial_config.vim_mode);
             editor.set_font_size(px(initial_config.font_size as f32));
-            let loaded = editor.load(&vault_root.join(relative)).is_ok();
-            if forced_reading || saved.is_some_and(|tab| tab.reading) {
-                editor.set_reading_mode(true);
+            if active {
+                let loaded = editor.load(&vault_root.join(relative)).is_ok();
+                if forced_reading || saved.is_some_and(|tab| tab.reading) {
+                    editor.set_reading_mode(true);
+                }
+                if let Some(saved) = saved {
+                    editor.set_cursor_position(saved.line, saved.col);
+                    editor.set_scroll_offset(saved.scroll);
+                    editor.scroll_reading_to(saved.reading_block);
+                }
+                loaded
+            } else {
+                // Reading and cursor are applied when the tab is activated.
+                true
             }
-            if let Some(saved) = saved {
-                editor.set_cursor_position(saved.line, saved.col);
-                editor.set_scroll_offset(saved.scroll);
-                editor.scroll_reading_to(saved.reading_block);
-            }
-            loaded
         });
         initial_tabs.push(Tab {
             relative: Some(relative.clone()),
@@ -8225,6 +8261,7 @@ fn open_vault_window(vault_path: PathBuf, uri_note: Option<String>, cx: &mut App
             } else {
                 Some("the file could not be read".to_string())
             },
+            pending_load: !active,
         });
     }
     if initial_tabs.is_empty() {
@@ -8242,16 +8279,10 @@ fn open_vault_window(vault_path: PathBuf, uri_note: Option<String>, cx: &mut App
             title: "Untitled".to_string(),
             conflict: false,
             load_error: None,
+            pending_load: false,
         });
     }
 
-    // The saved active tab decides which note opens first. A URI note or a forced reading
-    // mode still opens its own tab.
-    let initial_active = if wanted.is_empty() {
-        0
-    } else {
-        initial_session.active.min(initial_tabs.len() - 1)
-    };
     let editor = initial_tabs[initial_active].editor.clone();
     let first_rel = initial_tabs[initial_active].relative.clone();
     let initial_properties = editor.update(cx, |editor, _cx| editor.properties());
