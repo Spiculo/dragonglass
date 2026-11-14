@@ -386,6 +386,8 @@ pub struct Editor {
     heading_cache: (u64, u64, Rc<Vec<markdown::Heading>>),
     /// The text the heading cache was built from, for the cheap "still valid" check.
     heading_source: Option<Rc<String>>,
+    /// The paragraph the current layout kept raw.
+    layout_raw_block: (usize, usize),
     /// Bumped when `folded` changes so `lay_out` reflows.
     fold_revision: u64,
     /// The fold revision the current layout was built for.
@@ -553,12 +555,230 @@ fn list_continuation(line: &str, col: usize) -> Option<String> {
     None
 }
 
-/// A wrapped visual row: `[start, end)` character columns of logical line `line`.
-#[derive(Debug, Clone, Copy)]
+/// A wrapped visual row: `[start, end)` character columns of logical line `line`, plus the
+/// matching range in the shaped display text.
+#[derive(Debug, Clone)]
 struct RowMeta {
     line: usize,
     start: usize,
     end: usize,
+    display_start: usize,
+    display_end: usize,
+    display_start_byte: usize,
+    map: Rc<LineMap>,
+}
+
+/// Maps a source line to the text that is actually shaped for it.
+///
+/// Markdown markers (`**`, `` ` ``, `[[`, …) are hidden outside the caret line. The shaped
+/// text is shorter than the source, so every cursor, selection, click and IME position goes
+/// through this map instead of assuming equal columns.
+#[derive(Debug, Default)]
+struct LineMap {
+    /// The shaped characters.
+    display: Vec<char>,
+    /// Byte offset of every display column (len + 1 entries).
+    display_offsets: Vec<usize>,
+    /// Display column of every source column (len + 1 entries).
+    source_display: Vec<usize>,
+    /// Byte offset into the display text for every source column (len + 1 entries).
+    source_byte: Vec<usize>,
+    /// Source column of every display column (len + 1 entries).
+    display_source: Vec<usize>,
+}
+
+impl LineMap {
+    /// Display byte offset for a source column.
+    fn byte_for_source(&self, col: usize) -> usize {
+        let col = col.min(self.source_byte.len().saturating_sub(1));
+        self.source_byte[col]
+    }
+
+    /// Source column for a display column.
+    fn source_for_display(&self, col: usize) -> usize {
+        let col = col.min(self.display_source.len().saturating_sub(1));
+        self.display_source[col]
+    }
+
+    /// Display column for a source column.
+    fn display_for_source(&self, col: usize) -> usize {
+        let col = col.min(self.source_display.len().saturating_sub(1));
+        self.source_display[col]
+    }
+
+    /// The display column containing a byte offset within one row segment.
+    fn display_col_in_row(
+        &self,
+        row_start: usize,
+        row_start_byte: usize,
+        local_byte: usize,
+    ) -> usize {
+        let target = row_start_byte + local_byte;
+        let mut col = row_start;
+        while col < self.display_offsets.len().saturating_sub(1)
+            && self.display_offsets[col] < target
+        {
+            col += 1;
+        }
+        col
+    }
+}
+
+/// Build the shaped display text and both directions of the column map.
+fn conceal_text(text: &str, conceal: bool) -> LineMap {
+    let chars: Vec<char> = text.chars().collect();
+    let hidden = if conceal {
+        hidden_markers(&chars)
+    } else {
+        vec![false; chars.len()]
+    };
+
+    let mut display = Vec::with_capacity(chars.len());
+    let mut display_source = Vec::with_capacity(chars.len());
+    for (index, ch) in chars.iter().enumerate() {
+        if !hidden[index] {
+            display.push(*ch);
+            display_source.push(index);
+        }
+    }
+    display_source.push(chars.len());
+
+    let mut display_offsets = Vec::with_capacity(display.len() + 1);
+    let mut acc = 0usize;
+    for ch in &display {
+        display_offsets.push(acc);
+        acc += ch.len_utf8();
+    }
+    display_offsets.push(acc);
+
+    let mut source_display = Vec::with_capacity(chars.len() + 1);
+    let mut source_byte = Vec::with_capacity(chars.len() + 1);
+    let mut visible = 0usize;
+    for col in 0..=chars.len() {
+        while visible < display.len() && display_source[visible] < col {
+            visible += 1;
+        }
+        source_display.push(visible);
+        source_byte.push(display_offsets[visible]);
+    }
+
+    LineMap {
+        display,
+        display_offsets,
+        source_display,
+        source_byte,
+        display_source,
+    }
+}
+
+/// Which characters are markdown markers to hide when the line is not being edited.
+fn hidden_markers(chars: &[char]) -> Vec<bool> {
+    let mut hidden = vec![false; chars.len()];
+    let len = chars.len();
+    let mut i = 0usize;
+
+    while i < len {
+        // Inline code: hide both backticks; the content is literal.
+        if chars[i] == '`' {
+            if let Some(close) = (i + 1..len).find(|&at| chars[at] == '`') {
+                if close > i + 1 {
+                    hidden[i] = true;
+                    hidden[close] = true;
+                    i = close + 1;
+                    continue;
+                }
+            }
+            i += 1;
+            continue;
+        }
+
+        // `![[embed]]` and `[[link]]`: hide the brackets, keep the label.
+        let brackets = if starts_at(chars, i, "![[") {
+            Some((3, "]]"))
+        } else if starts_at(chars, i, "[[") {
+            Some((2, "]]"))
+        } else {
+            None
+        };
+        if let Some((open, close_token)) = brackets {
+            if let Some(close) = find_token(chars, i + open, close_token) {
+                for slot in &mut hidden[i..i + open] {
+                    *slot = true;
+                }
+                for slot in &mut hidden[close..close + close_token.chars().count()] {
+                    *slot = true;
+                }
+                i = close + close_token.chars().count();
+                continue;
+            }
+        }
+
+        // Paired emphasis/highlight/strike markers.
+        let pairs: [(&str, bool); 6] = [
+            ("**", false),
+            ("__", true),
+            ("~~", false),
+            ("==", false),
+            ("*", false),
+            ("_", true),
+        ];
+        let mut matched = false;
+        for (token, word_boundary) in pairs {
+            let width = token.chars().count();
+            if !starts_at(chars, i, token) {
+                continue;
+            }
+            if word_boundary {
+                let before = i.checked_sub(1).and_then(|at| chars.get(at)).copied();
+                if before.is_some_and(|ch| ch.is_alphanumeric()) {
+                    continue;
+                }
+            }
+            if chars.get(i + width).is_none_or(|ch| ch.is_whitespace()) {
+                continue;
+            }
+            let Some(close) = find_token(chars, i + width, token) else {
+                continue;
+            };
+            if close == i + width || chars[close - 1].is_whitespace() {
+                continue;
+            }
+            if word_boundary
+                && chars
+                    .get(close + width)
+                    .is_some_and(|ch| ch.is_alphanumeric())
+            {
+                continue;
+            }
+            for slot in &mut hidden[i..i + width] {
+                *slot = true;
+            }
+            for slot in &mut hidden[close..close + width] {
+                *slot = true;
+            }
+            i += width;
+            matched = true;
+            break;
+        }
+        if !matched {
+            i += 1;
+        }
+    }
+
+    hidden
+}
+
+fn starts_at(chars: &[char], at: usize, token: &str) -> bool {
+    let token: Vec<char> = token.chars().collect();
+    chars.len() >= at + token.len() && chars[at..at + token.len()] == token[..]
+}
+
+fn find_token(chars: &[char], from: usize, token: &str) -> Option<usize> {
+    let token: Vec<char> = token.chars().collect();
+    if token.is_empty() || chars.len() < token.len() {
+        return None;
+    }
+    (from..=chars.len() - token.len()).find(|&at| chars[at..at + token.len()] == token[..])
 }
 
 /// A `$$…$$` block in the source, before its rows are known.
@@ -650,8 +870,14 @@ struct LineLayout {
     in_code: bool,
     /// Fence language at the time the line was shaped, so a changed fence re-shapes.
     language: String,
+    /// Whether markers were hidden (the line was not the caret line).
+    concealed: bool,
     /// Wrapped spans of the line, in character columns.
     spans: Rc<Vec<(usize, usize)>>,
+    /// The same spans in display columns, for building row metadata.
+    display_spans: Rc<Vec<(usize, usize)>>,
+    /// Source ↔ display column map for the line.
+    map: Rc<LineMap>,
     /// One shaped row per span. Shared with the flattened row list, so flattening the
     /// document costs a pointer per row rather than a copy of every shaped line.
     rows: Rc<Vec<Rc<ShapedLine>>>,
@@ -711,6 +937,7 @@ impl Editor {
             folded: HashSet::new(),
             heading_cache: (u64::MAX, u64::MAX, Rc::new(Vec::new())),
             heading_source: None,
+            layout_raw_block: (usize::MAX, usize::MAX),
             fold_revision: 0,
             layout_fold_revision: u64::MAX,
             fold_markers: Rc::new(Vec::new()),
@@ -1869,13 +2096,20 @@ impl Editor {
         let revision = self.buffer.revision();
         let width_changed = (self.cache_width - width).abs() >= 0.5;
         let folds_changed = self.layout_fold_revision != self.fold_revision;
+        // The paragraph holding the caret stays raw, so moving to another paragraph
+        // changes which markers are hidden.
+        let caret_line = self.buffer.line_col().0;
+        let raw_block = self.raw_block_for_line(caret_line);
+        let block_changed = self.layout_raw_block != raw_block;
         if !width_changed
             && self.cache_revision == revision
             && !folds_changed
+            && !block_changed
             && !self.last_shaped.is_empty()
         {
             return;
         }
+        self.layout_raw_block = raw_block;
         if width_changed {
             // Every row's wrapping depends on the width.
             self.line_cache.clear();
@@ -1966,6 +2200,8 @@ impl Editor {
                 Some(cached)
                     if cached.in_code == in_code
                         && cached.language == language
+                        && cached.concealed
+                            == (line_index < raw_block.0 || line_index > raw_block.1)
                         && self.buffer.line_eq(line_index, &cached.text) =>
                 {
                     // Clone the layout, not the `&LineLayout`.
@@ -1979,7 +2215,16 @@ impl Editor {
                 None => {
                     let text = self.buffer.line(line_index);
                     LineLayout::shape(
-                        &text, in_code, &language, &font, font_size, width, color, theme, window,
+                        &text,
+                        in_code,
+                        &language,
+                        line_index < raw_block.0 || line_index > raw_block.1,
+                        &font,
+                        font_size,
+                        width,
+                        color,
+                        theme,
+                        window,
                     )
                 }
             };
@@ -1996,11 +2241,22 @@ impl Editor {
             if let Some(&block) = block_start.get(&line_index) {
                 blocks[block].first_row = rows.len();
             }
-            for span in layout.spans.iter() {
+            for (index, span) in layout.spans.iter().enumerate() {
+                let (display_start, display_end) =
+                    layout.display_spans.get(index).copied().unwrap_or((0, 0));
                 metas.push(RowMeta {
                     line: line_index,
                     start: span.0,
                     end: span.1,
+                    display_start,
+                    display_end,
+                    display_start_byte: layout
+                        .map
+                        .display_offsets
+                        .get(display_start)
+                        .copied()
+                        .unwrap_or(0),
+                    map: layout.map.clone(),
                 });
             }
             rows.extend(layout.rows.iter().cloned());
@@ -2026,6 +2282,20 @@ impl Editor {
         self.cache_width = width;
         self.fold_markers = Rc::new(markers);
         self.layout_fold_revision = self.fold_revision;
+    }
+
+    /// The blank-line-delimited paragraph containing `line`, which stays raw while edited.
+    fn raw_block_for_line(&self, line: usize) -> (usize, usize) {
+        let count = self.buffer.line_count();
+        let mut first = line.min(count.saturating_sub(1));
+        while first > 0 && !self.buffer.line(first - 1).trim().is_empty() {
+            first -= 1;
+        }
+        let mut last = line.min(count.saturating_sub(1));
+        while last + 1 < count && !self.buffer.line(last + 1).trim().is_empty() {
+            last += 1;
+        }
+        (first, last)
     }
 
     /// Shift the per-line cache to match whole lines that were inserted or removed.
@@ -2731,13 +3001,18 @@ impl Editor {
         if target < 0 || target as usize >= self.last_rows.len() {
             return None;
         }
-        let current_meta = self.last_rows[current];
-        let target_meta = self.last_rows[target as usize];
-        let offset = (col - current_meta.start).min(target_meta.end - target_meta.start);
-        Some(
-            self.buffer
-                .char_index_at(target_meta.line, target_meta.start + offset),
-        )
+        let current_meta = &self.last_rows[current];
+        let target_meta = &self.last_rows[target as usize];
+        let visual = current_meta.map.display_for_source(col);
+        let offset = visual.saturating_sub(current_meta.display_start);
+        let target_display = target_meta.display_start
+            + offset.min(
+                target_meta
+                    .display_end
+                    .saturating_sub(target_meta.display_start),
+            );
+        let target_col = target_meta.map.source_for_display(target_display);
+        Some(self.buffer.char_index_at(target_meta.line, target_col))
     }
 
     /// Move every caret with a buffer movement, collapsing their selections.
@@ -2848,14 +3123,20 @@ impl Editor {
             return;
         }
 
-        let current_meta = self.last_rows[current];
-        let target_meta = self.last_rows[target as usize];
-        let offset = (col - current_meta.start).min(target_meta.end - target_meta.start);
+        let current_meta = &self.last_rows[current];
+        let target_meta = &self.last_rows[target as usize];
+        let visual = current_meta.map.display_for_source(col);
+        let offset = visual.saturating_sub(current_meta.display_start);
+        let target_display = target_meta.display_start
+            + offset.min(
+                target_meta
+                    .display_end
+                    .saturating_sub(target_meta.display_start),
+            );
+        let target_col = target_meta.map.source_for_display(target_display);
 
-        self.buffer.set_cursor(
-            self.buffer
-                .char_index_at(target_meta.line, target_meta.start + offset),
-        );
+        self.buffer
+            .set_cursor(self.buffer.char_index_at(target_meta.line, target_col));
     }
 
     fn delete_selection(&mut self) -> bool {
@@ -4487,23 +4768,15 @@ impl Editor {
         let row = (f32::from(local.y) / f32::from(self.line_height))
             .floor()
             .max(0.0) as usize;
-        let meta = *self.last_rows.get(row)?;
+        let meta = self.last_rows.get(row)?;
         let shaped = self.last_shaped.get(row)?;
 
-        let row_text: String = self
-            .buffer
-            .line(meta.line)
-            .chars()
-            .skip(meta.start)
-            .take(meta.end.saturating_sub(meta.start))
-            .collect();
-
-        let byte = shaped.closest_index_for_x(local.x);
-        let col_in_row = row_text[..byte.min(row_text.len())].chars().count();
-        Some(
-            self.buffer
-                .char_index_at(meta.line, meta.start + col_in_row),
-        )
+        let local_byte = shaped.closest_index_for_x(local.x);
+        let display_col =
+            meta.map
+                .display_col_in_row(meta.display_start, meta.display_start_byte, local_byte);
+        let source_col = meta.map.source_for_display(display_col);
+        Some(self.buffer.char_index_at(meta.line, source_col))
     }
 
     /// Fold or unfold a heading when its gutter marker is clicked.
@@ -5523,12 +5796,14 @@ impl EntityInputHandler for Editor {
             .last_rows
             .iter()
             .rposition(|meta| meta.line == line && meta.start <= col)?;
-        let meta = self.last_rows[row];
+        let meta = &self.last_rows[row];
         let shaped = self.last_shaped.get(row)?;
 
         let col = col.min(meta.end);
-        let byte = self.buffer.char_col_to_byte(line, col)
-            - self.buffer.char_col_to_byte(line, meta.start);
+        let byte = meta
+            .map
+            .byte_for_source(col)
+            .saturating_sub(meta.display_start_byte);
         let x = shaped.x_for_index(byte);
         let top = bounds.top() + self.line_height * row as f32;
 
@@ -5562,6 +5837,7 @@ impl LineLayout {
         text: &str,
         in_code: bool,
         language: &str,
+        conceal: bool,
         font: &gpui::Font,
         font_size: Pixels,
         width: f32,
@@ -5569,28 +5845,47 @@ impl LineLayout {
         theme: Theme,
         window: &mut Window,
     ) -> Self {
-        let chars: Vec<char> = text.chars().collect();
-        let tokens = syntax::line_tokens(text, in_code);
+        let source_chars: Vec<char> = text.chars().collect();
+        let map = Rc::new(conceal_text(
+            text,
+            conceal && !in_code && !syntax::is_fence(text),
+        ));
+        let chars = map.display.clone();
+        let concealed = conceal;
+        let source_tokens = syntax::line_tokens(text, in_code);
+        let tokens: Vec<syntax::TokenKind> = map.display_source[..chars.len()]
+            .iter()
+            .map(|&source| {
+                source_tokens
+                    .get(source)
+                    .copied()
+                    .unwrap_or(syntax::TokenKind::Text)
+            })
+            .collect();
 
         // Inside a fence with a known language, colour the line with the code lexer.
         let code_kinds: Option<Vec<syntax::CodeKind>> = if in_code && !language.is_empty() {
-            let mut kinds = Vec::with_capacity(chars.len());
+            let mut source_kinds = Vec::with_capacity(source_chars.len());
             for span in syntax::code_spans(text, language) {
-                kinds.extend(std::iter::repeat_n(span.kind, span.text.chars().count()));
+                source_kinds.extend(std::iter::repeat_n(span.kind, span.text.chars().count()));
             }
-            (kinds.len() == chars.len()).then_some(kinds)
+            (source_kinds.len() == source_chars.len()).then(|| {
+                map.display_source[..chars.len()]
+                    .iter()
+                    .map(|&source| {
+                        source_kinds
+                            .get(source)
+                            .copied()
+                            .unwrap_or(syntax::CodeKind::Text)
+                    })
+                    .collect()
+            })
         } else {
             None
         };
 
-        // Byte offset of every character column, for measuring and slicing.
-        let mut offsets = Vec::with_capacity(chars.len() + 1);
-        let mut acc = 0usize;
-        for ch in &chars {
-            offsets.push(acc);
-            acc += ch.len_utf8();
-        }
-        offsets.push(acc);
+        // Byte offset of every display character column, for measuring and slicing.
+        let offsets = map.display_offsets.clone();
 
         let shape = |text: &str, runs: &[TextRun]| {
             window.text_system().shape_line(
@@ -5601,19 +5896,20 @@ impl LineLayout {
             )
         };
 
-        let spans: Vec<(usize, usize)> = if chars.is_empty() {
+        let display_text: String = chars.iter().collect();
+        let display_spans: Vec<(usize, usize)> = if chars.is_empty() {
             vec![(0, 0)]
         } else {
             // Measure the line once in a single run, then break it into visual rows.
             let full_run = TextRun {
-                len: text.len(),
+                len: display_text.len(),
                 font: font.clone(),
                 color,
                 background_color: None,
                 underline: None,
                 strikethrough: None,
             };
-            let full = shape(text, &[full_run]);
+            let full = shape(&display_text, &[full_run]);
             let width_of = |from: usize, to: usize| -> f32 {
                 f32::from(full.x_for_index(offsets[to]))
                     - f32::from(full.x_for_index(offsets[from]))
@@ -5621,8 +5917,10 @@ impl LineLayout {
             wrap::wrap(&chars, width_of, width)
         };
 
-        let mut rows: Vec<Rc<ShapedLine>> = Vec::with_capacity(spans.len());
-        for &(start, end) in &spans {
+        let spans = row_source_spans(&display_spans, &map, source_chars.len());
+
+        let mut rows: Vec<Rc<ShapedLine>> = Vec::with_capacity(display_spans.len());
+        for &(start, end) in &display_spans {
             let segment: String = chars[start..end].iter().collect();
             let runs = match &code_kinds {
                 Some(kinds) => {
@@ -5643,7 +5941,10 @@ impl LineLayout {
             text: text.to_string(),
             in_code,
             language: language.to_string(),
+            concealed,
             spans: Rc::new(spans),
+            display_spans: Rc::new(display_spans),
+            map,
             rows: Rc::new(rows),
         }
     }
@@ -6301,7 +6602,7 @@ impl Element for LineNumbers {
 
         let mut shaped = Vec::new();
         for row in visible {
-            let meta = metas[row];
+            let meta = &metas[row];
             if meta.start != 0 {
                 continue;
             }
@@ -6563,15 +6864,17 @@ impl Element for EditorText {
             metas.len(),
         );
 
-        let row_byte = |line: usize, row_start: usize, col: usize| -> usize {
-            editor.buffer.char_col_to_byte(line, col)
-                - editor.buffer.char_col_to_byte(line, row_start)
+        // A source column's byte offset inside its row's shaped display segment.
+        let row_byte = |meta: &RowMeta, col: usize| -> usize {
+            meta.map
+                .byte_for_source(col)
+                .saturating_sub(meta.display_start_byte)
         };
 
         let mut selection_quads = Vec::new();
         for selection in editor.selection_ranges() {
             for row_index in visible.clone() {
-                let meta = metas[row_index];
+                let meta = &metas[row_index];
                 if hidden_lines.contains(&meta.line) {
                     continue;
                 }
@@ -6582,13 +6885,8 @@ impl Element for EditorText {
                     continue;
                 }
 
-                let x0 = rows[row_index].x_for_index(row_byte(
-                    meta.line,
-                    meta.start,
-                    start - line_start,
-                ));
-                let x1 =
-                    rows[row_index].x_for_index(row_byte(meta.line, meta.start, end - line_start));
+                let x0 = rows[row_index].x_for_index(row_byte(meta, start - line_start));
+                let x1 = rows[row_index].x_for_index(row_byte(meta, end - line_start));
                 let top = bounds.top() + line_height * row_index as f32;
                 selection_quads.push(fill(
                     Bounds::from_corners(
@@ -6608,7 +6906,7 @@ impl Element for EditorText {
                 theme.accent.opacity(0.20)
             };
             for row_index in visible.clone() {
-                let meta = metas[row_index];
+                let meta = &metas[row_index];
                 if hidden_lines.contains(&meta.line) {
                     continue;
                 }
@@ -6618,13 +6916,8 @@ impl Element for EditorText {
                 if start >= end {
                     continue;
                 }
-                let x0 = rows[row_index].x_for_index(row_byte(
-                    meta.line,
-                    meta.start,
-                    start - line_start,
-                ));
-                let x1 =
-                    rows[row_index].x_for_index(row_byte(meta.line, meta.start, end - line_start));
+                let x0 = rows[row_index].x_for_index(row_byte(meta, start - line_start));
+                let x1 = rows[row_index].x_for_index(row_byte(meta, end - line_start));
                 let top = bounds.top() + line_height * row_index as f32;
                 find_quads.push(fill(
                     Bounds::from_corners(
@@ -6639,15 +6932,15 @@ impl Element for EditorText {
         let (line_idx, col) = editor.buffer.line_col();
         let mut cursor_row = None;
         for row_index in visible.clone() {
-            let meta = metas[row_index];
+            let meta = &metas[row_index];
             if meta.line == line_idx && meta.start <= col {
                 cursor_row = Some(row_index);
             }
         }
         let cursor = cursor_row.map(|row_index| {
-            let meta = metas[row_index];
+            let meta = &metas[row_index];
             let col = col.min(meta.end);
-            let x = rows[row_index].x_for_index(row_byte(meta.line, meta.start, col));
+            let x = rows[row_index].x_for_index(row_byte(meta, col));
             fill(
                 Bounds::new(
                     point(
@@ -6667,14 +6960,14 @@ impl Element for EditorText {
         for state in &editor.extra_cursors {
             let (state_line, state_col) = editor.buffer.line_col_at(state.cursor);
             let Some(row_index) = visible.clone().find(|row_index| {
-                let meta = metas[*row_index];
+                let meta = &metas[*row_index];
                 meta.line == state_line && meta.start <= state_col && state_col <= meta.end
             }) else {
                 continue;
             };
-            let meta = metas[row_index];
+            let meta = &metas[row_index];
             let col = state_col.min(meta.end);
-            let x = rows[row_index].x_for_index(row_byte(meta.line, meta.start, col));
+            let x = rows[row_index].x_for_index(row_byte(meta, col));
             extra_cursor_quads.push(fill(
                 Bounds::new(
                     point(
@@ -6862,6 +7155,29 @@ fn visible_row_range(
     start.min(row_count)..end.min(row_count)
 }
 
+/// Convert wrapped display spans into contiguous source row ranges. Hidden markers belong
+/// to the row they precede/follow, so every source column falls inside exactly one row.
+fn row_source_spans(
+    display_spans: &[(usize, usize)],
+    map: &LineMap,
+    source_len: usize,
+) -> Vec<(usize, usize)> {
+    let mut spans: Vec<(usize, usize)> = display_spans
+        .iter()
+        .map(|&(start, end)| (map.source_for_display(start), map.source_for_display(end)))
+        .collect();
+    if let Some(first) = spans.first_mut() {
+        first.0 = 0;
+    }
+    for at in 0..spans.len().saturating_sub(1) {
+        spans[at].1 = spans[at + 1].0.max(spans[at].0);
+    }
+    if let Some(last) = spans.last_mut() {
+        last.1 = source_len.max(last.0);
+    }
+    spans
+}
+
 /// Whether an edit cannot change the document's headings: same length, no newline and no
 /// heading/fence character in the changed bytes, and the edited line is not a heading, a
 /// fence or the text line of a setext heading.
@@ -6968,6 +7284,70 @@ fn caret_after_block_edit(
 mod tests {
     use super::*;
     use gpui::{point, size};
+
+    #[test]
+    fn concealed_markers_map_between_source_and_display() {
+        let text = "a **bold** b";
+        let map = conceal_text(text, true);
+        assert_eq!(map.display.iter().collect::<String>(), "a bold b");
+
+        // Every visible display character maps to the same source character, both ways.
+        let source: Vec<char> = text.chars().collect();
+        for (display_col, ch) in map.display.iter().enumerate() {
+            let source_col = map.source_for_display(display_col);
+            assert_eq!(source[source_col], *ch);
+            assert_eq!(map.display_for_source(source_col), display_col);
+        }
+
+        // A caret before the opening marker sits where the content starts.
+        assert_eq!(map.display_for_source(2), 2);
+        assert_eq!(map.byte_for_source(2), 2);
+        assert_eq!(map.source_for_display(2), 4);
+
+        // Turning concealment off is the identity.
+        let plain = conceal_text(text, false);
+        assert_eq!(plain.display, source);
+        for col in 0..source.len() {
+            assert_eq!(plain.display_for_source(col), col);
+            assert_eq!(plain.source_for_display(col), col);
+        }
+    }
+
+    #[test]
+    fn concealment_keeps_utf8_byte_offsets_aligned() {
+        let text = "é **b**";
+        let map = conceal_text(text, true);
+        assert_eq!(map.display.iter().collect::<String>(), "é b");
+        // `é` is two bytes; the display offsets and the caret byte must agree.
+        assert_eq!(map.display_offsets, vec![0, 2, 3, 4]);
+        assert_eq!(map.byte_for_source(3), 3);
+        assert_eq!(map.source_for_display(2), 4);
+        assert_eq!(map.byte_for_source(5), 4);
+    }
+
+    #[test]
+    fn concealing_leaves_code_and_unclosed_markers_alone() {
+        let map = conceal_text("`a**b**` and **c**", true);
+        assert_eq!(map.display.iter().collect::<String>(), "a**b** and c");
+        let map = conceal_text("2 * 3 * 4", true);
+        assert_eq!(map.display.iter().collect::<String>(), "2 * 3 * 4");
+        let map = conceal_text("[[Note]] and ![[shot.png]]", true);
+        assert_eq!(map.display.iter().collect::<String>(), "Note and shot.png");
+    }
+
+    #[test]
+    fn wrapped_rows_cover_every_source_column_once() {
+        let text = "a **bold** b";
+        let map = conceal_text(text, true);
+        let source_len = text.chars().count();
+        // Two display rows split inside the hidden markers.
+        let spans = row_source_spans(&[(0, 4), (4, 8)], &map, source_len);
+        assert_eq!(spans.first().map(|span| span.0), Some(0));
+        assert_eq!(spans.last().map(|span| span.1), Some(source_len));
+        for pair in spans.windows(2) {
+            assert_eq!(pair[0].1, pair[1].0);
+        }
+    }
 
     #[test]
     fn prose_edits_keep_the_heading_cache_valid() {

@@ -571,10 +571,19 @@ renders. **Landed:** display `$$…$$` blocks are typeset in place with the read
 RaTeX scene whenever the caret is outside them, scaled to the column and centred; the source
 returns while editing; empty, unclosed and invalid formulas keep their source instead of
 leaving a gap; rows keep their geometry so clicks, scroll, selection and find are unchanged.
-**Remaining:** a per-line display↔source column map before markers can be hidden
-(`**`, `==`, `[[…]]`) or images, tables, callouts and rules rendered in place, because
-clicks, selection, wrapping and IME all have to survive the substitution. Then render the
-formula live while it is being typed (today it appears when the caret leaves the block).
+**Landed (marker hiding):** each line is shaped from a display string that omits inline
+markers (`**`, `__`, `*`, `_`, `~~`, `==`, backticks and `[[…]]`/`![[…]]` brackets), with a
+per-line map in both directions: source column → display column and byte offset, display
+column → source column. Wrapping measures the display text, while row metadata keeps
+contiguous *source* ranges and each row's display start, so clicks, selection quads, the
+caret, vertical movement and IME bounds all convert through the map instead of assuming
+equal columns. The paragraph (blank-line-delimited) holding the caret stays raw, so markers
+reappear as you move into it; moving between paragraphs invalidates only the affected lines
+through the per-line cache. Tests cover both directions, UTF-8 byte offsets, wrapping that
+splits inside hidden markers, code spans and unclosed markers.
+**Remaining:** images, tables, callouts and rules are still shown as source (their syntax is
+not substituted by an element), and a display formula appears when the caret leaves the
+block rather than live while typing.
 **Done when:** a note with emphasis, an image and a table shows the caret's line as source
 and the rest as preview, and every click lands on the source column the user aimed at.
 
