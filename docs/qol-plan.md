@@ -603,8 +603,12 @@ column mapped through the display map, with outer edges and a bottom border. The
 the separator row are concealed, so the cells read as text; moving the caret into the table
 shows the full markdown again. Tests cover separator detection, table block detection around
 the caret paragraph, and pipe concealment.
-**Remaining:** a display formula appears when the caret leaves its block rather than live
-while typing.
+**Landed (live formula):** the block holding the caret now typesets its `$$…$$` formula in
+the same layout pass and paints it under the source on three reserved rows, scaled to fit
+the column and the reserved height, so the result is visible while typing. Errors and
+unclosed blocks keep just the source. This completes Q2.12's substitutions: markers, images,
+rules, callouts, tables and display formulas all render in place outside the caret's
+paragraph.
 **Done when:** a note with emphasis, an image and a table shows the caret's line as source
 and the rest as preview, and every click lands on the source column the user aimed at.
 

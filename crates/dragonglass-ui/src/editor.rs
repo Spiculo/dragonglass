@@ -340,6 +340,8 @@ pub struct Editor {
     layout_callouts: Rc<Vec<CalloutLayout>>,
     /// Table blocks drawn as a grid.
     layout_tables: Rc<Vec<TableLayout>>,
+    /// Live previews of formulas whose block contains the caret.
+    live_math: Vec<LiveMath>,
     /// The buffer revision `display_math` was parsed from.
     display_math_revision: u64,
     /// Typeset display formulas, keyed by TeX source. `None` records a failed formula.
@@ -821,6 +823,14 @@ fn find_token(chars: &[char], from: usize, token: &str) -> Option<usize> {
     (from..=chars.len() - token.len()).find(|&at| chars[at..at + token.len()] == token[..])
 }
 
+/// A live preview of the display formula being edited, drawn under its source block.
+#[derive(Debug, Clone)]
+struct LiveMath {
+    first_row: usize,
+    row_count: usize,
+    tex: String,
+}
+
 /// A table drawn as a grid over its rows. The separator row owns no rows of its own.
 #[derive(Debug, Clone)]
 struct TableLayout {
@@ -984,6 +994,7 @@ impl Editor {
             editor_images: Vec::new(),
             layout_callouts: Rc::new(Vec::new()),
             layout_tables: Rc::new(Vec::new()),
+            live_math: Vec::new(),
             display_math_revision: u64::MAX,
             math_scenes: HashMap::new(),
             doc_text: ((u64::MAX, u64::MAX), Rc::new(String::new())),
@@ -2261,6 +2272,21 @@ impl Editor {
                 row_count: 0,
             })
             .collect();
+        for block in &blocks {
+            if self.math_scenes.contains_key(&block.tex) {
+                continue;
+            }
+            let scene = math::typeset(
+                &block.tex,
+                &MathOptions {
+                    style: MathStyle::Display,
+                    color: [0.0, 0.0, 0.0, 1.0],
+                },
+            )
+            .ok()
+            .map(Rc::new);
+            self.math_scenes.insert(block.tex.clone(), scene);
+        }
         let mut block_start: HashMap<usize, usize> = HashMap::new();
         let mut block_end: HashMap<usize, usize> = HashMap::new();
         for (index, block) in blocks.iter().enumerate() {
@@ -2277,6 +2303,7 @@ impl Editor {
             0
         };
         self.editor_images.clear();
+        self.live_math.clear();
         // Callout blocks, outside the paragraph being edited, get a tinted box.
         let mut callout_ranges: Vec<(usize, usize, String)> = Vec::new();
         let mut scan = 0usize;
@@ -2299,6 +2326,12 @@ impl Editor {
         }
         let mut callout_rows: Vec<(usize, usize)> = vec![(usize::MAX, 0); callout_ranges.len()];
         let mut rules: HashSet<usize> = HashSet::new();
+        let blank_row = Rc::new(window.text_system().shape_line(
+            SharedString::from(""),
+            font_size,
+            &[],
+            None,
+        ));
         let mut in_code = false;
         let mut language = String::new();
         let mut rows: Vec<Rc<ShapedLine>> = Vec::new();
@@ -2408,19 +2441,13 @@ impl Editor {
                                 f32::from(self.line_height),
                                 requested,
                             );
-                            let empty = Rc::new(window.text_system().shape_line(
-                                SharedString::from(""),
-                                font_size,
-                                &[],
-                                None,
-                            ));
                             let first_row = rows.len();
                             let source_len = layout.text.chars().count();
                             let display_len = layout.map.display.len();
                             let display_byte =
                                 layout.map.display_offsets.last().copied().unwrap_or(0);
                             for _ in 0..row_count {
-                                rows.push(empty.clone());
+                                rows.push(blank_row.clone());
                                 metas.push(RowMeta {
                                     line: line_index,
                                     start: source_len,
@@ -2476,6 +2503,37 @@ impl Editor {
                 let first_row = blocks[block].first_row;
                 if first_row != usize::MAX {
                     blocks[block].row_count = rows.len().saturating_sub(first_row);
+                }
+                // While editing the block, show the typeset formula under the source.
+                let block_ref = &blocks[block];
+                if caret_line >= block_ref.first_line
+                    && caret_line <= block_ref.last_line
+                    && self
+                        .math_scenes
+                        .get(&block_ref.tex)
+                        .is_some_and(|scene| scene.is_some())
+                {
+                    let live_first = rows.len();
+                    let source_len = layout.text.chars().count();
+                    let display_len = layout.map.display.len();
+                    let display_byte = layout.map.display_offsets.last().copied().unwrap_or(0);
+                    for _ in 0..3 {
+                        rows.push(blank_row.clone());
+                        metas.push(RowMeta {
+                            line: line_index,
+                            start: source_len,
+                            end: source_len,
+                            display_start: display_len,
+                            display_end: display_len,
+                            display_start_byte: display_byte,
+                            map: layout.map.clone(),
+                        });
+                    }
+                    self.live_math.push(LiveMath {
+                        first_row: live_first,
+                        row_count: 3,
+                        tex: block_ref.tex.clone(),
+                    });
                 }
             }
 
@@ -7499,6 +7557,41 @@ impl Element for EditorText {
                 let left = bounds.left() + px(((column_width - f32::from(width)) / 2.0).max(0.0));
                 let top = bounds.top()
                     + line_height * first_row as f32
+                    + px(((f32::from(block_height) - f32::from(height)) / 2.0).max(0.0));
+                paint_scene(window, scene, font_size, theme.text, point(left, top));
+            }
+        }
+
+        // Draw the live formula preview under the block being edited.
+        {
+            let editor = self.editor.read(cx);
+            let theme = *cx.global::<Theme>();
+            let column_width = f32::from(bounds.size.width);
+            for live in editor.live_math.iter() {
+                let last_row = live.first_row + live.row_count;
+                if last_row <= visible.start || live.first_row >= visible.end {
+                    continue;
+                }
+                let Some(Some(scene)) = editor.math_scenes.get(&live.tex) else {
+                    continue;
+                };
+                let natural = 17.0f32;
+                let scene_width = scene.width() as f32;
+                let scene_height = scene.total_height() as f32;
+                let block_height = line_height * live.row_count as f32;
+                let mut font_size = natural;
+                if scene_width > 0.0 {
+                    font_size = font_size.min((column_width - 24.0) / scene_width);
+                }
+                if scene_height > 0.0 {
+                    font_size = font_size.min(f32::from(block_height - px(4.0)) / scene_height);
+                }
+                let font_size = font_size.clamp(8.0, natural);
+                let width = px(scene_width * font_size);
+                let height = px(scene_height * font_size);
+                let left = bounds.left() + px(((column_width - f32::from(width)) / 2.0).max(0.0));
+                let top = bounds.top()
+                    + line_height * live.first_row as f32
                     + px(((f32::from(block_height) - f32::from(height)) / 2.0).max(0.0));
                 paint_scene(window, scene, font_size, theme.text, point(left, top));
             }
