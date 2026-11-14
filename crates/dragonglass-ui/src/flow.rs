@@ -19,7 +19,7 @@ use gpui::{
 use dragonglass_core::math::MathScene;
 
 use crate::math_element;
-use crate::reading::{ImageOpener, LinkOpener, ReadPoint, ReadSelection};
+use crate::reading::{word_range, ImageOpener, LinkOpener, ReadPoint, ReadSelection};
 use crate::theme::Theme;
 
 /// One inline piece, in display-text order.
@@ -68,6 +68,8 @@ pub(crate) struct FlowContent {
 pub(crate) struct FlowText {
     content: Rc<FlowContent>,
     layout: Rc<RefCell<Option<Rc<FlowLayout>>>>,
+    /// Display text, for word and paragraph selection.
+    text: Rc<String>,
     block: Option<usize>,
     base: usize,
     len: usize,
@@ -84,6 +86,7 @@ impl FlowText {
         block: Option<usize>,
         base: usize,
         len: usize,
+        text: Rc<String>,
         selection: Rc<RefCell<ReadSelection>>,
         opener: Option<LinkOpener>,
         on_image: Option<ImageOpener>,
@@ -92,6 +95,7 @@ impl FlowText {
         Self {
             content,
             layout: Rc::new(RefCell::new(None)),
+            text,
             block,
             base,
             len,
@@ -540,6 +544,7 @@ impl Element for FlowText {
         if let Some(block) = block {
             let selection = self.selection.clone();
             let down_layout = layout.clone();
+            let text = self.text.clone();
             window.on_mouse_event(
                 move |event: &MouseDownEvent, phase, window: &mut Window, _cx: &mut App| {
                     if phase != DispatchPhase::Bubble || event.button != MouseButton::Left {
@@ -550,11 +555,43 @@ impl Element for FlowText {
                     }
                     let point = down_layout.point_at(base, len, event.position - origin, font_size);
                     let mut state = selection.borrow_mut();
-                    state.anchor = Some(ReadPoint { block, ..point });
-                    state.head = Some(ReadPoint { block, ..point });
-                    state.down = Some(event.position);
-                    state.dragging = true;
-                    state.moved = false;
+                    match event.click_count {
+                        2 => {
+                            let local = point.offset.saturating_sub(base).min(text.len());
+                            let range = word_range(&text, local);
+                            state.anchor = Some(ReadPoint {
+                                block,
+                                offset: base + range.start,
+                            });
+                            state.head = Some(ReadPoint {
+                                block,
+                                offset: base + range.end,
+                            });
+                            state.dragging = false;
+                            state.moved = true;
+                            state.down = None;
+                        }
+                        3 => {
+                            state.anchor = Some(ReadPoint {
+                                block,
+                                offset: base,
+                            });
+                            state.head = Some(ReadPoint {
+                                block,
+                                offset: base + len,
+                            });
+                            state.dragging = false;
+                            state.moved = true;
+                            state.down = None;
+                        }
+                        _ => {
+                            state.anchor = Some(ReadPoint { block, ..point });
+                            state.head = Some(ReadPoint { block, ..point });
+                            state.down = Some(event.position);
+                            state.dragging = true;
+                            state.moved = false;
+                        }
+                    }
                     drop(state);
                     window.refresh();
                 },

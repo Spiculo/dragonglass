@@ -34,7 +34,7 @@ use gpui::{
 };
 
 use crate::math_element::{paint_scene, MathElement};
-use crate::reading::{LinkOpener, ReadingCache};
+use crate::reading::{word_range, LinkOpener, ReadingCache};
 use crate::theme::Theme;
 use crate::vim::{Mode as VimMode, Vim};
 
@@ -5218,6 +5218,26 @@ impl Editor {
             return;
         };
 
+        // Double click selects a word, triple click the line under the pointer.
+        if event.click_count >= 2 {
+            self.extra_cursors.clear();
+            let (line, col) = self.buffer.line_col_at(index);
+            let line_start = self.buffer.char_index_at(line, 0);
+            let text = self.buffer.line(line);
+            if event.click_count == 2 {
+                let byte = self.buffer.char_col_to_byte(line, col);
+                let (start, end) = word_columns(&text, byte);
+                self.anchor = Some(line_start + start);
+                self.buffer.set_cursor(line_start + end);
+            } else {
+                self.anchor = Some(line_start);
+                self.buffer.set_cursor(line_start + text.chars().count());
+            }
+            self.selecting = false;
+            cx.notify();
+            return;
+        }
+
         if self.find.open {
             self.find.open = false;
             self.find.error = None;
@@ -7415,8 +7435,9 @@ impl Element for EditorText {
             }
         }
 
-        // Tables: header tint, outer edges, the divider under the header and a vertical
-        // line at every cell pipe. The source text paints on top.
+        // Tables: a tinted header, a divider under it and a quiet outer frame. The cells
+        // stay source text with their pipes concealed; per-pipe vertical lines made the
+        // block noisy and ragged when the source columns were not aligned.
         {
             let editor = self.editor.read(cx);
             let theme = *cx.global::<Theme>();
@@ -7435,6 +7456,12 @@ impl Element for EditorText {
                 let top = bounds.top() + line_height * first as f32;
                 let height = line_height * (last - first) as f32;
                 let header_end = table.divider_row.clamp(first, last);
+
+                // A soft backdrop for the whole block.
+                window.paint_quad(fill(
+                    Bounds::new(point(bounds.left(), top), size(width, height)),
+                    theme.panel_alt.opacity(0.6),
+                ));
                 if header_end > first {
                     window.paint_quad(fill(
                         Bounds::new(
@@ -7444,19 +7471,8 @@ impl Element for EditorText {
                         theme.chip,
                     ));
                 }
-                // Outer edges.
-                window.paint_quad(fill(
-                    Bounds::new(point(bounds.left(), top), size(px(1.0), height)),
-                    theme.border,
-                ));
-                window.paint_quad(fill(
-                    Bounds::new(
-                        point(bounds.left() + width - px(1.0), top),
-                        size(px(1.0), height),
-                    ),
-                    theme.border,
-                ));
-                // Header divider.
+
+                // A single divider under the header, plus the outer frame.
                 if table.divider_row >= first && table.divider_row <= last {
                     let y = bounds.top() + line_height * table.divider_row as f32;
                     window.paint_quad(fill(
@@ -7464,40 +7480,21 @@ impl Element for EditorText {
                         theme.border,
                     ));
                 }
-                // Cell separators, at the source column of each pipe.
-                for row_index in first..last {
-                    let (Some(meta), Some(row)) =
-                        (prepaint.metas.get(row_index), prepaint.rows.get(row_index))
-                    else {
-                        continue;
-                    };
-                    let line = editor.buffer.line(meta.line);
-                    if is_table_separator(&line) {
-                        continue;
-                    }
-                    let y = bounds.top() + line_height * row_index as f32;
-                    for (col, ch) in line.chars().enumerate() {
-                        if ch != '|' || col < meta.start || col >= meta.end {
-                            continue;
-                        }
-                        let byte = meta
-                            .map
-                            .byte_for_source(col)
-                            .saturating_sub(meta.display_start_byte);
-                        let x = bounds.left() + row.x_for_index(byte);
-                        window.paint_quad(fill(
-                            Bounds::new(point(x, y), size(px(1.0), line_height)),
-                            theme.border,
-                        ));
-                    }
-                }
-                if table.last_row < prepaint.visible.end {
+                window.paint_quad(fill(
+                    Bounds::new(point(bounds.left(), top), size(width, px(1.0))),
+                    theme.border,
+                ));
+                if table.last_row <= prepaint.visible.end {
                     let y = bounds.top() + line_height * table.last_row as f32 - px(1.0);
                     window.paint_quad(fill(
                         Bounds::new(point(bounds.left(), y), size(width, px(1.0))),
                         theme.border,
                     ));
                 }
+                window.paint_quad(fill(
+                    Bounds::new(point(bounds.left(), top), size(px(2.0), height)),
+                    theme.accent.opacity(0.6),
+                ));
             }
         }
 
@@ -7835,6 +7832,15 @@ fn editor_image_layout(
     (width, height, row_count)
 }
 
+/// The character columns of the word around a byte offset, for double-click selection.
+fn word_columns(text: &str, byte: usize) -> (usize, usize) {
+    let range = word_range(text, byte);
+    (
+        text[..range.start].chars().count(),
+        text[..range.end].chars().count(),
+    )
+}
+
 /// A thematic break: three or more of `-`, `*` or `_`, with nothing else.
 fn thematic_break(line: &str) -> bool {
     let trimmed = line.trim();
@@ -8094,6 +8100,13 @@ mod tests {
             editor_image_layout(200.0, 100.0, 120.0, 20.0, None),
             (120.0, 60.0, 3)
         );
+    }
+
+    #[test]
+    fn double_click_columns_handle_multibyte_lines() {
+        assert_eq!(word_columns("hello world", 7), (6, 11));
+        assert_eq!(word_columns("café au lait", 6), (5, 7));
+        assert_eq!(word_columns("a  b", 2), (2, 3));
     }
 
     #[test]

@@ -2124,11 +2124,21 @@ fn rich_text_styled(
             })
             .sum();
         let content = flow_content(&spans, block, size, weight, line_height, ctx);
+        let display: String = spans
+            .iter()
+            .map(|span| {
+                span.math
+                    .as_ref()
+                    .map(|tex| format!("${tex}$"))
+                    .unwrap_or_else(|| span.text.clone())
+            })
+            .collect();
         return FlowText::new(
             content,
             block,
             base,
             len,
+            Rc::new(display),
             ctx.selection.clone(),
             ctx.opener.cloned(),
             ctx.on_image.cloned(),
@@ -2531,12 +2541,22 @@ fn code_block(text: &str, language: &str, block: Option<usize>, ctx: &RenderCtx)
 
 fn code_font(base: &gpui::Font) -> gpui::Font {
     let mut font = base.clone();
-    font.family = "Cascadia Mono".into();
+    // Pick a family that exists on the platform first. A missing primary family otherwise
+    // falls back to the UI font, which makes code look proportional.
+    #[cfg(target_os = "macos")]
+    let primary = "Menlo";
+    #[cfg(target_os = "windows")]
+    let primary = "Consolas";
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let primary = "DejaVu Sans Mono";
+    font.family = primary.into();
     font.fallbacks = Some(gpui::FontFallbacks(std::sync::Arc::new(vec![
+        "SF Mono".to_string(),
+        "Menlo".to_string(),
+        "Cascadia Mono".to_string(),
         "Consolas".to_string(),
         "DejaVu Sans Mono".to_string(),
         "Liberation Mono".to_string(),
-        "Menlo".to_string(),
         "monospace".to_string(),
     ])));
     font
@@ -2547,7 +2567,7 @@ fn code_font(base: &gpui::Font) -> gpui::Font {
 /// Letters, digits and `_` form a word. Clicking on the space after a word selects that
 /// word; clicking between two non-word characters selects the character under the pointer,
 /// so a double click always selects something visible.
-fn word_range(text: &str, index: usize) -> Range<usize> {
+pub(crate) fn word_range(text: &str, index: usize) -> Range<usize> {
     let index = index.min(text.len());
     let mut start = index;
     let mut end = index;

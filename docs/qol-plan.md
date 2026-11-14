@@ -441,7 +441,9 @@ selects the whole paragraph/cell/callout line/code line, Shift-click extends fro
 Shift+arrows/Home/End/PageUp/Down and Ctrl+Shift+Home/End extend the selection from the
 keyboard across blocks, dragging past the top or bottom scrolls the list, Escape clears the
 selection before it closes panels, and copy reports "copied N character(s)" in the status
-bar (also when focus sits on a sidebar row, through the app-level Copy handler).
+bar (also when focus sits on a sidebar row, through the app-level Copy handler). The same
+double/triple-click word and paragraph selection works in measured flow paragraphs that
+contain math or images.
 
 #### Q2.4 Reading typography controls — D · A · S · M
 Move hardcoded sizes/width into persisted `ReaderSettings`: body size, line height, measure
@@ -505,6 +507,11 @@ Add a copy button to code fences, horizontal scroll plus sticky headers for wide
 and collapsible callouts (remember per-note state). Do not let wide tables widen the page.
 **Done when:** copying a fence works with one click; a 12-column table is readable without
 scrolling the whole page; callouts remember their collapsed state for the session.
+
+**Landed:** code fences have a one-click copy button and report the result. Code (fenced and
+inline) uses a platform-native monospace family first — Menlo on macOS, Consolas on Windows,
+DejaVu Sans Mono elsewhere — with mono fallbacks, so it no longer collapses to the UI font.
+Tables stay inside the reading measure and scroll horizontally when wider.
 
 #### Q2.8 Footnote popover — D · S
 Anchor the footnote popup near the clicked reference instead of `top(96)/left(24)`, show the
@@ -599,13 +606,13 @@ with a left accent coloured by kind (warning/error amber, tip/success green, oth
 accent). The leading `>` markers and the `[!kind]` tag are concealed on blockquote and callout
 lines through the same column map, so the text stays aligned and editable; moving into the
 block shows the markers again.
-**Landed (tables):** a pipe table outside the caret paragraph draws as a grid: the header row
-gets a tinted background, the `|---|` separator row collapses (it reserves no row) into the
-header divider, and a vertical line is drawn at every cell pipe using that row's source
-column mapped through the display map, with outer edges and a bottom border. The pipes and
-the separator row are concealed, so the cells read as text; moving the caret into the table
-shows the full markdown again. Tests cover separator detection, table block detection around
-the caret paragraph, and pipe concealment.
+**Landed (tables):** a pipe table outside the caret paragraph draws as a quiet framed block:
+a soft backdrop, a tinted header row, a divider where the `|---|` separator collapses (it
+reserves no row) and a thin outer edge with an accent stripe. Pipes and the separator row are
+concealed, so the cells read as text; per-pipe vertical rules were removed because ragged
+source columns made them noisy. Moving the caret into the table shows the full markdown
+again. Tests cover separator detection, table block detection around the caret paragraph, and
+pipe concealment.
 **Landed (live formula):** the block holding the caret now typesets its `$$…$$` formula in
 the same layout pass and paints it under the source on three reserved rows, scaled to fit
 the column and the reserved height, so the result is visible while typing. Errors and
@@ -761,9 +768,10 @@ indicator; block operations do not jump the viewport.
 
 **Landed:** Vim has redo and `:wq`/`:x`/`:q` close; failed searches report. The window title
 shows the note and a dirty dot. Tabs close on middle-click. Copy/link actions report their
-outcome. A right-click opens a context menu at the pointer with Cut, Copy, Paste, Bold,
-Italic, Highlight and Wikilink; it never moves the caret or drops the selection, and closes
-on Escape or an outside click.
+outcome. Double-click selects the word under the pointer and triple-click selects its line;
+a click-drag still extends normally. A right-click opens a context menu at the pointer with
+Cut, Copy, Paste, Bold, Italic, Highlight and Wikilink; it never moves the caret or drops the
+selection, and closes on Escape or an outside click.
 **Landed (tab overflow):** a `▾` button at the right of the tab bar opens a menu listing every
 open tab with its dirty dot; the active tab is highlighted and clicking a row activates it.
 The menu is anchored at the button, snaps inside the window, and closes on Escape or an
