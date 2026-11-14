@@ -709,6 +709,8 @@ internal object IntegrityCheckingUniffiLib {
     ): Int
     external fun uniffi_dragonglass_ffi_checksum_method_mobilevault_empty_trash(
     ): Int
+    external fun uniffi_dragonglass_ffi_checksum_method_mobilevault_filter_by_property(
+    ): Int
     external fun uniffi_dragonglass_ffi_checksum_method_mobilevault_fuzzy(
     ): Int
     external fun uniffi_dragonglass_ffi_checksum_method_mobilevault_graph(
@@ -736,6 +738,8 @@ internal object IntegrityCheckingUniffiLib {
     external fun uniffi_dragonglass_ffi_checksum_method_mobilevault_relations(
     ): Int
     external fun uniffi_dragonglass_ffi_checksum_method_mobilevault_rename_entry(
+    ): Int
+    external fun uniffi_dragonglass_ffi_checksum_method_mobilevault_resolve_target(
     ): Int
     external fun uniffi_dragonglass_ffi_checksum_method_mobilevault_restore_trash_entry(
     ): Int
@@ -805,6 +809,8 @@ internal object UniffiLib {
     ): RustBuffer.ByValue
     external fun uniffi_dragonglass_ffi_fn_method_mobilevault_empty_trash(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
     ): Long
+    external fun uniffi_dragonglass_ffi_fn_method_mobilevault_filter_by_property(`ptr`: Long,`key`: RustBuffer.ByValue,`value`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
     external fun uniffi_dragonglass_ffi_fn_method_mobilevault_fuzzy(`ptr`: Long,`query`: RustBuffer.ByValue,`limit`: Int,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
     external fun uniffi_dragonglass_ffi_fn_method_mobilevault_graph(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
@@ -832,6 +838,8 @@ internal object UniffiLib {
     external fun uniffi_dragonglass_ffi_fn_method_mobilevault_relations(`ptr`: Long,`relative`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
     external fun uniffi_dragonglass_ffi_fn_method_mobilevault_rename_entry(`ptr`: Long,`from`: RustBuffer.ByValue,`to`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
+    external fun uniffi_dragonglass_ffi_fn_method_mobilevault_resolve_target(`ptr`: Long,`target`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
     external fun uniffi_dragonglass_ffi_fn_method_mobilevault_restore_trash_entry(`ptr`: Long,`trashRelative`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
@@ -1049,6 +1057,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if ((lib.uniffi_dragonglass_ffi_checksum_method_mobilevault_empty_trash() and 0xFFFF) != 56931) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if ((lib.uniffi_dragonglass_ffi_checksum_method_mobilevault_filter_by_property() and 0xFFFF) != 28950) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if ((lib.uniffi_dragonglass_ffi_checksum_method_mobilevault_fuzzy() and 0xFFFF) != 51429) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
@@ -1089,6 +1100,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if ((lib.uniffi_dragonglass_ffi_checksum_method_mobilevault_rename_entry() and 0xFFFF) != 37783) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if ((lib.uniffi_dragonglass_ffi_checksum_method_mobilevault_resolve_target() and 0xFFFF) != 18552) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if ((lib.uniffi_dragonglass_ffi_checksum_method_mobilevault_restore_trash_entry() and 0xFFFF) != 54831) {
@@ -1596,6 +1610,11 @@ public interface MobileVaultInterface {
     fun `emptyTrash`(): kotlin.Long
     
     /**
+     * Notes whose frontmatter property `key` equals `value` (case-insensitive).
+     */
+    fun `filterByProperty`(`key`: kotlin.String, `value`: kotlin.String): List<NoteSummary>
+    
+    /**
      * Quick-switcher style fuzzy path matching.
      */
     fun `fuzzy`(`query`: kotlin.String, `limit`: kotlin.Int): List<NoteSummary>
@@ -1656,6 +1675,12 @@ public interface MobileVaultInterface {
      * Returns the sanitized vault-relative destination.
      */
     fun `renameEntry`(`from`: kotlin.String, `to`: kotlin.String): kotlin.String
+    
+    /**
+     * Resolve a wikilink or relation target (path, stem, slug or frontmatter alias) to a
+     * vault-relative note path.
+     */
+    fun `resolveTarget`(`target`: kotlin.String): kotlin.String?
     
     /**
      * Restore one trash entry to its original path. Returns that path.
@@ -1943,6 +1968,24 @@ open class MobileVault: Disposable, AutoCloseable, MobileVaultInterface
 
     
     /**
+     * Notes whose frontmatter property `key` equals `value` (case-insensitive).
+     */override fun `filterByProperty`(`key`: kotlin.String, `value`: kotlin.String): List<NoteSummary> {
+            return FfiConverterSequenceTypeNoteSummary.lift(
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_dragonglass_ffi_fn_method_mobilevault_filter_by_property(
+        it,
+        
+        FfiConverterString.lower(`key`),
+        FfiConverterString.lower(`value`),_status)
+}
+    }
+    )
+    }
+    
+
+    
+    /**
      * Quick-switcher style fuzzy path matching.
      */override fun `fuzzy`(`query`: kotlin.String, `limit`: kotlin.Int): List<NoteSummary> {
             return FfiConverterSequenceTypeNoteSummary.lift(
@@ -2166,6 +2209,24 @@ open class MobileVault: Disposable, AutoCloseable, MobileVaultInterface
         
         FfiConverterString.lower(`from`),
         FfiConverterString.lower(`to`),_status)
+}
+    }
+    )
+    }
+    
+
+    
+    /**
+     * Resolve a wikilink or relation target (path, stem, slug or frontmatter alias) to a
+     * vault-relative note path.
+     */override fun `resolveTarget`(`target`: kotlin.String): kotlin.String? {
+            return FfiConverterOptionalString.lift(
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_dragonglass_ffi_fn_method_mobilevault_resolve_target(
+        it,
+        
+        FfiConverterString.lower(`target`),_status)
 }
     }
     )

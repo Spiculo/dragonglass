@@ -389,8 +389,12 @@ class DragonGlassViewModel(application: Application) : AndroidViewModel(applicat
     var gitConflicts by mutableStateOf<List<String>>(emptyList())
         private set
 
+    /// An active frontmatter filter (`key` to `value`) shown above the note list.
+    var propertyFilter by mutableStateOf<Pair<String, String>?>(null)
+        private set
+
     val visibleNotes: List<NoteSummary>
-        get() = (if (query.isBlank()) notes else results)
+        get() = (if (query.isBlank() && propertyFilter == null) notes else results)
             .filter { !bookmarksOnly || it.relative in bookmarks }
 
     /// Tree rows with the children of collapsed folders removed.
@@ -454,16 +458,22 @@ class DragonGlassViewModel(application: Application) : AndroidViewModel(applicat
             val result = runCatching {
                 withContext(Dispatchers.IO) {
                     val loaded = ensureVault()
-                    Triple(loaded.notes(), loaded.bookmarks().toSet(), loaded.treeRows())
+                    val filter = propertyFilter
+                    val filtered = filter?.let { (key, value) ->
+                        loaded.filterByProperty(key, value)
+                    }
+                    Triple(loaded.notes(), loaded.bookmarks().toSet(), loaded.treeRows()) to
+                        filtered
                 }
             }
             result
-                .onSuccess { (loaded, marks, rows) ->
+                .onSuccess { (core, filtered) ->
+                    val (loaded, marks, rows) = core
                     notes = loaded
                     bookmarks = marks
                     treeRows = rows
                     graph = null
-                    if (query.isBlank()) results = loaded
+                    if (query.isBlank()) results = filtered ?: loaded
                 }
                 .onFailure { error = it.message ?: "Could not open the vault" }
             loading = false
@@ -701,6 +711,7 @@ class DragonGlassViewModel(application: Application) : AndroidViewModel(applicat
 
     fun onQueryChange(value: String) {
         query = value
+        propertyFilter = null
         searchJob?.cancel()
         if (value.isBlank()) {
             results = notes
@@ -902,7 +913,8 @@ class DragonGlassViewModel(application: Application) : AndroidViewModel(applicat
     }
 
     /// Create a note from a typed title: the title becomes the file name and the heading.
-    fun createNote(title: String) {
+    /// `folder` places it in a subfolder (created when missing); empty means the vault root.
+    fun createNote(title: String, folder: String = "") {
         val trimmed = title.trim()
         if (trimmed.isEmpty()) {
             error = "A note needs a name"
@@ -916,15 +928,21 @@ class DragonGlassViewModel(application: Application) : AndroidViewModel(applicat
             error = "A note needs a name"
             return
         }
+        val folderPath = folder.trim().trim('/').trim()
+        if (folderPath.split('/').any { it == ".." }) {
+            error = "A folder name cannot contain .."
+            return
+        }
+        val prefix = if (folderPath.isEmpty()) "" else "$folderPath/"
         viewModelScope.launch {
             val result = runCatching {
                 withContext(Dispatchers.IO) {
                     val loaded = ensureVault()
-                    var relative = "$safe.md"
+                    var relative = "$prefix$safe.md"
                     var index = 1
                     while (File(vaultDirectory, relative).exists()) {
                         index++
-                        relative = "$safe $index.md"
+                        relative = "$prefix$safe $index.md"
                     }
                     loaded.createNote(relative, "# $trimmed\n\n")
                     relative
@@ -1020,6 +1038,58 @@ class DragonGlassViewModel(application: Application) : AndroidViewModel(applicat
                     mirrorAll()
                 }
                 .onFailure { error = it.message ?: "Could not move the note to the trash" }
+        }
+    }
+
+    /// Close the open note (saving first) and list the notes whose property matches.
+    fun filterByProperty(key: String, value: String) {
+        val note = selected
+        val text = source
+        val dirtyNow = dirty
+        viewModelScope.launch {
+            if (note != null && dirtyNow) {
+                runCatching { withContext(Dispatchers.IO) { saveNoteChecked(ensureVault(), note, text) } }
+                    .onFailure { error = it.message ?: "Could not save the note" }
+            }
+            selected = null
+            source = ""
+            preview = false
+            previewScroll = 0
+            dirty = false
+            loading = true
+            val result = runCatching {
+                withContext(Dispatchers.IO) { ensureVault().filterByProperty(key, value) }
+            }
+            result
+                .onSuccess { rows ->
+                    propertyFilter = key to value
+                    query = ""
+                    results = rows
+                    hits = emptyList()
+                }
+                .onFailure { error = it.message ?: "Could not filter the notes" }
+            loading = false
+        }
+    }
+
+    fun clearPropertyFilter() {
+        propertyFilter = null
+        refresh()
+    }
+
+    /// Follow a relation chip: resolve its target through the engine's index and open it.
+    fun openRelation(target: String) {
+        val wanted = target.substringBefore('#').trim()
+        if (wanted.isEmpty()) return
+        viewModelScope.launch {
+            val relative = runCatching {
+                withContext(Dispatchers.IO) { ensureVault().resolveTarget(wanted) }
+            }.getOrNull()
+            if (relative != null) {
+                openLinkedNote(relative)
+            } else {
+                error = "No note matches $target"
+            }
         }
     }
 

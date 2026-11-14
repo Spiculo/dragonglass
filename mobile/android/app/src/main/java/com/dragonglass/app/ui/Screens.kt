@@ -394,6 +394,23 @@ private fun NotesScreen(
                 }
             }
 
+            vm.propertyFilter?.let { (key, value) ->
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 16.dp, vertical = 6.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text(
+                        text = "Filter: $key = $value",
+                        modifier = Modifier.weight(1f),
+                        style = MaterialTheme.typography.labelMedium,
+                        color = MaterialTheme.colorScheme.primary,
+                    )
+                    TextButton(onClick = vm::clearPropertyFilter) { Text("Clear") }
+                }
+            }
+
             val progress = vm.transferProgress
             if (progress != null) {
                 Row(
@@ -497,17 +514,10 @@ private fun NotesScreen(
         )
     }
     if (showNewNote) {
-        TextInputDialog(
-            title = "New note",
-            label = "Title",
-            initial = "",
-            hint = "The title becomes the file name and the first heading.",
-            confirmLabel = "Create",
+        NewNoteDialog(
+            vm = vm,
             onDismiss = { showNewNote = false },
-            onConfirm = {
-                vm.createNote(it)
-                showNewNote = false
-            },
+            onCreate = { showNewNote = false },
         )
     }
     if (showNewFolder) {
@@ -1537,12 +1547,20 @@ private fun DetailsSheet(vm: DragonGlassViewModel, onDismiss: () -> Unit) {
                 Muted("No frontmatter properties.")
             } else {
                 vm.properties.forEach { property ->
-                    Row(Modifier.fillMaxWidth().padding(vertical = 3.dp)) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable {
+                                onDismiss()
+                                vm.filterByProperty(property.key, property.value)
+                            }
+                            .padding(vertical = 4.dp),
+                    ) {
                         Text(
                             text = property.key,
                             modifier = Modifier.width(120.dp),
                             style = MaterialTheme.typography.labelMedium,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            color = MaterialTheme.colorScheme.primary,
                         )
                         Text(text = property.value)
                     }
@@ -1557,6 +1575,10 @@ private fun DetailsSheet(vm: DragonGlassViewModel, onDismiss: () -> Unit) {
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
+                            .clickable {
+                                onDismiss()
+                                vm.openRelation(relation.target)
+                            }
                             .padding(vertical = 4.dp),
                     ) {
                         Text(
@@ -2123,6 +2145,97 @@ private fun TemplatesSheet(
     }
 }
 
+/// Title plus folder for a new note; the folder list comes from the open vault.
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun NewNoteDialog(
+    vm: DragonGlassViewModel,
+    onDismiss: () -> Unit,
+    onCreate: () -> Unit,
+) {
+    var title by remember { mutableStateOf("") }
+    var folder by remember { mutableStateOf("") }
+    var folderMenu by remember { mutableStateOf(false) }
+    val folders = remember(vm.notes) {
+        vm.notes
+            .map { it.relative.substringBeforeLast('/', "") }
+            .filter { it.isNotEmpty() }
+            .distinct()
+            .sorted()
+    }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("New note") },
+        text = {
+            Column {
+                OutlinedTextField(
+                    value = title,
+                    onValueChange = { title = it },
+                    label = { Text("Title") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                Box {
+                    OutlinedTextField(
+                        value = folder,
+                        onValueChange = { folder = it },
+                        label = { Text("Folder") },
+                        singleLine = true,
+                        trailingIcon = {
+                            TextButton(onClick = { folderMenu = true }) { Text("\u25BE") }
+                        },
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(top = 8.dp),
+                    )
+                    DropdownMenu(
+                        expanded = folderMenu,
+                        onDismissRequest = { folderMenu = false },
+                    ) {
+                        DropdownMenuItem(
+                            text = { Text("Vault root") },
+                            onClick = {
+                                folder = ""
+                                folderMenu = false
+                            },
+                        )
+                        folders.forEach { path ->
+                            DropdownMenuItem(
+                                text = { Text(path) },
+                                onClick = {
+                                    folder = path
+                                    folderMenu = false
+                                },
+                            )
+                        }
+                    }
+                }
+                Text(
+                    text = "The title becomes the file name and first heading. The folder is " +
+                        "created when it does not exist yet; leave it empty for the vault root.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(top = 8.dp),
+                )
+            }
+        },
+        confirmButton = {
+            TextButton(
+                onClick = {
+                    vm.createNote(title, folder)
+                    onCreate()
+                },
+                enabled = title.isNotBlank(),
+            ) { Text("Create") }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text("Cancel") }
+        },
+    )
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun TextInputDialog(
     title: String,

@@ -771,15 +771,17 @@ Prompt for title and folder on create (no root "Untitled"), add long-press row a
 **Done when:** creating a note takes one intentional dialog; every chip in Details navigates
 or filters.
 
-**Landed (Android):** the floating button opens a **New note** dialog asking for a title;
-the title becomes the file name (sanitized, with ` 2`, ` 3` suffixes for duplicates) and the
+**Landed (Android):** the floating button opens a **New note** dialog asking for a title and
+a folder (type one or pick from the vault's existing folders; it is created when missing).
+The title becomes the file name (sanitized, with ` 2`, ` 3` suffixes for duplicates) and the
 first heading. Long-pressing a row (list, tree or search results) opens a sheet with
 Bookmark/Remove bookmark, Rename or move (a path dialog) and Move to trash; the actions work
 on that row even when another note is open, saving the open note first when needed.
-**Landed (tags):** tapping a tag chip in Details closes the note (saving it first) and
-returns to the list with that tag as the search query.
-**Remaining:** folder selection on create, and property/relation chips (relations need a
-resolver that accepts the engine's target strings).
+**Landed (chips):** every chip in Details acts. A tag closes the note (saving first) and
+searches for it; a property closes the note and filters the list to notes whose frontmatter
+matches that key and value exactly (through the engine's query runner, with a "Filter: key =
+value" bar that clears); a relation resolves its target through the engine's note index
+(path, stem, slug or alias) and opens that note.
 
 #### Q4.6 Import/export progress — A · S
 Report file/byte progress, allow cancel, and keep the UI responsive for large vaults.

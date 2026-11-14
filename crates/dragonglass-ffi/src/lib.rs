@@ -16,8 +16,8 @@ use dragonglass_core::fingerprint::{self, DocumentFingerprint, SaveReport};
 use dragonglass_core::graph::{self, EdgeKind, Graph};
 use dragonglass_core::relations::{self, NoteRelations};
 use dragonglass_core::{
-    bookmarks, config, drafts, find, frontmatter, html, markdown, query, search, stats, storage,
-    templates, tree, vaultfs, NodeKind, Note, NoteRef, TreeNode, Vault,
+    bookmarks, config, drafts, find, frontmatter, html, markdown, query, resolve, search, stats,
+    storage, templates, tree, vaultfs, NodeKind, Note, NoteRef, TreeNode, Vault,
 };
 
 #[derive(Debug, thiserror::Error, uniffi::Error)]
@@ -398,6 +398,36 @@ impl MobileVault {
         let mut rows = Vec::new();
         flatten_tree(&tree, 0, &mut rows);
         rows
+    }
+
+    /// Resolve a wikilink or relation target (path, stem, slug or frontmatter alias) to a
+    /// vault-relative note path.
+    pub fn resolve_target(&self, target: String) -> Option<String> {
+        let Ok(state) = self.lock() else {
+            return None;
+        };
+        let index = resolve::NoteIndex::new(&state.notes);
+        index
+            .resolve_relative(&target)
+            .map(|relative| relative.to_string())
+    }
+
+    /// Notes whose frontmatter property `key` equals `value` (case-insensitive).
+    pub fn filter_by_property(&self, key: String, value: String) -> Vec<NoteSummary> {
+        let Ok(state) = self.lock() else {
+            return Vec::new();
+        };
+        let filter = query::Query {
+            filters: vec![(key, value)],
+            ..query::Query::default()
+        };
+        query::run_query(&state.notes, &filter)
+            .into_iter()
+            .map(|row| NoteSummary {
+                relative: row.relative,
+                title: row.title,
+            })
+            .collect()
     }
 
     /// Fingerprint a note on disk, for a later conflict-safe save.
@@ -1084,6 +1114,35 @@ mod tests {
             2
         );
         assert!(find_in_text("a".to_string(), "(".to_string(), true, false, false).is_empty());
+    }
+
+    #[test]
+    fn property_filters_and_targets_resolve() {
+        let root = temp_vault("filter");
+        fs::write(
+            root.join("a.md"),
+            "---\nstatus: done\ntitle: Alpha\n---\n# A\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("b.md"),
+            "---\nstatus: todo\nslug: beta-slug\n---\n# B\n",
+        )
+        .unwrap();
+        let vault = MobileVault::open(root.to_string_lossy().to_string()).unwrap();
+
+        let done = vault.filter_by_property("status".to_string(), "done".to_string());
+        assert_eq!(done.len(), 1);
+        assert_eq!(done[0].relative, "a.md");
+        assert!(vault
+            .filter_by_property("status".to_string(), "missing".to_string())
+            .is_empty());
+
+        assert_eq!(
+            vault.resolve_target("beta-slug".to_string()).as_deref(),
+            Some("b.md")
+        );
+        assert_eq!(vault.resolve_target("nope".to_string()), None);
     }
 
     #[test]
