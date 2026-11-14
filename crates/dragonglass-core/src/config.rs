@@ -31,6 +31,12 @@ pub struct Config {
     pub reader_font: String,
     /// Reading line height, as a percentage of the body size (120–220).
     pub reader_line_height: u16,
+    /// Sidebar panel visibility.
+    pub show_sidebar: bool,
+    /// Outline panel visibility.
+    pub show_outline: bool,
+    /// Relations panel visibility.
+    pub show_relations: bool,
 }
 
 impl Default for Config {
@@ -50,6 +56,9 @@ impl Default for Config {
             reader_width: 780,
             reader_font: "serif".to_string(),
             reader_line_height: 150,
+            show_sidebar: true,
+            show_outline: true,
+            show_relations: false,
         }
     }
 }
@@ -127,6 +136,18 @@ impl Config {
                     if let Ok(height) = value.parse::<u16>() {
                         config.reader_line_height = height.clamp(120, 220);
                     }
+                }
+                "show_sidebar" => {
+                    config.show_sidebar =
+                        matches!(value.to_lowercase().as_str(), "true" | "1" | "yes")
+                }
+                "show_outline" => {
+                    config.show_outline =
+                        matches!(value.to_lowercase().as_str(), "true" | "1" | "yes")
+                }
+                "show_relations" => {
+                    config.show_relations =
+                        matches!(value.to_lowercase().as_str(), "true" | "1" | "yes")
                 }
                 "reader_font" => {
                     let font = value.to_lowercase();

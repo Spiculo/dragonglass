@@ -117,7 +117,7 @@ use gpui::{
 };
 use graph_view::GraphView;
 use reading::ReadingCache;
-use reading::{ReaderFont, ReaderSettings};
+use reading::{FocusMode, ReaderFont, ReaderSettings};
 use theme::Theme;
 
 actions!(
@@ -1831,6 +1831,11 @@ impl DragonGlassApp {
 
     fn toggle_zen(&mut self, _: &ToggleZen, _window: &mut Window, cx: &mut Context<Self>) {
         self.zen = !self.zen;
+        cx.set_global(FocusMode(self.zen));
+        let editors: Vec<Entity<Editor>> = self.tabs.iter().map(|tab| tab.editor.clone()).collect();
+        for editor in editors {
+            editor.update(cx, |_, cx| cx.notify());
+        }
         self.set_status(
             StatusKind::Info,
             if self.zen {
@@ -4551,6 +4556,27 @@ impl DragonGlassApp {
         cx.notify();
     }
 
+    /// Show or hide a side panel, persisting the choice with the vault.
+    fn toggle_panel(&mut self, panel: &str, cx: &mut Context<Self>) {
+        match panel {
+            "sidebar" => self.config.show_sidebar = !self.config.show_sidebar,
+            "outline" => self.config.show_outline = !self.config.show_outline,
+            "relations" => self.config.show_relations = !self.config.show_relations,
+            _ => return,
+        }
+        let on = match panel {
+            "sidebar" => self.config.show_sidebar,
+            "outline" => self.config.show_outline,
+            _ => self.config.show_relations,
+        };
+        let message = match config::save(&self.vault_root, &self.config) {
+            Ok(()) => format!("{panel}: {}", if on { "shown" } else { "hidden" }),
+            Err(error) => format!("{panel} changed (not saved: {error})"),
+        };
+        self.set_status(StatusKind::Info, message);
+        cx.notify();
+    }
+
     /// Cycle the reading line height through comfortable values.
     fn cycle_reader_line_height(&mut self, cx: &mut Context<Self>) {
         const STEPS: [u16; 6] = [130, 140, 150, 160, 175, 190];
@@ -4736,6 +4762,9 @@ impl DragonGlassApp {
             "reader-width" => self.cycle_reader_setting(true, cx),
             "reader-line" => self.cycle_reader_line_height(cx),
             "reader-font" => self.cycle_reader_font(cx),
+            "sidebar" => self.toggle_panel("sidebar", cx),
+            "outline" => self.toggle_panel("outline", cx),
+            "relations" => self.toggle_panel("relations", cx),
             "font" => self.open_setting(SettingKey::FontSize, window, cx),
             "accent" => self.open_setting(SettingKey::Accent, window, cx),
             "attachments" => self.open_setting(SettingKey::AttachmentsFolder, window, cx),
@@ -4912,6 +4941,43 @@ impl DragonGlassApp {
                         "Installed themes",
                         user_themes,
                         "none",
+                        theme,
+                    ))
+                    .child(heading("Panels", theme))
+                    .child(row(
+                        "setting-sidebar",
+                        "Sidebar",
+                        if self.config.show_sidebar {
+                            "on"
+                        } else {
+                            "off"
+                        }
+                        .to_string(),
+                        "sidebar",
+                        theme,
+                    ))
+                    .child(row(
+                        "setting-outline",
+                        "Outline",
+                        if self.config.show_outline {
+                            "on"
+                        } else {
+                            "off"
+                        }
+                        .to_string(),
+                        "outline",
+                        theme,
+                    ))
+                    .child(row(
+                        "setting-relations",
+                        "Relations",
+                        if self.config.show_relations {
+                            "on"
+                        } else {
+                            "off"
+                        }
+                        .to_string(),
+                        "relations",
                         theme,
                     ))
                     .child(heading("Editor", theme))
@@ -7952,12 +8018,12 @@ impl Render for DragonGlassApp {
                     .flex_row()
                     .flex_1()
                     .min_h(px(0.0))
-                    .when(!self.zen, |d| {
+                    .when(!self.zen && self.config.show_sidebar, |d| {
                         d.child(sidebar)
                             .child(resize_handle(ResizePanel::Sidebar, theme, cx))
                     })
                     .child(center)
-                    .children(if self.zen {
+                    .children(if self.zen || !self.config.show_outline {
                         None
                     } else {
                         outline.map(|panel| {
@@ -7971,7 +8037,7 @@ impl Render for DragonGlassApp {
                                 .into_any_element()
                         })
                     })
-                    .children(if self.zen {
+                    .children(if self.zen || !self.config.show_relations {
                         None
                     } else {
                         relations_panel.map(|panel| {
@@ -8523,6 +8589,7 @@ fn open_vault_window(vault_path: PathBuf, uri_note: Option<String>, cx: &mut App
     let initial_stats = stats::compute(&initial_text);
     let note_index = resolve::NoteIndex::new(&note_refs);
     cx.set_global(initial_theme);
+    cx.set_global(FocusMode::default());
     cx.set_global(ReaderSettings {
         body_size: initial_config.reader_size as f32,
         measure: initial_config.reader_width as f32,

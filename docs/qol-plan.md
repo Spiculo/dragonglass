@@ -455,9 +455,11 @@ the choice.
 not jump when panels hide.
 
 **Landed:** Zen mode (`Ctrl/Cmd+Alt+Z`, also in the palette) hides the tab bar, sidebar,
-outline and relations with one command; Escape leaves it. The reading column and editor
-keep their own width and scroll, so hiding the panels does not move the document.
-**Remaining:** dimming non-active paragraphs and remembering the panel choice per vault.
+outline and relations with one command; Escape leaves it. The reading column and editor keep
+their own width and scroll, so hiding the panels does not move the document. In zen the
+reader dims every paragraph outside the section being read (`FocusMode` global). Settings has
+a Panels section that toggles the sidebar, outline and relations independently and saves the
+choice in `config.txt`, so the layout survives relaunch.
 
 #### Q2.6 Media actually renders — D · A · M–L
 Render inline images (not just standalone embeds), honor `![[img|300]]` width/alt, support

@@ -100,6 +100,12 @@ impl Default for ReaderSettings {
 
 impl gpui::Global for ReaderSettings {}
 
+/// Zen mode's reading focus: dim paragraphs outside the current section.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FocusMode(pub bool);
+
+impl gpui::Global for FocusMode {}
+
 /// Writes text to the clipboard for the reading view's copy buttons.
 pub type CopyHandler = Rc<dyn Fn(&str, &mut Window, &mut App)>;
 
@@ -1307,6 +1313,7 @@ impl ReadingCache {
             });
         }
 
+        let focus = cx.try_global::<FocusMode>().is_some_and(|mode| mode.0);
         let reader = cx
             .try_global::<ReaderSettings>()
             .copied()
@@ -1348,60 +1355,86 @@ impl ReadingCache {
             .py_6()
             .text_color(theme.text)
             .children(metadata)
-            .child(
-                div().flex_1().min_h(px(0.0)).child(
-                    list(list_state.clone(), move |index, _window, _cx| {
-                        let Some(block) = blocks.get(index).cloned() else {
-                            return div().into_any_element();
-                        };
-                        if hidden.get(index).copied().unwrap_or(false) {
-                            return div().w_full().h(px(0.0)).into_any_element();
-                        }
-
-                        let ctx = RenderCtx {
-                            vault_root: vault_root.as_deref(),
-                            attachments: attachments.as_deref(),
-                            selection: &selection,
-                            opener: opener.as_ref(),
-                            math: &math,
-                            folded: &folded,
-                            on_fold: on_fold.as_ref(),
-                            copy: Some(&copy),
-                            find: Some(&find),
-                            on_image: Some(&on_image),
-                            open_file: Some(&open_file),
-                            embeds: Some(&embeds),
-                            embed_math: Some(&embed_math),
-                            next_block: Some(&next_block),
-                            list_state: Some(&list_state),
-                            block_count: blocks.len(),
-                            blocks: blocks.as_slice(),
-                            depth: 0,
-                            theme,
-                            template: &template,
-                            body_size: reader.body_size,
-                            measure: reader.measure,
-                            line_height: reader.line_height,
-                        };
-
-                        let mut item = div()
-                            .w_full()
-                            .max_w(px(reader.measure))
-                            .mx_auto()
-                            .px_2()
-                            .pb_3();
-                        // Display math is centred by the item itself: the list gives each
-                        // item the full column width, but a shrink-to-fit child would
-                        // otherwise sit at the left edge.
-                        if matches!(block, Block::Math { .. }) {
-                            item = item.flex().justify_center().py_3();
-                        }
-                        item.child(render_block(block, Some(index), &ctx))
-                            .into_any_element()
+            .child(div().flex_1().min_h(px(0.0)).child({
+                // Zen mode dims everything outside the section being read.
+                let active_section = if focus {
+                    self.current_heading().and_then(|name| {
+                        let headings: Vec<(usize, u8, String)> = blocks
+                            .iter()
+                            .enumerate()
+                            .filter_map(|(at, block)| match block {
+                                Block::Heading { level, text } => Some((at, *level, text.clone())),
+                                _ => None,
+                            })
+                            .collect();
+                        let position = headings.iter().position(|(_, _, text)| *text == name)?;
+                        let (start, level, _) = headings[position];
+                        let end = headings[position + 1..]
+                            .iter()
+                            .find(|(_, other, _)| *other <= level)
+                            .map(|(at, _, _)| *at)
+                            .unwrap_or(blocks.len());
+                        Some(start..end)
                     })
-                    .size_full(),
-                ),
-            )
+                } else {
+                    None
+                };
+                list(list_state.clone(), move |index, _window, _cx| {
+                    let Some(block) = blocks.get(index).cloned() else {
+                        return div().into_any_element();
+                    };
+                    if hidden.get(index).copied().unwrap_or(false) {
+                        return div().w_full().h(px(0.0)).into_any_element();
+                    }
+
+                    let ctx = RenderCtx {
+                        vault_root: vault_root.as_deref(),
+                        attachments: attachments.as_deref(),
+                        selection: &selection,
+                        opener: opener.as_ref(),
+                        math: &math,
+                        folded: &folded,
+                        on_fold: on_fold.as_ref(),
+                        copy: Some(&copy),
+                        find: Some(&find),
+                        on_image: Some(&on_image),
+                        open_file: Some(&open_file),
+                        embeds: Some(&embeds),
+                        embed_math: Some(&embed_math),
+                        next_block: Some(&next_block),
+                        list_state: Some(&list_state),
+                        block_count: blocks.len(),
+                        blocks: blocks.as_slice(),
+                        depth: 0,
+                        theme,
+                        template: &template,
+                        body_size: reader.body_size,
+                        measure: reader.measure,
+                        line_height: reader.line_height,
+                    };
+
+                    let dimmed = active_section
+                        .as_ref()
+                        .is_some_and(|range| !range.contains(&index));
+
+                    let mut item = div()
+                        .w_full()
+                        .max_w(px(reader.measure))
+                        .mx_auto()
+                        .px_2()
+                        .pb_3()
+                        .when(dimmed, |d| d.opacity(0.35));
+                    // Display math is centred by the item itself: the list gives each
+                    // item the full column width, but a shrink-to-fit child would
+                    // otherwise sit at the left edge.
+                    if matches!(block, Block::Math { .. }) {
+                        item = item.flex().justify_center().py_3();
+                    }
+                    item.child(render_block(block, Some(index), &ctx))
+                        .into_any_element()
+                })
+                .size_full()
+            }))
             .children(
                 footnote_popup
                     .clone()
