@@ -5,20 +5,17 @@
 **Focus:** the two loops users repeat all day — **edit a note** and **read a note** — and the
 transitions between them.
 
-> **Landed so far (quick wins, §10):** the reading-mode mutation guard (Q0.1), find/replace
-> keyboard bindings and `find.message` (Q3.1), `Ctrl/Cmd+Shift+S` plus Save As from `Ctrl+S`
-> on an untitled note (Q3.3), typed/expiring status messages (Q3.4), a conflict marker on
-> every affected tab (Q3.5), undo-close with `Ctrl/Cmd+Shift+T` (Q3.6), Android IME insets and
-> caret-safe keyboard options (Q0.6), Android preview `WebViewClient` links and Back from
-> Preview to Edit (Q0.5/Q1.8), Android search clear/IME-Search/Back-to-clear (Q4.1), joined
-> soft line breaks (Q2.10), clickable tag chips and frontmatter links (Q4.5/P2), the window
-> title as note + dirty marker (Q3.12), Vim `:wq` close, redo and failed-search reporting
-> (Q3.12), the code-fence copy button (Q2.7), the Escape order audit, and the first slice of
-> live preview: `$$…$$` blocks typeset in the editor while the caret is outside them
-> (Q2.12). Reading selection now has double/triple-click, Shift-click, keyboard extension,
-> drag auto-scroll and a copy confirmation (Q2.3). Everything else in this document is still
-> open. The Android changes compile with `:app:compileDebugKotlin` but have not been run on a
-> device yet.
+> **Status (current tree):** every P0 and P1 item is implemented, including the shared
+> save/draft/session/fingerprint contract, reading and editing continuity, back/forward,
+> in-page find, selection and copy, reader typography (size, width, line height, typeface,
+> theme), zen mode, transclusion, media, and the editor's live preview (Q2.12: hiding markers
+> and rendering images, rules, callouts, tables and display formulas in place outside the
+> caret's paragraph). Android has find/replace with options, a markdown toolbar and pickers,
+> syntax highlighting, row actions, conflict and save-failure sheets, progress/cancel and
+> shared reader settings. What remains is listed per item: optional editor↔preview scroll
+> sync (Q2.11), the Android text field's own scroll offset (Q1.7, no public handle), phone
+> line numbers (Q4.3, deliberately omitted), the iOS client (no toolchain in this
+> environment; `docs/ux-contract.md` is the porting target), and the P2 polish list.
 
 **Basis:** audit of the current working tree (commit `1cb0ec2` plus local session/mobile
 work). Line references are approximate and should be re-checked before implementation.
@@ -608,7 +605,8 @@ the same layout pass and paints it under the source on three reserved rows, scal
 the column and the reserved height, so the result is visible while typing. Errors and
 unclosed blocks keep just the source. This completes Q2.12's substitutions: markers, images,
 rules, callouts, tables and display formulas all render in place outside the caret's
-paragraph.
+paragraph, so the Q2.12 "Done when" case (emphasis + image + table with the caret's line as
+source) is met.
 **Done when:** a note with emphasis, an image and a table shows the caret's line as source
 and the rest as preview, and every click lands on the source column the user aimed at.
 
