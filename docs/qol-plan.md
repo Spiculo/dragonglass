@@ -728,8 +728,11 @@ or filters.
 
 **Landed (Android):** the floating button opens a **New note** dialog asking for a title;
 the title becomes the file name (sanitized, with ` 2`, ` 3` suffixes for duplicates) and the
-first heading, instead of an untyped `Untitled.md`.
-**Remaining:** folder selection, long-press row actions and clickable detail chips.
+first heading. Long-pressing a row (list, tree or search results) opens a sheet with
+Bookmark/Remove bookmark, Rename or move (a path dialog) and Move to trash; the actions work
+on that row even when another note is open, saving the open note first when needed.
+**Remaining:** folder selection on create, and clickable property/tag/relation chips in
+Details (they need a tag/relation filter that returns to the list with a query).
 
 #### Q4.6 Import/export progress — A · S
 Report file/byte progress, allow cancel, and keep the UI responsive for large vaults.

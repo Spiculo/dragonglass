@@ -10,7 +10,9 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.Arrangement
@@ -169,6 +171,9 @@ private fun NotesScreen(
     var showTrash by remember { mutableStateOf(false) }
     var showNewFolder by remember { mutableStateOf(false) }
     var showNewNote by remember { mutableStateOf(false) }
+    var actionNote by remember { mutableStateOf<NoteSummary?>(null) }
+    var renamingNote by remember { mutableStateOf<NoteSummary?>(null) }
+    val openRowActions: (NoteSummary) -> Unit = { actionNote = it }
     var showVaults by remember { mutableStateOf(false) }
     var pendingAction by remember { mutableStateOf<VaultAction?>(null) }
     var menuOpen by remember { mutableStateOf(false) }
@@ -374,13 +379,13 @@ private fun NotesScreen(
             }
 
             when {
-                vm.query.isNotBlank() -> SearchResults(vm, searchListState)
+                vm.query.isNotBlank() -> SearchResults(vm, searchListState, openRowActions)
                 vm.notes.isEmpty() && !vm.loading -> EmptyVault()
-                vm.browseMode == BrowseMode.Tree -> TreeList(vm, treeListState)
+                vm.browseMode == BrowseMode.Tree -> TreeList(vm, treeListState, openRowActions)
                 vm.visibleNotes.isEmpty() -> MutedLine(
                     if (vm.bookmarksOnly) "No bookmarked notes yet." else "No notes here yet.",
                 )
-                else -> NoteList(vm, noteListState)
+                else -> NoteList(vm, noteListState, openRowActions)
             }
         }
     }
@@ -400,6 +405,59 @@ private fun NotesScreen(
     }
     if (showTrash) {
         TrashSheet(vm, onDismiss = { showTrash = false })
+    }
+    val target = actionNote
+    if (target != null) {
+        ModalBottomSheet(onDismissRequest = { actionNote = null }) {
+            Column(Modifier.navigationBarsPadding()) {
+                ListItem(
+                    headlineContent = { Text(target.title, maxLines = 1) },
+                    supportingContent = { Text(target.relative, style = MaterialTheme.typography.labelSmall) },
+                )
+                HorizontalDivider()
+                TextButton(
+                    onClick = {
+                        vm.toggleBookmark(target.relative)
+                        actionNote = null
+                    },
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    Text(
+                        if (target.relative in vm.bookmarks) "Remove bookmark" else "Bookmark",
+                    )
+                }
+                TextButton(
+                    onClick = {
+                        actionNote = null
+                        renamingNote = target
+                    },
+                    modifier = Modifier.fillMaxWidth(),
+                ) { Text("Rename or move…") }
+                TextButton(
+                    onClick = {
+                        actionNote = null
+                        vm.trashNote(target.relative)
+                    },
+                    modifier = Modifier.fillMaxWidth(),
+                ) { Text("Move to trash") }
+            }
+        }
+    }
+
+    val renameTarget = renamingNote
+    if (renameTarget != null) {
+        TextInputDialog(
+            title = "Rename or move",
+            label = "Path",
+            initial = renameTarget.relative,
+            hint = "Use a folder prefix to move it, e.g. notes/New name.",
+            confirmLabel = "Rename",
+            onDismiss = { renamingNote = null },
+            onConfirm = {
+                vm.renameNote(renameTarget.relative, it)
+                renamingNote = null
+            },
+        )
     }
     if (showNewNote) {
         TextInputDialog(
@@ -448,7 +506,11 @@ private fun NotesScreen(
 }
 
 @Composable
-private fun NoteList(vm: DragonGlassViewModel, state: LazyListState) {
+private fun NoteList(
+    vm: DragonGlassViewModel,
+    state: LazyListState,
+    onRowAction: (NoteSummary) -> Unit,
+) {
     LazyColumn(state = state, modifier = Modifier.fillMaxSize()) {
         items(vm.visibleNotes, key = { it.relative }) { note ->
             NoteRow(
@@ -456,6 +518,7 @@ private fun NoteList(vm: DragonGlassViewModel, state: LazyListState) {
                 bookmarked = note.relative in vm.bookmarks,
                 onClick = { vm.openNote(note.relative) },
                 onToggleBookmark = { vm.toggleBookmark(note.relative) },
+                onLongClick = { onRowAction(note) },
             )
             HorizontalDivider(color = MaterialTheme.colorScheme.outline.copy(alpha = 0.25f))
         }
@@ -463,7 +526,11 @@ private fun NoteList(vm: DragonGlassViewModel, state: LazyListState) {
 }
 
 @Composable
-private fun TreeList(vm: DragonGlassViewModel, state: LazyListState) {
+private fun TreeList(
+    vm: DragonGlassViewModel,
+    state: LazyListState,
+    onRowAction: (NoteSummary) -> Unit,
+) {
     LazyColumn(state = state, modifier = Modifier.fillMaxSize()) {
         items(vm.visibleTreeRows, key = { it.path }) { row ->
             if (row.isDir) {
@@ -479,6 +546,9 @@ private fun TreeList(vm: DragonGlassViewModel, state: LazyListState) {
                     depth = row.depth,
                     onClick = { vm.openNote(row.path) },
                     onToggleBookmark = { vm.toggleBookmark(row.path) },
+                    onLongClick = {
+                        onRowAction(NoteSummary(relative = row.path, title = row.name))
+                    },
                 )
             }
             HorizontalDivider(color = MaterialTheme.colorScheme.outline.copy(alpha = 0.2f))
@@ -504,7 +574,11 @@ private fun DirectoryRow(row: TreeRow, collapsed: Boolean, onClick: () -> Unit) 
 }
 
 @Composable
-private fun SearchResults(vm: DragonGlassViewModel, state: LazyListState) {
+private fun SearchResults(
+    vm: DragonGlassViewModel,
+    state: LazyListState,
+    onRowAction: (NoteSummary) -> Unit,
+) {
     if (vm.visibleNotes.isEmpty() && vm.visibleHits.isEmpty() && !vm.loading) {
         MutedLine("No notes or text match “${vm.query}”.")
         return
@@ -518,6 +592,7 @@ private fun SearchResults(vm: DragonGlassViewModel, state: LazyListState) {
                     bookmarked = note.relative in vm.bookmarks,
                     onClick = { vm.openNote(note.relative) },
                     onToggleBookmark = { vm.toggleBookmark(note.relative) },
+                    onLongClick = { onRowAction(note) },
                 )
                 HorizontalDivider(color = MaterialTheme.colorScheme.outline.copy(alpha = 0.2f))
             }
@@ -604,6 +679,7 @@ private fun EmptyVault() {
     }
 }
 
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun NoteRow(
     note: NoteSummary,
@@ -611,6 +687,7 @@ private fun NoteRow(
     depth: Int = 0,
     onClick: () -> Unit,
     onToggleBookmark: () -> Unit,
+    onLongClick: (() -> Unit)? = null,
 ) {
     ListItem(
         headlineContent = {
@@ -638,7 +715,7 @@ private fun NoteRow(
             }
         },
         modifier = Modifier
-            .clickable(onClick = onClick)
+            .combinedClickable(onClick = onClick, onLongClick = onLongClick)
             .padding(start = (depth * 16).dp),
     )
 }

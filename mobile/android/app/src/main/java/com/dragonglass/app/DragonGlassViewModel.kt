@@ -805,6 +805,71 @@ class DragonGlassViewModel(application: Application) : AndroidViewModel(applicat
         }
     }
 
+    /// Move any note from the list to the trash, saving it first when it is the open one.
+    fun trashNote(relative: String) {
+        val text = source
+        val isOpen = selected == relative
+        val saveFirst = isOpen && dirty
+        viewModelScope.launch {
+            val result = runCatching {
+                withContext(Dispatchers.IO) {
+                    val loaded = ensureVault()
+                    if (saveFirst) loaded.saveNote(relative, text)
+                    loaded.trashNote(relative)
+                }
+            }
+            result
+                .onSuccess {
+                    if (isOpen) {
+                        selected = null
+                        source = ""
+                        preview = false
+                        dirty = false
+                    }
+                    message = "Moved $relative to the trash"
+                    refresh()
+                    mirrorAll()
+                }
+                .onFailure { error = it.message ?: "Could not move the note to the trash" }
+        }
+    }
+
+    /// Rename or move any note from the list.
+    fun renameNote(relative: String, destination: String) {
+        val trimmed = destination.trim().trimStart('/')
+        if (trimmed.isEmpty()) {
+            error = "Enter a file name"
+            return
+        }
+        val target = if (trimmed.substringAfterLast('/').contains('.')) {
+            trimmed
+        } else {
+            "$trimmed.md"
+        }
+        val text = source
+        val isOpen = selected == relative
+        val saveFirst = isOpen && dirty
+        viewModelScope.launch {
+            loading = true
+            val result = runCatching {
+                withContext(Dispatchers.IO) {
+                    val loaded = ensureVault()
+                    if (saveFirst) loaded.saveNote(relative, text)
+                    loaded.renameEntry(relative, target)
+                }
+            }
+            result
+                .onSuccess { renamed ->
+                    message = "Moved to $renamed"
+                    refresh()
+                    if (isOpen) openNote(renamed)
+                    mirrorAll()
+                }
+                .onFailure { error = it.message ?: "Could not move the note" }
+            loading = false
+        }
+    }
+
     /// Rename or move the open note, saving unsaved edits first.
     fun renameSelected(destination: String) {
         val note = selected ?: return
