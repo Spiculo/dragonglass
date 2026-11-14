@@ -717,8 +717,11 @@ pattern, an `n/m` count, previous/next and close. Matches come from the engine's
 through the new FFI `find_in_text`, which returns UTF-16 ranges for the text field; stepping
 puts the match in the editor selection and focuses the editor, so it scrolls into view.
 Matches refresh as the note changes.
-**Remaining:** replace, and regex/case/whole-word toggles in the mobile bar (the FFI already
-accepts those options).
+**Landed (replace):** the find bar has a replacement field with Replace (current match) and
+All (every match in one pass, built from the non-overlapping ranges). The editor text syncs
+to the buffer after a replace.
+**Remaining:** regex/case/whole-word toggles in the mobile bar (the FFI already accepts those
+options).
 
 #### Q4.3 Mobile editing toolbar and autocomplete — A · L
 Add a keyboard accessory row: bold, italic, highlight, link, heading, list, task, code;

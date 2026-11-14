@@ -817,6 +817,16 @@ private fun EditorScreen(vm: DragonGlassViewModel, relative: String) {
 
     LaunchedEffect(relative) { focusRequester.requestFocus() }
 
+    // Replace (and recovery) change the buffer outside onValueChange.
+    LaunchedEffect(vm.source) {
+        if (editorValue.text != vm.source) {
+            editorValue = TextFieldValue(
+                vm.source,
+                TextRange(editorValue.selection.end.coerceIn(0, vm.source.length)),
+            )
+        }
+    }
+
     // A recovered draft replaces the editor text.
     LaunchedEffect(vm.recoveryNonce) {
         if (vm.recoveryNonce == 0) return@LaunchedEffect
@@ -967,6 +977,22 @@ private fun EditorScreen(vm: DragonGlassViewModel, relative: String) {
                     TextButton(onClick = { vm.findNext(backwards = true) }) { Text("\u2191") }
                     TextButton(onClick = { vm.findNext() }) { Text("\u2193") }
                     TextButton(onClick = vm::closeFind) { Text("x") }
+                }
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 8.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    OutlinedTextField(
+                        value = vm.findReplacement,
+                        onValueChange = vm::onReplaceChange,
+                        placeholder = { Text("Replace with") },
+                        singleLine = true,
+                        modifier = Modifier.weight(1f),
+                    )
+                    TextButton(onClick = vm::replaceCurrent) { Text("Replace") }
+                    TextButton(onClick = vm::replaceAll) { Text("All") }
                 }
             }
             Box(Modifier.weight(1f).fillMaxWidth()) {

@@ -156,6 +156,8 @@ class DragonGlassViewModel(application: Application) : AndroidViewModel(applicat
         private set
     var findIndex by mutableStateOf(0)
         private set
+    var findReplacement by mutableStateOf("")
+        private set
 
     val findLabel: String
         get() = if (findRanges.isEmpty()) "0/0" else "${findIndex + 1}/${findRanges.size}"
@@ -170,12 +172,44 @@ class DragonGlassViewModel(application: Application) : AndroidViewModel(applicat
     fun closeFind() {
         findOpen = false
         findPattern = ""
+        findReplacement = ""
         findRanges = emptyList()
         findIndex = 0
     }
 
     fun onFindChange(value: String) {
         findPattern = value
+        refreshFind()
+    }
+
+    fun onReplaceChange(value: String) {
+        findReplacement = value
+    }
+
+    /// Replace the current match with the replacement text.
+    fun replaceCurrent() {
+        val range = findRanges.getOrNull(findIndex) ?: return
+        val text = source
+        if (range.first < 0 || range.last + 1 > text.length) return
+        source = text.substring(0, range.first) + findReplacement + text.substring(range.last + 1)
+        dirty = true
+        refreshFind()
+    }
+
+    /// Replace every match in one pass.
+    fun replaceAll() {
+        if (findRanges.isEmpty()) return
+        val text = source
+        val builder = StringBuilder()
+        var last = 0
+        for (range in findRanges) {
+            builder.append(text, last, range.first)
+            builder.append(findReplacement)
+            last = range.last + 1
+        }
+        builder.append(text, last, text.length)
+        source = builder.toString()
+        dirty = true
         refreshFind()
     }
 
