@@ -291,6 +291,10 @@ class DragonGlassViewModel(application: Application) : AndroidViewModel(applicat
     var conflictNote by mutableStateOf<String?>(null)
         private set
 
+    /// Set when closing a note failed to save it; the note stays open with its text.
+    var saveFailedNote by mutableStateOf<String?>(null)
+        private set
+
     /// Content hash of the version each open note is based on, for conflict-safe saves.
     private val fingerprints = mutableMapOf<String, ULong>()
 
@@ -983,6 +987,7 @@ class DragonGlassViewModel(application: Application) : AndroidViewModel(applicat
                 }
                 if (saved.isFailure) {
                     // Keep the note open with its text: a failed save must not close it.
+                    saveFailedNote = note
                     error = saved.exceptionOrNull()?.message
                         ?: "Could not save the note; it was left open"
                     return@launch
@@ -1000,7 +1005,19 @@ class DragonGlassViewModel(application: Application) : AndroidViewModel(applicat
 
     /// Close the open note without saving its edits (after the back prompt).
     fun discardAndClose() {
+        saveFailedNote = null
         dirty = false
+        closeNote()
+    }
+
+    /// Leave the note open and dismiss the failure prompt.
+    fun dismissSaveFailure() {
+        saveFailedNote = null
+    }
+
+    /// Try the failed close again.
+    fun retryClose() {
+        saveFailedNote = null
         closeNote()
     }
 

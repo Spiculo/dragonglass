@@ -1235,6 +1235,26 @@ private fun EditorScreen(vm: DragonGlassViewModel, relative: String) {
         )
     }
 
+    if (vm.saveFailedNote != null) {
+        AlertDialog(
+            onDismissRequest = { vm.dismissSaveFailure() },
+            title = { Text("Could not save") },
+            text = {
+                Text(
+                    "The note was left open. Retry, discard your edits, or keep working.",
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = vm::retryClose) { Text("Retry") }
+            },
+            dismissButton = {
+                Row {
+                    TextButton(onClick = vm::discardAndClose) { Text("Discard") }
+                    TextButton(onClick = { vm.dismissSaveFailure() }) { Text("Cancel") }
+                }
+            },
+        )
+    }
     if (vm.conflictNote != null) {
         ModalBottomSheet(onDismissRequest = {}) {
             Column(

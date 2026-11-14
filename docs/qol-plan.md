@@ -234,9 +234,8 @@ retry action; a fast reopen cannot race a pending save.
 **Landed:** `closeNote` and `switchVault` await the save and keep the note (and its text)
 open with an error when it fails; import, export and folder sync already aborted on a failed
 save; git sync now saves the open buffer first and refuses to sync or clear the editor when
-that save fails. `:app:compileDebugKotlin` passes.
-**Remaining:** a Retry/Discard/Cancel sheet (today the snackbar carries the error and the
-note stays open).
+that save fails. A failed close opens a Retry / Discard / Cancel dialog, and the note keeps
+its text until the user chooses.
 
 ---
 
