@@ -62,6 +62,8 @@ actions!(
         Right,
         Up,
         Down,
+        PageUp,
+        PageDown,
         WordLeft,
         WordRight,
         ParagraphUp,
@@ -127,6 +129,8 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("right", Right, None),
         KeyBinding::new("up", Up, None),
         KeyBinding::new("down", Down, None),
+        KeyBinding::new("pageup", PageUp, None),
+        KeyBinding::new("pagedown", PageDown, None),
         // Word-wise movement (the `cmd` forms mirror the rest of the keymap on macOS).
         KeyBinding::new("ctrl-left", WordLeft, None),
         KeyBinding::new("ctrl-right", WordRight, None),
@@ -2973,6 +2977,30 @@ impl Editor {
         cx.notify();
     }
 
+    fn page_up(&mut self, _: &PageUp, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.reading {
+            self.reading_content.scroll_screen(-1);
+            cx.notify();
+            return;
+        }
+        for _ in 0..10 {
+            self.move_all_vertical(-1);
+        }
+        cx.notify();
+    }
+
+    fn page_down(&mut self, _: &PageDown, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.reading {
+            self.reading_content.scroll_screen(1);
+            cx.notify();
+            return;
+        }
+        for _ in 0..10 {
+            self.move_all_vertical(1);
+        }
+        cx.notify();
+    }
+
     fn home(&mut self, _: &Home, _window: &mut Window, cx: &mut Context<Self>) {
         if self.reading {
             self.reading_content.scroll_blocks(isize::MIN / 2);
@@ -3345,6 +3373,18 @@ impl Editor {
                 let backwards = window.modifiers().shift;
                 self.reading_content.find_next(backwards);
                 cx.notify();
+                return;
+            }
+            // Enter follows the link under the reading selection.
+            if let Some(target) = self
+                .reading_content
+                .selection_head()
+                .and_then(|head| self.reading_content.link_at(head))
+            {
+                if let Some(opener) = self.link_opener.take() {
+                    opener(&target, window, cx);
+                    self.link_opener = Some(opener);
+                }
             }
             return;
         }
@@ -5077,6 +5117,8 @@ impl Render for Editor {
             .on_action(cx.listener(Self::right))
             .on_action(cx.listener(Self::up))
             .on_action(cx.listener(Self::down))
+            .on_action(cx.listener(Self::page_up))
+            .on_action(cx.listener(Self::page_down))
             .on_action(cx.listener(Self::word_left))
             .on_action(cx.listener(Self::word_right))
             .on_action(cx.listener(Self::paragraph_up))
@@ -5280,6 +5322,7 @@ impl EntityInputHandler for Editor {
                 "k" => self.reading_content.scroll_blocks(-1),
                 "g" => self.reading_content.scroll_blocks(isize::MIN / 2),
                 "G" => self.reading_content.scroll_blocks(isize::MAX / 2),
+                " " => self.reading_content.scroll_screen(1),
                 _ => return,
             }
             self.marked_range = None;

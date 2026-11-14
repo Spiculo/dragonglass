@@ -1083,6 +1083,47 @@ impl ReadingCache {
         self.list_state.scroll_to_reveal_item(target);
     }
 
+    /// The current reading selection head, if any.
+    pub fn selection_head(&self) -> Option<ReadPoint> {
+        self.selection.borrow().head
+    }
+
+    /// The link target at a selection point, for Enter in reading mode. Covers the prose
+    /// blocks; tables and code do not carry links.
+    pub fn link_at(&self, point: ReadPoint) -> Option<String> {
+        let block = self.blocks.get(point.block)?;
+        let texts: Vec<&str> = match block {
+            Block::Heading { text, .. } | Block::Paragraph(text) | Block::Quote(text) => {
+                vec![text]
+            }
+            Block::ListItem { text, .. } => vec![text],
+            Block::Callout { title, text, .. } => vec![title, text],
+            _ => return None,
+        };
+        let mut offset = 0usize;
+        let mut links: Vec<(Range<usize>, String)> = Vec::new();
+        for (index, text) in texts.iter().enumerate() {
+            if index > 0 {
+                offset += 1;
+            }
+            for span in inline::parse(text) {
+                if let Some(href) = &span.href {
+                    links.push((offset..offset + span.text.len(), href.clone()));
+                }
+                offset += span.text.len();
+            }
+        }
+        links
+            .into_iter()
+            .find(|(range, _)| range.contains(&point.offset))
+            .map(|(_, href)| href)
+    }
+
+    /// Scroll roughly one screen of prose, for PageUp/PageDown and Space in reading mode.
+    pub fn scroll_screen(&mut self, direction: isize) {
+        self.scroll_blocks(8 * direction);
+    }
+
     /// The nearest heading at or above the top visible block.
     pub fn current_heading(&self) -> Option<String> {
         if self.blocks.is_empty() {
