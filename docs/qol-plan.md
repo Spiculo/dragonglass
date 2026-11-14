@@ -868,9 +868,10 @@ following into `dragonglass-core` (or a thin shared layer) and expose through th
 | `NavEntry`/history | Back/forward semantics are product logic | `(path, mode, anchor)` stack with cap; clients render controls |
 
 **FFI additions:** `save_document_with_fingerprint`, `document_fingerprint`,
-`load_draft`/`save_draft`/`discard_draft`, `resolve_link_fragment`, `reader_settings`, and
-`sync_state`. Keep all of them local-only and synchronous where possible; do not add
-background work to the FFI.
+`load_draft`/`save_draft`/`discard_draft`, `resolve_link_fragment`, `reader_settings` (size,
+width, typeface, line height), `sync_state`, plus the shared readers `find_in_text`,
+`syntax_spans`, `resolve_target` and `filter_by_property`. Keep all of them local-only and
+synchronous where possible; do not add background work to the FFI.
 
 **Landed:** the FFI exposes `MobileVault.documentFingerprint`,
 `saveDocumentWithFingerprint` (returns `saved` / `conflict` with the disk hash / `error`),
@@ -885,8 +886,8 @@ its text, and the new baseline is stored after a successful write.
 (idle, dirty, syncing, conflict, error) and their attention rule; the FFI exposes them as
 `syncState(...)`, and Android's chip label/tint now come from that state machine instead of
 its own when-chain.
-**Remaining:** Android reader settings use the FFI functions but have no settings screen yet;
-iOS is not started.
+**Remaining:** the iOS client is not started; this environment has no iOS toolchain, so
+`docs/ux-contract.md` is the deliverable that stands in for it.
 
 **UX contract document:** write `docs/ux-contract.md` with the invariants in §2 and a table
 of state transitions (open, edit, save, close, read, follow, back). Desktop and Android

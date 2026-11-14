@@ -2829,7 +2829,11 @@ fn inline_image(path: &Path) -> DecodedImage {
                 )));
                 (data, width, height)
             });
-        cache.borrow_mut().insert(key, loaded.clone());
+        let mut cache = cache.borrow_mut();
+        if cache.len() >= 64 {
+            cache.clear();
+        }
+        cache.insert(key, loaded.clone());
         loaded
     })
 }
