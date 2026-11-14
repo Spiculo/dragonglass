@@ -114,6 +114,27 @@ class DragonGlassViewModel(application: Application) : AndroidViewModel(applicat
     var previewScroll by mutableStateOf(0)
         private set
 
+    /// Reading typography, shared with the desktop reader through the vault config.
+    var readerSize by mutableStateOf(15)
+        private set
+    var readerMeasure by mutableStateOf(780)
+        private set
+
+    fun setReaderTypography(size: Int, measure: Int) {
+        readerSize = size.coerceIn(11, 24)
+        readerMeasure = measure.coerceIn(480, 1200)
+        viewModelScope.launch {
+            runCatching {
+                withContext(Dispatchers.IO) {
+                    ensureVault().setReaderSettings(
+                        readerSize.toUInt(),
+                        readerMeasure.toUInt(),
+                    )
+                }
+            }
+        }
+    }
+
     /// Files copied by a running import/export, and whether it can still be cancelled.
     var transferProgress by mutableStateOf<Int?>(null)
         private set
@@ -383,7 +404,14 @@ class DragonGlassViewModel(application: Application) : AndroidViewModel(applicat
                 """.trimIndent()
             )
         }
-        return vault ?: MobileVault.open(vaultDirectory.absolutePath).also { vault = it }
+        return vault ?: MobileVault.open(vaultDirectory.absolutePath).also {
+            vault = it
+            // Reader typography is shared with the desktop reader through the vault config.
+            runCatching { it.readerSettings() }.onSuccess { settings ->
+                readerSize = settings.bodySize.toInt()
+                readerMeasure = settings.measure.toInt()
+            }
+        }
     }
 
     fun refresh() {

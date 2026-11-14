@@ -173,6 +173,7 @@ private fun NotesScreen(
     var showNewFolder by remember { mutableStateOf(false) }
     var showNewNote by remember { mutableStateOf(false) }
     var actionNote by remember { mutableStateOf<NoteSummary?>(null) }
+    var showReaderSettings by remember { mutableStateOf(false) }
     var renamingNote by remember { mutableStateOf<NoteSummary?>(null) }
     val openRowActions: (NoteSummary) -> Unit = { actionNote = it }
     var showVaults by remember { mutableStateOf(false) }
@@ -301,6 +302,13 @@ private fun NotesScreen(
                                 },
                             )
                             DropdownMenuItem(
+                                text = { Text("Reader settings…") },
+                                onClick = {
+                                    menuOpen = false
+                                    showReaderSettings = true
+                                },
+                            )
+                            DropdownMenuItem(
                                 text = { Text("Vaults and storage…") },
                                 onClick = {
                                     menuOpen = false
@@ -409,6 +417,9 @@ private fun NotesScreen(
         }
     }
 
+    if (showReaderSettings) {
+        ReaderSettingsSheet(vm, onDismiss = { showReaderSettings = false })
+    }
     if (showSync) {
         GitSyncSheet(vm, onDismiss = { showSync = false })
     }
@@ -967,6 +978,8 @@ private fun EditorScreen(vm: DragonGlassViewModel, relative: String) {
                     onOpenNote = { vm.openLinkedNote(it) },
                     initialScroll = vm.previewScroll,
                     onScroll = { vm.rememberPreviewScroll(it) },
+                    bodySize = vm.readerSize,
+                    measure = vm.readerMeasure,
                 )
             } else {
                 BasicTextField(
@@ -1170,6 +1183,59 @@ private fun OutlineRow(heading: HeadingInfo, onClick: () -> Unit) {
             .clickable(onClick = onClick)
             .padding(start = ((heading.level - 1).coerceAtLeast(0) * 12).dp),
     )
+}
+
+/// Reader text size and width, shared with the desktop reader.
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun ReaderSettingsSheet(vm: DragonGlassViewModel, onDismiss: () -> Unit) {
+    ModalBottomSheet(onDismissRequest = onDismiss) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 16.dp)
+                .padding(bottom = 24.dp),
+        ) {
+            Text(
+                "Reader settings",
+                style = MaterialTheme.typography.titleLarge,
+                modifier = Modifier.padding(vertical = 8.dp),
+            )
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text("Text size", Modifier.weight(1f))
+                TextButton(
+                    onClick = { vm.setReaderTypography(vm.readerSize - 1, vm.readerMeasure) },
+                ) { Text("−") }
+                Text("${vm.readerSize} px")
+                TextButton(
+                    onClick = { vm.setReaderTypography(vm.readerSize + 1, vm.readerMeasure) },
+                ) { Text("+") }
+            }
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text("Width", Modifier.weight(1f))
+                TextButton(
+                    onClick = { vm.setReaderTypography(vm.readerSize, vm.readerMeasure - 60) },
+                ) { Text("−") }
+                Text("${vm.readerMeasure} px")
+                TextButton(
+                    onClick = { vm.setReaderTypography(vm.readerSize, vm.readerMeasure + 60) },
+                ) { Text("+") }
+            }
+            Text(
+                text = "The width is the reading column; on a phone the page width wins. " +
+                    "These values are stored in the vault and shared with the desktop app.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(top = 8.dp),
+            )
+        }
+    }
 }
 
 /// Search the vault's notes and insert one as a wikilink.
@@ -2083,11 +2149,13 @@ private fun MarkdownWebView(
     onOpenNote: (String) -> Unit = {},
     initialScroll: Int = 0,
     onScroll: (Int) -> Unit = {},
+    bodySize: Int = 16,
+    measure: Int = 700,
 ) {
     val dark = isSystemInDarkTheme()
     // Comfortable defaults for a phone or tablet, plus the dark palette when needed.
-    val themed = remember(html, dark) {
-        val base = html.replace("</head>", "<style>$PREVIEW_CSS</style></head>")
+    val themed = remember(html, dark, bodySize, measure) {
+        val base = html.replace("</head>", "<style>${previewCss(bodySize, measure)}</style></head>")
         if (dark) {
             base.replace("</head>", "<style>$DARK_PREVIEW_CSS</style></head>")
         } else {
@@ -2201,11 +2269,10 @@ private fun handlePreviewLink(
     return true
 }
 
-/// Reading defaults for the preview: a comfortable measure and type size on phones and
-/// tablets, and images that never overflow the page.
-private const val PREVIEW_CSS = """
-body{max-width:44rem;margin:0 auto;padding:16px;font-size:16px;line-height:1.65;
-  -webkit-text-size-adjust:100%}
+/// Reading defaults for the preview, following the shared reader settings.
+private fun previewCss(bodySize: Int, measure: Int): String = """
+body{max-width:${measure}px;margin:0 auto;padding:16px;font-size:${bodySize}px;
+  line-height:1.65;-webkit-text-size-adjust:100%}
 img{max-width:100%;height:auto}
 pre,table{max-width:100%;overflow-x:auto}
 """
