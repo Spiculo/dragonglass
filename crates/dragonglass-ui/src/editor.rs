@@ -1548,7 +1548,7 @@ impl Editor {
         let text = self.buffer.text();
         match blocks::move_up(&text, self.cursor_line()) {
             Some(edit) => {
-                self.apply_block_edit(edit);
+                self.apply_block_edit(edit, true);
                 true
             }
             None => false,
@@ -1560,7 +1560,7 @@ impl Editor {
         let text = self.buffer.text();
         match blocks::move_down(&text, self.cursor_line()) {
             Some(edit) => {
-                self.apply_block_edit(edit);
+                self.apply_block_edit(edit, true);
                 true
             }
             None => false,
@@ -1572,7 +1572,7 @@ impl Editor {
         let text = self.buffer.text();
         match blocks::duplicate(&text, self.cursor_line()) {
             Some(edit) => {
-                self.apply_block_edit(edit);
+                self.apply_block_edit(edit, true);
                 true
             }
             None => false,
@@ -1584,24 +1584,32 @@ impl Editor {
         let text = self.buffer.text();
         match blocks::delete(&text, self.cursor_line()) {
             Some(edit) => {
-                self.apply_block_edit(edit);
+                self.apply_block_edit(edit, false);
                 true
             }
             None => false,
         }
     }
 
-    fn apply_block_edit(&mut self, edit: blocks::BlockEdit) {
+    /// Replace the document with a block edit, keeping the caret on the same line of the
+    /// moved or duplicated block (`follow`) and the viewport where it was. A deletion puts
+    /// the caret at the start of the block that took its place.
+    fn apply_block_edit(&mut self, edit: blocks::BlockEdit, follow: bool) {
         if !self.can_mutate() {
             return;
         }
+        let caret =
+            caret_after_block_edit(&self.buffer.text(), self.buffer.cursor(), &edit, follow);
+        let scroll = self.scroll_handle.offset();
         self.buffer.replace(0..self.buffer.len_chars(), &edit.text);
-        self.buffer
-            .set_cursor(self.buffer.char_index_at(edit.line, 0));
+        let caret = caret.min(self.buffer.len_chars());
+        self.buffer.set_cursor(caret);
         self.anchor = None;
         self.marked_range = None;
         self.properties_revision = u64::MAX;
         self.reset_layout_cache();
+        // The block moved, not the reader: restore the viewport the edit invalidated.
+        self.scroll_handle.set_offset(scroll);
     }
 
     /// Drop the shaped-line cache. The next prepaint re-shapes the whole document.
@@ -6761,10 +6769,60 @@ fn visible_row_range(
     start.min(row_count)..end.min(row_count)
 }
 
+/// The caret after a block edit. `follow` keeps the same line and column inside the moved or
+/// duplicated block; otherwise (a deletion) the caret goes to the start of the following
+/// block. Pure text math so it can be tested without an editor.
+fn caret_after_block_edit(
+    text: &str,
+    cursor: usize,
+    edit: &blocks::BlockEdit,
+    follow: bool,
+) -> usize {
+    let before = Buffer::from_text(text);
+    let (line, col) = before.line_col_at(cursor);
+    let block_start = blocks::block_at(text, line)
+        .map(|block| block.start)
+        .unwrap_or(line);
+    let offset = line.saturating_sub(block_start);
+    let after = Buffer::from_text(&edit.text);
+    let target = if follow {
+        edit.line + offset
+    } else {
+        edit.line
+    };
+    let target = target.min(after.line_count().saturating_sub(1));
+    after.char_index_at(target, if follow { col } else { 0 })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use gpui::{point, size};
+
+    #[test]
+    fn a_moved_block_keeps_the_caret_on_the_same_line() {
+        let text = "# A\n\nline one\nline two\n\n# B\n";
+        let cursor = text.find("line two").unwrap() + "line two".len();
+        let edit = blocks::move_down(text, 3).expect("move");
+        let after = Buffer::from_text(&edit.text);
+        let caret = caret_after_block_edit(text, cursor, &edit, true);
+        let (line, col) = after.line_col_at(caret);
+        assert_eq!(after.line(line).trim_end().to_string(), "line two");
+        // The column inside the line is kept too.
+        assert_eq!(col, "line two".len());
+    }
+
+    #[test]
+    fn a_deleted_block_puts_the_caret_at_the_next_block() {
+        let text = "# A\n\nfirst\n\nsecond\n";
+        let cursor = text.find("first").unwrap();
+        let edit = blocks::delete(text, 2).expect("delete");
+        let after = Buffer::from_text(&edit.text);
+        let caret = caret_after_block_edit(text, cursor, &edit, false);
+        let (line, col) = after.line_col_at(caret);
+        assert_eq!(col, 0);
+        assert_eq!(after.line(line).trim_end().to_string(), "second");
+    }
 
     #[test]
     fn lists_continue_on_enter() {

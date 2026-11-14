@@ -672,7 +672,10 @@ on Escape or an outside click.
 open tab with its dirty dot; the active tab is highlighted and clicking a row activates it.
 The menu is anchored at the button, snaps inside the window, and closes on Escape or an
 outside click.
-**Remaining:** block move/duplicate/delete keeping the exact caret and scroll.
+**Landed (block edits):** moving, duplicating or deleting a block keeps the caret on the same
+line and column inside the moved (or duplicated) block, keeps the viewport where it was, and
+places the caret at the following block after a delete. Unit tests cover a moved paragraph and
+a deletion.
 
 #### Q3.13 Dirty state reflects content — D · S
 Compare against the saved text/revision rather than flipping a bool. Type-then-delete and

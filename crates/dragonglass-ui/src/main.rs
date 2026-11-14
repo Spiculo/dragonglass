@@ -109,10 +109,10 @@ fn bind_named(cx: &mut App, key: &str, action: &str) {
 use dragonglass_plugins as plugins;
 use editor::Editor;
 use gpui::{
-    actions, anchored, div, point, prelude::*, px, size, uniform_list, AnyElement, App,
-    Application, Bounds, Context, Corner, CursorStyle, ElementId, Entity, FocusHandle, Focusable,
-    KeyBinding, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels,
-    Point, Render, Timer, WeakEntity, Window, WindowBounds, WindowOptions,
+    actions, anchored, div, prelude::*, px, size, uniform_list, AnyElement, App, Application,
+    Bounds, Context, Corner, CursorStyle, ElementId, Entity, FocusHandle, Focusable, KeyBinding,
+    KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, Render,
+    Timer, WeakEntity, Window, WindowBounds, WindowOptions,
 };
 use graph_view::GraphView;
 use reading::ReaderSettings;
