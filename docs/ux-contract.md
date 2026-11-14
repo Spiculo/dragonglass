@@ -12,10 +12,10 @@ enforces the marked rows; iOS starts from this document rather than from `Screen
 | # | Invariant | Enforced by | Tested by |
 |---|---|---|---|
 | 1 | **No silent text loss.** A save either succeeds visibly or stops with an actionable conflict/error. Nothing writes over a file that changed underneath the editor without asking. | `core::fingerprint::save_if_unchanged`; `Editor::save_checked`; conflict bar | `fingerprint` tests (clean, external edit, deleted file, mtime-only, write error) |
-| 2 | **No silent text mutation.** Reading mode never edits the source. Focus in a reader scrolls and selects, never changes bytes. | `Editor::can_mutate` on every mutating action and both IME insert paths | — (needs an editor fuzz harness) |
+| 2 | **No silent text mutation.** Reading mode never edits the source. Focus in a reader scrolls and selects, never changes bytes. | `Editor::can_mutate` on every mutating action; both IME insert paths divert to reading navigation/find; Tab/Enter walk links | — (a property-based shortcut fuzz harness is still wanted) |
 | 3 | **No lost place.** Per tab the client remembers mode, cursor/selection, edit scroll and reading scroll across tab switch, mode switch, quit and relaunch. | `core::session` v2; `remember_session`; startup restore | `session` tests; restore-filter tests |
-| 4 | **Reading and editing are continuous.** Entering reading starts at the block containing the caret; leaving restores the source line. Following a link keeps the mode. | `open_note_impl` carries the mode; `jump_to_heading` | — (source spans are still open, Q1.2) |
-| 5 | **Links are complete.** `[[Note]]`, `[[Note#Heading]]`, `[[#Local]]`, `[[Note#^block]]` navigate to the target, and every navigation has a back path. | `open_target`; nav history | — (fragments open in Q1.4) |
+| 4 | **Reading and editing are continuous.** Entering reading starts at the block containing the caret; leaving restores the source line. Following a link keeps the mode. | `open_note_impl` carries the mode; `jump_to_heading`; `parse_blocks_spanned` | span and line-mapping tests in `markdown` |
+| 5 | **Links are complete.** `[[Note]]`, `[[Note#Heading]]`, `[[#Local]]`, `[[Note#^block]]` navigate to the target, and every navigation has a back path. | `open_target`; `jump_to_fragment`; nav history | fragment tests; `resolveLinkFragment` tests |
 | 6 | **Leaving is reversible or explicit.** Closing a dirty tab/note offers Save / Discard / Cancel; quit cannot drop a failed save. | `close_tab`, `request_close`, `quit_action` | — |
 | 7 | **Every action reports back.** Save, sync, export, conflict and failed link produce a typed result (info/success/warn/error), not a stale line. | `StatusKind` + `set_status`; `expire_status` | UI status rewrite |
 | 8 | **No incidental layout jump.** Find, autocomplete, the format bar and toasts do not move the document under the caret. | fixed format bar; overlaid autocomplete | — |
@@ -57,9 +57,27 @@ SaveReport::{ Saved{fingerprint}, Conflict{disk: Option<fingerprint>}, Error{mes
 - Every client saves through this contract. No client calls `write_atomic` for a note
   without a fingerprint check except the explicit "keep mine" path.
 
-## 4. What is still open
+## 4. Shared FFI surface
+
+Every client calls these instead of reimplementing policy. All are synchronous and
+local-only; nothing here starts background work.
+
+| Call | Purpose |
+|---|---|
+| `MobileVault.documentFingerprint(relative)` | Capture the baseline before editing |
+| `MobileVault.saveDocumentWithFingerprint(relative, text, expectedHash?)` | Conflict-safe save; returns `saved` / `conflict` (with the disk hash) / `error` |
+| `saveDraft` / `loadDraft` / `discardDraft` | Crash-recovery drafts, written from a lifecycle hook |
+| `readerSettings` / `setReaderSettings(size, width, font, lineHeight)` | Typography shared with desktop (`reader_*` keys in `config.txt`) |
+| `syncState(changed, untracked, ahead, behind, conflicts, busy, failed)` | One sync state machine: idle, dirty, syncing, conflict, error |
+| `resolveLinkFragment(source, fragment)` | `#Heading` / `#^block` to a 1-based source line |
+| `findInText(source, pattern, regex, case, wholeWord)` | UTF-16 match ranges for a text field |
+| `syntaxSpans(source)` | UTF-16 markdown highlight runs for the editor |
+| `MobileVault.resolveTarget(target)` | Wikilink/relation target to a vault path |
+| `MobileVault.filterByProperty(key, value)` | Exact frontmatter filter rows |
+
+## 5. What is still open
 
 Tracked in [`qol-plan.md`](qol-plan.md): inline live preview beyond display math (Q2.12),
-source spans for edit↔read mapping (Q1.2), heading/block fragments (Q1.4), in-page find
-(Q2.2), Android drafts/lifecycle (Q0.3/Q0.7), the shared FFI surface (§5 of the plan), and
-the iOS client.
+the Android text field's own scroll offset (Q1.7), optional editor↔preview scroll sync
+(Q2.11), line numbers on phones (Q4.3, deliberately omitted), and the iOS client (no iOS
+toolchain in this environment; this document is the porting target).
