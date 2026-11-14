@@ -41,6 +41,7 @@ import java.io.File
 private data class OpenNote(
     val relative: String,
     val source: String,
+    val fingerprint: ULong?,
     val stats: StatsInfo,
     val headings: List<HeadingInfo>,
     val properties: List<PropertyInfo>,
@@ -172,6 +173,21 @@ class DragonGlassViewModel(application: Application) : AndroidViewModel(applicat
             }.getOrDefault(emptyList())
         }
         findIndex = 0
+    }
+
+    /// Content hash of the version each open note is based on, for conflict-safe saves.
+    private val fingerprints = mutableMapOf<String, ULong>()
+
+    /// Save through the shared contract: a conflict leaves the disk version alone.
+    private fun saveNoteChecked(loaded: MobileVault, relative: String, text: String) {
+        val report = loaded.saveDocumentWithFingerprint(relative, text, fingerprints[relative])
+        when (report.status) {
+            "saved" -> report.fingerprint?.let { fingerprints[relative] = it.contentHash }
+            "conflict" -> throw IllegalStateException(
+                "The note changed on disk. Reload it before saving over it.",
+            )
+            else -> throw IllegalStateException(report.message ?: "Could not save the note")
+        }
     }
 
     /// One-line sync state for the chrome.
@@ -499,7 +515,7 @@ class DragonGlassViewModel(application: Application) : AndroidViewModel(applicat
         val note = selected ?: return
         if (!dirty) return
         val text = source
-        withContext(Dispatchers.IO) { ensureVault().saveNote(note, text) }
+        withContext(Dispatchers.IO) { saveNoteChecked(ensureVault(), note, text) }
         dirty = false
         mirrorNote(note)
     }
@@ -586,7 +602,7 @@ class DragonGlassViewModel(application: Application) : AndroidViewModel(applicat
         viewModelScope.launch {
             val saved = runCatching {
                 withContext(Dispatchers.IO) {
-                    ensureVault().saveNote(current, text)
+                    saveNoteChecked(ensureVault(), current, text)
                 }
             }
             saved
@@ -615,6 +631,7 @@ class DragonGlassViewModel(application: Application) : AndroidViewModel(applicat
                     OpenNote(
                         relative = relative,
                         source = text,
+                        fingerprint = loaded.documentFingerprint(relative).contentHash,
                         stats = documentStats(text),
                         headings = parseHeadings(text),
                         properties = parseProperties(text),
@@ -625,6 +642,7 @@ class DragonGlassViewModel(application: Application) : AndroidViewModel(applicat
             }
             result
                 .onSuccess { opened ->
+                    opened.fingerprint?.let { fingerprints[opened.relative] = it }
                     selected = opened.relative
                     source = opened.source
                     stats = opened.stats
@@ -649,7 +667,7 @@ class DragonGlassViewModel(application: Application) : AndroidViewModel(applicat
             if (dirty) {
                 val text = source
                 val saved = runCatching {
-                    withContext(Dispatchers.IO) { ensureVault().saveNote(note, text) }
+                    withContext(Dispatchers.IO) { saveNoteChecked(ensureVault(), note, text) }
                 }
                 if (saved.isFailure) {
                     // Keep the note open with its text: a failed save must not close it.
@@ -681,7 +699,7 @@ class DragonGlassViewModel(application: Application) : AndroidViewModel(applicat
             val result = runCatching {
                 withContext(Dispatchers.IO) {
                     val loaded = ensureVault()
-                    loaded.saveNote(note, text)
+                    saveNoteChecked(loaded, note, text)
                     Triple(documentStats(text), parseHeadings(text), parseProperties(text))
                 }
             }
@@ -846,7 +864,7 @@ class DragonGlassViewModel(application: Application) : AndroidViewModel(applicat
             val result = runCatching {
                 withContext(Dispatchers.IO) {
                     val loaded = ensureVault()
-                    if (wasDirty) loaded.saveNote(note, text)
+                    if (wasDirty) saveNoteChecked(loaded, note, text)
                     loaded.trashNote(note)
                 }
             }
@@ -871,7 +889,7 @@ class DragonGlassViewModel(application: Application) : AndroidViewModel(applicat
         val dirtyNow = dirty
         viewModelScope.launch {
             if (note != null && dirtyNow) {
-                runCatching { withContext(Dispatchers.IO) { ensureVault().saveNote(note, text) } }
+                runCatching { withContext(Dispatchers.IO) { saveNoteChecked(ensureVault(), note, text) } }
                     .onFailure { error = it.message ?: "Could not save the note" }
             }
             selected = null
@@ -892,7 +910,7 @@ class DragonGlassViewModel(application: Application) : AndroidViewModel(applicat
             val result = runCatching {
                 withContext(Dispatchers.IO) {
                     val loaded = ensureVault()
-                    if (saveFirst) loaded.saveNote(relative, text)
+                    if (saveFirst) saveNoteChecked(loaded, relative, text)
                     loaded.trashNote(relative)
                 }
             }
@@ -932,7 +950,7 @@ class DragonGlassViewModel(application: Application) : AndroidViewModel(applicat
             val result = runCatching {
                 withContext(Dispatchers.IO) {
                     val loaded = ensureVault()
-                    if (saveFirst) loaded.saveNote(relative, text)
+                    if (saveFirst) saveNoteChecked(loaded, relative, text)
                     loaded.renameEntry(relative, target)
                 }
             }
@@ -968,7 +986,7 @@ class DragonGlassViewModel(application: Application) : AndroidViewModel(applicat
             val result = runCatching {
                 withContext(Dispatchers.IO) {
                     val loaded = ensureVault()
-                    if (wasDirty) loaded.saveNote(note, text)
+                    if (wasDirty) saveNoteChecked(loaded, note, text)
                     loaded.renameEntry(note, target)
                 }
             }

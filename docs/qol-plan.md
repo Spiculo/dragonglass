@@ -164,7 +164,10 @@ captures a fingerprint on load/reload/save, `Ctrl+S` reports the conflict, and a
 Reload / Keep mine / Compare (line diff in the existing diff view) / Save as copy. Close,
 quit and Save all stop on a conflict instead of dropping or overwriting the buffer. Tests
 cover clean save, external edit, deleted file, mtime-only change and write errors.
-**Remaining:** the Android sheet (Q0.7 covers the save-before-navigate part).
+**Landed (Android):** the same contract now backs Android saves — a fingerprint is captured
+on open and every save path checks it, so an external edit blocks the write and keeps the
+note open instead of overwriting it.
+**Remaining:** a dedicated Android conflict sheet with Reload / Keep mine / Save as copy.
 
 #### Q0.3 Drafts, autosave and crash recovery — D · A · S · L
 Persist a debounced draft under `.dragon-glass/drafts/` (path, base fingerprint, timestamp,
@@ -811,8 +814,11 @@ background work to the FFI.
 `resolveLinkFragment(source, fragment)` that resolves `#Heading` and `#^block` to a 1-based
 line. Kotlin bindings are regenerated. Tests cover conflict detection (the disk version is
 preserved), drafts round-trip, fragment resolution and clamped reader settings.
-**Remaining:** `sync_state`, and the clients using these functions instead of their own save
-paths (Android still saves through `saveNote`).
+**Landed (clients):** Android captures a fingerprint when it opens a note and every save now
+goes through `saveDocumentWithFingerprint`; a conflict throws and leaves the note open with
+its text, and the new baseline is stored after a successful write.
+**Remaining:** `sync_state`; Android drafts and reader settings use the FFI functions but are
+not yet wired into a lifecycle hook or a settings screen.
 
 **UX contract document:** write `docs/ux-contract.md` with the invariants in §2 and a table
 of state transitions (open, edit, save, close, read, follow, back). Desktop and Android
