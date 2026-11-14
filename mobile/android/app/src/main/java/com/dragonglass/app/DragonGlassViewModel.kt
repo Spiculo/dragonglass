@@ -19,6 +19,7 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import uniffi.dragonglass.DraftInfo
 import uniffi.dragonglass.GraphView
 import uniffi.dragonglass.HeadingInfo
 import uniffi.dragonglass.MobileVault
@@ -42,6 +43,7 @@ private data class OpenNote(
     val relative: String,
     val source: String,
     val fingerprint: ULong?,
+    val draft: DraftInfo?,
     val stats: StatsInfo,
     val headings: List<HeadingInfo>,
     val properties: List<PropertyInfo>,
@@ -178,11 +180,70 @@ class DragonGlassViewModel(application: Application) : AndroidViewModel(applicat
     /// Content hash of the version each open note is based on, for conflict-safe saves.
     private val fingerprints = mutableMapOf<String, ULong>()
 
+    /// Caret position, for the debounced draft written when the app goes to the background.
+    private var cursorLine = 0
+    private var cursorCol = 0
+
+    /// A draft found when the note opened, waiting for Recover / Discard.
+    var pendingDraft by mutableStateOf<DraftInfo?>(null)
+        private set
+
+    /// Bumped when a recovered draft replaces the editor text.
+    var recoveryNonce by mutableStateOf(0)
+        private set
+
+    fun onCursorChange(line: Int, col: Int) {
+        cursorLine = line
+        cursorCol = col
+    }
+
+    /// Write a draft for the open note; call from the activity's onStop.
+    fun flushDraft() {
+        val note = selected ?: return
+        if (!dirty) return
+        val text = source
+        val line = cursorLine
+        val col = cursorCol
+        viewModelScope.launch {
+            runCatching {
+                withContext(Dispatchers.IO) {
+                    ensureVault().saveDraft(note, text, line.toUInt(), col.toUInt())
+                }
+            }
+        }
+    }
+
+    fun recoverDraft() {
+        val draft = pendingDraft ?: return
+        source = draft.text
+        dirty = true
+        cursorLine = draft.line.toInt()
+        cursorCol = draft.col.toInt()
+        pendingDraft = null
+        recoveryNonce += 1
+    }
+
+    fun discardPendingDraft() {
+        val note = selected ?: return
+        val draft = pendingDraft
+        pendingDraft = null
+        if (draft != null) {
+            viewModelScope.launch {
+                runCatching {
+                    withContext(Dispatchers.IO) { ensureVault().discardDraft(note) }
+                }
+            }
+        }
+    }
+
     /// Save through the shared contract: a conflict leaves the disk version alone.
     private fun saveNoteChecked(loaded: MobileVault, relative: String, text: String) {
         val report = loaded.saveDocumentWithFingerprint(relative, text, fingerprints[relative])
         when (report.status) {
-            "saved" -> report.fingerprint?.let { fingerprints[relative] = it.contentHash }
+            "saved" -> {
+                report.fingerprint?.let { fingerprints[relative] = it.contentHash }
+                loaded.discardDraft(relative)
+            }
             "conflict" -> throw IllegalStateException(
                 "The note changed on disk. Reload it before saving over it.",
             )
@@ -632,6 +693,7 @@ class DragonGlassViewModel(application: Application) : AndroidViewModel(applicat
                         relative = relative,
                         source = text,
                         fingerprint = loaded.documentFingerprint(relative).contentHash,
+                        draft = loaded.loadDraft(relative),
                         stats = documentStats(text),
                         headings = parseHeadings(text),
                         properties = parseProperties(text),
@@ -643,6 +705,7 @@ class DragonGlassViewModel(application: Application) : AndroidViewModel(applicat
             result
                 .onSuccess { opened ->
                     opened.fingerprint?.let { fingerprints[opened.relative] = it }
+                    pendingDraft = opened.draft?.takeIf { it.text != opened.source }
                     selected = opened.relative
                     source = opened.source
                     stats = opened.stats

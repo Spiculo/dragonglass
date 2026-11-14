@@ -4,25 +4,26 @@ import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
-import androidx.compose.runtime.Composable
-import androidx.lifecycle.viewmodel.compose.viewModel
+import androidx.activity.viewModels
 import com.dragonglass.app.ui.DragonGlassApp
 import com.dragonglass.app.ui.DragonGlassTheme
 
 class MainActivity : ComponentActivity() {
+    private val viewModel: DragonGlassViewModel by viewModels()
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
         setContent {
             DragonGlassTheme {
-                DragonGlassContent()
+                DragonGlassApp(viewModel)
             }
         }
     }
-}
 
-@Composable
-private fun DragonGlassContent() {
-    val viewModel: DragonGlassViewModel = viewModel()
-    DragonGlassApp(viewModel)
+    override fun onStop() {
+        super.onStop()
+        // Backgrounding the app writes a recovery draft for the open note.
+        viewModel.flushDraft()
+    }
 }

@@ -806,6 +806,13 @@ private fun EditorScreen(vm: DragonGlassViewModel, relative: String) {
 
     LaunchedEffect(relative) { focusRequester.requestFocus() }
 
+    // A recovered draft replaces the editor text.
+    LaunchedEffect(vm.recoveryNonce) {
+        if (vm.recoveryNonce == 0) return@LaunchedEffect
+        editorValue = TextFieldValue(vm.source, TextRange(vm.source.length))
+        focusRequester.requestFocus()
+    }
+
     // Select the current match so the editor scrolls it into view.
     LaunchedEffect(vm.findOpen, vm.findIndex, vm.findRanges) {
         if (!vm.findOpen) return@LaunchedEffect
@@ -906,6 +913,23 @@ private fun EditorScreen(vm: DragonGlassViewModel, relative: String) {
                 .fillMaxSize()
                 .padding(padding),
         ) {
+            vm.pendingDraft?.let { draft ->
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 8.dp, vertical = 4.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text(
+                        text = "Unsaved draft from ${trashTime(draft.writtenAtMs.toLong())}",
+                        modifier = Modifier.weight(1f),
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.tertiary,
+                    )
+                    TextButton(onClick = vm::recoverDraft) { Text("Recover") }
+                    TextButton(onClick = vm::discardPendingDraft) { Text("Discard") }
+                }
+            }
             if (vm.findOpen) {
                 Row(
                     modifier = Modifier
@@ -951,6 +975,10 @@ private fun EditorScreen(vm: DragonGlassViewModel, relative: String) {
                         val previous = editorValue.text
                         editorValue = it
                         vm.onSourceChange(it.text)
+                        val caret = it.selection.end.coerceIn(0, it.text.length)
+                        val line = it.text.take(caret).count { ch -> ch == '\n' }
+                        val col = caret - (it.text.lastIndexOf('\n', caret - 1) + 1)
+                        vm.onCursorChange(line, col)
                         // Typing `[[` opens the note picker for a wikilink.
                         if (it.text.endsWith("[[") && !previous.endsWith("[[") && !vm.preview) {
                             linkStart = (it.selection.min - 2).coerceAtLeast(0)

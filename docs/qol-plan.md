@@ -189,7 +189,9 @@ notes): after the same idle, if the fingerprint still matches it saves and drops
 and on a conflict it pauses and raises the conflict bar. It ships **off** by default rather
 than the on-by-default recommendation in §8.1, because silent writes interact with git-sync
 commits; that is the one deviation, and it is a per-vault toggle.
-**Remaining:** Android drafts (Q0.7 covers the save-before-navigate part).
+**Landed (Android):** the activity flushes a draft for the open note in `onStop`, and opening
+a note with a draft that differs from the file shows an "Unsaved draft from …" banner with
+Recover and Discard. A successful save discards the draft.
 
 #### Q0.4 One exit contract for close/quit/background — D · A · M
 Desktop: dirty close and quit must use Save / Discard / Cancel (or auto-save + an
@@ -233,7 +235,7 @@ open with an error when it fails; import, export and folder sync already aborted
 save; git sync now saves the open buffer first and refuses to sync or clear the editor when
 that save fails. `:app:compileDebugKotlin` passes.
 **Remaining:** a Retry/Discard/Cancel sheet (today the snackbar carries the error and the
-note stays open); lifecycle draft flush.
+note stays open).
 
 ---
 
@@ -817,8 +819,8 @@ preserved), drafts round-trip, fragment resolution and clamped reader settings.
 **Landed (clients):** Android captures a fingerprint when it opens a note and every save now
 goes through `saveDocumentWithFingerprint`; a conflict throws and leaves the note open with
 its text, and the new baseline is stored after a successful write.
-**Remaining:** `sync_state`; Android drafts and reader settings use the FFI functions but are
-not yet wired into a lifecycle hook or a settings screen.
+**Remaining:** `sync_state`; Android reader settings use the FFI functions but have no
+settings screen yet.
 
 **UX contract document:** write `docs/ux-contract.md` with the invariants in §2 and a table
 of state transitions (open, edit, save, close, read, follow, back). Desktop and Android
