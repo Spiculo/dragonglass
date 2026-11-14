@@ -37,6 +37,8 @@ pub struct Config {
     pub show_outline: bool,
     /// Relations panel visibility.
     pub show_relations: bool,
+    /// Keep the split preview at the editor's scroll position.
+    pub scroll_sync: bool,
 }
 
 impl Default for Config {
@@ -59,6 +61,7 @@ impl Default for Config {
             show_sidebar: true,
             show_outline: true,
             show_relations: false,
+            scroll_sync: false,
         }
     }
 }
@@ -82,6 +85,10 @@ impl Config {
         out.push_str(&format!("reader_width={}\n", self.reader_width));
         out.push_str(&format!("reader_font={}\n", self.reader_font));
         out.push_str(&format!("reader_line_height={}\n", self.reader_line_height));
+        out.push_str(&format!("show_sidebar={}\n", self.show_sidebar));
+        out.push_str(&format!("show_outline={}\n", self.show_outline));
+        out.push_str(&format!("show_relations={}\n", self.show_relations));
+        out.push_str(&format!("scroll_sync={}\n", self.scroll_sync));
         out
     }
 
@@ -149,6 +156,10 @@ impl Config {
                     config.show_relations =
                         matches!(value.to_lowercase().as_str(), "true" | "1" | "yes")
                 }
+                "scroll_sync" => {
+                    config.scroll_sync =
+                        matches!(value.to_lowercase().as_str(), "true" | "1" | "yes")
+                }
                 "reader_font" => {
                     let font = value.to_lowercase();
                     config.reader_font = match font.as_str() {
@@ -192,6 +203,29 @@ mod tests {
         assert_eq!(config.accent, None);
         assert!(!config.vim_mode);
         assert_eq!(config.font_size, 14);
+    }
+
+    #[test]
+    fn scroll_sync_roundtrips_and_defaults_off() {
+        assert!(!Config::default().scroll_sync);
+        let config = Config {
+            scroll_sync: true,
+            ..Config::default()
+        };
+        assert!(Config::from_text(&config.to_text()).scroll_sync);
+        assert!(!Config::from_text("scroll_sync=no").scroll_sync);
+        assert!(Config::from_text("scroll_sync=yes").scroll_sync);
+        // Panel visibility is persisted too.
+        let panels = Config {
+            show_sidebar: false,
+            show_outline: false,
+            show_relations: true,
+            ..Config::default()
+        };
+        let loaded = Config::from_text(&panels.to_text());
+        assert!(!loaded.show_sidebar);
+        assert!(!loaded.show_outline);
+        assert!(loaded.show_relations);
     }
 
     #[test]

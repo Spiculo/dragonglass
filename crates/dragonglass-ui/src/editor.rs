@@ -1622,6 +1622,20 @@ impl Editor {
         self.scroll_handle.set_offset(point(x, px(offset.max(0.0))));
     }
 
+    /// How far down the document the viewport sits, from 0.0 to 1.0.
+    pub fn scroll_progress(&self) -> f32 {
+        let content = f32::from(self.line_height) * self.last_rows.len() as f32;
+        let viewport = f32::from(self.scroll_handle.bounds().size.height);
+        progress_from_scroll(self.scroll_offset(), content, viewport)
+    }
+
+    /// Scroll to a fraction of the document, for preview scroll sync.
+    pub fn set_scroll_progress(&mut self, progress: f32) {
+        let content = f32::from(self.line_height) * self.last_rows.len() as f32;
+        let viewport = f32::from(self.scroll_handle.bounds().size.height);
+        self.set_scroll_offset(offset_for_progress(progress, content, viewport));
+    }
+
     /// The selection anchor (a character index) when a non-empty selection exists.
     pub fn selection_anchor(&self) -> Option<usize> {
         let cursor = self.buffer.cursor();
@@ -7646,6 +7660,17 @@ impl Element for EditorText {
     }
 }
 
+/// Fraction of the scrollable range for a pixel offset.
+fn progress_from_scroll(offset: f32, content: f32, viewport: f32) -> f32 {
+    let scrollable = (content - viewport).max(1.0);
+    (offset.max(0.0) / scrollable).clamp(0.0, 1.0)
+}
+
+/// Pixel offset for a fraction of the scrollable range.
+fn offset_for_progress(progress: f32, content: f32, viewport: f32) -> f32 {
+    (content - viewport).max(0.0) * progress.clamp(0.0, 1.0)
+}
+
 /// The vertical scroll delta that brings `[top, bottom)` back inside the viewport.
 ///
 /// Positive moves content down (the caret was above the viewport), negative moves it up.
@@ -7967,6 +7992,20 @@ mod tests {
             assert_eq!(plain.display_for_source(col), col);
             assert_eq!(plain.source_for_display(col), col);
         }
+    }
+
+    #[test]
+    fn scroll_progress_round_trips() {
+        // 2000 px of content in a 500 px viewport: 1500 px of travel.
+        assert_eq!(progress_from_scroll(0.0, 2000.0, 500.0), 0.0);
+        assert_eq!(progress_from_scroll(750.0, 2000.0, 500.0), 0.5);
+        assert_eq!(progress_from_scroll(1500.0, 2000.0, 500.0), 1.0);
+        // Overscroll and undersized documents clamp.
+        assert_eq!(progress_from_scroll(4000.0, 2000.0, 500.0), 1.0);
+        assert_eq!(progress_from_scroll(-30.0, 2000.0, 500.0), 0.0);
+        assert_eq!(progress_from_scroll(10.0, 400.0, 500.0), 1.0);
+        assert_eq!(offset_for_progress(0.25, 2000.0, 500.0), 375.0);
+        assert_eq!(offset_for_progress(2.0, 2000.0, 500.0), 1500.0);
     }
 
     #[test]

@@ -716,6 +716,11 @@ struct DragonGlassApp {
     pending_save_as: bool,
     /// Window position of the open tab overflow menu, if any.
     tab_menu: Option<Point<Pixels>>,
+    /// Generation of the running preview scroll-sync loop.
+    scroll_sync_generation: u64,
+    /// Scroll fractions seen on each side, so a sync only reacts to real movement.
+    last_editor_progress: f32,
+    last_preview_progress: f32,
     /// Scroll position of the outline panel, so the active heading stays visible.
     outline_scroll: UniformListScrollHandle,
     /// The heading the outline last scrolled to.
@@ -4270,6 +4275,9 @@ impl DragonGlassApp {
                 pending_path: None,
                 pending_save_as: false,
                 tab_menu: None,
+                scroll_sync_generation: 0,
+                last_editor_progress: -1.0,
+                last_preview_progress: -1.0,
                 outline_scroll: UniformListScrollHandle::new(),
                 outline_current: None,
                 conflict: false,
@@ -4419,6 +4427,9 @@ impl DragonGlassApp {
 
     fn toggle_split_preview(&mut self, cx: &mut Context<Self>) {
         self.split_preview = !self.split_preview;
+        if self.split_preview && self.config.scroll_sync {
+            self.start_scroll_sync(cx);
+        }
         if self.split_preview {
             self.split_tabs.clear();
             self.editor.update(cx, |editor, cx| {
@@ -4554,6 +4565,77 @@ impl DragonGlassApp {
         self.refresh_reader_settings(cx);
         self.set_status(kind, message);
         cx.notify();
+    }
+
+    /// Follow the editor's scroll position in the split preview, or stop following.
+    fn toggle_scroll_sync(&mut self, cx: &mut Context<Self>) {
+        self.config.scroll_sync = !self.config.scroll_sync;
+        let message = match config::save(&self.vault_root, &self.config) {
+            Ok(()) => format!(
+                "preview scroll sync: {}",
+                if self.config.scroll_sync { "on" } else { "off" }
+            ),
+            Err(error) => format!("scroll sync changed (not saved: {error})"),
+        };
+        if self.config.scroll_sync && self.split_preview {
+            self.start_scroll_sync(cx);
+        } else if !self.config.scroll_sync {
+            // Bump the generation so the running loop stops on its next tick.
+            self.scroll_sync_generation = self.scroll_sync_generation.wrapping_add(1);
+        }
+        self.set_status(StatusKind::Info, message);
+        cx.notify();
+    }
+
+    /// Keep the split preview and the editor at the same place while it is open.
+    ///
+    /// Two-way: whichever side moved last drives the other. The loop stops as soon as the
+    /// setting is turned off or the preview closes, so idle CPU stays at zero otherwise.
+    fn start_scroll_sync(&mut self, cx: &mut Context<Self>) {
+        self.scroll_sync_generation = self.scroll_sync_generation.wrapping_add(1);
+        let generation = self.scroll_sync_generation;
+        self.last_editor_progress = -1.0;
+        self.last_preview_progress = -1.0;
+        cx.spawn(async move |this, cx| loop {
+            Timer::after(std::time::Duration::from_millis(150)).await;
+            let keep = this
+                .update(cx, |app, cx| {
+                    if !app.config.scroll_sync
+                        || app.scroll_sync_generation != generation
+                        || !app.split_preview
+                    {
+                        return false;
+                    }
+                    let editor_progress = app.editor.read(cx).scroll_progress();
+                    let preview_progress = app.preview_content.progress();
+                    let editor_moved = (editor_progress - app.last_editor_progress).abs() >= 0.005;
+                    let preview_moved =
+                        (preview_progress - app.last_preview_progress).abs() >= 0.005;
+                    if editor_moved {
+                        // The editor leads: scroll the preview, then record where the
+                        // block-based preview actually landed so it does not fight back.
+                        app.preview_content.scroll_to_progress(editor_progress);
+                        app.last_editor_progress = editor_progress;
+                        app.last_preview_progress = app.preview_content.progress();
+                        cx.notify();
+                    } else if preview_moved {
+                        // The preview leads: mirror its fraction in the editor.
+                        app.last_preview_progress = preview_progress;
+                        app.last_editor_progress = preview_progress;
+                        let editor = app.editor.clone();
+                        editor.update(cx, |editor, cx| {
+                            editor.set_scroll_progress(preview_progress);
+                            cx.notify();
+                        });
+                    }
+                    true
+                })
+                .unwrap_or(false);
+            if !keep {
+                break;
+            }
+        })
+        .detach();
     }
 
     /// Show or hide a side panel, persisting the choice with the vault.
@@ -4762,6 +4844,7 @@ impl DragonGlassApp {
             "reader-width" => self.cycle_reader_setting(true, cx),
             "reader-line" => self.cycle_reader_line_height(cx),
             "reader-font" => self.cycle_reader_font(cx),
+            "scroll-sync" => self.toggle_scroll_sync(cx),
             "sidebar" => self.toggle_panel("sidebar", cx),
             "outline" => self.toggle_panel("outline", cx),
             "relations" => self.toggle_panel("relations", cx),
@@ -8665,6 +8748,9 @@ fn open_vault_window(vault_path: PathBuf, uri_note: Option<String>, cx: &mut App
             pending_path: None,
             pending_save_as: false,
             tab_menu: None,
+            scroll_sync_generation: 0,
+            last_editor_progress: -1.0,
+            last_preview_progress: -1.0,
             outline_scroll: UniformListScrollHandle::new(),
             outline_current: None,
             conflict: false,
@@ -8734,6 +8820,9 @@ fn open_vault_window(vault_path: PathBuf, uri_note: Option<String>, cx: &mut App
         .expect("failed to open window");
 
     let _ = window.update(cx, |view, window, cx| {
+        if view.config.scroll_sync && view.split_preview {
+            view.start_scroll_sync(cx);
+        }
         window.focus(&view.editor.focus_handle(cx));
         cx.activate(true);
     });

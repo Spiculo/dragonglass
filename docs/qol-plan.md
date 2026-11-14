@@ -560,7 +560,13 @@ each keystroke; preview catches up within ~150 ms of typing stopping.
 typing, with a trailing one-shot timer, instead of on every revision; it shows the previous
 render until then. Switching to another note (a new epoch) updates immediately instead of
 flashing the old note. Stats and the outline were already throttled in Q3.8.
-**Remaining:** scroll sync between editor and preview (the plan marks it optional).
+**Landed (scroll sync):** Settings has a persisted "Preview scroll sync" toggle
+(`scroll_sync` in `config.txt`). While it is on and the split preview is open, a 150 ms loop
+reads the editor's scroll fraction (content height from the laid-out rows, viewport height
+from the scroll handle) and scrolls the preview to the same fraction of its blocks. The loop
+stops as soon as the setting is turned off or the preview closes, so it costs nothing
+otherwise. It is two-way: whichever side moved last drives the other, and the block-rounded
+preview position is recorded after each sync so the two do not fight.
 
 #### Q2.12 Live preview inside the source editor — D · M–L
 Obsidian-style: the block holding the caret stays raw source and the rest of the note

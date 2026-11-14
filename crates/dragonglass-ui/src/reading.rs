@@ -1261,6 +1261,15 @@ impl ReadingCache {
         (self.top_block() as f32 / (self.blocks.len() - 1) as f32).clamp(0.0, 1.0)
     }
 
+    /// Scroll to a fraction of the document, for editor ↔ preview sync.
+    pub fn scroll_to_progress(&mut self, progress: f32) {
+        if self.blocks.is_empty() {
+            return;
+        }
+        let index = block_for_progress(progress, self.blocks.len());
+        self.scroll_to_block(index);
+    }
+
     /// Scroll the reading view so `index` is visible. Restoring a session uses this.
     pub fn scroll_to_block(&mut self, index: usize) {
         if self.blocks.is_empty() {
@@ -3403,9 +3412,27 @@ fn selection_quads(
     quads
 }
 
+/// The block index nearest a 0..1 document fraction.
+fn block_for_progress(progress: f32, block_count: usize) -> usize {
+    if block_count <= 1 {
+        return 0;
+    }
+    ((progress.clamp(0.0, 1.0) * (block_count - 1) as f32).round() as usize).min(block_count - 1)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn preview_progress_maps_to_a_block() {
+        assert_eq!(block_for_progress(0.0, 11), 0);
+        assert_eq!(block_for_progress(0.5, 11), 5);
+        assert_eq!(block_for_progress(1.0, 11), 10);
+        assert_eq!(block_for_progress(0.9, 1), 0);
+        assert_eq!(block_for_progress(-1.0, 4), 0);
+        assert_eq!(block_for_progress(3.0, 4), 3);
+    }
 
     #[test]
     fn reading_cache_reparses_only_when_the_version_changes() {
