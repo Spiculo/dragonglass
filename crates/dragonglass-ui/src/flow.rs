@@ -494,6 +494,24 @@ impl Element for FlowText {
                     size: local.size,
                 };
                 math_element::set_math_tooltip(window, cx, tex, math_bounds);
+            } else if let Some(piece) = layout.piece_at(
+                self.base,
+                self.len,
+                mouse - bounds.origin,
+                self.content.font_size,
+            ) {
+                let href = match piece {
+                    PlacedPiece::Text {
+                        href: Some(href), ..
+                    }
+                    | PlacedPiece::Image {
+                        href: Some(href), ..
+                    } => Some(href),
+                    _ => None,
+                };
+                if let Some(href) = href {
+                    math_element::set_link_tooltip(window, cx, href, bounds);
+                }
             }
         }
         let hitbox = window.insert_hitbox(bounds, HitboxBehavior::Normal);

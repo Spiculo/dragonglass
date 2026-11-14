@@ -3095,6 +3095,16 @@ impl Element for SelectableText {
     ) -> Hitbox {
         self.text
             .prepaint(id, inspector_id, bounds, state, window, cx);
+        // A resting pointer over a link says where it goes.
+        let mouse = window.mouse_position();
+        if bounds.contains(&mouse) {
+            if let Ok(index) = self.text.layout().index_for_position(mouse) {
+                if let Some((_, href)) = self.links.iter().find(|(range, _)| range.contains(&index))
+                {
+                    crate::math_element::set_link_tooltip(window, cx, href, bounds);
+                }
+            }
+        }
         window.insert_hitbox(bounds, HitboxBehavior::Normal)
     }
 

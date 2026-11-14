@@ -926,8 +926,10 @@ with the desktop through the config; the desktop reading view does not consume i
 feedback, and `tel:`/`file://` link handling; explicit `./` and `../` wikilinks now resolve
 from the current note's folder. Settings has a persisted **Confirm external links** option:
 web, mail and phone links open only after an inline Open/Cancel bar (local files opened by
-the app do not ask). Android keeps its list/preview scroll, loads restored tabs lazily and
-has the shared reader settings. The rest of the list is still open.
+the app do not ask). A resting pointer over a reading-view link shows a tooltip with its
+target (note, heading/block fragment, footnote, tag or URL), for both plain and measured
+(flow) paragraphs. Android keeps its list/preview scroll, loads restored tabs lazily and has
+the shared reader settings. The rest of the list is still open.
 
 ---
 
