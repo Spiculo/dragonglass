@@ -1,13 +1,19 @@
 //! Graph view: paints a link graph with edges, nodes and labels, and opens a note when a
 //! node is clicked.
+//!
+//! The layout is a small live force simulation. Nodes repel each other, edges pull, and a
+//! collision pass keeps the circles apart. The simulation stops when it settles, so an idle
+//! graph does not keep repainting.
 
-use dragonglass_core::graph::{self, Graph};
+use std::collections::{HashMap, HashSet};
+
+use dragonglass_core::graph::{self, Graph, GraphLayout, LayoutParams};
 use gpui::{
-    div, fill, point, prelude::*, px, relative, size, App, Bounds, ContentMask, Context, Element,
-    ElementId, Entity, FocusHandle, Focusable, GlobalElementId, InspectorElementId, LayoutId,
-    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, PathBuilder, Pixels,
-    Point, Render, ScrollDelta, ScrollWheelEvent, ShapedLine, SharedString, Style, TextRun,
-    WeakEntity, Window,
+    div, fill, outline, point, prelude::*, px, relative, size, App, Bounds, ContentMask, Context,
+    Corners, Element, ElementId, Entity, FocusHandle, Focusable, GlobalElementId, Hsla,
+    InspectorElementId, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
+    PathBuilder, Pixels, Point, Render, ScrollDelta, ScrollWheelEvent, ShapedLine, SharedString,
+    Style, TextRun, WeakEntity, Window,
 };
 
 use crate::theme::Theme;
@@ -17,10 +23,21 @@ const CANVAS: (f32, f32) = (1000.0, 600.0);
 /// How many hops of the active note to show.
 const DEPTH: usize = 1;
 const MAX_NODES: usize = 80;
+/// Simulation steps. The UI spends these over frames; the headless wrapper spends them at once.
+const LAYOUT_STEPS: usize = 120;
+const LABEL_SIZE: f32 = 11.0;
+const LABEL_LINE_HEIGHT: f32 = 12.0;
+const LABEL_GAP: f32 = 4.0;
+const LABEL_ZOOM: f32 = 0.7;
+const LABEL_FADE: f32 = 0.35;
+const LABEL_ALPHA_STEPS: u8 = 8;
+const NODE_HIT_PADDING: f32 = 3.0;
+/// Keep at least this much of the graph on screen when the user pans.
+const PAN_MARGIN: f32 = 48.0;
 
 pub struct GraphView {
     graph: Graph,
-    positions: Vec<(f32, f32)>,
+    layout: GraphLayout,
     /// The whole vault graph, before the local window and filter are applied.
     full: Graph,
     focus: Option<String>,
@@ -33,15 +50,41 @@ pub struct GraphView {
     zoom: f32,
     /// Screen-space offset from the fitted layout, in pixels.
     pan: (f32, f32),
-    /// An in-progress drag: start position, starting pan and whether it moved.
-    drag: Option<(Point<Pixels>, (f32, f32), bool)>,
+    /// An in-progress canvas pan: start position, starting pan and whether it moved.
+    drag: Option<PanDrag>,
+    /// An in-progress node drag.
+    node_drag: Option<NodeDrag>,
+    hovered: Option<usize>,
+    frame_scheduled: bool,
+    /// Last positions by vault-relative path, so filters do not make the graph jump.
+    positions: HashMap<String, (f32, f32)>,
+    /// Shaped labels, keyed by name and quantized alpha.
+    label_cache: HashMap<(String, u8), ShapedLine>,
+    label_color: Option<Hsla>,
+}
+
+#[derive(Clone, Copy)]
+struct PanDrag {
+    start: Point<Pixels>,
+    pan: (f32, f32),
+    moved: bool,
+}
+
+#[derive(Clone, Copy)]
+struct NodeDrag {
+    node: usize,
+    start: Point<Pixels>,
+    offset: (f32, f32),
+    moved: bool,
 }
 
 impl GraphView {
     pub fn new(app: WeakEntity<crate::DragonGlassApp>, cx: &mut Context<Self>) -> Self {
+        let empty = Graph::default();
+        let layout = GraphLayout::new(&empty, LayoutParams::new(CANVAS.0, CANVAS.1, LAYOUT_STEPS));
         Self {
-            graph: Graph::default(),
-            positions: Vec::new(),
+            graph: empty,
+            layout,
             full: Graph::default(),
             focus: None,
             filter: String::new(),
@@ -52,13 +95,54 @@ impl GraphView {
             zoom: 1.0,
             pan: (0.0, 0.0),
             drag: None,
+            node_drag: None,
+            hovered: None,
+            frame_scheduled: false,
+            positions: HashMap::new(),
+            label_cache: HashMap::new(),
+            label_color: None,
         }
     }
 
-    /// Replace the displayed graph and recompute the layout.
+    /// Replace the displayed graph and start a new layout from the last positions.
     pub fn set_graph(&mut self, graph: Graph) {
-        self.positions = graph::layout(&graph, CANVAS.0, CANVAS.1, 120);
+        let previous = self.snapshot_positions();
         self.graph = graph;
+
+        let mut layout = GraphLayout::new(
+            &self.graph,
+            LayoutParams::new(CANVAS.0, CANVAS.1, LAYOUT_STEPS),
+        );
+        let mut seeded = 0;
+        for (id, node) in self.graph.nodes.iter().enumerate() {
+            if let Some(position) = previous.get(&node.relative) {
+                layout.set_position(id, *position);
+                seeded += 1;
+            }
+        }
+
+        self.layout = layout;
+        self.positions = previous;
+        self.hovered = None;
+        self.drag = None;
+        self.node_drag = None;
+        self.label_cache.clear();
+        if self.graph.nodes.len() > 1 {
+            // A graph made only of known nodes needs a gentle nudge; a graph with
+            // new nodes starts from the ring and gets the full simulation.
+            self.layout.reheat(if seeded == self.graph.nodes.len() {
+                0.35
+            } else {
+                1.0
+            });
+        }
+    }
+
+    /// Show the whole graph. Filters and depth rebuild from `full`.
+    pub fn show_global(&mut self, full: &Graph) {
+        self.full = full.clone();
+        self.focus = None;
+        self.rebuild();
     }
 
     /// The local graph around a vault-relative note.
@@ -98,8 +182,14 @@ impl GraphView {
         self.set_graph(filtered);
     }
 
-    fn node_radius(links: usize) -> f32 {
-        (5.0 + (links as f32).sqrt() * 2.0).min(16.0)
+    fn snapshot_positions(&self) -> HashMap<String, (f32, f32)> {
+        let mut positions = self.positions.clone();
+        for (id, node) in self.graph.nodes.iter().enumerate() {
+            if let Some(position) = self.layout.positions().get(id) {
+                positions.insert(node.relative.clone(), *position);
+            }
+        }
+        positions
     }
 
     /// The virtual-canvas point under a position local to the graph bounds.
@@ -113,10 +203,76 @@ impl GraphView {
         ))
     }
 
-    fn reset_view(&mut self, cx: &mut Context<Self>) {
+    fn canvas_point(&self, position: Point<Pixels>) -> Option<(f32, f32)> {
+        let bounds = self.last_bounds?;
+        let local = bounds.localize(&position)?;
+        self.scale(local)
+    }
+
+    /// The node under a window position, if any.
+    fn node_at(&self, position: Point<Pixels>) -> Option<usize> {
+        let bounds = self.last_bounds?;
+        let local = bounds.localize(&position)?;
+        let size = (f32::from(bounds.size.width), f32::from(bounds.size.height));
+        let scale = fit_scale(size) * self.zoom;
+        let pointer = (f32::from(local.x), f32::from(local.y));
+
+        let mut best: Option<(usize, f32)> = None;
+        for (id, (x, y)) in self.layout.positions().iter().enumerate() {
+            let Some(node) = self.graph.nodes.get(id) else {
+                continue;
+            };
+            let (sx, sy) = forward_point((*x, *y), size, self.zoom, self.pan);
+            let dx = sx - pointer.0;
+            let dy = sy - pointer.1;
+            let distance = (dx * dx + dy * dy).sqrt();
+            let reach = graph::node_radius(node.links) * scale + NODE_HIT_PADDING;
+            if distance <= reach && best.map(|(_, d)| distance < d).unwrap_or(true) {
+                best = Some((id, distance));
+            }
+        }
+        best.map(|(id, _)| id)
+    }
+
+    fn set_hover(&mut self, hovered: Option<usize>, cx: &mut Context<Self>) {
+        if self.hovered != hovered {
+            self.hovered = hovered;
+            cx.notify();
+        }
+    }
+
+    pub fn reset_view(&mut self, cx: &mut Context<Self>) {
         self.zoom = 1.0;
         self.pan = (0.0, 0.0);
+        self.clamp_pan();
         cx.notify();
+    }
+
+    fn clamp_pan(&mut self) {
+        let Some(bounds) = self.last_bounds else {
+            return;
+        };
+        let size = (f32::from(bounds.size.width), f32::from(bounds.size.height));
+        let scale = fit_scale(size) * self.zoom;
+        let half_width = CANVAS.0 * scale / 2.0;
+        let half_height = CANVAS.1 * scale / 2.0;
+        let margin_x = PAN_MARGIN.min(size.0 / 3.0);
+        let margin_y = PAN_MARGIN.min(size.1 / 3.0);
+
+        let center_x = size.0 / 2.0 + self.pan.0;
+        let center_y = size.1 / 2.0 + self.pan.1;
+        self.pan.0 = clamp_center(
+            center_x,
+            margin_x - half_width,
+            size.0 - margin_x + half_width,
+            size.0 / 2.0,
+        ) - size.0 / 2.0;
+        self.pan.1 = clamp_center(
+            center_y,
+            margin_y - half_height,
+            size.1 - margin_y + half_height,
+            size.1 / 2.0,
+        ) - size.1 / 2.0;
     }
 
     fn zoom_at(&mut self, local: Point<Pixels>, delta_lines: f32, cx: &mut Context<Self>) {
@@ -133,6 +289,7 @@ impl GraphView {
         );
         self.zoom = zoom;
         self.pan = pan;
+        self.clamp_pan();
         cx.notify();
     }
 
@@ -158,24 +315,67 @@ impl GraphView {
     fn on_mouse_move(
         &mut self,
         event: &MouseMoveEvent,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some((start, pan, moved)) = self.drag else {
+        if let Some(drag) = self.node_drag {
+            let dx = f32::from(event.position.x - drag.start.x);
+            let dy = f32::from(event.position.y - drag.start.y);
+            let moved = drag.moved || dx.abs() + dy.abs() > 3.0;
+            if moved {
+                if let Some((x, y)) = self.canvas_point(event.position) {
+                    self.layout
+                        .set_position(drag.node, (x + drag.offset.0, y + drag.offset.1));
+                    self.layout.reheat(0.85);
+                }
+                self.node_drag = Some(NodeDrag {
+                    moved: true,
+                    ..drag
+                });
+                self.schedule_frame(window, cx);
+                cx.notify();
+            }
             return;
-        };
-        let dx = f32::from(event.position.x - start.x);
-        let dy = f32::from(event.position.y - start.y);
-        let moved = moved || dx.abs() + dy.abs() > 3.0;
-        if moved {
-            self.pan = (pan.0 + dx, pan.1 + dy);
-            self.drag = Some((start, pan, true));
-            cx.notify();
         }
+
+        if let Some(PanDrag { start, pan, moved }) = self.drag {
+            let dx = f32::from(event.position.x - start.x);
+            let dy = f32::from(event.position.y - start.y);
+            let moved = moved || dx.abs() + dy.abs() > 3.0;
+            if moved {
+                self.pan = (pan.0 + dx, pan.1 + dy);
+                self.clamp_pan();
+                self.drag = Some(PanDrag {
+                    start,
+                    pan,
+                    moved: true,
+                });
+                cx.notify();
+            }
+            return;
+        }
+
+        let hovered = self.node_at(event.position);
+        self.set_hover(hovered, cx);
     }
 
     fn on_mouse_up(&mut self, event: &MouseUpEvent, window: &mut Window, cx: &mut Context<Self>) {
-        let Some((_, _, moved)) = self.drag.take() else {
+        if let Some(drag) = self.node_drag.take() {
+            if drag.moved {
+                // Keep the node where the user put it until the graph is rebuilt.
+                self.layout.pin(drag.node, true);
+                self.layout.reheat(0.6);
+            } else {
+                // A click that did not move the node should not leave it pinned.
+                self.layout.pin(drag.node, false);
+                self.open_node_at(event.position, window, cx);
+            }
+            self.schedule_frame(window, cx);
+            cx.notify();
+            return;
+        }
+
+        let Some(PanDrag { moved, .. }) = self.drag.take() else {
             return;
         };
         if !moved {
@@ -190,8 +390,36 @@ impl GraphView {
         cx: &mut Context<Self>,
     ) {
         window.focus(&self.focus_handle);
-        // A press starts a possible pan. A click without motion opens the node on release.
-        self.drag = Some((event.position, self.pan, false));
+
+        if let Some(node) = self.node_at(event.position) {
+            let offset = self
+                .canvas_point(event.position)
+                .and_then(|pointer| {
+                    self.layout
+                        .positions()
+                        .get(node)
+                        .map(|position| (position.0 - pointer.0, position.1 - pointer.1))
+                })
+                .unwrap_or((0.0, 0.0));
+            self.node_drag = Some(NodeDrag {
+                node,
+                start: event.position,
+                offset,
+                moved: false,
+            });
+            self.drag = None;
+            self.layout.pin(node, true);
+            self.set_hover(Some(node), cx);
+        } else {
+            // A press on empty space starts a possible pan. A click without motion
+            // opens the node on release.
+            self.drag = Some(PanDrag {
+                start: event.position,
+                pan: self.pan,
+                moved: false,
+            });
+            self.node_drag = None;
+        }
         cx.notify();
     }
 
@@ -201,34 +429,46 @@ impl GraphView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(bounds) = self.last_bounds else {
+        let Some(id) = self.node_at(position) else {
             return;
         };
-        let Some(local) = bounds.localize(&position) else {
-            return;
-        };
-        let Some((x, y)) = self.scale(local) else {
-            return;
-        };
+        let relative = self.graph.nodes[id].relative.clone();
+        let _ = self
+            .app
+            .update(cx, |app, cx| app.open_note(&relative, window, cx));
+        cx.notify();
+    }
 
-        let mut best: Option<(usize, f32)> = None;
-        for (id, (px_, py)) in self.positions.iter().enumerate() {
-            let dx = px_ - x;
-            let dy = py - y;
-            let distance = (dx * dx + dy * dy).sqrt();
-            let reach = Self::node_radius(self.graph.nodes[id].links) + 6.0;
-            if distance <= reach && best.map(|(_, d)| distance < d).unwrap_or(true) {
-                best = Some((id, distance));
+    fn is_visible(&self, cx: &App) -> bool {
+        self.app
+            .upgrade()
+            .is_some_and(|app| app.read(cx).show_graph)
+    }
+
+    fn schedule_frame(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.frame_scheduled || !self.layout.is_active() {
+            return;
+        }
+        self.frame_scheduled = true;
+        cx.on_next_frame(window, |this, window, cx| {
+            this.frame_scheduled = false;
+            if !this.is_visible(cx) {
+                return;
             }
-        }
-
-        if let Some((id, _)) = best {
-            let relative = self.graph.nodes[id].relative.clone();
-            let _ = self
-                .app
-                .update(cx, |app, cx| app.open_note(&relative, window, cx));
+            let active = this.layout.step(&this.graph, 1.0 / 60.0);
+            if active {
+                this.schedule_frame(window, cx);
+            }
             cx.notify();
-        }
+        });
+    }
+}
+
+fn clamp_center(value: f32, low: f32, high: f32, fallback: f32) -> f32 {
+    if low <= high {
+        value.clamp(low, high)
+    } else {
+        fallback
     }
 }
 
@@ -239,10 +479,12 @@ impl Focusable for GraphView {
 }
 
 impl Render for GraphView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = *cx.global::<Theme>();
         let count = self.graph.nodes.len();
         let edges = self.graph.edges.len();
+
+        self.schedule_frame(window, cx);
 
         div()
             .key_context("Graph")
@@ -266,7 +508,7 @@ impl Render for GraphView {
                         "graph: {count} notes / {edges} links · depth {}",
                         self.depth
                     ))
-                    .child("drag to pan · scroll to zoom · click a node to open · Esc to close")
+                    .child("drag nodes or canvas · scroll to zoom · click a node to open · Esc to close")
                     .child(
                         div()
                             .id("graph-reset")
@@ -286,9 +528,15 @@ impl Render for GraphView {
             )
             .child(
                 div()
+                    .id("graph-canvas")
                     .flex_1()
                     .min_h(px(0.0))
                     .overflow_hidden()
+                    .on_hover(cx.listener(|this, hovered: &bool, _window, cx| {
+                        if !*hovered {
+                            this.set_hover(None, cx);
+                        }
+                    }))
                     .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
                     .on_mouse_move(cx.listener(Self::on_mouse_move))
                     .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
@@ -351,8 +599,137 @@ fn folder_color(folder: &str, dark: bool) -> gpui::Hsla {
     gpui::hsla(hue, 0.55, if dark { 0.62 } else { 0.45 }, 1.0)
 }
 
+fn display_name(relative: &str) -> String {
+    relative
+        .rsplit('/')
+        .next()
+        .unwrap_or(relative)
+        .trim_end_matches(".md")
+        .to_string()
+}
+
+#[derive(Clone, Debug)]
+struct LabelCandidate {
+    node: usize,
+    width: f32,
+    height: f32,
+    center: (f32, f32),
+    radius: f32,
+    priority: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct LabelPlacement {
+    node: usize,
+    x: f32,
+    y: f32,
+}
+
+fn place_labels(candidates: &[LabelCandidate], viewport: (f32, f32)) -> Vec<LabelPlacement> {
+    let mut order: Vec<usize> = (0..candidates.len()).collect();
+    order.sort_by(|a, b| {
+        let a = &candidates[*a];
+        let b = &candidates[*b];
+        b.priority
+            .cmp(&a.priority)
+            .then_with(|| {
+                let da = distance_to_center(a, viewport);
+                let db = distance_to_center(b, viewport);
+                da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .then_with(|| a.node.cmp(&b.node))
+    });
+
+    let mut occupied: Vec<(f32, f32, f32, f32)> = candidates
+        .iter()
+        .map(|candidate| {
+            (
+                candidate.center.0 - candidate.radius,
+                candidate.center.1 - candidate.radius,
+                candidate.radius * 2.0,
+                candidate.radius * 2.0,
+            )
+        })
+        .collect();
+    let mut placed = Vec::new();
+
+    for index in order {
+        let candidate = &candidates[index];
+        let offsets = [
+            (
+                candidate.center.0 + candidate.radius + LABEL_GAP,
+                candidate.center.1 - candidate.height / 2.0,
+            ),
+            (
+                candidate.center.0 - candidate.radius - LABEL_GAP - candidate.width,
+                candidate.center.1 - candidate.height / 2.0,
+            ),
+            (
+                candidate.center.0 - candidate.width / 2.0,
+                candidate.center.1 + candidate.radius + LABEL_GAP,
+            ),
+            (
+                candidate.center.0 - candidate.width / 2.0,
+                candidate.center.1 - candidate.radius - LABEL_GAP - candidate.height,
+            ),
+        ];
+
+        for (x, y) in offsets {
+            if x < 0.0
+                || y < 0.0
+                || x + candidate.width > viewport.0
+                || y + candidate.height > viewport.1
+            {
+                continue;
+            }
+            let rect = (x, y, candidate.width, candidate.height);
+            if occupied
+                .iter()
+                .any(|occupied| rects_intersect(rect, *occupied))
+            {
+                continue;
+            }
+            occupied.push(rect);
+            placed.push(LabelPlacement {
+                node: candidate.node,
+                x,
+                y,
+            });
+            break;
+        }
+    }
+
+    placed
+}
+
+fn distance_to_center(candidate: &LabelCandidate, viewport: (f32, f32)) -> f32 {
+    let dx = candidate.center.0 - viewport.0 / 2.0;
+    let dy = candidate.center.1 - viewport.1 / 2.0;
+    dx * dx + dy * dy
+}
+
+fn rects_intersect(a: (f32, f32, f32, f32), b: (f32, f32, f32, f32)) -> bool {
+    const PAD: f32 = 2.0;
+    a.0 < b.0 + b.2 + PAD && b.0 < a.0 + a.2 + PAD && a.1 < b.1 + b.3 + PAD && b.1 < a.1 + a.3 + PAD
+}
+
 struct GraphCanvas {
     view: Entity<GraphView>,
+}
+
+struct GraphPrepaint {
+    graph: Graph,
+    centers: Vec<Point<Pixels>>,
+    radii: Vec<f32>,
+    labels: Vec<PaintedLabel>,
+    hovered: Option<usize>,
+    highlight: HashSet<usize>,
+    focus: Option<usize>,
+}
+
+struct PaintedLabel {
+    line: ShapedLine,
+    origin: Point<Pixels>,
 }
 
 impl IntoElement for GraphCanvas {
@@ -365,7 +742,7 @@ impl IntoElement for GraphCanvas {
 
 impl Element for GraphCanvas {
     type RequestLayoutState = ();
-    type PrepaintState = ();
+    type PrepaintState = GraphPrepaint;
 
     fn id(&self) -> Option<ElementId> {
         None
@@ -392,11 +769,200 @@ impl Element for GraphCanvas {
         &mut self,
         _id: Option<&GlobalElementId>,
         _inspector_id: Option<&InspectorElementId>,
-        _bounds: Bounds<Pixels>,
+        bounds: Bounds<Pixels>,
         _state: &mut (),
-        _window: &mut Window,
-        _cx: &mut App,
-    ) {
+        window: &mut Window,
+        cx: &mut App,
+    ) -> GraphPrepaint {
+        self.view.update(cx, |view, _| {
+            view.last_bounds = Some(bounds);
+            view.clamp_pan();
+        });
+
+        let theme = *cx.global::<Theme>();
+        let (graph, positions, zoom, pan, hovered, focus) = {
+            let view = self.view.read(cx);
+            (
+                view.graph.clone(),
+                view.layout.positions().to_vec(),
+                view.zoom,
+                view.pan,
+                view.hovered,
+                view.focus.clone(),
+            )
+        };
+
+        let size = (f32::from(bounds.size.width), f32::from(bounds.size.height));
+        let scale = fit_scale(size) * zoom;
+        let centers: Vec<Point<Pixels>> = positions
+            .iter()
+            .map(|(x, y)| {
+                let (x, y) = forward_point((*x, *y), size, zoom, pan);
+                point(bounds.left() + px(x), bounds.top() + px(y))
+            })
+            .collect();
+        let radii: Vec<f32> = graph
+            .nodes
+            .iter()
+            .map(|node| graph::node_radius(node.links) * scale)
+            .collect();
+        let focus = focus
+            .as_deref()
+            .and_then(|relative| graph.index_of(relative));
+
+        let highlight: HashSet<usize> = hovered
+            .map(|node| {
+                let mut set = HashSet::from([node]);
+                set.extend(graph.neighbors(node));
+                set
+            })
+            .unwrap_or_default();
+
+        // Collect labels that are visible. Names fade in with zoom; hovering a node
+        // always reveals its own label and the labels of its neighbors.
+        let mut candidates = Vec::new();
+        for (id, node) in graph.nodes.iter().enumerate() {
+            let Some(center) = centers.get(id).copied() else {
+                continue;
+            };
+            let radius = radii.get(id).copied().unwrap_or(0.0);
+            let local_center = (
+                f32::from(center.x - bounds.left()),
+                f32::from(center.y - bounds.top()),
+            );
+            if local_center.0 + radius < 0.0
+                || local_center.1 + radius < 0.0
+                || local_center.0 - radius > size.0
+                || local_center.1 - radius > size.1
+            {
+                continue;
+            }
+
+            let active = hovered == Some(id) || highlight.contains(&id);
+            let alpha = if active {
+                1.0
+            } else {
+                ((zoom - LABEL_ZOOM) / LABEL_FADE).clamp(0.0, 1.0)
+            };
+            if alpha <= 0.0 {
+                continue;
+            }
+
+            candidates.push(LabelCandidate {
+                node: id,
+                width: 0.0,
+                height: LABEL_LINE_HEIGHT,
+                center: local_center,
+                radius,
+                priority: if hovered == Some(id) {
+                    1_000_000
+                } else if highlight.contains(&id) {
+                    500_000
+                } else {
+                    0
+                } + node.links,
+            });
+        }
+
+        // Shape each visible name once per alpha bucket. The colour is baked into
+        // the shaped line, so the cache is keyed by the text and alpha bucket.
+        self.view.update(cx, |view, _| {
+            if view.label_color != Some(theme.text_dim) {
+                view.label_cache.clear();
+                view.label_color = Some(theme.text_dim);
+            }
+        });
+
+        let keys: Vec<(String, u8)> = candidates
+            .iter()
+            .map(|candidate| {
+                let name = display_name(&graph.nodes[candidate.node].relative);
+                let alpha =
+                    if hovered == Some(candidate.node) || highlight.contains(&candidate.node) {
+                        1.0
+                    } else {
+                        ((zoom - LABEL_ZOOM) / LABEL_FADE).clamp(0.0, 1.0)
+                    };
+                // A visible label must not round down to a zero-alpha cache entry.
+                (
+                    name,
+                    (alpha * f32::from(LABEL_ALPHA_STEPS)).round().max(1.0) as u8,
+                )
+            })
+            .collect();
+
+        let cached: Vec<Option<ShapedLine>> = {
+            let view = self.view.read(cx);
+            keys.iter()
+                .map(|key| view.label_cache.get(key).cloned())
+                .collect()
+        };
+
+        let text_style = window.text_style();
+        let font = text_style.font();
+        let mut lines = Vec::with_capacity(candidates.len());
+        let mut new_entries = Vec::new();
+        for (index, candidate) in candidates.iter_mut().enumerate() {
+            let key = keys[index].clone();
+            let alpha = (f32::from(key.1) / f32::from(LABEL_ALPHA_STEPS)).clamp(0.0, 1.0);
+            let line = if let Some(line) = cached[index].clone() {
+                line
+            } else {
+                let name = &key.0;
+                let run = TextRun {
+                    len: name.len(),
+                    font: font.clone(),
+                    color: theme.text_dim.opacity(alpha),
+                    background_color: None,
+                    underline: None,
+                    strikethrough: None,
+                };
+                let line = window.text_system().shape_line(
+                    SharedString::from(name.clone()),
+                    px(LABEL_SIZE),
+                    &[run],
+                    None,
+                );
+                new_entries.push((key, line.clone()));
+                line
+            };
+            candidate.width = f32::from(line.width);
+            lines.push(line);
+        }
+        if !new_entries.is_empty() {
+            self.view.update(cx, |view, _| {
+                for (key, line) in new_entries {
+                    view.label_cache.insert(key, line);
+                }
+            });
+        }
+
+        let placements = place_labels(&candidates, size);
+        let labels = placements
+            .into_iter()
+            .filter_map(|placement| {
+                let index = candidates
+                    .iter()
+                    .position(|candidate| candidate.node == placement.node)?;
+                Some(PaintedLabel {
+                    line: lines.get(index)?.clone(),
+                    origin: point(
+                        bounds.left() + px(placement.x),
+                        bounds.top() + px(placement.y),
+                    ),
+                })
+            })
+            .collect();
+
+        GraphPrepaint {
+            graph,
+            centers,
+            radii,
+            labels,
+            hovered,
+            highlight,
+            focus,
+        }
     }
 
     fn paint(
@@ -405,139 +971,172 @@ impl Element for GraphCanvas {
         _inspector_id: Option<&InspectorElementId>,
         bounds: Bounds<Pixels>,
         _state: &mut (),
-        _prepaint: &mut (),
+        prepaint: &mut GraphPrepaint,
         window: &mut Window,
         cx: &mut App,
     ) {
         // This is a custom element, so it must clip itself. Without this mask,
         // pan and zoom can paint nodes and labels over the sidebar and panels.
         window.with_content_mask(Some(ContentMask { bounds }), |window| {
-        let theme = *cx.global::<Theme>();
-        let (nw, nh) = (f32::from(bounds.size.width), f32::from(bounds.size.height));
+            let theme = *cx.global::<Theme>();
+            let graph = &prepaint.graph;
+            let centers = &prepaint.centers;
+            let radii = &prepaint.radii;
+            let hovered = prepaint.hovered;
 
-        let (graph_edges, graph_nodes, positions) = {
-            let view = self.view.read(cx);
-            (
-                view.graph.edges.clone(),
-                view.graph.nodes.clone(),
-                view.positions.clone(),
-            )
-        };
-        let canvas_position = |id: usize| positions.get(id).copied().unwrap_or((0.0, 0.0));
-        let (zoom, pan) = {
-            let view = self.view.read(cx);
-            (view.zoom, view.pan)
-        };
-        let _ = (nw, nh);
-        let to_screen = |px_: f32, py: f32| {
-            let (x, y) = forward_point((px_, py), (nw, nh), zoom, pan);
-            point(bounds.left() + px(x), bounds.top() + px(y))
-        };
+            // Edges first, so nodes sit on top. Plain links are solid; frontmatter
+            // relations are dashed and tinted, so the relation graph reads differently.
+            if let Some(hovered) = hovered {
+                let mut dim_links = PathBuilder::stroke(px(1.0));
+                let mut dim_relations =
+                    PathBuilder::stroke(px(1.0)).dash_array(&[px(4.0), px(3.0)]);
+                let mut hi_links = PathBuilder::stroke(px(1.5));
+                let mut hi_relations = PathBuilder::stroke(px(1.5)).dash_array(&[px(4.0), px(3.0)]);
+                let mut drew_dim_links = false;
+                let mut drew_dim_relations = false;
+                let mut drew_hi_links = false;
+                let mut drew_hi_relations = false;
 
-        // Edges first, so nodes sit on top. Plain links are solid; frontmatter relations are
-        // dashed and tinted, so the relation graph reads differently from the link graph.
-        let mut links = PathBuilder::stroke(px(1.0));
-        let mut relations = PathBuilder::stroke(px(1.0)).dash_array(&[px(4.0), px(3.0)]);
-        let mut drew_link = false;
-        let mut drew_relation = false;
-        for edge in &graph_edges {
-            let (ax, ay) = canvas_position(edge.from);
-            let (bx, by) = canvas_position(edge.to);
-            let a = to_screen(ax, ay);
-            let b = to_screen(bx, by);
+                for edge in &graph.edges {
+                    let Some(a) = centers.get(edge.from) else {
+                        continue;
+                    };
+                    let Some(b) = centers.get(edge.to) else {
+                        continue;
+                    };
+                    let incident = edge.from == hovered || edge.to == hovered;
+                    let (path, drew) = match (edge.is_relation(), incident) {
+                        (false, true) => (&mut hi_links, &mut drew_hi_links),
+                        (true, true) => (&mut hi_relations, &mut drew_hi_relations),
+                        (false, false) => (&mut dim_links, &mut drew_dim_links),
+                        (true, false) => (&mut dim_relations, &mut drew_dim_relations),
+                    };
+                    if !*drew {
+                        path.move_to(*a);
+                        *drew = true;
+                    } else {
+                        path.line_to(*a);
+                    }
+                    path.line_to(*b);
+                }
 
-            let (path, drew) = if edge.is_relation() {
-                (&mut relations, &mut drew_relation)
+                paint_paths(
+                    window,
+                    dim_links,
+                    drew_dim_links,
+                    theme.border.opacity(0.25),
+                );
+                paint_paths(
+                    window,
+                    dim_relations,
+                    drew_dim_relations,
+                    theme.accent_text.opacity(0.25),
+                );
+                paint_paths(window, hi_links, drew_hi_links, theme.text);
+                paint_paths(window, hi_relations, drew_hi_relations, theme.accent_text);
             } else {
-                (&mut links, &mut drew_link)
-            };
-            if !*drew {
-                path.move_to(a);
-                *drew = true;
-            } else {
-                path.line_to(a);
+                let mut links = PathBuilder::stroke(px(1.0));
+                let mut relations = PathBuilder::stroke(px(1.0)).dash_array(&[px(4.0), px(3.0)]);
+                let mut drew_link = false;
+                let mut drew_relation = false;
+                for edge in &graph.edges {
+                    let Some(a) = centers.get(edge.from) else {
+                        continue;
+                    };
+                    let Some(b) = centers.get(edge.to) else {
+                        continue;
+                    };
+                    let (path, drew) = if edge.is_relation() {
+                        (&mut relations, &mut drew_relation)
+                    } else {
+                        (&mut links, &mut drew_link)
+                    };
+                    if !*drew {
+                        path.move_to(*a);
+                        *drew = true;
+                    } else {
+                        path.line_to(*a);
+                    }
+                    path.line_to(*b);
+                }
+                paint_paths(window, links, drew_link, theme.border);
+                paint_paths(window, relations, drew_relation, theme.accent_text);
             }
-            path.line_to(b);
-        }
-        if drew_link {
-            if let Ok(path) = links.build() {
-                window.paint_path(path, theme.border);
+
+            // Nodes.
+            for (id, node) in graph.nodes.iter().enumerate() {
+                let Some(center) = centers.get(id).copied() else {
+                    continue;
+                };
+                let radius = radii.get(id).copied().unwrap_or(0.0);
+                let mut color = if prepaint.focus == Some(id) {
+                    theme.accent
+                } else {
+                    folder_color(graph::folder_of(&node.relative), theme.dark)
+                };
+                if hovered.is_some() && !prepaint.highlight.contains(&id) {
+                    color = color.opacity(0.3);
+                }
+
+                if hovered == Some(id) {
+                    window.paint_quad(
+                        fill(
+                            Bounds::new(
+                                point(center.x - px(radius + 5.0), center.y - px(radius + 5.0)),
+                                size(px(radius * 2.0 + 10.0), px(radius * 2.0 + 10.0)),
+                            ),
+                            theme.text.opacity(0.18),
+                        )
+                        .corner_radii(Corners::all(px(radius + 5.0))),
+                    );
+                }
+
+                window.paint_quad(
+                    fill(
+                        Bounds::new(
+                            point(center.x - px(radius), center.y - px(radius)),
+                            size(px(radius * 2.0), px(radius * 2.0)),
+                        ),
+                        color,
+                    )
+                    .corner_radii(Corners::all(px(radius))),
+                );
+
+                if hovered == Some(id) {
+                    window.paint_quad(
+                        outline(
+                            Bounds::new(
+                                point(center.x - px(radius + 1.5), center.y - px(radius + 1.5)),
+                                size(px(radius * 2.0 + 3.0), px(radius * 2.0 + 3.0)),
+                            ),
+                            theme.text,
+                            gpui::BorderStyle::default(),
+                        )
+                        .corner_radii(Corners::all(px(radius + 1.5))),
+                    );
+                }
             }
-        }
-        if drew_relation {
-            if let Ok(path) = relations.build() {
-                window.paint_path(path, theme.accent_text);
+
+            // Labels last, so they stay readable over edges and circles.
+            for label in &prepaint.labels {
+                let _ = label
+                    .line
+                    .paint(label.origin, px(LABEL_LINE_HEIGHT), window, cx);
             }
-        }
-
-        // Nodes.
-        let mut node_quads: Vec<PaintQuad> = Vec::new();
-        for (id, node) in graph_nodes.iter().enumerate() {
-            let (px_, py) = canvas_position(id);
-            let center = to_screen(px_, py);
-            let radius = GraphView::node_radius(node.links);
-            let folder = graph::folder_of(&node.relative);
-            let color = if id == 0 {
-                theme.accent
-            } else {
-                folder_color(folder, theme.dark)
-            };
-            node_quads.push(fill(
-                Bounds::new(
-                    point(center.x - px(radius), center.y - px(radius)),
-                    size(px(radius * 2.0), px(radius * 2.0)),
-                ),
-                color,
-            ));
-        }
-        for quad in node_quads {
-            window.paint_quad(quad);
-        }
-
-        // Labels.
-        let text_style = window.text_style();
-        let font = text_style.font();
-        let line_height = px(12.0);
-        let mut labels: Vec<ShapedLine> = Vec::new();
-        let mut label_origins: Vec<Point<Pixels>> = Vec::new();
-        for (id, node) in graph_nodes.iter().take(60).enumerate() {
-            let (px_, py) = canvas_position(id);
-            let center = to_screen(px_, py);
-            let radius = GraphView::node_radius(node.links);
-            let name = node
-                .relative
-                .rsplit('/')
-                .next()
-                .unwrap_or(&node.relative)
-                .trim_end_matches(".md")
-                .to_string();
-
-            let run = TextRun {
-                len: name.len(),
-                font: font.clone(),
-                color: theme.text_dim,
-                background_color: None,
-                underline: None,
-                strikethrough: None,
-            };
-            let shaped =
-                window
-                    .text_system()
-                    .shape_line(SharedString::from(name), px(11.0), &[run], None);
-            labels.push(shaped);
-            label_origins.push(point(
-                center.x + px(radius + 3.0),
-                center.y - line_height / 2.0,
-            ));
-        }
-        for (line, origin) in labels.iter().zip(label_origins) {
-            let _ = line.paint(origin, line_height, window, cx);
-        }
-
-        self.view.update(cx, |view, _cx| {
-            view.last_bounds = Some(bounds);
         });
-        });
+    }
+}
+
+fn paint_paths(
+    window: &mut Window,
+    path: PathBuilder,
+    has_path: bool,
+    color: impl Into<gpui::Background>,
+) {
+    if has_path {
+        if let Ok(path) = path.build() {
+            window.paint_path(path, color);
+        }
     }
 }
 
@@ -576,5 +1175,60 @@ mod tests {
         // A tall window letterboxes instead of stretching the graph.
         let scale = fit_scale((400.0, 900.0));
         assert!((scale - 0.4).abs() < 0.001);
+    }
+
+    fn candidate(node: usize, center: (f32, f32), radius: f32, priority: usize) -> LabelCandidate {
+        LabelCandidate {
+            node,
+            width: 60.0,
+            height: LABEL_LINE_HEIGHT,
+            center,
+            radius,
+            priority,
+        }
+    }
+
+    #[test]
+    fn labels_do_not_overlap_nodes_or_each_other() {
+        let candidates = vec![
+            candidate(0, (100.0, 100.0), 10.0, 10),
+            candidate(1, (120.0, 100.0), 10.0, 9),
+            candidate(2, (500.0, 300.0), 12.0, 8),
+        ];
+        let placed = place_labels(&candidates, (800.0, 600.0));
+        assert!(!placed.is_empty());
+        for (index, placement) in placed.iter().enumerate() {
+            let rect = (placement.x, placement.y, 60.0, LABEL_LINE_HEIGHT);
+            assert!(rect.0 >= 0.0 && rect.1 >= 0.0);
+            assert!(rect.0 + rect.2 <= 800.0);
+            assert!(rect.1 + rect.3 <= 600.0);
+            for other in placed.iter().skip(index + 1) {
+                let other_rect = (other.x, other.y, 60.0, LABEL_LINE_HEIGHT);
+                assert!(!rects_intersect(rect, other_rect));
+            }
+        }
+    }
+
+    #[test]
+    fn labels_are_hidden_when_the_pane_is_full() {
+        let candidates = vec![candidate(0, (40.0, 40.0), 10.0, 1)];
+        let placed = place_labels(&candidates, (40.0, 40.0));
+        assert!(placed.is_empty());
+    }
+
+    #[test]
+    fn labels_are_placed_in_priority_order() {
+        let candidates = vec![
+            candidate(0, (100.0, 100.0), 10.0, 1),
+            candidate(1, (105.0, 100.0), 10.0, 100),
+        ];
+        let placed = place_labels(&candidates, (800.0, 600.0));
+        assert_eq!(placed.first().map(|placement| placement.node), Some(1));
+    }
+
+    #[test]
+    fn pan_clamping_keeps_a_fallback_for_tiny_windows() {
+        assert_eq!(clamp_center(50.0, 100.0, 10.0, 30.0), 30.0);
+        assert_eq!(clamp_center(50.0, 10.0, 100.0, 30.0), 50.0);
     }
 }

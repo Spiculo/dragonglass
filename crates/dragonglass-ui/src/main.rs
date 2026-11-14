@@ -3035,9 +3035,9 @@ impl DragonGlassApp {
         view.update(cx, |graph_view, cx| {
             match &active {
                 Some(relative) => graph_view.show_local(&full, relative),
-                None => graph_view.set_graph(full.clone()),
+                None => graph_view.show_global(&full),
             }
-            cx.notify();
+            graph_view.reset_view(cx);
         });
 
         self.show_graph = true;
@@ -3064,8 +3064,8 @@ impl DragonGlassApp {
         };
         let enriched = relations::graph(&self.note_refs);
         view.update(cx, |view, cx| {
-            view.set_graph(enriched.clone());
-            cx.notify();
+            view.show_global(&enriched);
+            view.reset_view(cx);
         });
         self.show_graph = true;
         self.show_query = false;
