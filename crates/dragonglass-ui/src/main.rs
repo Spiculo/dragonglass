@@ -72,6 +72,24 @@ const HOTKEYS: &[(&str, &str, &str)] = &[
     ("PrevTab", "ctrl-shift-tab", "Previous tab"),
 ];
 
+/// Links that leave the app: web, mail, phone and local files.
+fn is_external_target(target: &str) -> bool {
+    target.starts_with("http://")
+        || target.starts_with("https://")
+        || target.starts_with("mailto:")
+        || target.starts_with("tel:")
+        || target.starts_with("file://")
+}
+
+/// Links where leaving the app deserves a confirmation (web, mail, phone). Local files
+/// opened by the app itself do not ask.
+fn needs_link_confirmation(target: &str) -> bool {
+    target.starts_with("http://")
+        || target.starts_with("https://")
+        || target.starts_with("mailto:")
+        || target.starts_with("tel:")
+}
+
 /// Resolve `./` and `../` in an explicit relative link against the folder of the note that
 /// contains it. Other targets are returned unchanged and keep the global resolver rules.
 fn relative_link_target(target: &str, base_dir: Option<&str>) -> String {
@@ -745,6 +763,8 @@ struct DragonGlassApp {
     /// Scroll fractions seen on each side, so a sync only reacts to real movement.
     last_editor_progress: f32,
     last_preview_progress: f32,
+    /// A link waiting for the user to confirm opening it.
+    pending_url: Option<String>,
     /// Scroll position of the outline panel, so the active heading stays visible.
     outline_scroll: UniformListScrollHandle,
     /// The heading the outline last scrolled to.
@@ -770,13 +790,14 @@ impl DragonGlassApp {
                 return;
             }
         }
-        if target.starts_with("http://")
-            || target.starts_with("https://")
-            || target.starts_with("mailto:")
-            || target.starts_with("tel:")
-            || target.starts_with("file://")
-        {
-            cx.open_url(target);
+        if is_external_target(target) {
+            if needs_link_confirmation(target) && self.config.confirm_external_links {
+                self.pending_url = Some(target.to_string());
+                self.set_status(StatusKind::Info, format!("confirm opening {target}"));
+                cx.notify();
+            } else {
+                cx.open_url(target);
+            }
             return;
         }
 
@@ -3456,6 +3477,11 @@ impl DragonGlassApp {
         }
 
         // Menus and popups close before the panels they belong to.
+        if self.pending_url.take().is_some() {
+            cx.notify();
+            return;
+        }
+
         if self.tab_menu.is_some() {
             self.tab_menu = None;
             cx.notify();
@@ -4311,6 +4337,7 @@ impl DragonGlassApp {
                 scroll_sync_generation: 0,
                 last_editor_progress: -1.0,
                 last_preview_progress: -1.0,
+                pending_url: None,
                 outline_scroll: UniformListScrollHandle::new(),
                 outline_current: None,
                 conflict: false,
@@ -4600,6 +4627,24 @@ impl DragonGlassApp {
         cx.notify();
     }
 
+    /// Ask before opening web, mail and phone links, or stop asking.
+    fn toggle_confirm_links(&mut self, cx: &mut Context<Self>) {
+        self.config.confirm_external_links = !self.config.confirm_external_links;
+        let message = match config::save(&self.vault_root, &self.config) {
+            Ok(()) => format!(
+                "confirm external links: {}",
+                if self.config.confirm_external_links {
+                    "on"
+                } else {
+                    "off"
+                }
+            ),
+            Err(error) => format!("setting changed (not saved: {error})"),
+        };
+        self.set_status(StatusKind::Info, message);
+        cx.notify();
+    }
+
     /// Follow the editor's scroll position in the split preview, or stop following.
     fn toggle_scroll_sync(&mut self, cx: &mut Context<Self>) {
         self.config.scroll_sync = !self.config.scroll_sync;
@@ -4878,6 +4923,7 @@ impl DragonGlassApp {
             "reader-line" => self.cycle_reader_line_height(cx),
             "reader-font" => self.cycle_reader_font(cx),
             "scroll-sync" => self.toggle_scroll_sync(cx),
+            "confirm-links" => self.toggle_confirm_links(cx),
             "sidebar" => self.toggle_panel("sidebar", cx),
             "outline" => self.toggle_panel("outline", cx),
             "relations" => self.toggle_panel("relations", cx),
@@ -7804,6 +7850,59 @@ impl Render for DragonGlassApp {
                 ))
         });
 
+        let external_bar = self.pending_url.clone().map(|url| {
+            let button = |id: &'static str, label: &'static str| {
+                div()
+                    .id(id)
+                    .px_2()
+                    .py_1()
+                    .rounded_md()
+                    .bg(theme.chip)
+                    .text_xs()
+                    .text_color(theme.text)
+                    .cursor_pointer()
+                    .hover(move |style| style.bg(theme.hover))
+                    .child(label)
+            };
+            div()
+                .id("external-link-bar")
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_2()
+                .h(px(36.0))
+                .px_3()
+                .flex_shrink_0()
+                .bg(theme.panel)
+                .border_b_1()
+                .border_color(theme.accent)
+                .text_sm()
+                .child(div().text_color(theme.text).child("Open external link?"))
+                .child(
+                    div()
+                        .max_w(px(560.0))
+                        .overflow_hidden()
+                        .text_color(theme.muted)
+                        .child(url.clone()),
+                )
+                .child(button("external-open", "Open").on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _event, _window, cx| {
+                        if let Some(url) = this.pending_url.take() {
+                            cx.open_url(&url);
+                        }
+                        cx.notify();
+                    }),
+                ))
+                .child(button("external-cancel", "Cancel").on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _event, _window, cx| {
+                        this.pending_url = None;
+                        cx.notify();
+                    }),
+                ))
+        });
+
         let tab_bar = div()
             .id("tab-bar")
             .on_drop::<TabDrag>(cx.listener(Self::drop_on_tab_bar))
@@ -8127,6 +8226,7 @@ impl Render for DragonGlassApp {
             .children(quit_bar)
             .children(conflict_bar)
             .children(draft_bar)
+            .children(external_bar)
             .when(!self.zen, |d| d.child(tab_bar))
             .child(
                 div()
@@ -8784,6 +8884,7 @@ fn open_vault_window(vault_path: PathBuf, uri_note: Option<String>, cx: &mut App
             scroll_sync_generation: 0,
             last_editor_progress: -1.0,
             last_preview_progress: -1.0,
+            pending_url: None,
             outline_scroll: UniformListScrollHandle::new(),
             outline_current: None,
             conflict: false,
@@ -8865,6 +8966,22 @@ fn open_vault_window(vault_path: PathBuf, uri_note: Option<String>, cx: &mut App
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn external_link_confirmation_only_covers_leaving_the_app() {
+        assert!(is_external_target("https://example.com"));
+        assert!(is_external_target("mailto:someone@example.com"));
+        assert!(is_external_target("tel:+123"));
+        assert!(is_external_target("file:///tmp/note.pdf"));
+        assert!(!is_external_target("Notes/Page"));
+        assert!(!is_external_target("#heading"));
+
+        assert!(needs_link_confirmation("https://example.com"));
+        assert!(needs_link_confirmation("mailto:someone@example.com"));
+        assert!(needs_link_confirmation("tel:+123"));
+        // Opening a local attachment does not need a prompt.
+        assert!(!needs_link_confirmation("file:///tmp/note.pdf"));
+    }
 
     #[test]
     fn relative_links_resolve_from_the_note_folder() {

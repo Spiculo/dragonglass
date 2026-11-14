@@ -39,6 +39,8 @@ pub struct Config {
     pub show_relations: bool,
     /// Keep the split preview at the editor's scroll position.
     pub scroll_sync: bool,
+    /// Ask before opening a web, mail or phone link.
+    pub confirm_external_links: bool,
 }
 
 impl Default for Config {
@@ -62,6 +64,7 @@ impl Default for Config {
             show_outline: true,
             show_relations: false,
             scroll_sync: false,
+            confirm_external_links: false,
         }
     }
 }
@@ -89,6 +92,10 @@ impl Config {
         out.push_str(&format!("show_outline={}\n", self.show_outline));
         out.push_str(&format!("show_relations={}\n", self.show_relations));
         out.push_str(&format!("scroll_sync={}\n", self.scroll_sync));
+        out.push_str(&format!(
+            "confirm_external_links={}\n",
+            self.confirm_external_links
+        ));
         out
     }
 
@@ -160,6 +167,10 @@ impl Config {
                     config.scroll_sync =
                         matches!(value.to_lowercase().as_str(), "true" | "1" | "yes")
                 }
+                "confirm_external_links" => {
+                    config.confirm_external_links =
+                        matches!(value.to_lowercase().as_str(), "true" | "1" | "yes")
+                }
                 "reader_font" => {
                     let font = value.to_lowercase();
                     config.reader_font = match font.as_str() {
@@ -226,6 +237,18 @@ mod tests {
         assert!(!loaded.show_sidebar);
         assert!(!loaded.show_outline);
         assert!(loaded.show_relations);
+    }
+
+    #[test]
+    fn external_link_confirmation_roundtrips() {
+        assert!(!Config::default().confirm_external_links);
+        let config = Config {
+            confirm_external_links: true,
+            ..Config::default()
+        };
+        assert!(Config::from_text(&config.to_text()).confirm_external_links);
+        assert!(Config::from_text("confirm_external_links=yes").confirm_external_links);
+        assert!(!Config::from_text("confirm_external_links=0").confirm_external_links);
     }
 
     #[test]
