@@ -787,12 +787,12 @@ value" bar that clears); a relation resolves its target through the engine's not
 Report file/byte progress, allow cancel, and keep the UI responsive for large vaults.
 **Done when:** importing 10k files shows progress and can be cancelled without corruption.
 
-**Landed:** the import and export copy loops report a running file count and check a cancel
-flag between files. The note list shows a progress bar with the count and a Cancel button;
-cancelling reports "Import/Export cancelled", and a cancelled import deletes the partial
-local copy so no half-vault is left behind (an export may leave the files already written in
-the chosen folder).
-**Remaining:** byte-level progress, and cancelling a cancelled `sync`/`pushAll` mid-run.
+**Landed:** the copy loops report a running file count and byte total and check a cancel flag
+between files. The note list shows a progress bar with the count and size and a Cancel button;
+cancelling reports "Import/Export/Sync cancelled", and a cancelled import deletes the partial
+local copy so no half-vault is left behind (an export or sync may leave the files already
+written in the chosen folder). Folder `sync` and `pushAll` take the same progress and cancel
+callbacks, and the sync sheet's folder path shows the same bar.
 
 #### Q4.7 Preview typography and theme — A · S
 Use the shared reader settings for size/width/theme; support pinch-zoom; avoid reloading

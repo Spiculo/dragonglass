@@ -421,7 +421,7 @@ private fun NotesScreen(
                 ) {
                     LinearProgressIndicator(modifier = Modifier.weight(1f))
                     Text(
-                        text = "${vm.transferLabel} $progress",
+                        text = "${vm.transferLabel} $progress files · ${formatBytes(vm.transferBytes)}",
                         modifier = Modifier.padding(horizontal = 8.dp),
                         style = MaterialTheme.typography.labelSmall,
                     )
@@ -2504,6 +2504,13 @@ private fun TrashSheet(vm: DragonGlassViewModel, onDismiss: () -> Unit) {
             },
         )
     }
+}
+
+/// A short, human-sized byte count for transfer progress.
+private fun formatBytes(bytes: Long): String = when {
+    bytes >= 1_048_576 -> String.format("%.1f MB", bytes / 1_048_576.0)
+    bytes >= 1_024 -> String.format("%.1f kB", bytes / 1_024.0)
+    else -> "$bytes B"
 }
 
 private fun trashTime(millis: Long): String {

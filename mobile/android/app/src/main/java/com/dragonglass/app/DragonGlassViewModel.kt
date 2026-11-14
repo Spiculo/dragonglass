@@ -168,6 +168,8 @@ class DragonGlassViewModel(application: Application) : AndroidViewModel(applicat
     /// Files copied by a running import/export, and whether it can still be cancelled.
     var transferProgress by mutableStateOf<Int?>(null)
         private set
+    var transferBytes by mutableStateOf(0L)
+        private set
     var transferLabel by mutableStateOf("")
         private set
     @Volatile
@@ -527,7 +529,10 @@ class DragonGlassViewModel(application: Application) : AndroidViewModel(applicat
                 withContext(Dispatchers.IO) {
                     vaultStore.importTree(
                         treeUri,
-                        onProgress = { transferProgress = it },
+                        onProgress = { files, bytes ->
+                            transferProgress = files
+                            transferBytes = bytes
+                        },
                         isCancelled = { transferCancelled },
                     )
                 }
@@ -563,7 +568,10 @@ class DragonGlassViewModel(application: Application) : AndroidViewModel(applicat
                     vaultStore.exportTree(
                         active,
                         treeUri,
-                        onProgress = { transferProgress = it },
+                        onProgress = { files, bytes ->
+                            transferProgress = files
+                            transferBytes = bytes
+                        },
                         isCancelled = { transferCancelled },
                     )
                 }
@@ -635,16 +643,36 @@ class DragonGlassViewModel(application: Application) : AndroidViewModel(applicat
         if (vault.treeUri == null) return
         viewModelScope.launch {
             loading = true
+            transferCancelled = false
+            transferLabel = "Syncing"
+            transferProgress = 0
+            transferBytes = 0
             val result = runCatching {
                 saveDirtyNote()
-                withContext(Dispatchers.IO) { vaultStore.sync(vault) }
+                withContext(Dispatchers.IO) {
+                    vaultStore.sync(
+                        vault,
+                        onProgress = { files, bytes ->
+                            transferProgress = files
+                            transferBytes = bytes
+                        },
+                        isCancelled = { transferCancelled },
+                    )
+                }
             }
             result
                 .onSuccess { (pulled, written) ->
                     message = "Synced with the folder: pulled $pulled, wrote $written"
                     refresh()
                 }
-                .onFailure { error = it.message ?: "Could not sync with the folder" }
+                .onFailure { failure ->
+                    if (failure is VaultStore.TransferCancelled) {
+                        message = "Sync cancelled"
+                    } else {
+                        error = failure.message ?: "Could not sync with the folder"
+                    }
+                }
+            transferProgress = null
             loading = false
         }
     }

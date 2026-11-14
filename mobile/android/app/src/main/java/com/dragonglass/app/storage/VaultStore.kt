@@ -29,6 +29,12 @@ class VaultStore(private val context: Context) {
     /// Thrown when the user cancels a long import or export.
     class TransferCancelled : Exception("Transfer cancelled")
 
+    /// Running totals for a long copy, so the UI can show files and bytes.
+    private class Transfer {
+        var files = 0
+        var bytes = 0L
+    }
+
     private val preferences =
         context.getSharedPreferences("dragon_glass_vaults", Context.MODE_PRIVATE)
     private val vaultsDirectory = File(context.filesDir, "vaults")
@@ -69,7 +75,7 @@ class VaultStore(private val context: Context) {
     /** Copy a SAF tree into a fresh app-private vault and make it the active one. */
     fun importTree(
         treeUri: Uri,
-        onProgress: (Int) -> Unit = {},
+        onProgress: (Int, Long) -> Unit = { _, _ -> },
         isCancelled: () -> Boolean = { false },
     ): StoredVault {
         takePermission(treeUri, write = false)
@@ -83,8 +89,9 @@ class VaultStore(private val context: Context) {
             throw IllegalStateException("Could not create local storage for $name")
         }
 
+        val tally = Transfer()
         val copied = try {
-            copyInto(source, root, onProgress, isCancelled)
+            copyInto(source, root, tally, onProgress, isCancelled)
         } catch (error: Throwable) {
             // A cancelled or failed import leaves no half-vault behind.
             root.deleteRecursively()
@@ -106,14 +113,15 @@ class VaultStore(private val context: Context) {
     fun exportTree(
         vault: StoredVault,
         treeUri: Uri,
-        onProgress: (Int) -> Unit = {},
+        onProgress: (Int, Long) -> Unit = { _, _ -> },
         isCancelled: () -> Boolean = { false },
     ): Int {
         takePermission(treeUri, write = true)
 
         val target = DocumentFile.fromTreeUri(context, treeUri)
             ?: throw IllegalStateException("The selected folder is not writable")
-        val written = copyOut(vault.root, target, onProgress, isCancelled)
+        val tally = Transfer()
+        val written = copyOut(vault.root, target, tally, onProgress, isCancelled)
         if (written == 0) {
             throw IllegalStateException("There are no notes to export yet")
         }
@@ -132,10 +140,10 @@ class VaultStore(private val context: Context) {
     private fun copyInto(
         source: DocumentFile,
         target: File,
-        onProgress: (Int) -> Unit,
+        tally: Transfer,
+        onProgress: (Int, Long) -> Unit,
         isCancelled: () -> Boolean,
     ): Int {
-        var copied = 0
         for (child in source.listFiles()) {
             if (isCancelled()) throw TransferCancelled()
             val name = child.name ?: continue
@@ -144,27 +152,31 @@ class VaultStore(private val context: Context) {
             if (child.isDirectory) {
                 val directory = File(target, name)
                 directory.mkdirs()
-                copied += copyInto(child, directory, onProgress, isCancelled)
+                copyInto(child, directory, tally, onProgress, isCancelled)
             } else if (child.isFile) {
                 val output = File(target, name)
                 val input = context.contentResolver.openInputStream(child.uri) ?: continue
+                var written = 0L
                 input.use { stream ->
-                    output.outputStream().use { file -> stream.copyTo(file) }
+                    output.outputStream().use { file ->
+                        written = stream.copyTo(file)
+                    }
                 }
-                copied++
-                onProgress(copied)
+                tally.files++
+                tally.bytes += written.coerceAtLeast(child.length())
+                onProgress(tally.files, tally.bytes)
             }
         }
-        return copied
+        return tally.files
     }
 
     private fun copyOut(
         source: File,
         target: DocumentFile,
-        onProgress: (Int) -> Unit,
+        tally: Transfer,
+        onProgress: (Int, Long) -> Unit,
         isCancelled: () -> Boolean,
     ): Int {
-        var written = 0
         for (file in source.listFiles().orEmpty()) {
             if (isCancelled()) throw TransferCancelled()
             if (file.name.startsWith(".")) continue
@@ -172,7 +184,7 @@ class VaultStore(private val context: Context) {
                 val directory = target.findFile(file.name)?.takeIf { it.isDirectory }
                     ?: target.createDirectory(file.name)
                     ?: continue
-                written += copyOut(file, directory, onProgress, isCancelled)
+                copyOut(file, directory, tally, onProgress, isCancelled)
             } else {
                 val existing = target.findFile(file.name)?.takeIf { it.isFile }
                 val document = existing
@@ -180,14 +192,18 @@ class VaultStore(private val context: Context) {
                     ?: continue
                 val output = context.contentResolver.openOutputStream(document.uri, "wt")
                     ?: continue
+                var written = 0L
                 file.inputStream().use { input ->
-                    output.use { stream -> input.copyTo(stream) }
+                    output.use { stream ->
+                        written = input.copyTo(stream)
+                    }
                 }
-                written++
-                onProgress(written)
+                tally.files++
+                tally.bytes += written
+                onProgress(tally.files, tally.bytes)
             }
         }
-        return written
+        return tally.files
     }
 
     /** Copy documents from the folder that are newer (or new) into the local vault. */
@@ -215,42 +231,62 @@ class VaultStore(private val context: Context) {
     }
 
     /** Mirror the whole local vault into the folder and prune files deleted locally. */
-    fun pushAll(vault: StoredVault): Int {
+    fun pushAll(
+        vault: StoredVault,
+        onProgress: (Int, Long) -> Unit = { _, _ -> },
+        isCancelled: () -> Boolean = { false },
+    ): Int {
         val tree = treeFor(vault) ?: return 0
-        val written = copyOut(vault.root, tree, {}, { false })
+        val written = copyOut(vault.root, tree, Transfer(), onProgress, isCancelled)
         pruneRemote(tree, vault.root)
         return written
     }
 
     /** Pull newer documents, then mirror local changes, destructively. */
-    fun sync(vault: StoredVault): Pair<Int, Int> {
+    fun sync(
+        vault: StoredVault,
+        onProgress: (Int, Long) -> Unit = { _, _ -> },
+        isCancelled: () -> Boolean = { false },
+    ): Pair<Int, Int> {
         val tree = treeFor(vault) ?: return 0 to 0
-        val pulled = pullDirectory(tree, vault.root, "")
-        val written = copyOut(vault.root, tree, {}, { false })
+        val tally = Transfer()
+        val pulled = pullDirectory(tree, vault.root, "", tally, onProgress, isCancelled)
+        val written = copyOut(vault.root, tree, tally, onProgress, isCancelled)
         pruneRemote(tree, vault.root)
         return pulled to written
     }
 
-    private fun pullDirectory(source: DocumentFile, target: File, prefix: String): Int {
-        var pulled = 0
+    private fun pullDirectory(
+        source: DocumentFile,
+        target: File,
+        prefix: String,
+        tally: Transfer = Transfer(),
+        onProgress: (Int, Long) -> Unit = { _, _ -> },
+        isCancelled: () -> Boolean = { false },
+    ): Int {
         for (child in source.listFiles()) {
+            if (isCancelled()) throw TransferCancelled()
             val name = child.name ?: continue
             if (name.startsWith(".")) continue
             val relative = if (prefix.isEmpty()) name else "$prefix/$name"
             if (child.isDirectory) {
                 val directory = File(target, name)
                 directory.mkdirs()
-                pulled += pullDirectory(child, directory, relative)
+                pullDirectory(child, directory, relative, tally, onProgress, isCancelled)
             } else if (child.isFile) {
                 val local = File(target, name)
                 val remoteTime = child.lastModified()
                 val newer = remoteTime > 0 && remoteTime > local.lastModified() + 1_000
                 if (!local.exists() || newer) {
-                    if (copyIn(child, local)) pulled++
+                    if (copyIn(child, local)) {
+                        tally.files++
+                        tally.bytes += child.length()
+                        onProgress(tally.files, tally.bytes)
+                    }
                 }
             }
         }
-        return pulled
+        return tally.files
     }
 
     private fun copyIn(document: DocumentFile, target: File): Boolean {
