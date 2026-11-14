@@ -1651,6 +1651,16 @@ impl Editor {
             .map(|anchor| anchor.min(limit));
     }
 
+    /// Heading indices folded in the reading view, for the session.
+    pub fn reading_folds(&self) -> Vec<usize> {
+        self.reading_content.reading_folds()
+    }
+
+    /// Restore reading folds when a session reopens the note.
+    pub fn set_reading_folds(&mut self, folds: &[usize]) {
+        self.reading_content.set_reading_folds(folds);
+    }
+
     /// Heading indices whose sections are folded.
     pub fn folded_headings(&self) -> Vec<usize> {
         let mut folds: Vec<usize> = self.folded.iter().copied().collect();

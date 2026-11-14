@@ -928,8 +928,9 @@ from the current note's folder. Settings has a persisted **Confirm external link
 web, mail and phone links open only after an inline Open/Cancel bar (local files opened by
 the app do not ask). A resting pointer over a reading-view link shows a tooltip with its
 target (note, heading/block fragment, footnote, tag or URL), for both plain and measured
-(flow) paragraphs. Android keeps its list/preview scroll, loads restored tabs lazily and has
-the shared reader settings. The rest of the list is still open.
+(flow) paragraphs. Reading-view folds are part of session v2, so folded sections reopen
+folded. Android keeps its list/preview scroll, loads restored tabs lazily and has the shared
+reader settings. The rest of the list is still open.
 
 ---
 

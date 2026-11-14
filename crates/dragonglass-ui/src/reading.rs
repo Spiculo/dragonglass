@@ -540,6 +540,8 @@ pub struct ReadingCache {
     footnote_popup: Option<Entity<FootnotePopup>>,
     /// Heading blocks whose sections are folded.
     folded: HashSet<usize>,
+    /// Folds restored from a session, applied when the document is parsed.
+    pending_folds: Option<HashSet<usize>>,
     /// Source lines for each block, so the editor can map caret ↔ reader.
     spans: Rc<Vec<markdown::BlockSpan>>,
     /// False when shared-block expansion rewrote the text, which moves the spans away
@@ -581,7 +583,23 @@ impl ReadingCache {
             embed_math: Rc::new(RefCell::new(HashMap::new())),
             footnote_popup: None,
             folded: HashSet::new(),
+            pending_folds: None,
         }
+    }
+
+    /// Heading indices folded in the reading view, for the session.
+    pub fn reading_folds(&self) -> Vec<usize> {
+        let mut folds: Vec<usize> = self.folded.iter().copied().collect();
+        folds.sort_unstable();
+        folds
+    }
+
+    /// Restore reading folds from a session. They take effect once the document parses,
+    /// because a new note clears the current set.
+    pub fn set_reading_folds(&mut self, folds: &[usize]) {
+        let folds: HashSet<usize> = folds.iter().copied().collect();
+        self.folded = folds.clone();
+        self.pending_folds = Some(folds);
     }
 
     /// Fold or unfold the section under a heading block.
@@ -617,6 +635,9 @@ impl ReadingCache {
         // Folds are per document; an edit keeps them, a different note does not.
         if self.version.0 != version.0 {
             self.folded.clear();
+        }
+        if let Some(folds) = self.pending_folds.take() {
+            self.folded = folds;
         }
 
         let original = source.to_string();
@@ -3433,6 +3454,16 @@ fn block_for_progress(progress: f32, block_count: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn restored_reading_folds_survive_the_first_parse() {
+        let mut cache = ReadingCache::new();
+        cache.set_reading_folds(&[2]);
+        cache.update((7, 1), "# One\n\ntext\n## Two\n\nbody\n", None);
+        assert_eq!(cache.reading_folds(), vec![2]);
+        cache.toggle_fold(2);
+        assert!(cache.reading_folds().is_empty());
+    }
 
     #[test]
     fn preview_progress_maps_to_a_block() {

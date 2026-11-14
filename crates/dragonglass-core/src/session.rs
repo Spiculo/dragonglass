@@ -44,6 +44,8 @@ pub struct TabSession {
     pub anchor: Option<usize>,
     /// Heading indices whose sections are folded in the editor.
     pub folded: Vec<usize>,
+    /// Heading block indices folded in the reading view.
+    pub reading_folded: Vec<usize>,
 }
 
 /// The tabs that were open, and which one was active.
@@ -61,8 +63,13 @@ impl Session {
         out.push_str(&format!("active={}\n", self.active.min(self.tabs.len())));
         for tab in self.tabs.iter().take(MAX_TABS) {
             let folds: Vec<String> = tab.folded.iter().map(|index| index.to_string()).collect();
+            let reading_folds: Vec<String> = tab
+                .reading_folded
+                .iter()
+                .map(|index| index.to_string())
+                .collect();
             out.push_str(&format!(
-                "tab={}|{}|{}|{}|{:.1}|{}|{}|{}\n",
+                "tab={}|{}|{}|{}|{:.1}|{}|{}|{}|{}\n",
                 tab.note,
                 u8::from(tab.reading),
                 tab.line,
@@ -72,7 +79,8 @@ impl Session {
                 tab.anchor
                     .map(|anchor| anchor.to_string())
                     .unwrap_or_default(),
-                folds.join(",")
+                folds.join(","),
+                reading_folds.join(",")
             ));
         }
         out
@@ -176,6 +184,12 @@ fn parse_tab(value: &str) -> Option<TabSession> {
             .filter_map(|index| index.trim().parse().ok())
             .collect();
     }
+    if let Some(folds) = fields.next() {
+        tab.reading_folded = folds
+            .split(',')
+            .filter_map(|index| index.trim().parse().ok())
+            .collect();
+    }
     // A tab with no note and every other field at its default is an untitled buffer, which
     // is valid; anything else is at least a note path.
     Some(tab)
@@ -216,6 +230,7 @@ mod tests {
                     reading_block: 4,
                     anchor: Some(9),
                     folded: vec![0, 3],
+                    reading_folded: vec![2],
                 },
                 TabSession {
                     note: "notes/b.md".to_string(),
@@ -226,6 +241,7 @@ mod tests {
                     reading_block: 0,
                     anchor: None,
                     folded: Vec::new(),
+                    reading_folded: Vec::new(),
                 },
             ],
         };
@@ -238,6 +254,7 @@ mod tests {
         let session = Session::from_text("version=2\nactive=0\ntab=notes/a.md|1|12|3|0.0|4\n");
         assert_eq!(session.tabs[0].anchor, None);
         assert!(session.tabs[0].folded.is_empty());
+        assert!(session.tabs[0].reading_folded.is_empty());
         assert_eq!(session.tabs[0].line, 12);
     }
 
@@ -314,6 +331,7 @@ mod tests {
                 reading_block: 2,
                 anchor: None,
                 folded: vec![1],
+                reading_folded: vec![2, 4],
             }],
         };
         save(&dir, &session).unwrap();
