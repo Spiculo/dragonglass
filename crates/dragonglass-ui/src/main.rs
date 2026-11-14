@@ -112,7 +112,8 @@ use gpui::{
     actions, anchored, div, prelude::*, px, size, uniform_list, AnyElement, App, Application,
     Bounds, Context, Corner, CursorStyle, ElementId, Entity, FocusHandle, Focusable, KeyBinding,
     KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, Render,
-    Timer, WeakEntity, Window, WindowBounds, WindowOptions,
+    ScrollStrategy, Timer, UniformListScrollHandle, WeakEntity, Window, WindowBounds,
+    WindowOptions,
 };
 use graph_view::GraphView;
 use reading::ReaderSettings;
@@ -715,6 +716,10 @@ struct DragonGlassApp {
     pending_save_as: bool,
     /// Window position of the open tab overflow menu, if any.
     tab_menu: Option<Point<Pixels>>,
+    /// Scroll position of the outline panel, so the active heading stays visible.
+    outline_scroll: UniformListScrollHandle,
+    /// The heading the outline last scrolled to.
+    outline_current: Option<String>,
 }
 
 impl DragonGlassApp {
@@ -4249,6 +4254,8 @@ impl DragonGlassApp {
                 pending_path: None,
                 pending_save_as: false,
                 tab_menu: None,
+                outline_scroll: UniformListScrollHandle::new(),
+                outline_current: None,
                 conflict: false,
                 watcher: None,
                 update_source: self.update_source.clone(),
@@ -6914,6 +6921,19 @@ impl Render for DragonGlassApp {
                     })
                     .collect();
             let row_count = outline_rows.len();
+            // Keep the active section visible as the reader scrolls.
+            if reading_heading != self.outline_current {
+                self.outline_current = reading_heading.clone();
+                if let Some(name) = &reading_heading {
+                    if let Some(row) = outline_rows
+                        .iter()
+                        .position(|(_, heading, _, _)| &heading.text == name)
+                    {
+                        self.outline_scroll
+                            .scroll_to_item(row, ScrollStrategy::Center);
+                    }
+                }
+            }
             let current_heading = reading_heading.clone();
             let rows = uniform_list("outline-list", row_count, move |range, _window, _cx| {
                 range
@@ -7003,7 +7023,8 @@ impl Render for DragonGlassApp {
                     .collect::<Vec<AnyElement>>()
             })
             .flex_1()
-            .min_h(px(0.0));
+            .min_h(px(0.0))
+            .track_scroll(self.outline_scroll.clone());
 
             Some(
                 div()
@@ -8488,6 +8509,8 @@ fn open_vault_window(vault_path: PathBuf, uri_note: Option<String>, cx: &mut App
             pending_path: None,
             pending_save_as: false,
             tab_menu: None,
+            outline_scroll: UniformListScrollHandle::new(),
+            outline_current: None,
             conflict: false,
             watcher: None,
             update_source,

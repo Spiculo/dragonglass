@@ -371,8 +371,8 @@ heading (including folded ones) visibly moves the page.
 **Landed:** the reading view reports its nearest heading and progress; the outline row for
 that section is highlighted (and the reading status bar shows `Section · 42%` instead of
 Ln/Col). An outline jump first unfolds every ancestor of the target, so a heading hidden by
-a folded parent is visible when the page moves.
-**Remaining:** scrolling the outline panel itself to keep the active row in view.
+a folded parent is visible when the page moves. The outline list tracks its own scroll and
+centres the active row whenever the reader moves to a different section.
 
 ---
 
