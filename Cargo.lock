@@ -1810,7 +1810,9 @@ dependencies = [
  "dragonglass-core",
  "dragonglass-plugins",
  "gpui",
+ "image",
  "notify",
+ "smallvec",
  "smol",
  "winresource",
 ]

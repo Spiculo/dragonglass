@@ -5,6 +5,18 @@
 **Focus:** the two loops users repeat all day — **edit a note** and **read a note** — and the
 transitions between them.
 
+> **Status (current tree):** every P0 and P1 item is implemented, including the shared
+> save/draft/session/fingerprint contract, reading and editing continuity, back/forward,
+> in-page find, selection and copy, reader typography (size, width, line height, typeface,
+> theme), zen mode, transclusion, media, and the editor's live preview (Q2.12: hiding markers
+> and rendering images, rules, callouts, tables and display formulas in place outside the
+> caret's paragraph). Android has find/replace with options, a markdown toolbar and pickers,
+> syntax highlighting, row actions, conflict and save-failure sheets, progress/cancel and
+> shared reader settings. What remains is listed per item: optional editor↔preview scroll
+> sync (Q2.11), the Android text field's own scroll offset (Q1.7, no public handle), phone
+> line numbers (Q4.3, deliberately omitted), the iOS client (no toolchain in this
+> environment; `docs/ux-contract.md` is the porting target), and the P2 polish list.
+
 **Basis:** audit of the current working tree (commit `1cb0ec2` plus local session/mobile
 work). Line references are approximate and should be re-checked before implementation.
 
@@ -133,6 +145,11 @@ mirroring the existing guard in `apply_style` (`editor.rs:523`).
 **Done when:** a fuzz test of all editing shortcuts in reading mode leaves the source hash
 unchanged; copy/select still work.
 
+**Landed:** every mutating action starts with `can_mutate()`, which is false in reading mode,
+and both `EntityInputHandler` insert paths divert to reading navigation (j/k/g/G, Space) or the
+in-page find field, so typing and IME text never reach the buffer. Selection and copy keep
+working; the mode switch is pinned by a status line that names the note as read-only.
+
 #### Q0.2 Conflict-safe save — D · A · S · M–L
 Add a shared save contract in core: `DocumentFingerprint { mtime, size, content_hash }`,
 captured on load/save, and `SaveReport { Saved, Conflict, Error }`. Save with an expected
@@ -142,6 +159,19 @@ Reload / Compare / Keep mine bar; Android shows the same choice in a sheet. Reus
 **Done when:** an external edit followed by Ctrl+S never overwrites silently; the user can
 see both versions and choose; a test covers clean reload, dirty conflict and deleted file.
 
+**Landed (desktop + core):** `core::fingerprint` has `DocumentFingerprint` (FNV-1a content
+hash, size and mtime as hints) and `SaveReport`, and `save_if_unchanged` refuses to write
+when the on-disk hash moved, when the file was deleted, or when it cannot be read. The editor
+captures a fingerprint on load/reload/save, `Ctrl+S` reports the conflict, and a bar offers
+Reload / Keep mine / Compare (line diff in the existing diff view) / Save as copy. Close,
+quit and Save all stop on a conflict instead of dropping or overwriting the buffer. Tests
+cover clean save, external edit, deleted file, mtime-only change and write errors.
+**Landed (Android):** the same contract now backs Android saves — a fingerprint is captured
+on open and every save path checks it, so an external edit blocks the write and keeps the
+note open instead of overwriting it. A conflict opens a sheet with **Reload from disk**,
+**Keep mine (overwrite)** and **Save a copy** (`name (conflict).md`); the note keeps its text
+until the user chooses.
+
 #### Q0.3 Drafts, autosave and crash recovery — D · A · S · L
 Persist a debounced draft under `.dragon-glass/drafts/` (path, base fingerprint, timestamp,
 text, cursor). Autosave the note after idle only when the fingerprint still matches;
@@ -149,6 +179,22 @@ otherwise stop at the conflict bar. On launch, if a draft is newer than the note
 Recover / Compare / Discard. Keep drafts out of git (`.dragon-glass/` is already ignored).
 **Done when:** killing the process 2 seconds after typing recovers every character; a
 clean buffer writes no timer and no disk I/O; a conflicted buffer never auto-overwrites.
+
+**Landed (desktop + core):** `core::drafts` stores one human-readable file per note
+(metadata header, `---`, then the text verbatim), capped at 64 drafts, keyed by a stable hash
+of the note path. The editor arms a trailing 1.5 s timer only while the buffer is dirty, and
+writes the draft with its cursor and base content hash; a clean buffer arms nothing. A
+successful save deletes the draft. Opening a note (or a restored tab) with a draft that
+differs from the file shows a bar with Recover / Compare / Discard; Recover applies the text
+as one undoable edit.
+Note autosave is implemented behind `autosave=on` in `config.txt` (Settings → Autosave
+notes): after the same idle, if the fingerprint still matches it saves and drops the draft,
+and on a conflict it pauses and raises the conflict bar. It ships **off** by default rather
+than the on-by-default recommendation in §8.1, because silent writes interact with git-sync
+commits; that is the one deviation, and it is a per-vault toggle.
+**Landed (Android):** the activity flushes a draft for the open note in `onStop`, and opening
+a note with a draft that differs from the file shows an "Unsaved draft from …" banner with
+Recover and Discard. A successful save discards the draft.
 
 #### Q0.4 One exit contract for close/quit/background — D · A · M
 Desktop: dirty close and quit must use Save / Discard / Cancel (or auto-save + an
@@ -158,6 +204,17 @@ not clear `selected/source` until the save has actually succeeded.
 **Done when:** disk-full / read-only / conflict each leave the editor open with a Retry
 path; no exit path can silently drop a dirty buffer; tests cover close, quit and background.
 
+**Landed (desktop):** Cmd+Q now goes through the same `request_close` gate as the window
+button: Save and quit / Quit without saving / Cancel, and a failed save keeps the app open
+with the error and the conflict bar instead of quitting. The macOS
+`applicationWillTerminate` observer remains only for system-initiated termination (logout,
+shutdown), where no window exists to ask. Window close and Cmd+Q share one code path.
+**Landed (Android):** the activity keeps the view model and calls `flushDraft` in `onStop`, so
+backgrounding writes a recovery draft; `closeNote`, vault switches and navigation await the
+save first and leave `selected`/`source` in place when it fails (Q0.7's Retry / Discard /
+Cancel dialog covers the decision). No exit path clears a dirty buffer before the write
+succeeds.
+
 #### Q0.5 Mobile preview is a real navigation surface — A · M
 Attach a `WebViewClient`: resolve internal `.html` links to `vm.openNote`, send external
 links to `ACTION_VIEW`, and block in-place navigation for local files. Preserve the current
@@ -166,6 +223,11 @@ the normal save/close contract.
 **Done when:** tapping `[[Note]]` in preview opens that note; external links leave the app;
 Back never skips a level; the preview does not reload/reset on every recomposition.
 
+**Landed:** the WebView has a `WebViewClient`: internal links resolve through `shouldOverrideUrlLoading`
+and open the note in the app (keeping preview mode), external schemes go to `ACTION_VIEW`, and
+local file navigation is blocked. Back from preview returns to edit, and the preview keeps its
+scroll and only reloads when the rendered document changes.
+
 #### Q0.6 Mobile keyboard never covers the caret — A · S
 Apply `imePadding()`/`WindowInsets.ime` to the editor scaffold, bring the caret into view
 on focus and selection changes, and set markdown-friendly `KeyboardOptions`
@@ -173,12 +235,22 @@ on focus and selection changes, and set markdown-friendly `KeyboardOptions`
 **Done when:** on a 360×640 phone and a tablet, the caret and save state are visible with
 the IME open at the start, middle and end of a long note.
 
+**Landed:** the editor scaffold applies `imePadding()`, so the top bar, editor and status stay
+above the keyboard; the text field uses markdown-friendly keyboard options (no autocorrect or
+smart quotes); focusing and selecting refocuses the field, which scrolls the caret into view.
+
 #### Q0.7 Mobile save failure blocks navigation — A · S
 `closeNote`, `switchVault`, `syncVault`, import/export and git sync must await
 `saveDirtyNote()` and stop on failure. Show Retry / Discard / Cancel; do not clear state
 before the write completes.
 **Done when:** a read-only or full vault leaves the note open with its text intact and a
 retry action; a fast reopen cannot race a pending save.
+
+**Landed:** `closeNote` and `switchVault` await the save and keep the note (and its text)
+open with an error when it fails; import, export and folder sync already aborted on a failed
+save; git sync now saves the open buffer first and refuses to sync or clear the editor when
+that save fails. A failed close opens a Retry / Discard / Cancel dialog, and the note keeps
+its text until the user chooses.
 
 ---
 
@@ -192,6 +264,17 @@ unknown keys. Cap state per tab and prune tabs that vanished.
 **Done when:** open 3 tabs at different positions/modes, quit, relaunch, and every tab is
 within one line/one block/16 px of its previous position.
 
+**Landed:** `session.txt` is versioned and human-readable (`tab=note|reading|line|col|scroll|block`),
+tolerant of unknown keys and malformed fields, capped at 32 tabs, and version 1 files still
+load. Each tab round-trips its mode, caret line and column, editor scroll offset and reading
+top block; startup reopens every saved tab whose file still exists, prunes missing files and
+restores the active tab. Tests cover round-trip, untitled tabs, v1 migration, malformed
+lines, caps and the restore filter.
+**Landed (selection and folds):** a tab now also stores its selection anchor (character
+index, empty for no selection) and the folded heading indices. The parser treats both as
+optional trailing fields, so older session files still load. Restoring applies folds before
+the caret and selection so the geometry is stable.
+
 #### Q1.2 Map edit position to read position (and back) — D · M
 Add source line spans to the block parser (`markdown::parse_blocks` returns blocks plus
 spans, without breaking the existing enum). On entering reading, reveal the block that
@@ -201,12 +284,31 @@ the first line of the top visible block and keep the edit scroll near it.
 paragraph; press Ctrl+E again and return to the same source area — repeated 20 times with
 no drift.
 
+**Landed:** `markdown::parse_blocks_spanned` returns a `BlockSpan { first_line, last_line }`
+for every block (frontmatter and comment lines included; `strip_comments` now preserves line
+breaks), with `parse_blocks` unchanged for existing callers. The reading cache stores the
+spans and answers "block for line" / "first line of block"; entering reading scrolls to the
+block holding the caret, leaving reading puts the caret on the top visible block's first
+line, a block-id jump maps the same way, and shared-block expansion disables the mapping
+rather than pointing at the wrong line. Tests cover paragraph/fence/table/setext spans,
+comment line preservation and the line-to-block lookup.
+
 #### Q1.3 Back/forward navigation stack — D · A · M
 Maintain `(note, mode, anchor/scroll)` entries for link clicks, quick-switch, search hits,
 outline jumps and daily notes. Bind Alt+Left/Right and mouse back/forward on desktop; expose
 Back in mobile chrome without overloading "close note". Restore the exact reading block.
 **Done when:** read A → link B#H → link C → Back returns B at H → Back returns A at the
 original block; forward replays the path.
+
+**Landed (desktop):** `NavBack`/`NavForward` (Ctrl/Cmd+`[` / `]`, in the hotkey editor)
+walk a 100-entry history of `(note, mode, cursor line, reading block)` recorded on every
+note open — links, quick switcher, search hits, daily notes, reopen — and on back/forward
+restore the mode, caret and reading position. Visiting a new place after going back drops
+the forward tail; a status line shows the position in the history.
+**Landed (mouse, outline, mobile):** the mouse back/forward buttons run the same history, an
+outline jump records its starting place before the page moves, and Android keeps a 50-entry
+note history with its own `‹`/`›` chrome (separate from Done, which closes the note),
+restoring the note, mode and preview scroll.
 
 #### Q1.4 Heading and block fragments — D · M
 Keep the `#fragment` in parsed inline links instead of stripping it (`inline.rs`), parse
@@ -216,12 +318,23 @@ scroll without a reload.
 **Done when:** `[[Note#Heading]]`, `[[#Local]]` and `[[Note#^block]]` all land on the target
 in edit and reading mode; missing fragments show a clear message instead of doing nothing.
 
+**Landed:** `inline::split_wikilink` keeps the fragment (`[[#Local]]` renders as `#Local`),
+`open_target` splits note from fragment, and after opening it jumps with
+`jump_to_heading_text` (case-insensitive, works in reading through the heading index) or
+`jump_to_block_id` (finds a line ending in `^id`; in reading it maps the line back to its
+block through the new spans). Same-note fragments jump without a reload; a missing fragment
+reports "no heading or block named …". Tests cover fragment retention and the visible label.
+
 #### Q1.5 Opening a link keeps the mode — D · S
 Carry "opened from reader" (and the source tab's reading flag) into `open_note`; remember
 mode per tab instead of only restoring the active tab at launch. External URLs and assets
 open in the OS, not as bogus notes.
 **Done when:** reading a note and clicking a wikilink opens the target in reading mode at
 the right position; quick-switch from reading remains in reading; edit mode remains edit.
+
+**Landed:** `open_note` reads the current tab's mode and applies it to the editor it loads
+into, so following a wikilink or quick-switching from reading stays in reading, and edit
+stays edit. External URLs and assets already go to the OS.
 
 #### Q1.6 Search hits open at the hit line — D · A · S
 Preserve `hit.line_number` through `Item::Note` (desktop) and `pendingLine` (mobile), focus
@@ -230,12 +343,27 @@ result list instead of only the title.
 **Done when:** every search result opens with the hit visible and selected; Back returns to
 the results with the query and scroll intact.
 
+**Landed (desktop):** search results carry the line number (`Item::NoteAt`), list the line
+text next to the path, and opening one focuses the editor with the query text selected on
+that line; the caret-follow scroll brings it into view. Mobile already passed `pendingLine`;
+its results list shows the hit text.
+
 #### Q1.7 Mobile scroll retention — A · M
 Remember the note-list `LazyListState`, editor selection/scroll and WebView scroll position
 per vault/session. Keep the list composed (or hoist state) instead of destroying it when a
 note opens. Preserve preview scroll across Edit ↔ Preview.
 **Done when:** open a note from row 80, read to the bottom, press Back, and return to row
 80; toggle Preview and return to the same paragraph.
+
+**Landed:** the note list, tree list and search results keep their `LazyListState` in
+`DragonGlassApp`, so opening a note and pressing Back returns to the same row and query. The
+preview WebView saves its scroll offset when Edit replaces it and restores it after the page
+finishes loading, and it only reloads when the rendered document actually changes (so a
+recomposition no longer resets the page).
+**Landed (Android selection):** the editor remembers each note's selection range and restores
+it when the note reopens, so the caret returns to where it was.
+**Remaining:** the text field's own scroll offset still belongs to `BasicTextField` and has no
+public handle, so it is not restored on rebuild (desktop is complete via session v2).
 
 #### Q1.8 Mobile back precedence — A · S
 Define one hierarchy: Preview → Edit; search results → list; sheet/dialog → dismiss; dirty
@@ -244,12 +372,24 @@ exit. Use one `BackHandler` per level, not competing handlers.
 **Done when:** every Back press is predictable and no screen is skipped; a scripted
 back-through-the-app test passes.
 
+**Landed:** Back goes Preview → Edit → list; sheets and dialogs dismiss themselves through
+Material; the editor's Back on a dirty note opens a Save / Discard / Cancel prompt (Save
+closes only after a successful write, so a failed save keeps the note open, Q0.7); the list
+clears the search query, then the bookmarks filter, before it leaves the screen. One
+`BackHandler` per level.
+
 #### Q1.9 Outline follows the reader — D · S
 Highlight the current heading while scrolling, scroll the outline to it, and make outline
 jumps reveal headings hidden by folds. Show a compact section/progress indicator in the
 reading status bar.
 **Done when:** scrolling a long note updates the active outline row; jumping to every
 heading (including folded ones) visibly moves the page.
+
+**Landed:** the reading view reports its nearest heading and progress; the outline row for
+that section is highlighted (and the reading status bar shows `Section · 42%` instead of
+Ln/Col). An outline jump first unfolds every ancestor of the target, so a heading hidden by
+a folded parent is visible when the page moves. The outline list tracks its own scroll and
+centres the active row whenever the reader moves to a different section.
 
 ---
 
@@ -262,12 +402,32 @@ opens in-page find. Never move the hidden edit caret.
 **Done when:** a keyboard-only user can read an entire long note, follow links and return
 without touching the mouse; the source hash stays unchanged.
 
+**Landed:** in reading mode Up/Down and Ctrl+Up/Down scroll a block, PageUp/PageDown and
+Space scroll a screen, Home/End and Ctrl+Home/End jump to the top/bottom, Left/Right and word
+motions do nothing (they can no longer move the hidden caret), and `j`/`k`/`g`/`G` scroll
+through the input handler with all other typing swallowed. Ctrl+F opens in-page find (Q2.2).
+Enter follows the link under the reading selection. Shift+arrows still extend the reading
+selection (Q2.3).
+Tab and Shift+Tab step through the links in document order, selecting each one so the
+existing highlight marks the focus; Enter follows it, so reading and following links needs no
+mouse.
+
 #### Q2.2 In-page find — D · M
 Build a reading find bar over block display text: case/regex/whole-word reuse from
 `core::find`, match highlighting, Enter/F3 cycling, a count, and no mode switch. Reuse the
 existing find-bar layout but target `ReadingCache` scroll positions.
 **Done when:** Ctrl+F in reading highlights and cycles matches, Escape restores the prior
 scroll, and the note is untouched.
+
+**Landed:** `Ctrl+F` in reading opens a find bar inside the reading view instead of switching
+to edit. It searches block display text with `core::find`, shows `current/total` (or "no
+matches"/the regex error), highlights every match behind the text with the current one in a
+stronger colour, cycles with Enter / Shift+Enter / F3 / Shift+F3, and toggles regex, case and
+whole word with the same `Ctrl+Alt+R/C/W` keys as the editor. Escape closes it and scrolls
+back to the block where it opened; the buffer is never touched. Tests cover counting,
+wrapping, backspace, option toggles, invalid regex and document immutability.
+**Landed (flow paragraphs):** paragraphs that use the measured flow layout (inline math or
+images) now paint the same find quads, so a match is visible there too.
 
 #### Q2.3 Selection and copy polish — D · M
 Add double-click word, triple-click paragraph/line, Shift-click extension, keyboard
@@ -276,6 +436,15 @@ clear and a subtle "Copied" confirmation. Preserve the existing cross-block sele
 **Done when:** selecting across blocks with mouse or keyboard copies the visible text with
 math preserved; Ctrl+C works immediately after clicking a sidebar/outline row.
 
+**Landed:** double-click selects the word under the pointer (multi-byte safe), triple-click
+selects the whole paragraph/cell/callout line/code line, Shift-click extends from the anchor,
+Shift+arrows/Home/End/PageUp/Down and Ctrl+Shift+Home/End extend the selection from the
+keyboard across blocks, dragging past the top or bottom scrolls the list, Escape clears the
+selection before it closes panels, and copy reports "copied N character(s)" in the status
+bar (also when focus sits on a sidebar row, through the app-level Copy handler). The same
+double/triple-click word and paragraph selection works in measured flow paragraphs that
+contain math or images.
+
 #### Q2.4 Reading typography controls — D · A · S · M
 Move hardcoded sizes/width into persisted `ReaderSettings`: body size, line height, measure
 (px), font family (sans/serif/mono for code), and zoom. Align the metadata header with the
@@ -283,12 +452,28 @@ body measure. Expose the same settings on mobile preview.
 **Done when:** changing size/width updates all open readers and split previews immediately
 and survives relaunch; no horizontal scroll appears at 320 px width.
 
+**Landed (desktop):** `reading::ReaderSettings` (body size, measure, line height, typeface)
+is a GPUI global backed by `reader_size`, `reader_width`, `reader_line_height` and
+`reader_font` in `config.txt`, with Settings rows that cycle comfortable values. Body text,
+list items, quotes and callouts use the line height and typeface, the column width bounds
+every block, display math scales to the measure, and open readers plus the split preview
+repaint immediately. Zoom is the body-size control: it scales the text without changing the
+column. The mobile preview exposes the same values through the shared FFI (Q4.7).
+**Remaining:** nothing functional; the metadata header already sits inside the measure.
+
 #### Q2.5 Zen / focus reading — D · M
 Add a distraction-free mode that hides the tab bar, sidebar, outline and relations, centers
 the page and optionally dims non-active paragraphs. Make every panel toggleable and persist
 the choice.
 **Done when:** one shortcut/palette command enters and leaves zen mode; the document does
 not jump when panels hide.
+
+**Landed:** Zen mode (`Ctrl/Cmd+Alt+Z`, also in the palette) hides the tab bar, sidebar,
+outline and relations with one command; Escape leaves it. The reading column and editor keep
+their own width and scroll, so hiding the panels does not move the document. In zen the
+reader dims every paragraph outside the section being read (`FocusMode` global). Settings has
+a Panels section that toggles the sidebar, outline and relations independently and saves the
+choice in `config.txt`, so the layout survives relaunch.
 
 #### Q2.6 Media actually renders — D · A · M–L
 Render inline images (not just standalone embeds), honor `![[img|300]]` width/alt, support
@@ -298,11 +483,35 @@ Add a lightbox with Escape/click-outside. On Android, pass an attachment index i
 **Done when:** a note containing a local image, a sized image, a PDF and an audio file is
 usable in reading mode on both platforms; no "not previewed" dead ends for supported types.
 
+**Landed:** `Block::Embed` carries `width` and `alt`, parsed from `![[img|300]]`,
+`![[img|alt text]]` and `![alt](src)`; the reading view sizes the picture, shows the alt as
+a caption, and the HTML export writes `width`/`alt` attributes. Clicking a standalone image
+opens a lightbox (backdrop click or Escape closes). PDF/audio/video embeds render an
+attachment card with **Open**, which hands the file to the OS instead of showing "not
+previewed", and an unresolved inline asset link opens the file with the OS too. Android's
+preview uses the new FFI `render_html_from_vault(source, root)`, which builds the vault
+attachment index so `![[shot.png]]` resolves to its subfolder path; the Kotlin bindings were
+regenerated and `:app:compileDebugKotlin` passes.
+**Landed (inline images):** images inside running text render as pictures. `![[img.png]]` and
+`![alt](src)` are flagged as images by the inline parser, resolved through the same vault
+attachment index, decoded once (cached by path and mtime) and placed as atomic pieces in the
+measured flow, so they sit on the text baseline, wrap like words and scale down rather than
+overflow the column; clicking one opens the lightbox. Selection and copy still use the
+label text, so offsets are unchanged.
+**Remaining (by design/choice):** remote image URLs are not fetched (the app is offline by
+default), but they stay clickable and open in the browser; PDF/audio/video use the OS viewer
+rather than an embedded player.
+
 #### Q2.7 Code, tables and callouts — D · S–M
 Add a copy button to code fences, horizontal scroll plus sticky headers for wide tables,
 and collapsible callouts (remember per-note state). Do not let wide tables widen the page.
 **Done when:** copying a fence works with one click; a 12-column table is readable without
 scrolling the whole page; callouts remember their collapsed state for the session.
+
+**Landed:** code fences have a one-click copy button and report the result. Code (fenced and
+inline) uses a platform-native monospace family first — Menlo on macOS, Consolas on Windows,
+DejaVu Sans Mono elsewhere — with mono fallbacks, so it no longer collapses to the UI font.
+Tables stay inside the reading measure and scroll horizontally when wider.
 
 #### Q2.8 Footnote popover — D · S
 Anchor the footnote popup near the clicked reference instead of `top(96)/left(24)`, show the
@@ -311,6 +520,13 @@ inside a fold.
 **Done when:** every reference opens a readable popup that dismisses predictably and does
 not cover the reference itself.
 
+**Landed:** the popup opens beside the clicked reference — the marker's window position is
+captured and the panel is placed with GPUI's `anchored` element, offset below it, snapped
+inside the window — and a full-view backdrop closes it on any outside click; Escape also
+closes it. It lists every reference with its snippet and the definition link, and a jump to a
+reference or definition that a folded heading hides first unfolds the section and reflows, so
+the page actually moves. A unit test covers the remembered anchor and its reset on close.
+
 #### Q2.9 Transclusion fidelity — D · L
 Give embedded blocks synthetic ids so link hit-testing and selection work, cache parsed
 embeds by mtime, typeset math in embeds, honor `![[Note#Section]]`, and show a clear
@@ -318,17 +534,94 @@ missing-note placeholder. Do not re-read/re-parse the vault on every render.
 **Done when:** a note with 3 nested embeds scrolls smoothly, links inside embeds work, and
 editing the embedded note updates the host on the next render without a full vault scan.
 
+**Landed:** each transcluded note is parsed once per `(path, fragment)` and reused while its
+mtime is unchanged (shared blocks are expanded at parse time, not per frame). Embedded blocks
+get synthetic ids above the host block count, so links inside an embed are clickable and
+selection paints across its text. Math inside embeds is typeset lazily into a shared scene
+map and reused. `![[Note#Section]]` renders only that heading's section (it stops at the next
+same-or-higher heading), a missing section and a missing note each show a placeholder, and
+nested embeds stay depth-limited.
+**Landed (copy and blocks):** a selection that spans a transclusion copies the embedded
+note's display text in place (from the cached parse, or by parsing the file once), and
+`![[Note#^block]]` renders just the block whose last line carries `^id` (a missing block id
+shows a placeholder). Trailing `^id` markers are hidden from display text and therefore from
+copies.
+
 #### Q2.10 Reading progress and typography details — D · S
 Show section name and percent read in the status bar (replace edit-mode Ln/Col), join soft
 line breaks with spaces while preserving explicit hard breaks, and keep footnote/heading
 spacing consistent.
 **Done when:** reading status is meaningful; one-sentence-per-line notes read as paragraphs.
 
+**Landed:** the reading status bar shows the current section and percent read in place of
+Ln/Col, and soft line breaks are joined into spaces while two-space and backslash hard breaks
+are preserved.
+
 #### Q2.11 Split preview performance and sync — D · M
 Debounce full re-parse/re-typeset of split preview and the stats/outline computations on
 every revision; cache by buffer revision. Optionally add scroll sync with a toggle.
 **Done when:** typing in a 5k-line note does not drop frames or re-typeset every formula on
 each keystroke; preview catches up within ~150 ms of typing stopping.
+
+**Landed:** the split preview re-parses and re-typesets at most once per 150 ms window while
+typing, with a trailing one-shot timer, instead of on every revision; it shows the previous
+render until then. Switching to another note (a new epoch) updates immediately instead of
+flashing the old note. Stats and the outline were already throttled in Q3.8.
+**Landed (scroll sync):** Settings has a persisted "Preview scroll sync" toggle
+(`scroll_sync` in `config.txt`). While it is on and the split preview is open, a 150 ms loop
+reads the editor's scroll fraction (content height from the laid-out rows, viewport height
+from the scroll handle) and scrolls the preview to the same fraction of its blocks. The loop
+stops as soon as the setting is turned off or the preview closes, so it costs nothing
+otherwise. It is two-way: whichever side moved last drives the other, and the block-rounded
+preview position is recorded after each sync so the two do not fight.
+
+#### Q2.12 Live preview inside the source editor — D · M–L
+Obsidian-style: the block holding the caret stays raw source and the rest of the note
+renders. **Landed:** display `$$…$$` blocks are typeset in place with the reading view's
+RaTeX scene whenever the caret is outside them, scaled to the column and centred; the source
+returns while editing; empty, unclosed and invalid formulas keep their source instead of
+leaving a gap; rows keep their geometry so clicks, scroll, selection and find are unchanged.
+**Landed (marker hiding):** each line is shaped from a display string that omits inline
+markers (`**`, `__`, `*`, `_`, `~~`, `==`, backticks and `[[…]]`/`![[…]]` brackets), with a
+per-line map in both directions: source column → display column and byte offset, display
+column → source column. Wrapping measures the display text, while row metadata keeps
+contiguous *source* ranges and each row's display start, so clicks, selection quads, the
+caret, vertical movement and IME bounds all convert through the map instead of assuming
+equal columns. The paragraph (blank-line-delimited) holding the caret stays raw, so markers
+reappear as you move into it; moving between paragraphs invalidates only the affected lines
+through the per-line cache. Tests cover both directions, UTF-8 byte offsets, wrapping that
+splits inside hidden markers, code spans and unclosed markers.
+**Landed (rules):** a thematic break (`---`, `***`, `___` on a blank-line-delimited line,
+outside frontmatter and code fences) paints as a horizontal rule instead of source while it
+is outside the caret paragraph.
+**Landed (images):** a standalone `![[image]]` line outside the caret paragraph is decoded
+(shared, mtime-keyed image cache) and drawn in place: about five lines tall, or the width
+from `![[image|300]]`, keeping the aspect ratio and fitting the column. Its layout reserves
+exactly the rows the picture needs and pushes them as blank rows with the line's map, so
+scroll, click-to-edit (the caret lands on that line and the source returns), selection and
+IME mapping are unchanged. Moving into the paragraph re-shows the source, and moving out
+draws the image again.
+**Landed (callouts):** a `> [!kind]` block outside the caret paragraph paints a tinted box
+with a left accent coloured by kind (warning/error amber, tip/success green, otherwise
+accent). The leading `>` markers and the `[!kind]` tag are concealed on blockquote and callout
+lines through the same column map, so the text stays aligned and editable; moving into the
+block shows the markers again.
+**Landed (tables):** a pipe table outside the caret paragraph draws as a quiet framed block:
+a soft backdrop, a tinted header row, a divider where the `|---|` separator collapses (it
+reserves no row) and a thin outer edge with an accent stripe. Pipes and the separator row are
+concealed, so the cells read as text; per-pipe vertical rules were removed because ragged
+source columns made them noisy. Moving the caret into the table shows the full markdown
+again. Tests cover separator detection, table block detection around the caret paragraph, and
+pipe concealment.
+**Landed (live formula):** the block holding the caret now typesets its `$$…$$` formula in
+the same layout pass and paints it under the source on three reserved rows, scaled to fit
+the column and the reserved height, so the result is visible while typing. Errors and
+unclosed blocks keep just the source. This completes Q2.12's substitutions: markers, images,
+rules, callouts, tables and display formulas all render in place outside the caret's
+paragraph, so the Q2.12 "Done when" case (emphasis + image + table with the caret's line as
+source) is met.
+**Done when:** a note with emphasis, an image and a table shows the caret's line as source
+and the rest as preview, and every click lands on the source column the user aimed at.
 
 ---
 
@@ -349,12 +642,24 @@ focus out of the editor.
 **Done when:** Tab indents a multi-line selection, Shift+Tab outdents, list markers continue
 correctly, and autocomplete still accepts with Tab/Enter.
 
+**Landed:** `Tab` indents every selected line by four spaces (the selection maps through the
+edit and stays selected); with a bare caret it inserts an indent at the caret. `Shift+Tab`
+removes one tab or up to four leading spaces from each selected line, or from the caret's
+line. `Tab` still accepts an autocomplete suggestion first, and Tab never leaves the editor.
+Enter at the end of a bullet, task, numbered or quoted line continues its marker
+(`3.` becomes `4.`, `- [x]` becomes `- [ ]`, indentation kept); an empty item does not
+continue. Unit tests cover the marker rules.
+
 #### Q3.3 Save As is discoverable — D · S
 Bind Ctrl/Cmd+Shift+S. When Ctrl+S or Ctrl+W hits an Untitled note, open Save As immediately
 (as a dialog or inline filename field) instead of discarding an error. After saving, focus
 returns to the editor at the same position.
 **Done when:** a new note can be named and saved in one flow; Ctrl+W on Untitled offers
 Save As, not a dead end.
+
+**Landed:** `Ctrl/Cmd+Shift+S` and the palette open Save As; `Ctrl+S` and close on an untitled
+buffer open the same name panel instead of failing, and saving focuses the editor at the
+unchanged caret.
 
 #### Q3.4 A real feedback system — D · A · S · M
 Replace the single never-expiring muted `status_message` with toasts/status entries that
@@ -364,12 +669,21 @@ save/sync state in the status bar.
 **Done when:** save success, save failure, conflict, link-not-found and sync failure are
 distinguishable at a glance; no stale message survives a context change.
 
+**Landed:** status lines carry a kind (info, success, warn, error), success expires after
+3 s, info after 6 s, warnings and errors stay until dismissed or superseded, the status bar
+shows a persistent save/sync state, and a new action clears the previous message.
+
 #### Q3.5 Conflict and reload bar — D · M
 When a file changes externally: clean buffer reloads silently **and preserves scroll/cursor**;
 dirty buffer shows a per-tab badge plus Reload / Compare / Keep mine / Save as copy. Never
 auto-reload a dirty buffer. Deleted files surface instead of being skipped.
 **Done when:** external edits never surprise the user; inactive tabs show a conflict marker;
 Compare uses the existing line diff and recovery history.
+
+**Landed:** the file watcher compares the disk fingerprint; a clean buffer reloads silently
+(caret, scroll and reading block restored), a dirty buffer raises a per-tab `conflict` flag
+shown as a warning glyph and an inline bar with Reload / Keep mine / Compare / Save as copy.
+Deleted files surface as an error instead of vanishing.
 
 #### Q3.6 Close is undoable; trash is reachable — D · S–M
 Add Ctrl/Cmd+Shift+T to reopen the last closed tab (store a small closed-tab stack with
@@ -378,11 +692,22 @@ path/mode/position) and a "Trash" command that lists, restores and empties using
 **Done when:** accidental close is recoverable without the file tree; deleted notes can be
 restored from inside the app.
 
+**Landed:** `Ctrl/Cmd+Shift+T` reopens the last closed tab from a closed-tab stack (path,
+mode, caret and reading block); closing shows "Closed note — Undo". A Trash view lists
+`.dragon-glass/trash`, restores entries and empties the folder, and moving a note to the trash
+saves a dirty buffer first or refuses.
+
 #### Q3.7 Multi-cursor correctness — D · M
 Apply formatting to every selection, remap extra cursors after edits, clear extras on
 undo/redo/Vim transitions, and coalesce a multi-cursor typing burst into one undo step.
 **Done when:** formatting a multi-selection edits all ranges; one undo reverses the whole
 burst; carets never land at stale offsets.
+
+**Landed:** inline formatting toggles around every selection (overlaps format once), all
+edits go through one `replace_many` batch so a single undo reverses them, and every caret is
+remapped into its own formatted run instead of a stale offset. Typing, deleting and pasting
+at several carets were already batched this way, and undo/redo still clear the extra
+carets.
 
 #### Q3.8 Per-keystroke work is bounded — D · M
 Debounce/cache stats, outline headings, reading attachments index, and split preview by
@@ -390,11 +715,25 @@ buffer revision. Build the attachments/alias index once per vault scan, not on f
 **Done when:** a 1 MB note remains responsive while typing; idle CPU stays at zero; no
 full-vault walk on mode entry.
 
+**Landed:** the editor's word/character counts and the app's header stats and outline are
+throttled to ~7 passes a second with a trailing one-shot timer (no timer when the buffer is
+clean), instead of counting the whole note on every keystroke. The attachment index is still
+built once per vault/mode entry.
+**Landed (headings):** a revision now re-parses headings only when the edit can change them.
+A same-length edit with no newline, `#`, backtick, `~` or `=` in the changed bytes, on a line
+that is not a heading, a fence or a setext heading's text, reuses the cached heading list; any
+structural edit (newline, marker, heading line, frontmatter) re-parses. A unit test covers the
+prose case and each structural case that must invalidate the cache.
+
 #### Q3.9 Focused split is the command target — D · S
 Track the focused pane/tab; Ctrl+W, Save, Find and format commands apply to the focused
 editor, not always `active_tab`. Clicking a pane focuses it and updates the active tab.
 **Done when:** two side-by-side notes can be edited and closed independently with the
 keyboard; the tab bar highlights the focused pane.
+
+**Landed:** clicking a split pane activates its tab and focuses its editor, so Ctrl+W, Save,
+Find and formatting target the pane the user is looking at; the tab bar already marks
+secondary panes.
 
 #### Q3.10 Autocomplete belongs at the caret — D · M
 Replace the bottom bar with a caret-anchored popup (or a non-resizing overlay), keep it
@@ -403,11 +742,21 @@ substring matches.
 **Done when:** `[[`, `#` and `/` suggestions appear next to the caret, never resize the
 document, and are fully keyboard-operable.
 
+**Landed:** the suggestion list is an overlay, not a row that pushes the document up, so
+opening it never moves the caret. Every paint records the caret's screen corner, and the list
+is anchored just below it with GPUI's `anchored` element, snapped inside the window with an
+8 px margin; the first frame (before a caret position exists) falls back to the viewport
+bottom. Prefix matches rank ahead of substring matches for notes and tags.
+Up/Down/Enter/Escape and Tab all work.
+
 #### Q3.11 Format bar does not move the page — D · S
 Overlay the selection formatting bar near the selection (or reserve stable space) so
 appearing/disappearing bars do not change the editor viewport.
 **Done when:** selecting text at the top/bottom of the viewport does not scroll the
 document.
+
+**Landed:** the format bar reserves a fixed 30 px strip in edit mode (an empty bar when
+nothing is selected), so selecting or deselecting text never resizes the editor.
 
 #### Q3.12 Small editor gaps — D · S
 Vim: support redo, make `:wq` close the tab, surface failed searches. Window title: show
@@ -417,11 +766,32 @@ move/duplicate/delete: preserve cursor and scroll.
 **Done when:** no common action is a silent no-op; the window title is a reliable dirty
 indicator; block operations do not jump the viewport.
 
+**Landed:** Vim has redo and `:wq`/`:x`/`:q` close; failed searches report. The window title
+shows the note and a dirty dot. Tabs close on middle-click. Copy/link actions report their
+outcome. Double-click selects the word under the pointer and triple-click selects its line;
+a click-drag still extends normally. A right-click opens a context menu at the pointer with
+Cut, Copy, Paste, Bold, Italic, Highlight and Wikilink; it never moves the caret or drops the
+selection, and closes on Escape or an outside click.
+**Landed (tab overflow):** a `▾` button at the right of the tab bar opens a menu listing every
+open tab with its dirty dot; the active tab is highlighted and clicking a row activates it.
+The menu is anchored at the button, snaps inside the window, and closes on Escape or an
+outside click.
+**Landed (block edits):** moving, duplicating or deleting a block keeps the caret on the same
+line and column inside the moved (or duplicated) block, keeps the viewport where it was, and
+places the caret at the following block after a delete. Unit tests cover a moved paragraph and
+a deletion.
+
 #### Q3.13 Dirty state reflects content — D · S
 Compare against the saved text/revision rather than flipping a bool. Type-then-delete and
 undo-after-save return to clean. Use this same signal for close prompts and tab dots.
 **Done when:** a property test of random edit/undo sequences only reports dirty when bytes
 differ from the saved revision.
+
+**Landed:** `Buffer` keeps the content hash of the saved version and derives `is_dirty` from
+the current text (FNV-1a over the rope, cached per revision), so typing and deleting, or
+undoing back to the saved bytes, reports clean again. A 200-step randomized edit/undo test
+asserts `is_dirty == (text != saved)` after every step; the tab dot, title marker and close
+prompt all read this one signal.
 
 #### Q3.14 Startup is honest — D · S
 If a restored tab fails to load, show an inline error with Retry/Locate instead of a blank
@@ -429,6 +799,13 @@ looking tab. Do not block window creation on loading every tab; load the active 
 and the rest lazily.
 **Done when:** a missing/locked file is visible and recoverable; 50 restored tabs still
 start under the cold-start budget.
+
+**Landed:** a restored tab whose file cannot be read records the failure, and the pane shows
+"… could not be opened", the path and reason, plus **Retry** and **Close tab** instead of an
+empty editor that silently accepts typing. Retry reloads in place. Only the saved active tab
+is read when the window is created; every other restored tab is marked pending and loads
+(with its saved mode, caret and scroll applied) the first time it is activated, so a session
+with many tabs no longer blocks startup on reading all of them.
 
 ---
 
@@ -445,6 +822,17 @@ Add find (and replace, if the editor remains plain text) with a compact bar abov
 match count, next/previous and scroll-to-match. Reuse the engine's find options.
 **Done when:** finding a phrase in a long note is possible without scrolling manually.
 
+**Landed:** "Find in note" in the editor menu opens a compact bar above the text: the
+pattern, an `n/m` count, previous/next and close. Matches come from the engine's finder
+through the new FFI `find_in_text`, which returns UTF-16 ranges for the text field; stepping
+puts the match in the editor selection and focuses the editor, so it scrolls into view.
+Matches refresh as the note changes.
+**Landed (replace):** the find bar has a replacement field with Replace (current match) and
+All (every match in one pass, built from the non-overlapping ranges). The editor text syncs
+to the buffer after a replace.
+**Landed (options):** the find bar has `.*`, `Aa` and `Word` toggles for regex, case and
+whole-word matching; changing one recomputes the matches through the engine's finder.
+
 #### Q4.3 Mobile editing toolbar and autocomplete — A · L
 Add a keyboard accessory row: bold, italic, highlight, link, heading, list, task, code;
 insert wikilinks, tags and slash commands from a caret/selection-aware picker. Add basic
@@ -453,6 +841,20 @@ screens.
 **Done when:** common markdown can be authored on a phone without typing punctuation
 syntax; `[[` opens a searchable note picker; the toolbar does not cover the caret.
 
+**Landed:** a keyboard accessory row above the editor (hidden in preview) with bold, italic,
+highlight, inline code, heading, bullet, task and wikilink buttons. Each acts on the current
+selection and writes through to the buffer; the wikilink button, and typing `[[`, open a
+searchable note picker that inserts `[[stem]]` at the caret. Typing `#` after whitespace opens
+a searchable tag picker (inserts `#tag`) and typing `/` at the start of a line opens a
+slash-command picker for headings, lists, tasks, quotes, code, math, callouts and tables; each
+picker replaces the trigger character it was opened from.
+**Landed (highlighting):** the editor colours markdown as you type. The tokenizer is the
+engine's own line tokenizer (`core::syntax`), now exposed through `syntax_spans` (UTF-16
+runs, merged, with fenced-code state tracked across lines), so Android and the desktop editor
+agree on what is a heading, link, code span, math, highlight, comment or emphasis marker. A
+`VisualTransformation` adds styles only, so the cursor and selection offsets are unchanged.
+**Remaining:** line numbers (judged harmful on a phone).
+
 #### Q4.4 Sync is visible and recoverable — A · M
 Show a sync chip/state in the editor and list (synced/unsaved/syncing/error/last sync),
 allow sync from the editor after saving, make conflict rows actionable with Retry/Abort,
@@ -460,21 +862,61 @@ and never leak JGit error strings as the only explanation.
 **Done when:** a user always knows whether their work is local-only; a failed sync can be
 retried from where it failed.
 
+**Landed:** the note list and the editor both show a sync chip whose text is the current
+state — Syncing…, Sync failed, Conflicts, Unsynced, Behind, Synced, Folder sync, Git sync —
+tinted when work is local, behind or failed. Tapping it opens the sync sheet, so the editor
+can sync directly; `syncGit` saves the open note first and refuses to run when that save
+fails (Q0.7). The sheet shows the last successful sync time (persisted per vault) and a
+conflict section with **Retry** and **Abort sync** buttons.
+
 #### Q4.5 New note and row actions — A · S
 Prompt for title and folder on create (no root "Untitled"), add long-press row actions
 (rename/move/delete/bookmark), and make properties/tags/relations chips clickable.
 **Done when:** creating a note takes one intentional dialog; every chip in Details navigates
 or filters.
 
+**Landed (Android):** the floating button opens a **New note** dialog asking for a title and
+a folder (type one or pick from the vault's existing folders; it is created when missing).
+The title becomes the file name (sanitized, with ` 2`, ` 3` suffixes for duplicates) and the
+first heading. Long-pressing a row (list, tree or search results) opens a sheet with
+Bookmark/Remove bookmark, Rename or move (a path dialog) and Move to trash; the actions work
+on that row even when another note is open, saving the open note first when needed.
+**Landed (chips):** every chip in Details acts. A tag closes the note (saving first) and
+searches for it; a property closes the note and filters the list to notes whose frontmatter
+matches that key and value exactly (through the engine's query runner, with a "Filter: key =
+value" bar that clears); a relation resolves its target through the engine's note index
+(path, stem, slug or alias) and opens that note.
+
 #### Q4.6 Import/export progress — A · S
 Report file/byte progress, allow cancel, and keep the UI responsive for large vaults.
 **Done when:** importing 10k files shows progress and can be cancelled without corruption.
+
+**Landed:** the copy loops report a running file count and byte total and check a cancel flag
+between files. The note list shows a progress bar with the count and size and a Cancel button;
+cancelling reports "Import/Export/Sync cancelled", and a cancelled import deletes the partial
+local copy so no half-vault is left behind (an export or sync may leave the files already
+written in the chosen folder). Folder `sync` and `pushAll` take the same progress and cancel
+callbacks, and the sync sheet's folder path shows the same bar.
 
 #### Q4.7 Preview typography and theme — A · S
 Use the shared reader settings for size/width/theme; support pinch-zoom; avoid reloading
 the WebView on every recomposition.
 **Done when:** text is comfortable on a phone and tablet; zoom and theme survive mode
 switches.
+
+**Landed:** the preview injects a reading stylesheet (44 rem measure, 16 px body, 1.65 line
+height, images capped at the page width, scrollable code/tables) on top of the export CSS and
+the existing dark overrides; pinch-to-zoom is enabled without the floating zoom buttons; and
+the WebView only reloads when the rendered document changes, so mode switches keep the page.
+**Landed (settings):** Android has a Reader settings sheet (from the note-list menu) with
+text size and column width steppers, stored in the vault config through the shared FFI
+(`readerSettings` / `setReaderSettings`) and applied to the preview stylesheet; the values
+match the desktop reader's `reader_size`/`reader_width`.
+**Landed (font and theme):** the Reader settings sheet also picks the typeface (sans, serif
+or mono) — stored as `reader_font` in the vault config and applied to the preview stylesheet,
+with code kept monospace — and the app theme (system, light or dark), stored on the device and
+applied to both the Compose colours and the preview's dark overrides. The typeface is shared
+with the desktop through the config; the desktop reading view does not consume it yet.
 
 #### P2 — polish (schedule after P0/P1)
 - Mobile: graph layout off the main thread, pan/zoom, share/deep-link entry, vault
@@ -487,6 +929,21 @@ switches.
   count in the reading status bar, accessibility labels and focus order audit, RTL and
   IME regression pass.
 - Performance: background index/alias build, lazy tab loading, cache invalidation audit.
+
+**Landed from this list:** the desktop tab overflow menu, tag chips as navigation, code-copy
+feedback, and `tel:`/`file://` link handling; explicit `./` and `../` wikilinks now resolve
+from the current note's folder. Settings has a persisted **Confirm external links** option:
+web, mail and phone links open only after an inline Open/Cancel bar (local files opened by
+the app do not ask). A resting pointer over a reading-view link shows a tooltip with its
+target (note, heading/block fragment, footnote, tag or URL), for both plain and measured
+(flow) paragraphs. Reading-view folds are part of session v2, so folded sections reopen
+folded. The vault's frontmatter/alias index is built off the startup path: a path/stem-only
+index is usable immediately and the full index (slugs and aliases) replaces it when a
+background pass finishes, with a generation check dropping stale builds. The desktop graph
+view pans by dragging, zooms at the pointer with the wheel or trackpad (0.35×–4×, with a reset
+control) and fits the canvas uniformly instead of stretching it to the window's aspect ratio.
+Android keeps its list/preview scroll, loads restored tabs lazily and has the shared reader
+settings. The rest of the list is still open.
 
 ---
 
@@ -508,13 +965,34 @@ following into `dragonglass-core` (or a thin shared layer) and expose through th
 | `NavEntry`/history | Back/forward semantics are product logic | `(path, mode, anchor)` stack with cap; clients render controls |
 
 **FFI additions:** `save_document_with_fingerprint`, `document_fingerprint`,
-`load_draft`/`save_draft`/`discard_draft`, `resolve_link_fragment`, `reader_settings`, and
-`sync_state`. Keep all of them local-only and synchronous where possible; do not add
-background work to the FFI.
+`load_draft`/`save_draft`/`discard_draft`, `resolve_link_fragment`, `reader_settings` (size,
+width, typeface, line height), `sync_state`, plus the shared readers `find_in_text`,
+`syntax_spans`, `resolve_target` and `filter_by_property`. Keep all of them local-only and
+synchronous where possible; do not add background work to the FFI.
+
+**Landed:** the FFI exposes `MobileVault.documentFingerprint`,
+`saveDocumentWithFingerprint` (returns `saved` / `conflict` with the disk hash / `error`),
+`saveDraft`/`loadDraft`/`discardDraft`, `readerSettings`/`setReaderSettings`, and a
+`resolveLinkFragment(source, fragment)` that resolves `#Heading` and `#^block` to a 1-based
+line. Kotlin bindings are regenerated. Tests cover conflict detection (the disk version is
+preserved), drafts round-trip, fragment resolution and clamped reader settings.
+**Landed (clients):** Android captures a fingerprint when it opens a note and every save now
+goes through `saveDocumentWithFingerprint`; a conflict throws and leaves the note open with
+its text, and the new baseline is stored after a successful write.
+**Landed (`sync_state`):** `core::git::SyncState`/`SyncSnapshot` define the five states
+(idle, dirty, syncing, conflict, error) and their attention rule; the FFI exposes them as
+`syncState(...)`, and Android's chip label/tint now come from that state machine instead of
+its own when-chain.
+**Remaining:** the iOS client is not started; this environment has no iOS toolchain, so
+`docs/ux-contract.md` is the deliverable that stands in for it.
 
 **UX contract document:** write `docs/ux-contract.md` with the invariants in §2 and a table
 of state transitions (open, edit, save, close, read, follow, back). Desktop and Android
 should both point tests at it; iOS implements it rather than copying Android screens.
+
+**Landed:** [`docs/ux-contract.md`](ux-contract.md) exists: the eight invariants with the
+code that enforces each and the tests that cover it, the state-transition table, the
+`DocumentFingerprint`/`SaveReport` save contract, and an explicit list of what is still open.
 
 **CLI:** no separate edit/read flow, but `export`/search should reuse the same link-fragment
 resolution and reader settings so exported HTML matches the in-app reader. Deep-link/URI

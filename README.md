@@ -31,30 +31,50 @@ A lot already works. This is a working application, not a mockup — but it is e
 
 **Editing**
 - Source editor with a rope buffer, undo/redo, IME, word wrap and a line-number gutter
-- Reading view and a live-preview pane beside the editor
+- Reading view and a live-preview pane beside the editor; reading is strictly read-only,
+  joins soft line breaks into paragraphs (hard breaks stay), and gives every code fence a
+  copy button
+- One-sentence-per-line notes read as paragraphs; `tags:` chips in the properties header
+  open a vault search, and frontmatter links are clickable
+- Reading selection: double-click a word, triple-click a paragraph, Shift-click to extend,
+  Shift+arrows/Home/End for keyboard selection, drag past the edge to scroll, Escape to
+  clear, and a "copied N characters" confirmation
 - Syntax highlighting, code fences, tables, task lists, footnotes, callouts and
   `==highlights==`
 - KaTeX-compatible math (`$…$` / `$$…$$`) via [RaTeX](https://github.com/erweixin/RaTeX),
-  rendered natively and exported as vector SVG
-- Tabs, split panes, detached windows, multiple windows per vault
-- Find and replace with regex, capture groups, case and whole-word toggles
+  rendered natively and exported as vector SVG; display `$$…$$` blocks are typeset in the
+  editor itself whenever the caret is outside the block, and show their LaTeX source again
+  while you edit them
+- Tabs, split panes, detached windows, multiple windows per vault; the window title shows
+  the active note and a dirty marker
+- Find and replace with regex, capture groups, case and whole-word toggles, keyboard-only
+  replace, and a visible result count
 - Multi-cursor editing (Ctrl+D, Ctrl+Alt+Up/Down, Alt+click) and optional Vim mode
-  (normal/visual/insert, counts, motions, operators, `/` search, `:w`, `:%s/…/…/g`)
+  (normal/visual/insert, counts, motions, operators, `/` search, `:w`, `:wq`, `:%s/…/…/g`)
 - A formatting bar on text selection plus shortcuts for bold, italic, strikethrough,
   highlight, inline code and comments; `Ctrl+K` turns a selection into
   `[[target|selection]]`
 - Wikilink, tag and slash-command autocomplete while typing
 - Command palette, a settings page (`Ctrl+,`), configurable hotkeys, light/dark themes and
   snippets
+- Reading typography: text size and column width are settings, applied to every open reader
+  and the split preview immediately and stored per vault
 
 **Vault and knowledge**
 - File tree with new note/folder, rename, move and delete to a recoverable trash
   (right-click a row), plus the quick switcher and full-text search
 - Wikilinks, backlinks, tags, outline, document relations and a graph view
 - Daily/weekly/monthly notes, templates, properties, bookmarks
-- Embeds and attachments (images, PDF, audio), transclusion, shared blocks
+- Embeds and attachments (images, PDF, audio), transclusion, shared blocks; images honor
+  `![[img|300]]` width and alt text, click opens a lightbox, and other attachments open in
+  the OS viewer from a card
 - A/B versions with a line diff, document review, block move/duplicate/delete/extract
 - Recovery snapshots, browsable and restorable from **File recovery** in the palette
+- Conflict-safe saves: a save never overwrites a file that changed on disk; the app offers
+  Reload / Keep mine / Compare / Save as copy instead
+- Crash-safe drafts: typing writes a debounced draft under `.dragon-glass/drafts/`, and the
+  next launch offers Recover / Compare / Discard; optional note autosave is a vault setting
+  (`autosave=on`)
 
 **Around the editor**
 - Git sync by driving your own `git` binary (your credentials, SSH config, hooks and commit
@@ -65,10 +85,11 @@ A lot already works. This is a working application, not a mockup — but it is e
 - Importers for Evernote (`.enex`) and Roam exports
 - A local package store for themes and WASM plugins
 - A vault picker that remembers recent vaults and reopens the note you were last in
-
 **Not there yet:** notarized macOS builds, Mermaid diagrams, a community (online)
 theme/plugin store, end-to-end-encrypted sync, and full mobile parity (an Android vertical
 slice and an assessed iOS path exist). See [`PLAN.md`](PLAN.md) for the full roadmap and
+[`docs/ux-contract.md`](docs/ux-contract.md) for the edit/read invariants every client must
+keep.
 the decisions behind it.
 
 ## Build from source
@@ -154,17 +175,27 @@ The app remembers the vaults you open, outside any vault, in
 `~/Library/Application Support/DragonGlass/vaults.txt` on macOS, or
 `~/.config/dragon-glass/vaults.txt` on Linux (`$XDG_CONFIG_HOME` is respected, and
 `DRAGON_GLASS_CONFIG_DIR` overrides all of them).
-On launch it reopens the last vault and the note you were last in — stored per vault in
-`.dragon-glass/session.txt`. Use **Open vault** in the command palette (`Ctrl+P`, `Cmd+P`
+On launch it reopens the last vault and every tab that was open — with each tab's mode,
+caret and scroll position — stored per vault in `.dragon-glass/session.txt`. Tabs whose files
+have disappeared are dropped. Use **Open vault** in the command palette (`Ctrl+P`, `Cmd+P`
 on macOS) to open another vault in its own window, or remove stale entries in the picker.
 
 ## Editing shortcuts
 
 | Key | Action |
 |---|---|
-| `Ctrl+F` | Find in the current note |
+| `Ctrl+F` | Find in the current note (an in-page find while reading) |
 | `Ctrl+H` | Find and replace |
 | `F3` / `Shift+F3` | Next / previous match |
+| `Tab` / `Shift+Tab` (find bar) | Move between the pattern and replacement fields |
+| `Enter` in replacement | Replace the current match (`Shift+Enter` finds the previous one) |
+| `Ctrl+Alt+Enter` / `Ctrl+Alt+A` | Replace one / replace all |
+| `Ctrl+Alt+R` / `Ctrl+Alt+C` / `Ctrl+Alt+W` | Toggle regex / case / whole word |
+| `Ctrl+Shift+S` | Save as (also offered by `Ctrl+S` on an untitled note) |
+| `Ctrl+Shift+T` | Reopen the last closed tab |
+| `Ctrl+[` / `Ctrl+]` | Back / forward through visited notes |
+| `Ctrl+Alt+Z` | Zen mode (hide the tab bar and side panels; Escape leaves) |
+| `Tab` / `Shift+Tab` | Indent / outdent the selection (or the caret's line) |
 | `Ctrl+D` | Select the word and then its next occurrence (multi-cursor) |
 | `Ctrl+Alt+Up/Down` | Add a cursor on the row above/below |
 | `Alt+click` | Add a cursor at the click |
@@ -175,7 +206,11 @@ on macOS) to open another vault in its own window, or remove stale entries in th
 | `Ctrl+Shift+H` | Highlight the selection |
 | `Ctrl+Shift+C` | Inline code |
 | `Ctrl+K` | Start a wikilink from the selection or caret |
+| `Ctrl+R` | Redo (also `Ctrl+Shift+Z`, `Ctrl+Y`) |
 | `Ctrl+,` | Settings |
+
+Status messages in the header expire on their own (errors stay until you click them or
+press Escape) and are coloured by kind: info, success, warning and error.
 
 On macOS, use `Cmd` wherever the table says `Ctrl`, except find and replace, which is
 `Cmd+Alt+F` because `Cmd+H` hides the app. The menu bar carries the same commands with
@@ -193,7 +228,9 @@ and **Cancel** instead of discarding the edits.
 
 Vim mode is per vault (`.dragon-glass/config.txt`, `vim_mode=true`) and supports
 normal/visual/insert modes, counts, the common motions and `d/y/c` operators, `/` search
-with `n`/`N`, `:w`, and `:s/…/…/` / `:%s/…/…/g`.
+with `n`/`N` (a miss or a bad pattern reports in the status line), `Ctrl+R` for redo, `:w`,
+and `:s/…/…/` / `:%s/…/…/g`. `:wq`, `:x` and `:q` save if needed and close the tab; closing
+goes through the normal save path, so it cannot drop unsaved text.
 
 Git commits use the identity from your own `git config`. To override it for one vault, set
 **Settings → Git → Commit name / Commit email** (stored as `git_name=` and `git_email=` in

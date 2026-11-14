@@ -8,6 +8,10 @@
 
 use ropey::Rope;
 
+/// FNV-1a constants, matching `fingerprint` so a buffer hash and a file hash are comparable.
+const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
 /// A single reversible edit, stored for undo/redo.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Edit {
@@ -25,28 +29,67 @@ enum Edit {
     Batch(Vec<Edit>),
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct Buffer {
     rope: Rope,
     /// Cursor position as a character index into `rope`.
     cursor: usize,
     undo: Vec<Edit>,
     redo: Vec<Edit>,
-    dirty: bool,
+    /// Content hash of the version last loaded or saved. Dirty state is derived from the
+    /// text itself, so typing and undoing back to the saved bytes reports clean again.
+    saved_hash: u64,
+    /// `(revision, hash)` of the current text, so repeated `is_dirty` calls cost one hash
+    /// per edit rather than one per call.
+    hash_cache: std::cell::Cell<Option<(u64, u64)>>,
     /// Bumped on every change, so the UI can cache derived layout.
     revision: u64,
 }
 
+impl Default for Buffer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Buffer {
     pub fn new() -> Self {
-        Self::default()
+        Self::from_text("")
     }
 
     pub fn from_text(text: &str) -> Self {
-        Self {
+        let mut buffer = Self {
             rope: Rope::from_str(text),
-            ..Self::default()
+            cursor: 0,
+            undo: Vec::new(),
+            redo: Vec::new(),
+            saved_hash: FNV_OFFSET,
+            hash_cache: std::cell::Cell::new(None),
+            revision: 0,
+        };
+        buffer.saved_hash = buffer.content_hash();
+        buffer
+    }
+
+    /// FNV-1a over the buffer contents, cached per revision.
+    ///
+    /// Dirty state compares a hash instead of a boolean so that an edit and its undo, or
+    /// typing and deleting the same characters, return to clean.
+    fn content_hash(&self) -> u64 {
+        if let Some((revision, hash)) = self.hash_cache.get() {
+            if revision == self.revision {
+                return hash;
+            }
         }
+        let mut hash = FNV_OFFSET;
+        for chunk in self.rope.chunks() {
+            for byte in chunk.bytes() {
+                hash ^= u64::from(byte);
+                hash = hash.wrapping_mul(FNV_PRIME);
+            }
+        }
+        self.hash_cache.set(Some((self.revision, hash)));
+        hash
     }
 
     /// Whole contents as a `String`.
@@ -98,7 +141,7 @@ impl Buffer {
     }
 
     pub fn is_dirty(&self) -> bool {
-        self.dirty
+        self.content_hash() != self.saved_hash
     }
 
     /// Monotonic change counter, for cache invalidation.
@@ -107,7 +150,7 @@ impl Buffer {
     }
 
     pub fn mark_saved(&mut self) {
-        self.dirty = false;
+        self.saved_hash = self.content_hash();
     }
 
     pub fn can_undo(&self) -> bool {
@@ -201,7 +244,6 @@ impl Buffer {
             inserted: text.to_string(),
         });
         self.redo.clear();
-        self.dirty = true;
         self.revision = self.revision.wrapping_add(1);
     }
 
@@ -265,7 +307,6 @@ impl Buffer {
         self.cursor = lowest_start + lowest_inserted;
         self.undo.push(Edit::Batch(batch));
         self.redo.clear();
-        self.dirty = true;
         self.revision = self.revision.wrapping_add(1);
         count
     }
@@ -353,7 +394,6 @@ impl Buffer {
         }
 
         self.redo.clear();
-        self.dirty = true;
         self.revision = self.revision.wrapping_add(1);
     }
 
@@ -380,7 +420,6 @@ impl Buffer {
         }
 
         self.redo.clear();
-        self.dirty = true;
         self.revision = self.revision.wrapping_add(1);
         true
     }
@@ -395,7 +434,6 @@ impl Buffer {
         self.rope.remove(at..at + 1);
         self.undo.push(Edit::Remove { at, text: removed });
         self.redo.clear();
-        self.dirty = true;
         self.revision = self.revision.wrapping_add(1);
         true
     }
@@ -566,7 +604,6 @@ impl Buffer {
         };
         self.revert(&edit);
         self.redo.push(edit);
-        self.dirty = true;
         self.revision = self.revision.wrapping_add(1);
         true
     }
@@ -577,7 +614,6 @@ impl Buffer {
         };
         self.apply(&edit);
         self.undo.push(edit);
-        self.dirty = true;
         self.revision = self.revision.wrapping_add(1);
         true
     }
@@ -763,8 +799,63 @@ mod tests {
         assert!(b.is_dirty());
         b.mark_saved();
         assert!(!b.is_dirty());
-        b.undo();
+
+        // Undoing back to the saved bytes is clean, even though a revision passed.
+        // (Inserting at 0 rather than at the caret keeps it a separate undo step; a typing
+        // burst at the caret coalesces into one.)
+        b.set_cursor(0);
+        b.insert("y");
         assert!(b.is_dirty());
+        b.undo();
+        assert_eq!(b.text(), "x");
+        assert!(!b.is_dirty());
+
+        // Typing and deleting the same text is clean too.
+        b.insert("z");
+        b.backspace();
+        assert!(!b.is_dirty());
+    }
+
+    #[test]
+    fn dirty_state_matches_the_bytes_through_random_edits_and_undos() {
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut rand = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+
+        let mut b = Buffer::from_text("alpha beta");
+        let mut saved = b.text();
+        for _ in 0..200 {
+            match rand() % 4 {
+                0 => {
+                    let at = (rand() as usize) % (b.len_chars() + 1);
+                    b.set_cursor(at);
+                    b.insert("xy");
+                }
+                1 => {
+                    b.backspace();
+                }
+                2 => {
+                    b.undo();
+                }
+                _ => {
+                    b.redo();
+                }
+            }
+            if rand() % 7 == 0 {
+                b.mark_saved();
+                saved = b.text();
+            }
+            assert_eq!(
+                b.is_dirty(),
+                b.text() != saved,
+                "dirty must follow the bytes: {:?}",
+                b.text()
+            );
+        }
     }
 
     #[test]

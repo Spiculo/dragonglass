@@ -5,8 +5,8 @@ use dragonglass_core::graph::{self, Graph};
 use gpui::{
     div, fill, point, prelude::*, px, relative, size, App, Bounds, Context, Element, ElementId,
     Entity, FocusHandle, Focusable, GlobalElementId, InspectorElementId, LayoutId, MouseButton,
-    MouseDownEvent, PaintQuad, PathBuilder, Pixels, Point, Render, ShapedLine, SharedString, Style,
-    TextRun, WeakEntity, Window,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, PathBuilder, Pixels, Point, Render,
+    ScrollDelta, ScrollWheelEvent, ShapedLine, SharedString, Style, TextRun, WeakEntity, Window,
 };
 
 use crate::theme::Theme;
@@ -28,6 +28,12 @@ pub struct GraphView {
     app: WeakEntity<crate::DragonGlassApp>,
     focus_handle: FocusHandle,
     last_bounds: Option<Bounds<Pixels>>,
+    /// Magnification of the fitted layout.
+    zoom: f32,
+    /// Screen-space offset from the fitted layout, in pixels.
+    pan: (f32, f32),
+    /// An in-progress drag: start position, starting pan and whether it moved.
+    drag: Option<(Point<Pixels>, (f32, f32), bool)>,
 }
 
 impl GraphView {
@@ -42,6 +48,9 @@ impl GraphView {
             app,
             focus_handle: cx.focus_handle(),
             last_bounds: None,
+            zoom: 1.0,
+            pan: (0.0, 0.0),
+            drag: None,
         }
     }
 
@@ -92,11 +101,85 @@ impl GraphView {
         (5.0 + (links as f32).sqrt() * 2.0).min(16.0)
     }
 
+    /// The virtual-canvas point under a position local to the graph bounds.
     fn scale(&self, local: Point<Pixels>) -> Option<(f32, f32)> {
         let bounds = self.last_bounds?;
-        let x = f32::from(local.x) / f32::from(bounds.size.width) * CANVAS.0;
-        let y = f32::from(local.y) / f32::from(bounds.size.height) * CANVAS.1;
-        Some((x, y))
+        Some(inverse_point(
+            (f32::from(local.x), f32::from(local.y)),
+            (f32::from(bounds.size.width), f32::from(bounds.size.height)),
+            self.zoom,
+            self.pan,
+        ))
+    }
+
+    fn reset_view(&mut self, cx: &mut Context<Self>) {
+        self.zoom = 1.0;
+        self.pan = (0.0, 0.0);
+        cx.notify();
+    }
+
+    fn zoom_at(&mut self, local: Point<Pixels>, delta_lines: f32, cx: &mut Context<Self>) {
+        let Some(bounds) = self.last_bounds else {
+            return;
+        };
+        let size = (f32::from(bounds.size.width), f32::from(bounds.size.height));
+        let (zoom, pan) = zoom_about(
+            self.zoom,
+            self.pan,
+            (f32::from(local.x), f32::from(local.y)),
+            size,
+            delta_lines,
+        );
+        self.zoom = zoom;
+        self.pan = pan;
+        cx.notify();
+    }
+
+    fn on_scroll(
+        &mut self,
+        event: &ScrollWheelEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(bounds) = self.last_bounds else {
+            return;
+        };
+        let Some(local) = bounds.localize(&event.position) else {
+            return;
+        };
+        let lines = match event.delta {
+            ScrollDelta::Lines(delta) => delta.y,
+            ScrollDelta::Pixels(delta) => f32::from(delta.y) / 40.0,
+        };
+        self.zoom_at(local, lines, cx);
+    }
+
+    fn on_mouse_move(
+        &mut self,
+        event: &MouseMoveEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((start, pan, moved)) = self.drag else {
+            return;
+        };
+        let dx = f32::from(event.position.x - start.x);
+        let dy = f32::from(event.position.y - start.y);
+        let moved = moved || dx.abs() + dy.abs() > 3.0;
+        if moved {
+            self.pan = (pan.0 + dx, pan.1 + dy);
+            self.drag = Some((start, pan, true));
+            cx.notify();
+        }
+    }
+
+    fn on_mouse_up(&mut self, event: &MouseUpEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((_, _, moved)) = self.drag.take() else {
+            return;
+        };
+        if !moved {
+            self.open_node_at(event.position, window, cx);
+        }
     }
 
     fn on_mouse_down(
@@ -106,11 +189,21 @@ impl GraphView {
         cx: &mut Context<Self>,
     ) {
         window.focus(&self.focus_handle);
+        // A press starts a possible pan. A click without motion opens the node on release.
+        self.drag = Some((event.position, self.pan, false));
+        cx.notify();
+    }
 
+    fn open_node_at(
+        &mut self,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(bounds) = self.last_bounds else {
             return;
         };
-        let Some(local) = bounds.localize(&event.position) else {
+        let Some(local) = bounds.localize(&position) else {
             return;
         };
         let Some((x, y)) = self.scale(local) else {
@@ -171,16 +264,79 @@ impl Render for GraphView {
                         "graph: {count} notes / {edges} links · depth {}",
                         self.depth
                     ))
-                    .child("click a node to open · Esc to close · dashed = relations · colours group by folder"),
+                    .child("drag to pan · scroll to zoom · click a node to open · Esc to close")
+                    .child(
+                        div()
+                            .id("graph-reset")
+                            .px_2()
+                            .rounded_sm()
+                            .cursor_pointer()
+                            .hover(move |style| style.bg(theme.hover))
+                            .child("reset view")
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _event, _window, cx| {
+                                    cx.stop_propagation();
+                                    this.reset_view(cx);
+                                }),
+                            ),
+                    ),
             )
             .child(
                 div()
                     .flex_1()
                     .min_h(px(0.0))
                     .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
+                    .on_mouse_move(cx.listener(Self::on_mouse_move))
+                    .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
+                    .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
+                    .on_scroll_wheel(cx.listener(Self::on_scroll))
                     .child(GraphCanvas { view: cx.entity() }),
             )
     }
+}
+
+/// Uniform fit scale, so the graph is never stretched by the window's aspect ratio.
+fn fit_scale(size: (f32, f32)) -> f32 {
+    (size.0 / CANVAS.0).min(size.1 / CANVAS.1).max(0.01)
+}
+
+/// Map a canvas point to a screen point inside a `size` viewport, with the fitted layout
+/// magnified by `zoom` and shifted by `pan` (both around the viewport centre).
+fn forward_point(canvas: (f32, f32), size: (f32, f32), zoom: f32, pan: (f32, f32)) -> (f32, f32) {
+    let scale = fit_scale(size) * zoom;
+    (
+        size.0 / 2.0 + pan.0 + (canvas.0 - CANVAS.0 / 2.0) * scale,
+        size.1 / 2.0 + pan.1 + (canvas.1 - CANVAS.1 / 2.0) * scale,
+    )
+}
+
+/// Inverse of [`forward_point`].
+fn inverse_point(screen: (f32, f32), size: (f32, f32), zoom: f32, pan: (f32, f32)) -> (f32, f32) {
+    let scale = (fit_scale(size) * zoom).max(0.0001);
+    (
+        (screen.0 - size.0 / 2.0 - pan.0) / scale + CANVAS.0 / 2.0,
+        (screen.1 - size.1 / 2.0 - pan.1) / scale + CANVAS.1 / 2.0,
+    )
+}
+
+/// Zoom by a wheel delta while keeping the canvas point under `pointer` fixed.
+fn zoom_about(
+    zoom: f32,
+    pan: (f32, f32),
+    pointer: (f32, f32),
+    size: (f32, f32),
+    delta_lines: f32,
+) -> (f32, (f32, f32)) {
+    let factor = (delta_lines * 0.1).exp();
+    let new_zoom = (zoom * factor).clamp(0.35, 4.0);
+    let anchor = inverse_point(pointer, size, zoom, pan);
+    let scale = fit_scale(size) * new_zoom;
+    let new_pan = (
+        pointer.0 - size.0 / 2.0 - (anchor.0 - CANVAS.0 / 2.0) * scale,
+        pointer.1 - size.1 / 2.0 - (anchor.1 - CANVAS.1 / 2.0) * scale,
+    );
+    (new_zoom, new_pan)
 }
 
 /// A stable colour per top-level folder, so related notes group visually.
@@ -262,11 +418,14 @@ impl Element for GraphCanvas {
             )
         };
         let canvas_position = |id: usize| positions.get(id).copied().unwrap_or((0.0, 0.0));
+        let (zoom, pan) = {
+            let view = self.view.read(cx);
+            (view.zoom, view.pan)
+        };
+        let _ = (nw, nh);
         let to_screen = |px_: f32, py: f32| {
-            point(
-                bounds.left() + px(nw * px_ / CANVAS.0),
-                bounds.top() + px(nh * py / CANVAS.1),
-            )
+            let (x, y) = forward_point((px_, py), (nw, nh), zoom, pan);
+            point(bounds.left() + px(x), bounds.top() + px(y))
         };
 
         // Edges first, so nodes sit on top. Plain links are solid; frontmatter relations are
@@ -372,5 +531,43 @@ impl Element for GraphCanvas {
         self.view.update(cx, |view, _cx| {
             view.last_bounds = Some(bounds);
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pan_and_zoom_round_trip() {
+        let size = (900.0, 600.0);
+        let canvas = (250.0, 480.0);
+        let screen = forward_point(canvas, size, 1.0, (0.0, 0.0));
+        let back = inverse_point(screen, size, 1.0, (0.0, 0.0));
+        assert!((back.0 - canvas.0).abs() < 0.01);
+        assert!((back.1 - canvas.1).abs() < 0.01);
+    }
+
+    #[test]
+    fn zoom_keeps_the_point_under_the_pointer_fixed() {
+        let size = (900.0, 600.0);
+        let pointer = (640.0, 180.0);
+        let before = inverse_point(pointer, size, 1.0, (0.0, 0.0));
+        let (zoom, pan) = zoom_about(1.0, (0.0, 0.0), pointer, size, 4.0);
+        assert!(zoom > 1.0);
+        let after = inverse_point(pointer, size, zoom, pan);
+        assert!((before.0 - after.0).abs() < 0.01);
+        assert!((before.1 - after.1).abs() < 0.01);
+    }
+
+    #[test]
+    fn zoom_is_clamped_and_the_fit_is_uniform() {
+        let (zoom, _) = zoom_about(1.0, (0.0, 0.0), (0.0, 0.0), (900.0, 600.0), 100.0);
+        assert_eq!(zoom, 4.0);
+        let (zoom, _) = zoom_about(1.0, (0.0, 0.0), (0.0, 0.0), (900.0, 600.0), -100.0);
+        assert_eq!(zoom, 0.35);
+        // A tall window letterboxes instead of stretching the graph.
+        let scale = fit_scale((400.0, 900.0));
+        assert!((scale - 0.4).abs() < 0.001);
     }
 }

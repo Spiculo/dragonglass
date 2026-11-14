@@ -56,6 +56,76 @@ impl Status {
     }
 }
 
+/// The shared sync state machine: every client renders these five states, not its own set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SyncState {
+    #[default]
+    Idle,
+    /// Local work has not been pushed yet.
+    Dirty,
+    Syncing,
+    Conflict,
+    Error,
+}
+
+impl SyncState {
+    pub fn label(self) -> &'static str {
+        match self {
+            SyncState::Idle => "synced",
+            SyncState::Dirty => "unsynced",
+            SyncState::Syncing => "syncing",
+            SyncState::Conflict => "conflict",
+            SyncState::Error => "sync failed",
+        }
+    }
+
+    pub fn needs_attention(self) -> bool {
+        !matches!(self, SyncState::Idle)
+    }
+
+    /// The state implied by a repository snapshot, plus whether a sync is running/failed.
+    pub fn of(snapshot: SyncSnapshot, busy: bool, failed: bool) -> Self {
+        if busy {
+            return SyncState::Syncing;
+        }
+        if failed {
+            return SyncState::Error;
+        }
+        if snapshot.conflicts > 0 {
+            return SyncState::Conflict;
+        }
+        if snapshot.changed > 0 || snapshot.untracked > 0 || snapshot.ahead > 0 {
+            return SyncState::Dirty;
+        }
+        SyncState::Idle
+    }
+}
+
+/// Counts from `git status`, independent of any client's model types.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SyncSnapshot {
+    pub changed: usize,
+    pub untracked: usize,
+    pub ahead: usize,
+    pub behind: usize,
+    pub conflicts: usize,
+}
+
+impl SyncSnapshot {
+    pub fn of(status: Option<&Status>) -> Self {
+        match status {
+            Some(status) => Self {
+                changed: status.changed,
+                untracked: status.untracked,
+                ahead: status.ahead,
+                behind: status.behind,
+                conflicts: status.conflicted.len(),
+            },
+            None => Self::default(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Outcome {
     /// Nothing needed doing.
@@ -307,6 +377,57 @@ fn run(root: &Path, args: &[&str]) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sync_state_follows_the_snapshot_and_flags() {
+        assert_eq!(
+            SyncState::of(SyncSnapshot::default(), false, false),
+            SyncState::Idle
+        );
+        assert_eq!(
+            SyncState::of(
+                SyncSnapshot {
+                    changed: 1,
+                    ..Default::default()
+                },
+                false,
+                false
+            ),
+            SyncState::Dirty
+        );
+        assert_eq!(
+            SyncState::of(
+                SyncSnapshot {
+                    ahead: 2,
+                    ..Default::default()
+                },
+                false,
+                false
+            ),
+            SyncState::Dirty
+        );
+        assert_eq!(
+            SyncState::of(
+                SyncSnapshot {
+                    conflicts: 1,
+                    ..Default::default()
+                },
+                false,
+                false
+            ),
+            SyncState::Conflict
+        );
+        assert_eq!(
+            SyncState::of(SyncSnapshot::default(), true, false),
+            SyncState::Syncing
+        );
+        assert_eq!(
+            SyncState::of(SyncSnapshot::default(), false, true),
+            SyncState::Error
+        );
+        assert!(!SyncState::Idle.needs_attention());
+        assert!(SyncState::Dirty.needs_attention());
+    }
 
     fn temp_repo(tag: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!(

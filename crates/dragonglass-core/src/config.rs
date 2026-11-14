@@ -19,8 +19,28 @@ pub struct Config {
     pub snippets: bool,
     /// Whether Vim-style modal editing is enabled for this vault.
     pub vim_mode: bool,
+    /// Save the note itself after idle, not just a recovery draft.
+    pub autosave: bool,
     /// Editor text size in points, persisted so the setting follows the vault.
     pub font_size: u16,
+    /// Reading view body text size in points.
+    pub reader_size: u16,
+    /// Reading view column width in pixels.
+    pub reader_width: u16,
+    /// Reading body font: `sans`, `serif` or `mono`.
+    pub reader_font: String,
+    /// Reading line height, as a percentage of the body size (120–220).
+    pub reader_line_height: u16,
+    /// Sidebar panel visibility.
+    pub show_sidebar: bool,
+    /// Outline panel visibility.
+    pub show_outline: bool,
+    /// Relations panel visibility.
+    pub show_relations: bool,
+    /// Keep the split preview at the editor's scroll position.
+    pub scroll_sync: bool,
+    /// Ask before opening a web, mail or phone link.
+    pub confirm_external_links: bool,
     /// Optional git commit name. Empty means "use the user's git config".
     pub git_name: Option<String>,
     /// Optional git commit email. Empty means "use the user's git config".
@@ -38,7 +58,17 @@ impl Default for Config {
             accent: None,
             snippets: true,
             vim_mode: false,
+            autosave: false,
             font_size: 14,
+            reader_size: 15,
+            reader_width: 780,
+            reader_font: "serif".to_string(),
+            reader_line_height: 150,
+            show_sidebar: true,
+            show_outline: true,
+            show_relations: false,
+            scroll_sync: false,
+            confirm_external_links: false,
             git_name: None,
             git_email: None,
         }
@@ -58,7 +88,20 @@ impl Config {
         }
         out.push_str(&format!("snippets={}\n", self.snippets));
         out.push_str(&format!("vim_mode={}\n", self.vim_mode));
+        out.push_str(&format!("autosave={}\n", self.autosave));
         out.push_str(&format!("font_size={}\n", self.font_size));
+        out.push_str(&format!("reader_size={}\n", self.reader_size));
+        out.push_str(&format!("reader_width={}\n", self.reader_width));
+        out.push_str(&format!("reader_font={}\n", self.reader_font));
+        out.push_str(&format!("reader_line_height={}\n", self.reader_line_height));
+        out.push_str(&format!("show_sidebar={}\n", self.show_sidebar));
+        out.push_str(&format!("show_outline={}\n", self.show_outline));
+        out.push_str(&format!("show_relations={}\n", self.show_relations));
+        out.push_str(&format!("scroll_sync={}\n", self.scroll_sync));
+        out.push_str(&format!(
+            "confirm_external_links={}\n",
+            self.confirm_external_links
+        ));
         if let Some(name) = &self.git_name {
             out.push_str(&format!("git_name={name}\n"));
         }
@@ -97,10 +140,55 @@ impl Config {
                 "vim_mode" => {
                     config.vim_mode = !matches!(value.to_lowercase().as_str(), "false" | "0" | "no")
                 }
+                "autosave" => {
+                    config.autosave = matches!(value.to_lowercase().as_str(), "true" | "1" | "yes")
+                }
                 "font_size" => {
                     if let Ok(size) = value.parse::<u16>() {
                         config.font_size = size.clamp(9, 32);
                     }
+                }
+                "reader_size" => {
+                    if let Ok(size) = value.parse::<u16>() {
+                        config.reader_size = size.clamp(11, 24);
+                    }
+                }
+                "reader_width" => {
+                    if let Ok(width) = value.parse::<u16>() {
+                        config.reader_width = width.clamp(480, 1200);
+                    }
+                }
+                "reader_line_height" => {
+                    if let Ok(height) = value.parse::<u16>() {
+                        config.reader_line_height = height.clamp(120, 220);
+                    }
+                }
+                "show_sidebar" => {
+                    config.show_sidebar =
+                        matches!(value.to_lowercase().as_str(), "true" | "1" | "yes")
+                }
+                "show_outline" => {
+                    config.show_outline =
+                        matches!(value.to_lowercase().as_str(), "true" | "1" | "yes")
+                }
+                "show_relations" => {
+                    config.show_relations =
+                        matches!(value.to_lowercase().as_str(), "true" | "1" | "yes")
+                }
+                "scroll_sync" => {
+                    config.scroll_sync =
+                        matches!(value.to_lowercase().as_str(), "true" | "1" | "yes")
+                }
+                "confirm_external_links" => {
+                    config.confirm_external_links =
+                        matches!(value.to_lowercase().as_str(), "true" | "1" | "yes")
+                }
+                "reader_font" => {
+                    let font = value.to_lowercase();
+                    config.reader_font = match font.as_str() {
+                        "sans" | "mono" => font,
+                        _ => "serif".to_string(),
+                    };
                 }
                 "git_name" => config.git_name = Some(value),
                 "git_email" => config.git_email = Some(value),
@@ -160,6 +248,41 @@ mod tests {
     }
 
     #[test]
+    fn scroll_sync_roundtrips_and_defaults_off() {
+        assert!(!Config::default().scroll_sync);
+        let config = Config {
+            scroll_sync: true,
+            ..Config::default()
+        };
+        assert!(Config::from_text(&config.to_text()).scroll_sync);
+        assert!(!Config::from_text("scroll_sync=no").scroll_sync);
+        assert!(Config::from_text("scroll_sync=yes").scroll_sync);
+        // Panel visibility is persisted too.
+        let panels = Config {
+            show_sidebar: false,
+            show_outline: false,
+            show_relations: true,
+            ..Config::default()
+        };
+        let loaded = Config::from_text(&panels.to_text());
+        assert!(!loaded.show_sidebar);
+        assert!(!loaded.show_outline);
+        assert!(loaded.show_relations);
+    }
+
+    #[test]
+    fn external_link_confirmation_roundtrips() {
+        assert!(!Config::default().confirm_external_links);
+        let config = Config {
+            confirm_external_links: true,
+            ..Config::default()
+        };
+        assert!(Config::from_text(&config.to_text()).confirm_external_links);
+        assert!(Config::from_text("confirm_external_links=yes").confirm_external_links);
+        assert!(!Config::from_text("confirm_external_links=0").confirm_external_links);
+    }
+
+    #[test]
     fn font_size_roundtrips_and_is_clamped() {
         let config = Config {
             font_size: 18,
@@ -168,6 +291,22 @@ mod tests {
         assert_eq!(Config::from_text(&config.to_text()).font_size, 18);
         assert_eq!(Config::from_text("font_size=2").font_size, 9);
         assert_eq!(Config::from_text("font_size=99").font_size, 32);
+    }
+
+    #[test]
+    fn reader_typography_roundtrips_and_is_clamped() {
+        let config = Config {
+            reader_size: 18,
+            reader_width: 900,
+            ..Config::default()
+        };
+        let loaded = Config::from_text(&config.to_text());
+        assert_eq!(loaded.reader_size, 18);
+        assert_eq!(loaded.reader_width, 900);
+        assert_eq!(Config::from_text("reader_size=1").reader_size, 11);
+        assert_eq!(Config::from_text("reader_width=9999").reader_width, 1200);
+        assert_eq!(Config::default().reader_size, 15);
+        assert_eq!(Config::default().reader_width, 780);
     }
 
     #[test]

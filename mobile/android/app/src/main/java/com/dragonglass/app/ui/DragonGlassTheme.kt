@@ -34,10 +34,12 @@ private val LightColors = lightColorScheme(
     outline = Color(0xFFC8CCD6),
 )
 
+/// `darkTheme` overrides the system choice; null follows the system.
 @Composable
-fun DragonGlassTheme(content: @Composable () -> Unit) {
+fun DragonGlassTheme(darkTheme: Boolean? = null, content: @Composable () -> Unit) {
+    val dark = darkTheme ?: isSystemInDarkTheme()
     MaterialTheme(
-        colorScheme = if (isSystemInDarkTheme()) DarkColors else LightColors,
+        colorScheme = if (dark) DarkColors else LightColors,
         typography = Typography(),
         content = content,
     )

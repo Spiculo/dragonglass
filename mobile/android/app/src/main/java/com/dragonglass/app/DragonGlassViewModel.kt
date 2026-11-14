@@ -20,6 +20,7 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import uniffi.dragonglass.DraftInfo
 import uniffi.dragonglass.GraphView
 import uniffi.dragonglass.HeadingInfo
 import uniffi.dragonglass.MobileVault
@@ -28,6 +29,8 @@ import uniffi.dragonglass.PropertyInfo
 import uniffi.dragonglass.RelationInfo
 import uniffi.dragonglass.SearchHit
 import uniffi.dragonglass.StatsInfo
+import uniffi.dragonglass.SyncStateInfo
+import uniffi.dragonglass.syncState
 import uniffi.dragonglass.TagCount
 import uniffi.dragonglass.TemplateInfo
 import uniffi.dragonglass.TrashEntry
@@ -35,16 +38,21 @@ import uniffi.dragonglass.TreeRow
 import uniffi.dragonglass.documentStats
 import uniffi.dragonglass.headings as parseHeadings
 import uniffi.dragonglass.properties as parseProperties
-import uniffi.dragonglass.renderHtml
+import uniffi.dragonglass.findInText
+import uniffi.dragonglass.renderHtmlFromVault
 import java.io.File
 
 private data class OpenNote(
     val relative: String,
     val source: String,
+    val fingerprint: ULong?,
+    val draft: DraftInfo?,
     val stats: StatsInfo,
     val headings: List<HeadingInfo>,
     val properties: List<PropertyInfo>,
     val relations: List<RelationInfo>,
+    /// Rendered preview HTML when the link was followed from preview mode.
+    val html: String = "",
 )
 
 /// How the note list is presented: a flat, recent-first list or the vault tree.
@@ -57,6 +65,8 @@ class DragonGlassViewModel(application: Application) : AndroidViewModel(applicat
     private val gitPreferences =
         application.getSharedPreferences("dragon_glass_git", Context.MODE_PRIVATE)
     private val tokenStore = SecureTokenStore(application)
+    private val uiPreferences =
+        application.getSharedPreferences("dragon_glass_ui", Context.MODE_PRIVATE)
     private var vault: MobileVault? = null
 
     var vaults by mutableStateOf(vaultStore.vaults())
@@ -103,7 +113,434 @@ class DragonGlassViewModel(application: Application) : AndroidViewModel(applicat
     var source by mutableStateOf("")
         private set
     var preview by mutableStateOf(false)
+    /// WebView scroll offset, kept when switching between Edit and Preview.
+    var previewScroll by mutableStateOf(0)
         private set
+
+    /// Reading typography, shared with the desktop reader through the vault config.
+    var readerSize by mutableStateOf(15)
+        private set
+    var readerMeasure by mutableStateOf(780)
+        private set
+    var readerFont by mutableStateOf("serif")
+        private set
+    var readerLineHeight by mutableStateOf(150)
+        private set
+
+    fun setReaderTypography(
+        size: Int,
+        measure: Int,
+        font: String = readerFont,
+        lineHeight: Int = readerLineHeight,
+    ) {
+        readerSize = size.coerceIn(11, 24)
+        readerMeasure = measure.coerceIn(480, 1200)
+        readerFont = if (font in setOf("sans", "serif", "mono")) font else "serif"
+        readerLineHeight = lineHeight.coerceIn(120, 220)
+        val bodySize = readerSize
+        val width = readerMeasure
+        val face = readerFont
+        val leading = readerLineHeight
+        viewModelScope.launch {
+            runCatching {
+                withContext(Dispatchers.IO) {
+                    ensureVault().setReaderSettings(
+                        bodySize.toUInt(),
+                        width.toUInt(),
+                        face,
+                        leading.toUInt(),
+                    )
+                }
+            }
+        }
+    }
+
+    fun chooseReaderFont(font: String) {
+        setReaderTypography(readerSize, readerMeasure, font)
+    }
+
+    fun chooseReaderLineHeight(lineHeight: Int) {
+        setReaderTypography(readerSize, readerMeasure, readerFont, lineHeight)
+    }
+
+    /// App theme: `system`, `light` or `dark`, stored on the device.
+    var themeMode by mutableStateOf(uiPreferences.getString("theme", "system") ?: "system")
+        private set
+
+    val darkTheme: Boolean?
+        get() = when (themeMode) {
+            "light" -> false
+            "dark" -> true
+            else -> null
+        }
+
+    fun chooseTheme(mode: String) {
+        if (mode !in setOf("system", "light", "dark")) return
+        themeMode = mode
+        uiPreferences.edit().putString("theme", mode).apply()
+    }
+
+    /// Files copied by a running import/export, and whether it can still be cancelled.
+    var transferProgress by mutableStateOf<Int?>(null)
+        private set
+    var transferBytes by mutableStateOf(0L)
+        private set
+    var transferLabel by mutableStateOf("")
+        private set
+    @Volatile
+    private var transferCancelled = false
+
+    fun cancelTransfer() {
+        transferCancelled = true
+    }
+
+    /// In-note find: pattern, matches (UTF-16 ranges) and the current one.
+    var findOpen by mutableStateOf(false)
+        private set
+    var findPattern by mutableStateOf("")
+        private set
+    var findRanges by mutableStateOf<List<IntRange>>(emptyList())
+        private set
+    var findIndex by mutableStateOf(0)
+        private set
+    var findReplacement by mutableStateOf("")
+        private set
+    var findRegex by mutableStateOf(false)
+        private set
+    var findCase by mutableStateOf(false)
+        private set
+    var findWholeWord by mutableStateOf(false)
+        private set
+
+    val findLabel: String
+        get() = if (findRanges.isEmpty()) "0/0" else "${findIndex + 1}/${findRanges.size}"
+
+    fun openFind() {
+        findOpen = true
+        findPattern = ""
+        findRanges = emptyList()
+        findIndex = 0
+    }
+
+    fun closeFind() {
+        findOpen = false
+        findPattern = ""
+        findReplacement = ""
+        findRanges = emptyList()
+        findIndex = 0
+    }
+
+    fun onFindChange(value: String) {
+        findPattern = value
+        refreshFind()
+    }
+
+    fun onReplaceChange(value: String) {
+        findReplacement = value
+    }
+
+    /// Replace the current match with the replacement text.
+    fun replaceCurrent() {
+        val range = findRanges.getOrNull(findIndex) ?: return
+        val text = source
+        if (range.first < 0 || range.last + 1 > text.length) return
+        source = text.substring(0, range.first) + findReplacement + text.substring(range.last + 1)
+        dirty = true
+        refreshFind()
+    }
+
+    /// Replace every match in one pass.
+    fun replaceAll() {
+        if (findRanges.isEmpty()) return
+        val text = source
+        val builder = StringBuilder()
+        var last = 0
+        for (range in findRanges) {
+            builder.append(text, last, range.first)
+            builder.append(findReplacement)
+            last = range.last + 1
+        }
+        builder.append(text, last, text.length)
+        source = builder.toString()
+        dirty = true
+        refreshFind()
+    }
+
+    fun toggleFindRegex() {
+        findRegex = !findRegex
+        refreshFind()
+    }
+
+    fun toggleFindCase() {
+        findCase = !findCase
+        refreshFind()
+    }
+
+    fun toggleFindWholeWord() {
+        findWholeWord = !findWholeWord
+        refreshFind()
+    }
+
+    fun findNext(backwards: Boolean = false) {
+        if (findRanges.isEmpty()) return
+        findIndex = if (backwards) {
+            (findIndex + findRanges.size - 1) % findRanges.size
+        } else {
+            (findIndex + 1) % findRanges.size
+        }
+    }
+
+    private fun refreshFind() {
+        findRanges = if (findPattern.isEmpty()) {
+            emptyList()
+        } else {
+            runCatching {
+                findInText(source, findPattern, findRegex, findCase, findWholeWord)
+                    .map { it.start.toInt() until it.end.toInt() }
+            }.getOrDefault(emptyList())
+        }
+        findIndex = 0
+    }
+
+    /// Set when a save found a newer version on disk; the note stays open with its text.
+    var conflictNote by mutableStateOf<String?>(null)
+        private set
+
+    /// Set when closing a note failed to save it; the note stays open with its text.
+    var saveFailedNote by mutableStateOf<String?>(null)
+        private set
+
+    /// Content hash of the version each open note is based on, for conflict-safe saves.
+    private val fingerprints = mutableMapOf<String, ULong>()
+
+    /// Back/forward spots through the notes, with their mode and scroll.
+    private data class NavSpot(val relative: String, val preview: Boolean, val scroll: Int)
+
+    private val navHistory = mutableListOf<NavSpot>()
+    private var navIndex = -1
+    /// A spot being restored, so opening it does not record itself again.
+    private var pendingNav: NavSpot? = null
+
+    val canGoBack: Boolean get() = navIndex > 0
+    val canGoForward: Boolean get() = navIndex + 1 < navHistory.size
+
+    private fun recordNav(spot: NavSpot) {
+        if (navHistory.getOrNull(navIndex) == spot) return
+        while (navHistory.size > navIndex + 1) {
+            navHistory.removeAt(navHistory.lastIndex)
+        }
+        navHistory.add(spot)
+        if (navHistory.size > 50) navHistory.removeAt(0)
+        navIndex = navHistory.lastIndex
+    }
+
+    fun navBack() {
+        if (!canGoBack) return
+        navIndex--
+        restoreNav()
+    }
+
+    fun navForward() {
+        if (!canGoForward) return
+        navIndex++
+        restoreNav()
+    }
+
+    private fun restoreNav() {
+        val spot = navHistory.getOrNull(navIndex) ?: return
+        pendingNav = spot
+        openNote(spot.relative, jumpToLine = null, keepPreview = spot.preview)
+    }
+
+    /// Editor selection per note, so reopening a note returns to the place in it.
+    private val selections = mutableMapOf<String, IntRange>()
+
+    fun selectionFor(relative: String): IntRange = selections[relative] ?: IntRange(0, 0)
+
+    fun rememberSelection(relative: String, range: IntRange) {
+        selections[relative] = range
+    }
+
+    /// Caret position, for the debounced draft written when the app goes to the background.
+    private var cursorLine = 0
+    private var cursorCol = 0
+
+    /// A draft found when the note opened, waiting for Recover / Discard.
+    var pendingDraft by mutableStateOf<DraftInfo?>(null)
+        private set
+
+    /// Bumped when a recovered draft replaces the editor text.
+    var recoveryNonce by mutableStateOf(0)
+        private set
+
+    fun onCursorChange(line: Int, col: Int) {
+        cursorLine = line
+        cursorCol = col
+    }
+
+    /// Write a draft for the open note; call from the activity's onStop.
+    fun flushDraft() {
+        val note = selected ?: return
+        if (!dirty) return
+        val text = source
+        val line = cursorLine
+        val col = cursorCol
+        viewModelScope.launch {
+            runCatching {
+                withContext(Dispatchers.IO) {
+                    ensureVault().saveDraft(note, text, line.toUInt(), col.toUInt())
+                }
+            }
+        }
+    }
+
+    fun recoverDraft() {
+        val draft = pendingDraft ?: return
+        source = draft.text
+        dirty = true
+        cursorLine = draft.line.toInt()
+        cursorCol = draft.col.toInt()
+        pendingDraft = null
+        recoveryNonce += 1
+    }
+
+    fun discardPendingDraft() {
+        val note = selected ?: return
+        val draft = pendingDraft
+        pendingDraft = null
+        if (draft != null) {
+            viewModelScope.launch {
+                runCatching {
+                    withContext(Dispatchers.IO) { ensureVault().discardDraft(note) }
+                }
+            }
+        }
+    }
+
+    /// Save through the shared contract: a conflict leaves the disk version alone.
+    private fun saveNoteChecked(loaded: MobileVault, relative: String, text: String) {
+        val report = loaded.saveDocumentWithFingerprint(relative, text, fingerprints[relative])
+        when (report.status) {
+            "saved" -> {
+                report.fingerprint?.let { fingerprints[relative] = it.contentHash }
+                loaded.discardDraft(relative)
+            }
+            "conflict" -> {
+                conflictNote = relative
+                throw IllegalStateException(
+                    "The note changed on disk. Reload it before saving over it.",
+                )
+            }
+            else -> throw IllegalStateException(report.message ?: "Could not save the note")
+        }
+    }
+
+    /// Reload the conflicting note from disk, dropping the local text.
+    fun reloadConflicted() {
+        val note = conflictNote ?: return
+        conflictNote = null
+        dirty = false
+        openNote(note)
+    }
+
+    /// Overwrite the disk version with the text in the editor.
+    fun keepMine() {
+        val note = selected ?: return
+        val text = source
+        viewModelScope.launch {
+            val result = runCatching {
+                withContext(Dispatchers.IO) {
+                    val loaded = ensureVault()
+                    val report = loaded.saveDocumentWithFingerprint(note, text, null)
+                    if (report.status != "saved") {
+                        throw IllegalStateException(report.message ?: "Could not save the note")
+                    }
+                    report.fingerprint?.let { fingerprints[note] = it.contentHash }
+                }
+            }
+            result
+                .onSuccess {
+                    conflictNote = null
+                    dirty = false
+                    message = "Saved over the version on disk"
+                    mirrorNote(note)
+                }
+                .onFailure { error = it.message ?: "Could not save the note" }
+        }
+    }
+
+    /// Write the editor text beside the note instead of over the disk version.
+    fun saveConflictCopy() {
+        val note = selected ?: return
+        val text = source
+        val stem = note.substringBeforeLast('.')
+        val extension = note.substringAfterLast('.', "md")
+        viewModelScope.launch {
+            val result = runCatching {
+                withContext(Dispatchers.IO) {
+                    val loaded = ensureVault()
+                    var candidate = "$stem (conflict).$extension"
+                    var index = 1
+                    while (File(vaultDirectory, candidate).exists()) {
+                        index++
+                        candidate = "$stem (conflict $index).$extension"
+                    }
+                    loaded.createNote(candidate, text)
+                    candidate
+                }
+            }
+            result
+                .onSuccess {
+                    conflictNote = null
+                    message = "Saved a copy as $it"
+                    refresh()
+                }
+                .onFailure { error = it.message ?: "Could not save a copy" }
+        }
+    }
+
+    /// The shared sync state machine, fed from this vault's git status.
+    val syncState: SyncStateInfo
+        get() {
+            val status = gitStatus
+            if (status?.isRepo != true) {
+                return SyncStateInfo.IDLE
+            }
+            return uniffi.dragonglass.syncState(
+                changed = status.changed.toUInt(),
+                untracked = status.untracked.toUInt(),
+                ahead = status.ahead.toUInt(),
+                behind = status.behind.toUInt(),
+                conflicts = status.conflicts.size.toUInt(),
+                busy = gitBusy,
+                failed = gitError != null,
+            )
+        }
+
+    /// One-line sync state for the chrome.
+    val syncLabel: String
+        get() {
+            val status = gitStatus
+            if (status?.isRepo != true) {
+                return if (canSyncWithFolder) "Folder sync" else "Git sync"
+            }
+            return when (syncState) {
+                SyncStateInfo.IDLE -> if (status.behind > 0) "Behind" else "Synced"
+                SyncStateInfo.DIRTY -> "Unsynced"
+                SyncStateInfo.SYNCING -> "Syncing…"
+                SyncStateInfo.CONFLICT -> "Conflicts"
+                SyncStateInfo.ERROR -> "Sync failed"
+            }
+        }
+
+    /// Whether the sync chip should stand out.
+    val syncNeedsAttention: Boolean
+        get() = syncState != SyncStateInfo.IDLE
+
+    /// Remember where the preview was scrolled when it is closed.
+    fun rememberPreviewScroll(offset: Int) {
+        previewScroll = offset
+    }
     var previewHtml by mutableStateOf("")
         private set
     var dirty by mutableStateOf(false)
@@ -147,8 +584,12 @@ class DragonGlassViewModel(application: Application) : AndroidViewModel(applicat
     var gitConflicts by mutableStateOf<List<String>>(emptyList())
         private set
 
+    /// An active frontmatter filter (`key` to `value`) shown above the note list.
+    var propertyFilter by mutableStateOf<Pair<String, String>?>(null)
+        private set
+
     val visibleNotes: List<NoteSummary>
-        get() = (if (query.isBlank()) notes else results)
+        get() = (if (query.isBlank() && propertyFilter == null) notes else results)
             .filter { !bookmarksOnly || it.relative in bookmarks }
 
     /// Tree rows with the children of collapsed folders removed.
@@ -197,7 +638,16 @@ class DragonGlassViewModel(application: Application) : AndroidViewModel(applicat
                 """.trimIndent()
             )
         }
-        return vault ?: MobileVault.open(vaultDirectory.absolutePath).also { vault = it }
+        return vault ?: MobileVault.open(vaultDirectory.absolutePath).also {
+            vault = it
+            // Reader typography is shared with the desktop reader through the vault config.
+            runCatching { it.readerSettings() }.onSuccess { settings ->
+                readerSize = settings.bodySize.toInt()
+                readerMeasure = settings.measure.toInt()
+                readerFont = settings.font
+                readerLineHeight = settings.lineHeight.toInt()
+            }
+        }
     }
 
     fun refresh() {
@@ -206,16 +656,22 @@ class DragonGlassViewModel(application: Application) : AndroidViewModel(applicat
             val result = runCatching {
                 withContext(Dispatchers.IO) {
                     val loaded = ensureVault()
-                    Triple(loaded.notes(), loaded.bookmarks().toSet(), loaded.treeRows())
+                    val filter = propertyFilter
+                    val filtered = filter?.let { (key, value) ->
+                        loaded.filterByProperty(key, value)
+                    }
+                    Triple(loaded.notes(), loaded.bookmarks().toSet(), loaded.treeRows()) to
+                        filtered
                 }
             }
             result
-                .onSuccess { (loaded, marks, rows) ->
+                .onSuccess { (core, filtered) ->
+                    val (loaded, marks, rows) = core
                     notes = loaded
                     bookmarks = marks
                     treeRows = rows
                     graph = null
-                    if (query.isBlank()) results = loaded
+                    if (query.isBlank()) results = filtered ?: loaded
                 }
                 .onFailure { error = it.message ?: "Could not open the vault" }
             loading = false
@@ -230,16 +686,35 @@ class DragonGlassViewModel(application: Application) : AndroidViewModel(applicat
     fun importVault(treeUri: Uri) {
         viewModelScope.launch {
             loading = true
+            transferCancelled = false
+            transferLabel = "Importing"
+            transferProgress = 0
             val result = runCatching {
                 saveDirtyNote()
-                withContext(Dispatchers.IO) { vaultStore.importTree(treeUri) }
+                withContext(Dispatchers.IO) {
+                    vaultStore.importTree(
+                        treeUri,
+                        onProgress = { files, bytes ->
+                            transferProgress = files
+                            transferBytes = bytes
+                        },
+                        isCancelled = { transferCancelled },
+                    )
+                }
             }
             result
                 .onSuccess { stored ->
                     applyActiveVault(stored)
                     message = "Imported ${stored.name}"
                 }
-                .onFailure { error = it.message ?: "Could not import that folder" }
+                .onFailure { failure ->
+                    if (failure is VaultStore.TransferCancelled) {
+                        message = "Import cancelled"
+                    } else {
+                        error = failure.message ?: "Could not import that folder"
+                    }
+                }
+            transferProgress = null
             loading = false
         }
     }
@@ -249,13 +724,33 @@ class DragonGlassViewModel(application: Application) : AndroidViewModel(applicat
         val active = activeVault
         viewModelScope.launch {
             loading = true
+            transferCancelled = false
+            transferLabel = "Exporting"
+            transferProgress = 0
             val result = runCatching {
                 saveDirtyNote()
-                withContext(Dispatchers.IO) { vaultStore.exportTree(active, treeUri) }
+                withContext(Dispatchers.IO) {
+                    vaultStore.exportTree(
+                        active,
+                        treeUri,
+                        onProgress = { files, bytes ->
+                            transferProgress = files
+                            transferBytes = bytes
+                        },
+                        isCancelled = { transferCancelled },
+                    )
+                }
             }
             result
                 .onSuccess { message = "Exported $it ${if (it == 1) "file" else "files"}" }
-                .onFailure { error = it.message ?: "Could not export the vault" }
+                .onFailure { failure ->
+                    if (failure is VaultStore.TransferCancelled) {
+                        message = "Export cancelled"
+                    } else {
+                        error = failure.message ?: "Could not export the vault"
+                    }
+                }
+            transferProgress = null
             loading = false
         }
     }
@@ -264,7 +759,13 @@ class DragonGlassViewModel(application: Application) : AndroidViewModel(applicat
     fun switchVault(vault: StoredVault) {
         if (vault.id == activeVault.id) return
         viewModelScope.launch {
-            runCatching { saveDirtyNote() }
+            // Never leave a dirty note behind when the vault changes.
+            val saved = runCatching { saveDirtyNote() }
+            if (saved.isFailure) {
+                error = saved.exceptionOrNull()?.message
+                    ?: "Could not save the note; the vault was not switched"
+                return@launch
+            }
             vaultStore.activate(if (vaultStore.isDefault(vault)) null else vault.id)
             applyActiveVault(vaultStore.activeVault())
             message = "Opened ${vault.name}"
@@ -281,6 +782,20 @@ class DragonGlassViewModel(application: Application) : AndroidViewModel(applicat
         gitAuthorEmail = readGit("author_email", "")
     }
 
+    /// Unix millis of the last successful sync, shown in the sync sheet.
+    var lastSyncAt by mutableStateOf(readGit("lastSync", "").toLongOrNull())
+        private set
+
+    private fun writeGit(key: String, value: String) {
+        gitPreferences.edit().putString(gitKey(key), value).apply()
+    }
+
+    private fun recordSync() {
+        val now = System.currentTimeMillis()
+        lastSyncAt = now
+        writeGit("lastSync", now.toString())
+    }
+
     private fun readGit(key: String, fallback: String): String {
         gitPreferences.getString(gitKey(key), null)?.let { return it }
         if (activeVault.id == "default") {
@@ -295,16 +810,36 @@ class DragonGlassViewModel(application: Application) : AndroidViewModel(applicat
         if (vault.treeUri == null) return
         viewModelScope.launch {
             loading = true
+            transferCancelled = false
+            transferLabel = "Syncing"
+            transferProgress = 0
+            transferBytes = 0
             val result = runCatching {
                 saveDirtyNote()
-                withContext(Dispatchers.IO) { vaultStore.sync(vault) }
+                withContext(Dispatchers.IO) {
+                    vaultStore.sync(
+                        vault,
+                        onProgress = { files, bytes ->
+                            transferProgress = files
+                            transferBytes = bytes
+                        },
+                        isCancelled = { transferCancelled },
+                    )
+                }
             }
             result
                 .onSuccess { (pulled, written) ->
                     message = "Synced with the folder: pulled $pulled, wrote $written"
                     refresh()
                 }
-                .onFailure { error = it.message ?: "Could not sync with the folder" }
+                .onFailure { failure ->
+                    if (failure is VaultStore.TransferCancelled) {
+                        message = "Sync cancelled"
+                    } else {
+                        error = failure.message ?: "Could not sync with the folder"
+                    }
+                }
+            transferProgress = null
             loading = false
         }
     }
@@ -355,7 +890,7 @@ class DragonGlassViewModel(application: Application) : AndroidViewModel(applicat
         val note = selected ?: return
         if (!dirty) return
         val text = source
-        withContext(Dispatchers.IO) { ensureVault().saveNote(note, text) }
+        withContext(Dispatchers.IO) { saveNoteChecked(ensureVault(), note, text) }
         dirty = false
         mirrorNote(note)
     }
@@ -403,6 +938,7 @@ class DragonGlassViewModel(application: Application) : AndroidViewModel(applicat
 
     fun onQueryChange(value: String) {
         query = value
+        propertyFilter = null
         searchJob?.cancel()
         if (value.isBlank()) {
             results = notes
@@ -431,11 +967,38 @@ class DragonGlassViewModel(application: Application) : AndroidViewModel(applicat
     /// Open a note and scroll the editor to a 1-based source line.
     fun openSearchHit(relative: String, line: Int) = openNote(relative, jumpToLine = line)
 
+    /// Open a note from a link tapped in the preview, staying in preview mode. Unsaved
+    /// edits are written first so following a link can never drop text.
+    fun openLinkedNote(relative: String) {
+        val current = selected
+        if (current == null || !dirty) {
+            openNote(relative, jumpToLine = null, keepPreview = true)
+            return
+        }
+        val text = source
+        viewModelScope.launch {
+            val saved = runCatching {
+                withContext(Dispatchers.IO) {
+                    saveNoteChecked(ensureVault(), current, text)
+                }
+            }
+            saved
+                .onSuccess {
+                    dirty = false
+                    mirrorNote(current)
+                }
+                .onFailure { error = it.message ?: "Could not save the note" }
+            if (saved.isSuccess) {
+                openNote(relative, jumpToLine = null, keepPreview = true)
+            }
+        }
+    }
+
     fun consumePendingLine() {
         pendingLine = null
     }
 
-    private fun openNote(relative: String, jumpToLine: Int?) {
+    private fun openNote(relative: String, jumpToLine: Int?, keepPreview: Boolean = false) {
         viewModelScope.launch {
             loading = true
             val result = runCatching {
@@ -445,25 +1008,41 @@ class DragonGlassViewModel(application: Application) : AndroidViewModel(applicat
                     OpenNote(
                         relative = relative,
                         source = text,
+                        fingerprint = loaded.documentFingerprint(relative).contentHash,
+                        draft = loaded.loadDraft(relative),
                         stats = documentStats(text),
                         headings = parseHeadings(text),
                         properties = parseProperties(text),
                         relations = loaded.relations(relative),
+                        html = if (keepPreview) renderHtmlFromVault(text, vaultDirectory.absolutePath) else "",
                     )
                 }
             }
             result
                 .onSuccess { opened ->
+                    opened.fingerprint?.let { fingerprints[opened.relative] = it }
+                    pendingDraft = opened.draft?.takeIf { it.text != opened.source }
                     selected = opened.relative
                     source = opened.source
                     stats = opened.stats
                     headings = opened.headings
                     properties = opened.properties
                     relations = opened.relations
-                    preview = false
-                    previewHtml = ""
+                    // A link followed inside the preview keeps the preview open.
+                    preview = keepPreview
+                    previewHtml = opened.html
+                    val restore = pendingNav
+                    pendingNav = null
+                    if (restore != null && restore.relative == opened.relative) {
+                        previewScroll = restore.scroll
+                    } else {
+                        previewScroll = 0
+                    }
                     dirty = false
                     pendingLine = jumpToLine
+                    if (restore == null) {
+                        recordNav(NavSpot(opened.relative, preview, 0))
+                    }
                 }
                 .onFailure { error = it.message ?: "Could not open the note" }
             loading = false
@@ -471,25 +1050,53 @@ class DragonGlassViewModel(application: Application) : AndroidViewModel(applicat
     }
 
     fun closeNote() {
-        val note = selected
+        val note = selected ?: return
         viewModelScope.launch {
-            if (note != null && dirty) {
-                runCatching { withContext(Dispatchers.IO) { ensureVault().saveNote(note, source) } }
-                    .onFailure { error = it.message ?: "Could not save the note" }
+            if (dirty) {
+                val text = source
+                val saved = runCatching {
+                    withContext(Dispatchers.IO) { saveNoteChecked(ensureVault(), note, text) }
+                }
+                if (saved.isFailure) {
+                    // Keep the note open with its text: a failed save must not close it.
+                    saveFailedNote = note
+                    error = saved.exceptionOrNull()?.message
+                        ?: "Could not save the note; it was left open"
+                    return@launch
+                }
+                dirty = false
                 mirrorNote(note)
             }
             selected = null
             source = ""
             preview = false
             previewHtml = ""
-            dirty = false
             refresh()
         }
+    }
+
+    /// Close the open note without saving its edits (after the back prompt).
+    fun discardAndClose() {
+        saveFailedNote = null
+        dirty = false
+        closeNote()
+    }
+
+    /// Leave the note open and dismiss the failure prompt.
+    fun dismissSaveFailure() {
+        saveFailedNote = null
+    }
+
+    /// Try the failed close again.
+    fun retryClose() {
+        saveFailedNote = null
+        closeNote()
     }
 
     fun onSourceChange(value: String) {
         source = value
         dirty = true
+        if (findOpen) refreshFind()
     }
 
     fun save(showMessage: Boolean = true) {
@@ -499,7 +1106,7 @@ class DragonGlassViewModel(application: Application) : AndroidViewModel(applicat
             val result = runCatching {
                 withContext(Dispatchers.IO) {
                     val loaded = ensureVault()
-                    loaded.saveNote(note, text)
+                    saveNoteChecked(loaded, note, text)
                     Triple(documentStats(text), parseHeadings(text), parseProperties(text))
                 }
             }
@@ -524,7 +1131,7 @@ class DragonGlassViewModel(application: Application) : AndroidViewModel(applicat
         val text = source
         viewModelScope.launch {
             val result = runCatching {
-                withContext(Dispatchers.IO) { renderHtml(text) }
+                withContext(Dispatchers.IO) { renderHtmlFromVault(text, vaultDirectory.absolutePath) }
             }
             result
                 .onSuccess {
@@ -547,6 +1154,52 @@ class DragonGlassViewModel(application: Application) : AndroidViewModel(applicat
                         relative = "Untitled $index.md"
                     }
                     loaded.createNote(relative, "# Untitled\n\n")
+                    relative
+                }
+            }
+            result
+                .onSuccess {
+                    refresh()
+                    openNote(it)
+                    mirrorNote(it)
+                }
+                .onFailure { error = it.message ?: "Could not create the note" }
+        }
+    }
+
+    /// Create a note from a typed title: the title becomes the file name and the heading.
+    /// `folder` places it in a subfolder (created when missing); empty means the vault root.
+    fun createNote(title: String, folder: String = "") {
+        val trimmed = title.trim()
+        if (trimmed.isEmpty()) {
+            error = "A note needs a name"
+            return
+        }
+        val safe = trimmed
+            .map { ch -> if (ch in "/\\:*?\"<>|") '-' else ch }
+            .joinToString("")
+            .trim()
+        if (safe.isEmpty()) {
+            error = "A note needs a name"
+            return
+        }
+        val folderPath = folder.trim().trim('/').trim()
+        if (folderPath.split('/').any { it == ".." }) {
+            error = "A folder name cannot contain .."
+            return
+        }
+        val prefix = if (folderPath.isEmpty()) "" else "$folderPath/"
+        viewModelScope.launch {
+            val result = runCatching {
+                withContext(Dispatchers.IO) {
+                    val loaded = ensureVault()
+                    var relative = "$prefix$safe.md"
+                    var index = 1
+                    while (File(vaultDirectory, relative).exists()) {
+                        index++
+                        relative = "$prefix$safe $index.md"
+                    }
+                    loaded.createNote(relative, "# $trimmed\n\n")
                     relative
                 }
             }
@@ -625,7 +1278,7 @@ class DragonGlassViewModel(application: Application) : AndroidViewModel(applicat
             val result = runCatching {
                 withContext(Dispatchers.IO) {
                     val loaded = ensureVault()
-                    if (wasDirty) loaded.saveNote(note, text)
+                    if (wasDirty) saveNoteChecked(loaded, note, text)
                     loaded.trashNote(note)
                 }
             }
@@ -640,6 +1293,142 @@ class DragonGlassViewModel(application: Application) : AndroidViewModel(applicat
                     mirrorAll()
                 }
                 .onFailure { error = it.message ?: "Could not move the note to the trash" }
+        }
+    }
+
+    /// Close the open note (saving first) and list the notes whose property matches.
+    fun filterByProperty(key: String, value: String) {
+        val note = selected
+        val text = source
+        val dirtyNow = dirty
+        viewModelScope.launch {
+            if (note != null && dirtyNow) {
+                runCatching { withContext(Dispatchers.IO) { saveNoteChecked(ensureVault(), note, text) } }
+                    .onFailure { error = it.message ?: "Could not save the note" }
+            }
+            selected = null
+            source = ""
+            preview = false
+            previewScroll = 0
+            dirty = false
+            loading = true
+            val result = runCatching {
+                withContext(Dispatchers.IO) { ensureVault().filterByProperty(key, value) }
+            }
+            result
+                .onSuccess { rows ->
+                    propertyFilter = key to value
+                    query = ""
+                    results = rows
+                    hits = emptyList()
+                }
+                .onFailure { error = it.message ?: "Could not filter the notes" }
+            loading = false
+        }
+    }
+
+    fun clearPropertyFilter() {
+        propertyFilter = null
+        refresh()
+    }
+
+    /// Follow a relation chip: resolve its target through the engine's index and open it.
+    fun openRelation(target: String) {
+        val wanted = target.substringBefore('#').trim()
+        if (wanted.isEmpty()) return
+        viewModelScope.launch {
+            val relative = runCatching {
+                withContext(Dispatchers.IO) { ensureVault().resolveTarget(wanted) }
+            }.getOrNull()
+            if (relative != null) {
+                openLinkedNote(relative)
+            } else {
+                error = "No note matches $target"
+            }
+        }
+    }
+
+    /// Close the open note and search the vault for a tag, so Details chips can filter.
+    fun filterByTag(tag: String) {
+        val note = selected
+        val text = source
+        val dirtyNow = dirty
+        viewModelScope.launch {
+            if (note != null && dirtyNow) {
+                runCatching { withContext(Dispatchers.IO) { saveNoteChecked(ensureVault(), note, text) } }
+                    .onFailure { error = it.message ?: "Could not save the note" }
+            }
+            selected = null
+            source = ""
+            preview = false
+            previewScroll = 0
+            dirty = false
+            onQueryChange(tag)
+        }
+    }
+
+    /// Move any note from the list to the trash, saving it first when it is the open one.
+    fun trashNote(relative: String) {
+        val text = source
+        val isOpen = selected == relative
+        val saveFirst = isOpen && dirty
+        viewModelScope.launch {
+            val result = runCatching {
+                withContext(Dispatchers.IO) {
+                    val loaded = ensureVault()
+                    if (saveFirst) saveNoteChecked(loaded, relative, text)
+                    loaded.trashNote(relative)
+                }
+            }
+            result
+                .onSuccess {
+                    if (isOpen) {
+                        selected = null
+                        source = ""
+                        preview = false
+                        dirty = false
+                    }
+                    message = "Moved $relative to the trash"
+                    refresh()
+                    mirrorAll()
+                }
+                .onFailure { error = it.message ?: "Could not move the note to the trash" }
+        }
+    }
+
+    /// Rename or move any note from the list.
+    fun renameNote(relative: String, destination: String) {
+        val trimmed = destination.trim().trimStart('/')
+        if (trimmed.isEmpty()) {
+            error = "Enter a file name"
+            return
+        }
+        val target = if (trimmed.substringAfterLast('/').contains('.')) {
+            trimmed
+        } else {
+            "$trimmed.md"
+        }
+        val text = source
+        val isOpen = selected == relative
+        val saveFirst = isOpen && dirty
+        viewModelScope.launch {
+            loading = true
+            val result = runCatching {
+                withContext(Dispatchers.IO) {
+                    val loaded = ensureVault()
+                    if (saveFirst) saveNoteChecked(loaded, relative, text)
+                    loaded.renameEntry(relative, target)
+                }
+            }
+            result
+                .onSuccess { renamed ->
+                    message = "Moved to $renamed"
+                    refresh()
+                    if (isOpen) openNote(renamed)
+                    mirrorAll()
+                }
+                .onFailure { error = it.message ?: "Could not move the note" }
+            loading = false
         }
     }
 
@@ -663,7 +1452,7 @@ class DragonGlassViewModel(application: Application) : AndroidViewModel(applicat
             val result = runCatching {
                 withContext(Dispatchers.IO) {
                     val loaded = ensureVault()
-                    if (wasDirty) loaded.saveNote(note, text)
+                    if (wasDirty) saveNoteChecked(loaded, note, text)
                     loaded.renameEntry(note, target)
                 }
             }
@@ -868,6 +1657,14 @@ class DragonGlassViewModel(application: Application) : AndroidViewModel(applicat
             gitError = null
             gitMessage = null
             gitConflicts = emptyList()
+            // Commit what the user sees, and do not sync (or close the note) if that fails.
+            val saved = runCatching { saveDirtyNote() }
+            if (saved.isFailure) {
+                gitError = saved.exceptionOrNull()?.message
+                    ?: "Could not save the open note; git sync did not run"
+                gitBusy = false
+                return@launch
+            }
             val result = runCatching {
                 withContext(Dispatchers.IO) {
                     GitSyncManager(
@@ -883,6 +1680,7 @@ class DragonGlassViewModel(application: Application) : AndroidViewModel(applicat
             result
                 .onSuccess { synced ->
                     gitStatus = synced.status
+                    recordSync()
                     gitMessage = buildString {
                         if (synced.committed) append("Committed local changes. ")
                         if (synced.pulled) append("Pulled remote changes. ")

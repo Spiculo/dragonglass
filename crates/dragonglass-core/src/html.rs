@@ -170,17 +170,24 @@ fn render_block(block: Block, attachments: Option<&Attachments>, used: &mut Vec<
                 body
             )
         }
-        Block::Embed { target } => {
+        Block::Embed {
+            target, width, alt, ..
+        } => {
             if is_image(&target) {
                 let resolved = attachments.and_then(|index| index.resolve(&target));
                 let source = resolved.unwrap_or(target.as_str());
                 if resolved.is_some() && !used.iter().any(|file| file == source) {
                     used.push(source.to_string());
                 }
+                let alt = alt.as_deref().unwrap_or(&target);
+                let width = width
+                    .map(|width| format!(" width=\"{width}\""))
+                    .unwrap_or_default();
                 format!(
-                    "<p><img src=\"{}\" alt=\"{}\"></p>",
+                    "<p><img src=\"{}\" alt=\"{}\"{}></p>",
                     escape(source),
-                    escape(&target)
+                    escape(alt),
+                    width
                 )
             } else {
                 format!(
@@ -376,6 +383,16 @@ mod tests {
     fn image_embed_becomes_img() {
         let html = render_body("![[shot.png]]\n");
         assert!(html.contains("<img src=\"shot.png\""));
+    }
+
+    #[test]
+    fn an_image_embed_carries_width_and_alt() {
+        let html = render_body("![[shot.png|320]]\n");
+        assert!(html.contains("width=\"320\""), "{html}");
+        assert!(html.contains("alt=\"shot.png\""), "{html}");
+
+        let html = render_body("![A screenshot](shot.png)\n");
+        assert!(html.contains("alt=\"A screenshot\""), "{html}");
     }
 
     #[test]

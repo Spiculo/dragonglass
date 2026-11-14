@@ -679,11 +679,21 @@ internal object IntegrityCheckingUniffiLib {
     ): Int
     external fun uniffi_dragonglass_ffi_checksum_func_engine_version(
     ): Int
+    external fun uniffi_dragonglass_ffi_checksum_func_find_in_text(
+    ): Int
     external fun uniffi_dragonglass_ffi_checksum_func_headings(
     ): Int
     external fun uniffi_dragonglass_ffi_checksum_func_properties(
     ): Int
     external fun uniffi_dragonglass_ffi_checksum_func_render_html(
+    ): Int
+    external fun uniffi_dragonglass_ffi_checksum_func_render_html_from_vault(
+    ): Int
+    external fun uniffi_dragonglass_ffi_checksum_func_resolve_link_fragment(
+    ): Int
+    external fun uniffi_dragonglass_ffi_checksum_func_sync_state(
+    ): Int
+    external fun uniffi_dragonglass_ffi_checksum_func_syntax_spans(
     ): Int
     external fun uniffi_dragonglass_ffi_checksum_method_mobilevault_bookmarks(
     ): Int
@@ -693,11 +703,19 @@ internal object IntegrityCheckingUniffiLib {
     ): Int
     external fun uniffi_dragonglass_ffi_checksum_method_mobilevault_create_note(
     ): Int
+    external fun uniffi_dragonglass_ffi_checksum_method_mobilevault_discard_draft(
+    ): Int
+    external fun uniffi_dragonglass_ffi_checksum_method_mobilevault_document_fingerprint(
+    ): Int
     external fun uniffi_dragonglass_ffi_checksum_method_mobilevault_empty_trash(
+    ): Int
+    external fun uniffi_dragonglass_ffi_checksum_method_mobilevault_filter_by_property(
     ): Int
     external fun uniffi_dragonglass_ffi_checksum_method_mobilevault_fuzzy(
     ): Int
     external fun uniffi_dragonglass_ffi_checksum_method_mobilevault_graph(
+    ): Int
+    external fun uniffi_dragonglass_ffi_checksum_method_mobilevault_load_draft(
     ): Int
     external fun uniffi_dragonglass_ffi_checksum_method_mobilevault_note_html(
     ): Int
@@ -713,19 +731,29 @@ internal object IntegrityCheckingUniffiLib {
     ): Int
     external fun uniffi_dragonglass_ffi_checksum_method_mobilevault_query(
     ): Int
+    external fun uniffi_dragonglass_ffi_checksum_method_mobilevault_reader_settings(
+    ): Int
     external fun uniffi_dragonglass_ffi_checksum_method_mobilevault_refresh(
     ): Int
     external fun uniffi_dragonglass_ffi_checksum_method_mobilevault_relations(
     ): Int
     external fun uniffi_dragonglass_ffi_checksum_method_mobilevault_rename_entry(
     ): Int
+    external fun uniffi_dragonglass_ffi_checksum_method_mobilevault_resolve_target(
+    ): Int
     external fun uniffi_dragonglass_ffi_checksum_method_mobilevault_restore_trash_entry(
     ): Int
     external fun uniffi_dragonglass_ffi_checksum_method_mobilevault_root(
     ): Int
+    external fun uniffi_dragonglass_ffi_checksum_method_mobilevault_save_document_with_fingerprint(
+    ): Int
+    external fun uniffi_dragonglass_ffi_checksum_method_mobilevault_save_draft(
+    ): Int
     external fun uniffi_dragonglass_ffi_checksum_method_mobilevault_save_note(
     ): Int
     external fun uniffi_dragonglass_ffi_checksum_method_mobilevault_search(
+    ): Int
+    external fun uniffi_dragonglass_ffi_checksum_method_mobilevault_set_reader_settings(
     ): Int
     external fun uniffi_dragonglass_ffi_checksum_method_mobilevault_tags(
     ): Int
@@ -775,11 +803,19 @@ internal object UniffiLib {
     ): RustBuffer.ByValue
     external fun uniffi_dragonglass_ffi_fn_method_mobilevault_create_note(`ptr`: Long,`relative`: RustBuffer.ByValue,`source`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
+    external fun uniffi_dragonglass_ffi_fn_method_mobilevault_discard_draft(`ptr`: Long,`relative`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): Unit
+    external fun uniffi_dragonglass_ffi_fn_method_mobilevault_document_fingerprint(`ptr`: Long,`relative`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
     external fun uniffi_dragonglass_ffi_fn_method_mobilevault_empty_trash(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
     ): Long
+    external fun uniffi_dragonglass_ffi_fn_method_mobilevault_filter_by_property(`ptr`: Long,`key`: RustBuffer.ByValue,`value`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
     external fun uniffi_dragonglass_ffi_fn_method_mobilevault_fuzzy(`ptr`: Long,`query`: RustBuffer.ByValue,`limit`: Int,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
     external fun uniffi_dragonglass_ffi_fn_method_mobilevault_graph(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
+    external fun uniffi_dragonglass_ffi_fn_method_mobilevault_load_draft(`ptr`: Long,`relative`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
     external fun uniffi_dragonglass_ffi_fn_method_mobilevault_note_html(`ptr`: Long,`relative`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
@@ -795,20 +831,30 @@ internal object UniffiLib {
     ): RustBuffer.ByValue
     external fun uniffi_dragonglass_ffi_fn_method_mobilevault_query(`ptr`: Long,`expression`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
+    external fun uniffi_dragonglass_ffi_fn_method_mobilevault_reader_settings(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
     external fun uniffi_dragonglass_ffi_fn_method_mobilevault_refresh(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
     external fun uniffi_dragonglass_ffi_fn_method_mobilevault_relations(`ptr`: Long,`relative`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
     external fun uniffi_dragonglass_ffi_fn_method_mobilevault_rename_entry(`ptr`: Long,`from`: RustBuffer.ByValue,`to`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
+    external fun uniffi_dragonglass_ffi_fn_method_mobilevault_resolve_target(`ptr`: Long,`target`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
     external fun uniffi_dragonglass_ffi_fn_method_mobilevault_restore_trash_entry(`ptr`: Long,`trashRelative`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
     external fun uniffi_dragonglass_ffi_fn_method_mobilevault_root(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
+    external fun uniffi_dragonglass_ffi_fn_method_mobilevault_save_document_with_fingerprint(`ptr`: Long,`relative`: RustBuffer.ByValue,`text`: RustBuffer.ByValue,`expectedHash`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
+    external fun uniffi_dragonglass_ffi_fn_method_mobilevault_save_draft(`ptr`: Long,`relative`: RustBuffer.ByValue,`text`: RustBuffer.ByValue,`line`: Int,`col`: Int,uniffi_out_err: UniffiRustCallStatus, 
+    ): Unit
     external fun uniffi_dragonglass_ffi_fn_method_mobilevault_save_note(`ptr`: Long,`relative`: RustBuffer.ByValue,`source`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
     external fun uniffi_dragonglass_ffi_fn_method_mobilevault_search(`ptr`: Long,`query`: RustBuffer.ByValue,`limit`: Int,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
+    external fun uniffi_dragonglass_ffi_fn_method_mobilevault_set_reader_settings(`ptr`: Long,`bodySize`: Int,`measure`: Int,`font`: RustBuffer.ByValue,`lineHeight`: Int,uniffi_out_err: UniffiRustCallStatus, 
+    ): Unit
     external fun uniffi_dragonglass_ffi_fn_method_mobilevault_tags(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
     external fun uniffi_dragonglass_ffi_fn_method_mobilevault_templates(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
@@ -825,11 +871,21 @@ internal object UniffiLib {
     ): RustBuffer.ByValue
     external fun uniffi_dragonglass_ffi_fn_func_engine_version(uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
+    external fun uniffi_dragonglass_ffi_fn_func_find_in_text(`source`: RustBuffer.ByValue,`pattern`: RustBuffer.ByValue,`regex`: Byte,`caseSensitive`: Byte,`wholeWord`: Byte,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
     external fun uniffi_dragonglass_ffi_fn_func_headings(`source`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
     external fun uniffi_dragonglass_ffi_fn_func_properties(`source`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
     external fun uniffi_dragonglass_ffi_fn_func_render_html(`source`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
+    external fun uniffi_dragonglass_ffi_fn_func_render_html_from_vault(`source`: RustBuffer.ByValue,`root`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
+    external fun uniffi_dragonglass_ffi_fn_func_resolve_link_fragment(`source`: RustBuffer.ByValue,`fragment`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
+    external fun uniffi_dragonglass_ffi_fn_func_sync_state(`changed`: Int,`untracked`: Int,`ahead`: Int,`behind`: Int,`conflicts`: Int,`busy`: Byte,`failed`: Byte,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
+    external fun uniffi_dragonglass_ffi_fn_func_syntax_spans(`source`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
     external fun ffi_dragonglass_ffi_rustbuffer_alloc(`size`: Long,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
@@ -956,6 +1012,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if ((lib.uniffi_dragonglass_ffi_checksum_func_engine_version() and 0xFFFF) != 39834) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if ((lib.uniffi_dragonglass_ffi_checksum_func_find_in_text() and 0xFFFF) != 20025) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if ((lib.uniffi_dragonglass_ffi_checksum_func_headings() and 0xFFFF) != 8491) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
@@ -963,6 +1022,18 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if ((lib.uniffi_dragonglass_ffi_checksum_func_render_html() and 0xFFFF) != 22921) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if ((lib.uniffi_dragonglass_ffi_checksum_func_render_html_from_vault() and 0xFFFF) != 6224) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if ((lib.uniffi_dragonglass_ffi_checksum_func_resolve_link_fragment() and 0xFFFF) != 43324) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if ((lib.uniffi_dragonglass_ffi_checksum_func_sync_state() and 0xFFFF) != 17630) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if ((lib.uniffi_dragonglass_ffi_checksum_func_syntax_spans() and 0xFFFF) != 7) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if ((lib.uniffi_dragonglass_ffi_checksum_method_mobilevault_bookmarks() and 0xFFFF) != 6789) {
@@ -977,13 +1048,25 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if ((lib.uniffi_dragonglass_ffi_checksum_method_mobilevault_create_note() and 0xFFFF) != 16690) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if ((lib.uniffi_dragonglass_ffi_checksum_method_mobilevault_discard_draft() and 0xFFFF) != 15637) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if ((lib.uniffi_dragonglass_ffi_checksum_method_mobilevault_document_fingerprint() and 0xFFFF) != 19610) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if ((lib.uniffi_dragonglass_ffi_checksum_method_mobilevault_empty_trash() and 0xFFFF) != 56931) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if ((lib.uniffi_dragonglass_ffi_checksum_method_mobilevault_filter_by_property() and 0xFFFF) != 28950) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if ((lib.uniffi_dragonglass_ffi_checksum_method_mobilevault_fuzzy() and 0xFFFF) != 51429) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if ((lib.uniffi_dragonglass_ffi_checksum_method_mobilevault_graph() and 0xFFFF) != 329) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if ((lib.uniffi_dragonglass_ffi_checksum_method_mobilevault_load_draft() and 0xFFFF) != 60820) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if ((lib.uniffi_dragonglass_ffi_checksum_method_mobilevault_note_html() and 0xFFFF) != 250) {
@@ -1007,6 +1090,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if ((lib.uniffi_dragonglass_ffi_checksum_method_mobilevault_query() and 0xFFFF) != 11693) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if ((lib.uniffi_dragonglass_ffi_checksum_method_mobilevault_reader_settings() and 0xFFFF) != 7459) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if ((lib.uniffi_dragonglass_ffi_checksum_method_mobilevault_refresh() and 0xFFFF) != 42951) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
@@ -1016,16 +1102,28 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if ((lib.uniffi_dragonglass_ffi_checksum_method_mobilevault_rename_entry() and 0xFFFF) != 37783) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if ((lib.uniffi_dragonglass_ffi_checksum_method_mobilevault_resolve_target() and 0xFFFF) != 18552) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if ((lib.uniffi_dragonglass_ffi_checksum_method_mobilevault_restore_trash_entry() and 0xFFFF) != 54831) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if ((lib.uniffi_dragonglass_ffi_checksum_method_mobilevault_root() and 0xFFFF) != 53877) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if ((lib.uniffi_dragonglass_ffi_checksum_method_mobilevault_save_document_with_fingerprint() and 0xFFFF) != 44387) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if ((lib.uniffi_dragonglass_ffi_checksum_method_mobilevault_save_draft() and 0xFFFF) != 48770) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if ((lib.uniffi_dragonglass_ffi_checksum_method_mobilevault_save_note() and 0xFFFF) != 62134) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if ((lib.uniffi_dragonglass_ffi_checksum_method_mobilevault_search() and 0xFFFF) != 61885) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if ((lib.uniffi_dragonglass_ffi_checksum_method_mobilevault_set_reader_settings() and 0xFFFF) != 8904) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if ((lib.uniffi_dragonglass_ffi_checksum_method_mobilevault_tags() and 0xFFFF) != 23594) {
@@ -1209,6 +1307,29 @@ private class JavaLangRefCleanable(
 /**
  * @suppress
  */
+public object FfiConverterUInt: FfiConverter<UInt, Int> {
+    override fun lift(value: Int): UInt {
+        return value.toUInt()
+    }
+
+    override fun read(buf: ByteBuffer): UInt {
+        return lift(buf.getInt())
+    }
+
+    override fun lower(value: UInt): Int {
+        return value.toInt()
+    }
+
+    override fun allocationSize(value: UInt) = 4UL
+
+    override fun write(value: UInt, buf: ByteBuffer) {
+        buf.putInt(value.toInt())
+    }
+}
+
+/**
+ * @suppress
+ */
 public object FfiConverterInt: FfiConverter<Int, Int> {
     override fun lift(value: Int): Int {
         return value
@@ -1226,6 +1347,29 @@ public object FfiConverterInt: FfiConverter<Int, Int> {
 
     override fun write(value: Int, buf: ByteBuffer) {
         buf.putInt(value)
+    }
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterULong: FfiConverter<ULong, Long> {
+    override fun lift(value: Long): ULong {
+        return value.toULong()
+    }
+
+    override fun read(buf: ByteBuffer): ULong {
+        return lift(buf.getLong())
+    }
+
+    override fun lower(value: ULong): Long {
+        return value.toLong()
+    }
+
+    override fun allocationSize(value: ULong) = 8UL
+
+    override fun write(value: ULong, buf: ByteBuffer) {
+        buf.putLong(value.toLong())
     }
 }
 
@@ -1453,10 +1597,22 @@ public interface MobileVaultInterface {
      */
     fun `createNote`(`relative`: kotlin.String, `source`: kotlin.String)
     
+    fun `discardDraft`(`relative`: kotlin.String)
+    
+    /**
+     * Fingerprint a note on disk, for a later conflict-safe save.
+     */
+    fun `documentFingerprint`(`relative`: kotlin.String): FingerprintInfo
+    
     /**
      * Permanently remove everything in the trash. Returns the entry count.
      */
     fun `emptyTrash`(): kotlin.Long
+    
+    /**
+     * Notes whose frontmatter property `key` equals `value` (case-insensitive).
+     */
+    fun `filterByProperty`(`key`: kotlin.String, `value`: kotlin.String): List<NoteSummary>
     
     /**
      * Quick-switcher style fuzzy path matching.
@@ -1464,6 +1620,11 @@ public interface MobileVaultInterface {
     fun `fuzzy`(`query`: kotlin.String, `limit`: kotlin.Int): List<NoteSummary>
     
     fun `graph`(): GraphView
+    
+    /**
+     * The draft for a note, if one is newer than what the app last saw.
+     */
+    fun `loadDraft`(`relative`: kotlin.String): DraftInfo?
     
     /**
      * Render a note as a standalone HTML document for a WebView.
@@ -1495,6 +1656,11 @@ public interface MobileVaultInterface {
     fun `query`(`expression`: kotlin.String): List<QueryRow>
     
     /**
+     * Reading typography from the vault config.
+     */
+    fun `readerSettings`(): ReaderSettingsInfo
+    
+    /**
      * Re-scan the vault after files changed on disk.
      */
     fun `refresh`()
@@ -1511,11 +1677,30 @@ public interface MobileVaultInterface {
     fun `renameEntry`(`from`: kotlin.String, `to`: kotlin.String): kotlin.String
     
     /**
+     * Resolve a wikilink or relation target (path, stem, slug or frontmatter alias) to a
+     * vault-relative note path.
+     */
+    fun `resolveTarget`(`target`: kotlin.String): kotlin.String?
+    
+    /**
      * Restore one trash entry to its original path. Returns that path.
      */
     fun `restoreTrashEntry`(`trashRelative`: kotlin.String): kotlin.String
     
     fun `root`(): kotlin.String
+    
+    /**
+     * Save a note only if its content still hashes to `expected_hash`.
+     *
+     * `expected_hash = None` means "no baseline" and writes. A conflict leaves the disk
+     * version untouched and reports its hash so the app can offer Reload / Keep mine.
+     */
+    fun `saveDocumentWithFingerprint`(`relative`: kotlin.String, `text`: kotlin.String, `expectedHash`: kotlin.ULong?): SaveReportInfo
+    
+    /**
+     * Write a recovery draft for a note (call from an idle/lifecycle hook).
+     */
+    fun `saveDraft`(`relative`: kotlin.String, `text`: kotlin.String, `line`: kotlin.UInt, `col`: kotlin.UInt)
     
     fun `saveNote`(`relative`: kotlin.String, `source`: kotlin.String)
     
@@ -1523,6 +1708,8 @@ public interface MobileVaultInterface {
      * Full-text search, capped at `limit` hits.
      */
     fun `search`(`query`: kotlin.String, `limit`: kotlin.Int): List<SearchHit>
+    
+    fun `setReaderSettings`(`bodySize`: kotlin.UInt, `measure`: kotlin.UInt, `font`: kotlin.String, `lineHeight`: kotlin.UInt)
     
     /**
      * All tags in the vault, with the number of notes that use each one.
@@ -1731,6 +1918,37 @@ open class MobileVault: Disposable, AutoCloseable, MobileVaultInterface
     
     
 
+    override fun `discardDraft`(`relative`: kotlin.String)
+        = 
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_dragonglass_ffi_fn_method_mobilevault_discard_draft(
+        it,
+        
+        FfiConverterString.lower(`relative`),_status)
+}
+    }
+    
+    
+
+    
+    /**
+     * Fingerprint a note on disk, for a later conflict-safe save.
+     */
+    @Throws(MobileException::class)override fun `documentFingerprint`(`relative`: kotlin.String): FingerprintInfo {
+            return FfiConverterTypeFingerprintInfo.lift(
+    callWithHandle {
+    uniffiRustCallWithError(MobileException) { _status ->
+    UniffiLib.uniffi_dragonglass_ffi_fn_method_mobilevault_document_fingerprint(
+        it,
+        
+        FfiConverterString.lower(`relative`),_status)
+}
+    }
+    )
+    }
+    
+
     
     /**
      * Permanently remove everything in the trash. Returns the entry count.
@@ -1742,6 +1960,24 @@ open class MobileVault: Disposable, AutoCloseable, MobileVaultInterface
     UniffiLib.uniffi_dragonglass_ffi_fn_method_mobilevault_empty_trash(
         it,
         _status)
+}
+    }
+    )
+    }
+    
+
+    
+    /**
+     * Notes whose frontmatter property `key` equals `value` (case-insensitive).
+     */override fun `filterByProperty`(`key`: kotlin.String, `value`: kotlin.String): List<NoteSummary> {
+            return FfiConverterSequenceTypeNoteSummary.lift(
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_dragonglass_ffi_fn_method_mobilevault_filter_by_property(
+        it,
+        
+        FfiConverterString.lower(`key`),
+        FfiConverterString.lower(`value`),_status)
 }
     }
     )
@@ -1773,6 +2009,23 @@ open class MobileVault: Disposable, AutoCloseable, MobileVaultInterface
     UniffiLib.uniffi_dragonglass_ffi_fn_method_mobilevault_graph(
         it,
         _status)
+}
+    }
+    )
+    }
+    
+
+    
+    /**
+     * The draft for a note, if one is newer than what the app last saw.
+     */override fun `loadDraft`(`relative`: kotlin.String): DraftInfo? {
+            return FfiConverterOptionalTypeDraftInfo.lift(
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_dragonglass_ffi_fn_method_mobilevault_load_draft(
+        it,
+        
+        FfiConverterString.lower(`relative`),_status)
 }
     }
     )
@@ -1895,6 +2148,22 @@ open class MobileVault: Disposable, AutoCloseable, MobileVaultInterface
 
     
     /**
+     * Reading typography from the vault config.
+     */override fun `readerSettings`(): ReaderSettingsInfo {
+            return FfiConverterTypeReaderSettingsInfo.lift(
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_dragonglass_ffi_fn_method_mobilevault_reader_settings(
+        it,
+        _status)
+}
+    }
+    )
+    }
+    
+
+    
+    /**
      * Re-scan the vault after files changed on disk.
      */
     @Throws(MobileException::class)override fun `refresh`()
@@ -1948,6 +2217,24 @@ open class MobileVault: Disposable, AutoCloseable, MobileVaultInterface
 
     
     /**
+     * Resolve a wikilink or relation target (path, stem, slug or frontmatter alias) to a
+     * vault-relative note path.
+     */override fun `resolveTarget`(`target`: kotlin.String): kotlin.String? {
+            return FfiConverterOptionalString.lift(
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_dragonglass_ffi_fn_method_mobilevault_resolve_target(
+        it,
+        
+        FfiConverterString.lower(`target`),_status)
+}
+    }
+    )
+    }
+    
+
+    
+    /**
      * Restore one trash entry to its original path. Returns that path.
      */
     @Throws(MobileException::class)override fun `restoreTrashEntry`(`trashRelative`: kotlin.String): kotlin.String {
@@ -1975,6 +2262,48 @@ open class MobileVault: Disposable, AutoCloseable, MobileVaultInterface
     }
     )
     }
+    
+
+    
+    /**
+     * Save a note only if its content still hashes to `expected_hash`.
+     *
+     * `expected_hash = None` means "no baseline" and writes. A conflict leaves the disk
+     * version untouched and reports its hash so the app can offer Reload / Keep mine.
+     */override fun `saveDocumentWithFingerprint`(`relative`: kotlin.String, `text`: kotlin.String, `expectedHash`: kotlin.ULong?): SaveReportInfo {
+            return FfiConverterTypeSaveReportInfo.lift(
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_dragonglass_ffi_fn_method_mobilevault_save_document_with_fingerprint(
+        it,
+        
+        FfiConverterString.lower(`relative`),
+        FfiConverterString.lower(`text`),
+        FfiConverterOptionalULong.lower(`expectedHash`),_status)
+}
+    }
+    )
+    }
+    
+
+    
+    /**
+     * Write a recovery draft for a note (call from an idle/lifecycle hook).
+     */
+    @Throws(MobileException::class)override fun `saveDraft`(`relative`: kotlin.String, `text`: kotlin.String, `line`: kotlin.UInt, `col`: kotlin.UInt)
+        = 
+    callWithHandle {
+    uniffiRustCallWithError(MobileException) { _status ->
+    UniffiLib.uniffi_dragonglass_ffi_fn_method_mobilevault_save_draft(
+        it,
+        
+        FfiConverterString.lower(`relative`),
+        FfiConverterString.lower(`text`),
+        FfiConverterUInt.lower(`line`),
+        FfiConverterUInt.lower(`col`),_status)
+}
+    }
+    
     
 
     
@@ -2008,6 +2337,23 @@ open class MobileVault: Disposable, AutoCloseable, MobileVaultInterface
     }
     )
     }
+    
+
+    
+    @Throws(MobileException::class)override fun `setReaderSettings`(`bodySize`: kotlin.UInt, `measure`: kotlin.UInt, `font`: kotlin.String, `lineHeight`: kotlin.UInt)
+        = 
+    callWithHandle {
+    uniffiRustCallWithError(MobileException) { _status ->
+    UniffiLib.uniffi_dragonglass_ffi_fn_method_mobilevault_set_reader_settings(
+        it,
+        
+        FfiConverterUInt.lower(`bodySize`),
+        FfiConverterUInt.lower(`measure`),
+        FfiConverterString.lower(`font`),
+        FfiConverterUInt.lower(`lineHeight`),_status)
+}
+    }
+    
     
 
     
@@ -2160,6 +2506,152 @@ public object FfiConverterTypeMobileVault: FfiConverter<MobileVault, Long> {
 
     override fun write(value: MobileVault, buf: ByteBuffer) {
         buf.putLong(lower(value))
+    }
+}
+
+
+
+/**
+ * A recovery draft for one note.
+ */
+data class DraftInfo (
+    var `text`: kotlin.String
+    , 
+    var `line`: kotlin.UInt
+    , 
+    var `col`: kotlin.UInt
+    , 
+    var `writtenAtMs`: kotlin.ULong
+    , 
+    var `baseHash`: kotlin.ULong?
+    
+){
+    
+
+    
+
+    
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeDraftInfo: FfiConverterRustBuffer<DraftInfo> {
+    override fun read(buf: ByteBuffer): DraftInfo {
+        return DraftInfo(
+            FfiConverterString.read(buf),
+            FfiConverterUInt.read(buf),
+            FfiConverterUInt.read(buf),
+            FfiConverterULong.read(buf),
+            FfiConverterOptionalULong.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: DraftInfo) = (
+            FfiConverterString.allocationSize(value.`text`) +
+            FfiConverterUInt.allocationSize(value.`line`) +
+            FfiConverterUInt.allocationSize(value.`col`) +
+            FfiConverterULong.allocationSize(value.`writtenAtMs`) +
+            FfiConverterOptionalULong.allocationSize(value.`baseHash`)
+    )
+
+    override fun write(value: DraftInfo, buf: ByteBuffer) {
+            FfiConverterString.write(value.`text`, buf)
+            FfiConverterUInt.write(value.`line`, buf)
+            FfiConverterUInt.write(value.`col`, buf)
+            FfiConverterULong.write(value.`writtenAtMs`, buf)
+            FfiConverterOptionalULong.write(value.`baseHash`, buf)
+    }
+}
+
+
+
+/**
+ * One in-note find match, in UTF-16 code units (what Android text fields index by).
+ */
+data class FindRange (
+    var `start`: kotlin.UInt
+    , 
+    var `end`: kotlin.UInt
+    
+){
+    
+
+    
+
+    
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeFindRange: FfiConverterRustBuffer<FindRange> {
+    override fun read(buf: ByteBuffer): FindRange {
+        return FindRange(
+            FfiConverterUInt.read(buf),
+            FfiConverterUInt.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: FindRange) = (
+            FfiConverterUInt.allocationSize(value.`start`) +
+            FfiConverterUInt.allocationSize(value.`end`)
+    )
+
+    override fun write(value: FindRange, buf: ByteBuffer) {
+            FfiConverterUInt.write(value.`start`, buf)
+            FfiConverterUInt.write(value.`end`, buf)
+    }
+}
+
+
+
+/**
+ * The identity of one version of a note on disk.
+ */
+data class FingerprintInfo (
+    var `size`: kotlin.ULong
+    , 
+    /**
+     * Modification time in Unix milliseconds (0 when unknown).
+     */
+    var `modifiedMs`: kotlin.ULong
+    , 
+    var `contentHash`: kotlin.ULong
+    
+){
+    
+
+    
+
+    
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeFingerprintInfo: FfiConverterRustBuffer<FingerprintInfo> {
+    override fun read(buf: ByteBuffer): FingerprintInfo {
+        return FingerprintInfo(
+            FfiConverterULong.read(buf),
+            FfiConverterULong.read(buf),
+            FfiConverterULong.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: FingerprintInfo) = (
+            FfiConverterULong.allocationSize(value.`size`) +
+            FfiConverterULong.allocationSize(value.`modifiedMs`) +
+            FfiConverterULong.allocationSize(value.`contentHash`)
+    )
+
+    override fun write(value: FingerprintInfo, buf: ByteBuffer) {
+            FfiConverterULong.write(value.`size`, buf)
+            FfiConverterULong.write(value.`modifiedMs`, buf)
+            FfiConverterULong.write(value.`contentHash`, buf)
     }
 }
 
@@ -2465,6 +2957,63 @@ public object FfiConverterTypeQueryRow: FfiConverterRustBuffer<QueryRow> {
 
 
 
+/**
+ * Reading typography, shared with the desktop reader.
+ */
+data class ReaderSettingsInfo (
+    var `bodySize`: kotlin.UInt
+    , 
+    var `measure`: kotlin.UInt
+    , 
+    /**
+     * `sans`, `serif` or `mono`.
+     */
+    var `font`: kotlin.String
+    , 
+    /**
+     * Line height as a percentage of the body size (120–220).
+     */
+    var `lineHeight`: kotlin.UInt
+    
+){
+    
+
+    
+
+    
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeReaderSettingsInfo: FfiConverterRustBuffer<ReaderSettingsInfo> {
+    override fun read(buf: ByteBuffer): ReaderSettingsInfo {
+        return ReaderSettingsInfo(
+            FfiConverterUInt.read(buf),
+            FfiConverterUInt.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterUInt.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: ReaderSettingsInfo) = (
+            FfiConverterUInt.allocationSize(value.`bodySize`) +
+            FfiConverterUInt.allocationSize(value.`measure`) +
+            FfiConverterString.allocationSize(value.`font`) +
+            FfiConverterUInt.allocationSize(value.`lineHeight`)
+    )
+
+    override fun write(value: ReaderSettingsInfo, buf: ByteBuffer) {
+            FfiConverterUInt.write(value.`bodySize`, buf)
+            FfiConverterUInt.write(value.`measure`, buf)
+            FfiConverterString.write(value.`font`, buf)
+            FfiConverterUInt.write(value.`lineHeight`, buf)
+    }
+}
+
+
+
 data class RelationInfo (
     var `kind`: kotlin.String
     , 
@@ -2513,6 +3062,63 @@ public object FfiConverterTypeRelationInfo: FfiConverterRustBuffer<RelationInfo>
             FfiConverterOptionalString.write(value.`label`, buf)
             FfiConverterOptionalInt.write(value.`line`, buf)
             FfiConverterBoolean.write(value.`incoming`, buf)
+    }
+}
+
+
+
+/**
+ * The result of a conflict-safe save.
+ */
+data class SaveReportInfo (
+    /**
+     * `saved`, `conflict` or `error`.
+     */
+    var `status`: kotlin.String
+    , 
+    var `fingerprint`: FingerprintInfo?
+    , 
+    /**
+     * Content hash of the version on disk when the save conflicted.
+     */
+    var `diskHash`: kotlin.ULong?
+    , 
+    var `message`: kotlin.String?
+    
+){
+    
+
+    
+
+    
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeSaveReportInfo: FfiConverterRustBuffer<SaveReportInfo> {
+    override fun read(buf: ByteBuffer): SaveReportInfo {
+        return SaveReportInfo(
+            FfiConverterString.read(buf),
+            FfiConverterOptionalTypeFingerprintInfo.read(buf),
+            FfiConverterOptionalULong.read(buf),
+            FfiConverterOptionalString.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: SaveReportInfo) = (
+            FfiConverterString.allocationSize(value.`status`) +
+            FfiConverterOptionalTypeFingerprintInfo.allocationSize(value.`fingerprint`) +
+            FfiConverterOptionalULong.allocationSize(value.`diskHash`) +
+            FfiConverterOptionalString.allocationSize(value.`message`)
+    )
+
+    override fun write(value: SaveReportInfo, buf: ByteBuffer) {
+            FfiConverterString.write(value.`status`, buf)
+            FfiConverterOptionalTypeFingerprintInfo.write(value.`fingerprint`, buf)
+            FfiConverterOptionalULong.write(value.`diskHash`, buf)
+            FfiConverterOptionalString.write(value.`message`, buf)
     }
 }
 
@@ -2609,6 +3215,52 @@ public object FfiConverterTypeStatsInfo: FfiConverterRustBuffer<StatsInfo> {
             FfiConverterInt.write(value.`sentences`, buf)
             FfiConverterInt.write(value.`paragraphs`, buf)
             FfiConverterInt.write(value.`readingMinutes`, buf)
+    }
+}
+
+
+
+/**
+ * One highlighted span, in UTF-16 code units (what Android text fields index by).
+ */
+data class SyntaxSpanInfo (
+    var `start`: kotlin.UInt
+    , 
+    var `end`: kotlin.UInt
+    , 
+    var `kind`: SyntaxKindInfo
+    
+){
+    
+
+    
+
+    
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeSyntaxSpanInfo: FfiConverterRustBuffer<SyntaxSpanInfo> {
+    override fun read(buf: ByteBuffer): SyntaxSpanInfo {
+        return SyntaxSpanInfo(
+            FfiConverterUInt.read(buf),
+            FfiConverterUInt.read(buf),
+            FfiConverterTypeSyntaxKindInfo.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: SyntaxSpanInfo) = (
+            FfiConverterUInt.allocationSize(value.`start`) +
+            FfiConverterUInt.allocationSize(value.`end`) +
+            FfiConverterTypeSyntaxKindInfo.allocationSize(value.`kind`)
+    )
+
+    override fun write(value: SyntaxSpanInfo, buf: ByteBuffer) {
+            FfiConverterUInt.write(value.`start`, buf)
+            FfiConverterUInt.write(value.`end`, buf)
+            FfiConverterTypeSyntaxKindInfo.write(value.`kind`, buf)
     }
 }
 
@@ -2858,6 +3510,121 @@ public object FfiConverterTypeMobileError : FfiConverterRustBuffer<MobileExcepti
 
 
 
+/**
+ * The shared sync state, so Android and iOS render one state machine.
+ */
+
+enum class SyncStateInfo {
+    
+    IDLE,
+    DIRTY,
+    SYNCING,
+    CONFLICT,
+    ERROR;
+
+    
+
+
+    companion object
+}
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeSyncStateInfo: FfiConverterRustBuffer<SyncStateInfo> {
+    override fun read(buf: ByteBuffer) = try {
+        SyncStateInfo.values()[buf.getInt() - 1]
+    } catch (e: IndexOutOfBoundsException) {
+        throw RuntimeException("invalid enum value, something is very wrong!!", e)
+    }
+
+    override fun allocationSize(value: SyncStateInfo) = 4UL
+
+    override fun write(value: SyncStateInfo, buf: ByteBuffer) {
+        buf.putInt(value.ordinal + 1)
+    }
+}
+
+
+
+
+
+/**
+ * One coloured run of the editor's markdown highlighting.
+ */
+
+enum class SyntaxKindInfo {
+    
+    HEADING,
+    EMPHASIS,
+    CODE,
+    CODE_BLOCK,
+    LINK,
+    MARKUP,
+    MATH,
+    COMMENT;
+
+    
+
+
+    companion object
+}
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeSyntaxKindInfo: FfiConverterRustBuffer<SyntaxKindInfo> {
+    override fun read(buf: ByteBuffer) = try {
+        SyntaxKindInfo.values()[buf.getInt() - 1]
+    } catch (e: IndexOutOfBoundsException) {
+        throw RuntimeException("invalid enum value, something is very wrong!!", e)
+    }
+
+    override fun allocationSize(value: SyntaxKindInfo) = 4UL
+
+    override fun write(value: SyntaxKindInfo, buf: ByteBuffer) {
+        buf.putInt(value.ordinal + 1)
+    }
+}
+
+
+
+
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterOptionalUInt: FfiConverterRustBuffer<kotlin.UInt?> {
+    override fun read(buf: ByteBuffer): kotlin.UInt? {
+        if (buf.get().toInt() == 0) {
+            return null
+        }
+        return FfiConverterUInt.read(buf)
+    }
+
+    override fun allocationSize(value: kotlin.UInt?): ULong {
+        if (value == null) {
+            return 1UL
+        } else {
+            return 1UL + FfiConverterUInt.allocationSize(value)
+        }
+    }
+
+    override fun write(value: kotlin.UInt?, buf: ByteBuffer) {
+        if (value == null) {
+            buf.put(0)
+        } else {
+            buf.put(1)
+            FfiConverterUInt.write(value, buf)
+        }
+    }
+}
+
+
+
 
 /**
  * @suppress
@@ -2884,6 +3651,38 @@ public object FfiConverterOptionalInt: FfiConverterRustBuffer<kotlin.Int?> {
         } else {
             buf.put(1)
             FfiConverterInt.write(value, buf)
+        }
+    }
+}
+
+
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterOptionalULong: FfiConverterRustBuffer<kotlin.ULong?> {
+    override fun read(buf: ByteBuffer): kotlin.ULong? {
+        if (buf.get().toInt() == 0) {
+            return null
+        }
+        return FfiConverterULong.read(buf)
+    }
+
+    override fun allocationSize(value: kotlin.ULong?): ULong {
+        if (value == null) {
+            return 1UL
+        } else {
+            return 1UL + FfiConverterULong.allocationSize(value)
+        }
+    }
+
+    override fun write(value: kotlin.ULong?, buf: ByteBuffer) {
+        if (value == null) {
+            buf.put(0)
+        } else {
+            buf.put(1)
+            FfiConverterULong.write(value, buf)
         }
     }
 }
@@ -2926,6 +3725,70 @@ public object FfiConverterOptionalString: FfiConverterRustBuffer<kotlin.String?>
 /**
  * @suppress
  */
+public object FfiConverterOptionalTypeDraftInfo: FfiConverterRustBuffer<DraftInfo?> {
+    override fun read(buf: ByteBuffer): DraftInfo? {
+        if (buf.get().toInt() == 0) {
+            return null
+        }
+        return FfiConverterTypeDraftInfo.read(buf)
+    }
+
+    override fun allocationSize(value: DraftInfo?): ULong {
+        if (value == null) {
+            return 1UL
+        } else {
+            return 1UL + FfiConverterTypeDraftInfo.allocationSize(value)
+        }
+    }
+
+    override fun write(value: DraftInfo?, buf: ByteBuffer) {
+        if (value == null) {
+            buf.put(0)
+        } else {
+            buf.put(1)
+            FfiConverterTypeDraftInfo.write(value, buf)
+        }
+    }
+}
+
+
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterOptionalTypeFingerprintInfo: FfiConverterRustBuffer<FingerprintInfo?> {
+    override fun read(buf: ByteBuffer): FingerprintInfo? {
+        if (buf.get().toInt() == 0) {
+            return null
+        }
+        return FfiConverterTypeFingerprintInfo.read(buf)
+    }
+
+    override fun allocationSize(value: FingerprintInfo?): ULong {
+        if (value == null) {
+            return 1UL
+        } else {
+            return 1UL + FfiConverterTypeFingerprintInfo.allocationSize(value)
+        }
+    }
+
+    override fun write(value: FingerprintInfo?, buf: ByteBuffer) {
+        if (value == null) {
+            buf.put(0)
+        } else {
+            buf.put(1)
+            FfiConverterTypeFingerprintInfo.write(value, buf)
+        }
+    }
+}
+
+
+
+
+/**
+ * @suppress
+ */
 public object FfiConverterSequenceString: FfiConverterRustBuffer<List<kotlin.String>> {
     override fun read(buf: ByteBuffer): List<kotlin.String> {
         val len = buf.getInt()
@@ -2944,6 +3807,34 @@ public object FfiConverterSequenceString: FfiConverterRustBuffer<List<kotlin.Str
         buf.putInt(value.size)
         value.iterator().forEach {
             FfiConverterString.write(it, buf)
+        }
+    }
+}
+
+
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterSequenceTypeFindRange: FfiConverterRustBuffer<List<FindRange>> {
+    override fun read(buf: ByteBuffer): List<FindRange> {
+        val len = buf.getInt()
+        return List<FindRange>(len) {
+            FfiConverterTypeFindRange.read(buf)
+        }
+    }
+
+    override fun allocationSize(value: List<FindRange>): ULong {
+        val sizeForLength = 4UL
+        val sizeForItems = value.map { FfiConverterTypeFindRange.allocationSize(it) }.sum()
+        return sizeForLength + sizeForItems
+    }
+
+    override fun write(value: List<FindRange>, buf: ByteBuffer) {
+        buf.putInt(value.size)
+        value.iterator().forEach {
+            FfiConverterTypeFindRange.write(it, buf)
         }
     }
 }
@@ -3178,6 +4069,34 @@ public object FfiConverterSequenceTypeSearchHit: FfiConverterRustBuffer<List<Sea
 /**
  * @suppress
  */
+public object FfiConverterSequenceTypeSyntaxSpanInfo: FfiConverterRustBuffer<List<SyntaxSpanInfo>> {
+    override fun read(buf: ByteBuffer): List<SyntaxSpanInfo> {
+        val len = buf.getInt()
+        return List<SyntaxSpanInfo>(len) {
+            FfiConverterTypeSyntaxSpanInfo.read(buf)
+        }
+    }
+
+    override fun allocationSize(value: List<SyntaxSpanInfo>): ULong {
+        val sizeForLength = 4UL
+        val sizeForItems = value.map { FfiConverterTypeSyntaxSpanInfo.allocationSize(it) }.sum()
+        return sizeForLength + sizeForItems
+    }
+
+    override fun write(value: List<SyntaxSpanInfo>, buf: ByteBuffer) {
+        buf.putInt(value.size)
+        value.iterator().forEach {
+            FfiConverterTypeSyntaxSpanInfo.write(it, buf)
+        }
+    }
+}
+
+
+
+
+/**
+ * @suppress
+ */
 public object FfiConverterSequenceTypeTagCount: FfiConverterRustBuffer<List<TagCount>> {
     override fun read(buf: ByteBuffer): List<TagCount> {
         val len = buf.getInt()
@@ -3311,6 +4230,25 @@ public object FfiConverterSequenceTypeTreeRow: FfiConverterRustBuffer<List<TreeR
     
 
         /**
+         * Find matches in `source` with the engine's finder: literal or regex, case and whole-word
+         * options. Offsets are UTF-16 code units so Kotlin can use them for a text selection.
+         */ fun `findInText`(`source`: kotlin.String, `pattern`: kotlin.String, `regex`: kotlin.Boolean, `caseSensitive`: kotlin.Boolean, `wholeWord`: kotlin.Boolean): List<FindRange> {
+            return FfiConverterSequenceTypeFindRange.lift(
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_dragonglass_ffi_fn_func_find_in_text(
+    
+        
+        FfiConverterString.lower(`source`),
+        FfiConverterString.lower(`pattern`),
+        FfiConverterBoolean.lower(`regex`),
+        FfiConverterBoolean.lower(`caseSensitive`),
+        FfiConverterBoolean.lower(`wholeWord`),_status)
+}
+    )
+    }
+    
+
+        /**
          * Parse headings for an outline panel.
          */ fun `headings`(`source`: kotlin.String): List<HeadingInfo> {
             return FfiConverterSequenceTypeHeadingInfo.lift(
@@ -3344,6 +4282,69 @@ public object FfiConverterSequenceTypeTreeRow: FfiConverterRustBuffer<List<TreeR
             return FfiConverterString.lift(
     uniffiRustCall() { _status ->
     UniffiLib.uniffi_dragonglass_ffi_fn_func_render_html(
+    
+        
+        FfiConverterString.lower(`source`),_status)
+}
+    )
+    }
+    
+
+        /**
+         * Render markdown with the vault's attachment index, so `![[shot.png]]` resolves to a
+         * subfolder path the WebView can load relative to the vault root.
+         */ fun `renderHtmlFromVault`(`source`: kotlin.String, `root`: kotlin.String): kotlin.String {
+            return FfiConverterString.lift(
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_dragonglass_ffi_fn_func_render_html_from_vault(
+    
+        
+        FfiConverterString.lower(`source`),
+        FfiConverterString.lower(`root`),_status)
+}
+    )
+    }
+    
+
+        /**
+         * The 1-based source line a `#Heading` or `#^block` fragment points at, if present.
+         */ fun `resolveLinkFragment`(`source`: kotlin.String, `fragment`: kotlin.String): kotlin.UInt? {
+            return FfiConverterOptionalUInt.lift(
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_dragonglass_ffi_fn_func_resolve_link_fragment(
+    
+        
+        FfiConverterString.lower(`source`),
+        FfiConverterString.lower(`fragment`),_status)
+}
+    )
+    }
+    
+ fun `syncState`(`changed`: kotlin.UInt, `untracked`: kotlin.UInt, `ahead`: kotlin.UInt, `behind`: kotlin.UInt, `conflicts`: kotlin.UInt, `busy`: kotlin.Boolean, `failed`: kotlin.Boolean): SyncStateInfo {
+            return FfiConverterTypeSyncStateInfo.lift(
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_dragonglass_ffi_fn_func_sync_state(
+    
+        
+        FfiConverterUInt.lower(`changed`),
+        FfiConverterUInt.lower(`untracked`),
+        FfiConverterUInt.lower(`ahead`),
+        FfiConverterUInt.lower(`behind`),
+        FfiConverterUInt.lower(`conflicts`),
+        FfiConverterBoolean.lower(`busy`),
+        FfiConverterBoolean.lower(`failed`),_status)
+}
+    )
+    }
+    
+
+        /**
+         * Highlight a whole document for the editor: token kinds from `core::syntax`, merged into
+         * runs and with fenced code state tracked across lines. Offsets are UTF-16 code units.
+         */ fun `syntaxSpans`(`source`: kotlin.String): List<SyntaxSpanInfo> {
+            return FfiConverterSequenceTypeSyntaxSpanInfo.lift(
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_dragonglass_ffi_fn_func_syntax_spans(
     
         
         FfiConverterString.lower(`source`),_status)

@@ -1,12 +1,19 @@
 package com.dragonglass.app.ui
 
+import android.content.Intent
+import android.net.Uri
+import android.webkit.WebResourceRequest
 import android.webkit.WebView
+import android.webkit.WebViewClient
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.Arrangement
@@ -18,15 +25,20 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.BasicTextField
+import androidx.compose.foundation.text.KeyboardActions
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
@@ -61,13 +73,22 @@ import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.TextRange
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.input.OffsetMapping
+import androidx.compose.ui.text.input.KeyboardCapitalization
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.TextFieldValue
+import androidx.compose.ui.text.input.TransformedText
+import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -81,7 +102,9 @@ import uniffi.dragonglass.GraphView
 import uniffi.dragonglass.HeadingInfo
 import uniffi.dragonglass.NoteSummary
 import uniffi.dragonglass.SearchHit
+import uniffi.dragonglass.SyntaxKindInfo
 import uniffi.dragonglass.TreeRow
+import uniffi.dragonglass.syntaxSpans
 import kotlin.math.PI
 import kotlin.math.cos
 import kotlin.math.min
@@ -107,10 +130,16 @@ fun DragonGlassApp(vm: DragonGlassViewModel) {
         }
     }
 
+    // The note lists stay in these states across a note opening and closing, so Back
+    // returns to the same row instead of the top of the list.
+    val noteListState = rememberLazyListState()
+    val treeListState = rememberLazyListState()
+    val searchListState = rememberLazyListState()
+
     Box(Modifier.fillMaxSize()) {
         val selected = vm.selected
         if (selected == null) {
-            NotesScreen(vm)
+            NotesScreen(vm, noteListState, treeListState, searchListState)
         } else {
             EditorScreen(vm, selected)
         }
@@ -138,16 +167,37 @@ private enum class VaultAction { Import, Export }
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun NotesScreen(vm: DragonGlassViewModel) {
+private fun NotesScreen(
+    vm: DragonGlassViewModel,
+    noteListState: LazyListState,
+    treeListState: LazyListState,
+    searchListState: LazyListState,
+) {
     var showSync by remember { mutableStateOf(false) }
     var showGraph by remember { mutableStateOf(false) }
     var showTemplates by remember { mutableStateOf(false) }
     var showTrash by remember { mutableStateOf(false) }
     var showNewFolder by remember { mutableStateOf(false) }
+    var showNewNote by remember { mutableStateOf(false) }
+    var actionNote by remember { mutableStateOf<NoteSummary?>(null) }
+    var showReaderSettings by remember { mutableStateOf(false) }
+    var renamingNote by remember { mutableStateOf<NoteSummary?>(null) }
+    val openRowActions: (NoteSummary) -> Unit = { actionNote = it }
     var showVaults by remember { mutableStateOf(false) }
     var pendingAction by remember { mutableStateOf<VaultAction?>(null) }
     var menuOpen by remember { mutableStateOf(false) }
     var todayOpen by remember { mutableStateOf(false) }
+    val focusManager = LocalFocusManager.current
+
+    // Back clears the search before it leaves the screen, so a query is never lost by
+    // accident and never traps the user either.
+    BackHandler(enabled = vm.query.isNotEmpty() || vm.bookmarksOnly) {
+        if (vm.query.isNotEmpty()) {
+            vm.onQueryChange("")
+        } else {
+            vm.toggleBookmarksOnly()
+        }
+    }
 
     val vaultPicker = rememberLauncherForActivityResult(
         ActivityResultContracts.OpenDocumentTree(),
@@ -189,6 +239,11 @@ private fun NotesScreen(vm: DragonGlassViewModel) {
                     }
                 },
                 actions = {
+                    SyncChip(vm) {
+                        vm.clearGitMessages()
+                        vm.refreshGitStatus()
+                        showSync = true
+                    }
                     Box {
                         TextButton(onClick = { todayOpen = true }) { Text("Today") }
                         DropdownMenu(
@@ -254,6 +309,13 @@ private fun NotesScreen(vm: DragonGlassViewModel) {
                                 },
                             )
                             DropdownMenuItem(
+                                text = { Text("Reader settings…") },
+                                onClick = {
+                                    menuOpen = false
+                                    showReaderSettings = true
+                                },
+                            )
+                            DropdownMenuItem(
                                 text = { Text("Vaults and storage…") },
                                 onClick = {
                                     menuOpen = false
@@ -288,7 +350,7 @@ private fun NotesScreen(vm: DragonGlassViewModel) {
         },
         floatingActionButton = {
             FloatingActionButton(
-                onClick = vm::newNote,
+                onClick = { showNewNote = true },
                 containerColor = MaterialTheme.colorScheme.primary,
                 contentColor = MaterialTheme.colorScheme.onPrimary,
             ) {
@@ -314,6 +376,13 @@ private fun NotesScreen(vm: DragonGlassViewModel) {
                         Text(if (vm.bookmarksOnly) "Search bookmarks" else "Search notes")
                     },
                     singleLine = true,
+                    keyboardOptions = KeyboardOptions(imeAction = ImeAction.Search),
+                    keyboardActions = KeyboardActions(onSearch = { focusManager.clearFocus() }),
+                    trailingIcon = {
+                        if (vm.query.isNotEmpty()) {
+                            TextButton(onClick = { vm.onQueryChange("") }) { Text("Clear") }
+                        }
+                    },
                     modifier = Modifier.weight(1f),
                 )
                 if (vm.bookmarksOnly) {
@@ -325,18 +394,56 @@ private fun NotesScreen(vm: DragonGlassViewModel) {
                 }
             }
 
+            vm.propertyFilter?.let { (key, value) ->
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 16.dp, vertical = 6.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text(
+                        text = "Filter: $key = $value",
+                        modifier = Modifier.weight(1f),
+                        style = MaterialTheme.typography.labelMedium,
+                        color = MaterialTheme.colorScheme.primary,
+                    )
+                    TextButton(onClick = vm::clearPropertyFilter) { Text("Clear") }
+                }
+            }
+
+            val progress = vm.transferProgress
+            if (progress != null) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 16.dp, vertical = 6.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    LinearProgressIndicator(modifier = Modifier.weight(1f))
+                    Text(
+                        text = "${vm.transferLabel} $progress files · ${formatBytes(vm.transferBytes)}",
+                        modifier = Modifier.padding(horizontal = 8.dp),
+                        style = MaterialTheme.typography.labelSmall,
+                    )
+                    TextButton(onClick = vm::cancelTransfer) { Text("Cancel") }
+                }
+            }
+
             when {
-                vm.query.isNotBlank() -> SearchResults(vm)
+                vm.query.isNotBlank() -> SearchResults(vm, searchListState, openRowActions)
                 vm.notes.isEmpty() && !vm.loading -> EmptyVault()
-                vm.browseMode == BrowseMode.Tree -> TreeList(vm)
+                vm.browseMode == BrowseMode.Tree -> TreeList(vm, treeListState, openRowActions)
                 vm.visibleNotes.isEmpty() -> MutedLine(
                     if (vm.bookmarksOnly) "No bookmarked notes yet." else "No notes here yet.",
                 )
-                else -> NoteList(vm)
+                else -> NoteList(vm, noteListState, openRowActions)
             }
         }
     }
 
+    if (showReaderSettings) {
+        ReaderSettingsSheet(vm, onDismiss = { showReaderSettings = false })
+    }
     if (showSync) {
         GitSyncSheet(vm, onDismiss = { showSync = false })
     }
@@ -352,6 +459,66 @@ private fun NotesScreen(vm: DragonGlassViewModel) {
     }
     if (showTrash) {
         TrashSheet(vm, onDismiss = { showTrash = false })
+    }
+    val target = actionNote
+    if (target != null) {
+        ModalBottomSheet(onDismissRequest = { actionNote = null }) {
+            Column(Modifier.navigationBarsPadding()) {
+                ListItem(
+                    headlineContent = { Text(target.title, maxLines = 1) },
+                    supportingContent = { Text(target.relative, style = MaterialTheme.typography.labelSmall) },
+                )
+                HorizontalDivider()
+                TextButton(
+                    onClick = {
+                        vm.toggleBookmark(target.relative)
+                        actionNote = null
+                    },
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    Text(
+                        if (target.relative in vm.bookmarks) "Remove bookmark" else "Bookmark",
+                    )
+                }
+                TextButton(
+                    onClick = {
+                        actionNote = null
+                        renamingNote = target
+                    },
+                    modifier = Modifier.fillMaxWidth(),
+                ) { Text("Rename or move…") }
+                TextButton(
+                    onClick = {
+                        actionNote = null
+                        vm.trashNote(target.relative)
+                    },
+                    modifier = Modifier.fillMaxWidth(),
+                ) { Text("Move to trash") }
+            }
+        }
+    }
+
+    val renameTarget = renamingNote
+    if (renameTarget != null) {
+        TextInputDialog(
+            title = "Rename or move",
+            label = "Path",
+            initial = renameTarget.relative,
+            hint = "Use a folder prefix to move it, e.g. notes/New name.",
+            confirmLabel = "Rename",
+            onDismiss = { renamingNote = null },
+            onConfirm = {
+                vm.renameNote(renameTarget.relative, it)
+                renamingNote = null
+            },
+        )
+    }
+    if (showNewNote) {
+        NewNoteDialog(
+            vm = vm,
+            onDismiss = { showNewNote = false },
+            onCreate = { showNewNote = false },
+        )
     }
     if (showNewFolder) {
         TextInputDialog(
@@ -386,14 +553,19 @@ private fun NotesScreen(vm: DragonGlassViewModel) {
 }
 
 @Composable
-private fun NoteList(vm: DragonGlassViewModel) {
-    LazyColumn(Modifier.fillMaxSize()) {
+private fun NoteList(
+    vm: DragonGlassViewModel,
+    state: LazyListState,
+    onRowAction: (NoteSummary) -> Unit,
+) {
+    LazyColumn(state = state, modifier = Modifier.fillMaxSize()) {
         items(vm.visibleNotes, key = { it.relative }) { note ->
             NoteRow(
                 note = note,
                 bookmarked = note.relative in vm.bookmarks,
                 onClick = { vm.openNote(note.relative) },
                 onToggleBookmark = { vm.toggleBookmark(note.relative) },
+                onLongClick = { onRowAction(note) },
             )
             HorizontalDivider(color = MaterialTheme.colorScheme.outline.copy(alpha = 0.25f))
         }
@@ -401,8 +573,12 @@ private fun NoteList(vm: DragonGlassViewModel) {
 }
 
 @Composable
-private fun TreeList(vm: DragonGlassViewModel) {
-    LazyColumn(Modifier.fillMaxSize()) {
+private fun TreeList(
+    vm: DragonGlassViewModel,
+    state: LazyListState,
+    onRowAction: (NoteSummary) -> Unit,
+) {
+    LazyColumn(state = state, modifier = Modifier.fillMaxSize()) {
         items(vm.visibleTreeRows, key = { it.path }) { row ->
             if (row.isDir) {
                 DirectoryRow(
@@ -417,6 +593,9 @@ private fun TreeList(vm: DragonGlassViewModel) {
                     depth = row.depth,
                     onClick = { vm.openNote(row.path) },
                     onToggleBookmark = { vm.toggleBookmark(row.path) },
+                    onLongClick = {
+                        onRowAction(NoteSummary(relative = row.path, title = row.name))
+                    },
                 )
             }
             HorizontalDivider(color = MaterialTheme.colorScheme.outline.copy(alpha = 0.2f))
@@ -442,12 +621,16 @@ private fun DirectoryRow(row: TreeRow, collapsed: Boolean, onClick: () -> Unit) 
 }
 
 @Composable
-private fun SearchResults(vm: DragonGlassViewModel) {
+private fun SearchResults(
+    vm: DragonGlassViewModel,
+    state: LazyListState,
+    onRowAction: (NoteSummary) -> Unit,
+) {
     if (vm.visibleNotes.isEmpty() && vm.visibleHits.isEmpty() && !vm.loading) {
         MutedLine("No notes or text match “${vm.query}”.")
         return
     }
-    LazyColumn(Modifier.fillMaxSize()) {
+    LazyColumn(state = state, modifier = Modifier.fillMaxSize()) {
         if (vm.visibleNotes.isNotEmpty()) {
             item { SectionHeader("Notes") }
             items(vm.visibleNotes, key = { "note:${it.relative}" }) { note ->
@@ -456,6 +639,7 @@ private fun SearchResults(vm: DragonGlassViewModel) {
                     bookmarked = note.relative in vm.bookmarks,
                     onClick = { vm.openNote(note.relative) },
                     onToggleBookmark = { vm.toggleBookmark(note.relative) },
+                    onLongClick = { onRowAction(note) },
                 )
                 HorizontalDivider(color = MaterialTheme.colorScheme.outline.copy(alpha = 0.2f))
             }
@@ -491,6 +675,19 @@ private fun SearchHitRow(hit: SearchHit, onClick: () -> Unit) {
         },
         modifier = Modifier.clickable(onClick = onClick),
     )
+}
+
+/// A compact sync state, tappable to open the sync sheet.
+@Composable
+private fun SyncChip(vm: DragonGlassViewModel, onClick: () -> Unit) {
+    val color = when {
+        vm.gitError != null -> MaterialTheme.colorScheme.error
+        vm.syncNeedsAttention -> MaterialTheme.colorScheme.tertiary
+        else -> MaterialTheme.colorScheme.onSurfaceVariant
+    }
+    TextButton(onClick = onClick) {
+        Text(vm.syncLabel, color = color, maxLines = 1)
+    }
 }
 
 @Composable
@@ -529,6 +726,7 @@ private fun EmptyVault() {
     }
 }
 
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun NoteRow(
     note: NoteSummary,
@@ -536,6 +734,7 @@ private fun NoteRow(
     depth: Int = 0,
     onClick: () -> Unit,
     onToggleBookmark: () -> Unit,
+    onLongClick: (() -> Unit)? = null,
 ) {
     ListItem(
         headlineContent = {
@@ -563,7 +762,7 @@ private fun NoteRow(
             }
         },
         modifier = Modifier
-            .clickable(onClick = onClick)
+            .combinedClickable(onClick = onClick, onLongClick = onLongClick)
             .padding(start = (depth * 16).dp),
     )
 }
@@ -571,17 +770,179 @@ private fun NoteRow(
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun EditorScreen(vm: DragonGlassViewModel, relative: String) {
-    BackHandler { vm.closeNote() }
+    // Back goes Preview → Edit, then asks about unsaved edits, then returns to the list.
+    // Sheets and dialogs handle their own Back before this handler sees it.
+    val noteTitle = relative.substringAfterLast('/').removeSuffix(".md")
+    var confirmClose by remember { mutableStateOf(false) }
+    BackHandler {
+        if (vm.preview) {
+            vm.togglePreview()
+        } else if (vm.dirty) {
+            confirmClose = true
+        } else {
+            vm.closeNote()
+        }
+    }
+
+    if (confirmClose) {
+        AlertDialog(
+            onDismissRequest = { confirmClose = false },
+            title = { Text("Save changes?") },
+            text = { Text("$noteTitle has unsaved edits.") },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        confirmClose = false
+                        vm.closeNote()
+                    },
+                ) { Text("Save") }
+            },
+            dismissButton = {
+                Row {
+                    TextButton(
+                        onClick = {
+                            confirmClose = false
+                            vm.discardAndClose()
+                        },
+                    ) { Text("Discard") }
+                    TextButton(onClick = { confirmClose = false }) { Text("Cancel") }
+                }
+            },
+        )
+    }
 
     var menuOpen by remember { mutableStateOf(false) }
     var showOutline by remember { mutableStateOf(false) }
     var showDetails by remember { mutableStateOf(false) }
     var showRename by remember { mutableStateOf(false) }
-    var editorValue by remember(relative) { mutableStateOf(TextFieldValue(vm.source)) }
+    var showSync by remember { mutableStateOf(false) }
+    var linkPickerOpen by remember { mutableStateOf(false) }
+    var linkStart by remember { mutableStateOf<Int?>(null) }
+    var tagPickerOpen by remember { mutableStateOf(false) }
+    var tagStart by remember { mutableStateOf<Int?>(null) }
+    var slashPickerOpen by remember { mutableStateOf(false) }
+    var slashStart by remember { mutableStateOf<Int?>(null) }
+    var editorValue by remember(relative) {
+        val stored = vm.selectionFor(relative)
+        val start = stored.first.coerceIn(0, vm.source.length)
+        val end = stored.last.coerceIn(start, vm.source.length)
+        mutableStateOf(TextFieldValue(vm.source, TextRange(start, end)))
+    }
     val focusRequester = remember { FocusRequester() }
+    val focusManager = LocalFocusManager.current
     val title = relative.substringAfterLast('/').removeSuffix(".md")
 
+    // Markdown colouring comes from the shared tokenizer so Android and the desktop editor
+    // agree on what a heading, link or code span is. Only styles are added, never text, so
+    // the offset mapping stays the identity.
+    val syntax = remember(vm.source) {
+        runCatching { syntaxSpans(vm.source) }.getOrDefault(emptyList())
+    }
+    val colors = MaterialTheme.colorScheme
+    val syntaxTransformation = remember(syntax, colors) {
+        VisualTransformation { text ->
+            val builder = AnnotatedString.Builder(text)
+            for (span in syntax) {
+                val start = span.start.toInt().coerceIn(0, text.length)
+                val end = span.end.toInt().coerceIn(start, text.length)
+                if (start == end) continue
+                val style = when (span.kind) {
+                    SyntaxKindInfo.HEADING -> SpanStyle(
+                        color = colors.primary,
+                        fontWeight = FontWeight.SemiBold,
+                    )
+                    SyntaxKindInfo.EMPHASIS -> SpanStyle(color = colors.onSurfaceVariant)
+                    SyntaxKindInfo.CODE,
+                    SyntaxKindInfo.CODE_BLOCK,
+                    SyntaxKindInfo.MATH -> SpanStyle(color = colors.tertiary)
+                    SyntaxKindInfo.LINK -> SpanStyle(color = colors.primary)
+                    SyntaxKindInfo.MARKUP -> SpanStyle(color = colors.secondary)
+                    SyntaxKindInfo.COMMENT -> SpanStyle(color = colors.outline)
+                }
+                builder.addStyle(style, start, end)
+            }
+            TransformedText(builder.toAnnotatedString(), OffsetMapping.Identity)
+        }
+    }
+
+    // Toolbar edits act on the current selection and write through to the buffer.
+    fun applyValue(value: TextFieldValue) {
+        editorValue = value
+        vm.onSourceChange(value.text)
+    }
+
+    fun wrapSelection(open: String, close: String = open) {
+        val value = editorValue
+        val start = value.selection.min
+        val end = value.selection.max
+        val selected = value.text.substring(start, end)
+        val newText = value.text.substring(0, start) + open + selected + close + value.text.substring(end)
+        val caret = if (selected.isEmpty()) start + open.length else start + open.length + selected.length + close.length
+        applyValue(TextFieldValue(newText, TextRange(caret)))
+        focusRequester.requestFocus()
+    }
+
+    fun prefixLine(prefix: String) {
+        val value = editorValue
+        val lineStart = value.text.substring(0, value.selection.min).lastIndexOf('\n') + 1
+        val newText = value.text.substring(0, lineStart) + prefix + value.text.substring(lineStart)
+        applyValue(
+            TextFieldValue(
+                newText,
+                TextRange(value.selection.start + prefix.length, value.selection.end + prefix.length),
+            ),
+        )
+        focusRequester.requestFocus()
+    }
+
+    /// Replace the trigger the picker was opened from with `text`.
+    fun insertFrom(start: Int?, text: String) {
+        val from = start ?: editorValue.selection.min
+        val to = editorValue.selection.max.coerceAtLeast(from)
+        val newText = editorValue.text.substring(0, from) + text + editorValue.text.substring(to)
+        applyValue(TextFieldValue(newText, TextRange(from + text.length)))
+        focusRequester.requestFocus()
+    }
+
+    fun insertWikilink(target: String) {
+        val start = linkStart ?: editorValue.selection.min
+        val end = editorValue.selection.max
+        val insertion = "[[$target]]"
+        val newText = editorValue.text.substring(0, start) + insertion + editorValue.text.substring(end)
+        applyValue(TextFieldValue(newText, TextRange(start + insertion.length)))
+        linkStart = null
+        focusRequester.requestFocus()
+    }
+
     LaunchedEffect(relative) { focusRequester.requestFocus() }
+
+    // Replace (and recovery) change the buffer outside onValueChange.
+    LaunchedEffect(vm.source) {
+        if (editorValue.text != vm.source) {
+            editorValue = TextFieldValue(
+                vm.source,
+                TextRange(editorValue.selection.end.coerceIn(0, vm.source.length)),
+            )
+        }
+    }
+
+    // A recovered draft replaces the editor text.
+    LaunchedEffect(vm.recoveryNonce) {
+        if (vm.recoveryNonce == 0) return@LaunchedEffect
+        editorValue = TextFieldValue(vm.source, TextRange(vm.source.length))
+        focusRequester.requestFocus()
+    }
+
+    // Select the current match so the editor scrolls it into view.
+    LaunchedEffect(vm.findOpen, vm.findIndex, vm.findRanges) {
+        if (!vm.findOpen) return@LaunchedEffect
+        val range = vm.findRanges.getOrNull(vm.findIndex) ?: return@LaunchedEffect
+        editorValue = TextFieldValue(
+            text = vm.source,
+            selection = TextRange(range.first, range.last + 1),
+        )
+        focusRequester.requestFocus()
+    }
 
     // Jump to a full-text search hit once the note source has loaded.
     LaunchedEffect(relative, vm.pendingLine) {
@@ -595,13 +956,24 @@ private fun EditorScreen(vm: DragonGlassViewModel, relative: String) {
     }
 
     Scaffold(
+        // Keep the caret and the status bar above the on-screen keyboard.
+        modifier = Modifier.imePadding(),
         topBar = {
             TopAppBar(
-                navigationIcon = {
-                    TextButton(onClick = vm::closeNote) { Text("Back") }
-                },
                 title = {
                     Text(title, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                },
+                navigationIcon = {
+                    // History arrows are separate from Done, which closes the note.
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        TextButton(onClick = vm::navBack, enabled = vm.canGoBack) {
+                            Text("\u2039", fontSize = 22.sp)
+                        }
+                        TextButton(onClick = vm::navForward, enabled = vm.canGoForward) {
+                            Text("\u203A", fontSize = 22.sp)
+                        }
+                        TextButton(onClick = vm::closeNote) { Text("Done") }
+                    }
                 },
                 actions = {
                     TextButton(onClick = vm::togglePreview) {
@@ -610,12 +982,24 @@ private fun EditorScreen(vm: DragonGlassViewModel, relative: String) {
                     TextButton(onClick = { vm.save() }, enabled = vm.dirty) {
                         Text("Save")
                     }
+                    SyncChip(vm) {
+                        vm.clearGitMessages()
+                        vm.refreshGitStatus()
+                        showSync = true
+                    }
                     Box {
                         TextButton(onClick = { menuOpen = true }) { Text("•••") }
                         DropdownMenu(
                             expanded = menuOpen,
                             onDismissRequest = { menuOpen = false },
                         ) {
+                            DropdownMenuItem(
+                                text = { Text("Find in note") },
+                                onClick = {
+                                    menuOpen = false
+                                    vm.openFind()
+                                },
+                            )
                             DropdownMenuItem(
                                 text = { Text("Outline") },
                                 onClick = {
@@ -653,23 +1037,131 @@ private fun EditorScreen(vm: DragonGlassViewModel, relative: String) {
         },
         bottomBar = { StatusBar(vm) },
     ) { padding ->
-        Box(
+        Column(
             Modifier
                 .fillMaxSize()
                 .padding(padding),
         ) {
+            vm.pendingDraft?.let { draft ->
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 8.dp, vertical = 4.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text(
+                        text = "Unsaved draft from ${trashTime(draft.writtenAtMs.toLong())}",
+                        modifier = Modifier.weight(1f),
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.tertiary,
+                    )
+                    TextButton(onClick = vm::recoverDraft) { Text("Recover") }
+                    TextButton(onClick = vm::discardPendingDraft) { Text("Discard") }
+                }
+            }
+            if (vm.findOpen) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 8.dp, vertical = 4.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    OutlinedTextField(
+                        value = vm.findPattern,
+                        onValueChange = vm::onFindChange,
+                        placeholder = { Text("Find in note") },
+                        singleLine = true,
+                        keyboardOptions = KeyboardOptions(imeAction = ImeAction.Search),
+                        keyboardActions = KeyboardActions(
+                            onSearch = { focusManager.clearFocus() },
+                        ),
+                        modifier = Modifier.weight(1f),
+                    )
+                    Text(
+                        vm.findLabel,
+                        modifier = Modifier.padding(horizontal = 8.dp),
+                        style = MaterialTheme.typography.labelSmall,
+                    )
+                    TextButton(onClick = { vm.findNext(backwards = true) }) { Text("\u2191") }
+                    TextButton(onClick = { vm.findNext() }) { Text("\u2193") }
+                    TextButton(onClick = vm::closeFind) { Text("x") }
+                }
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 8.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    FindToggle(".*", vm.findRegex, vm::toggleFindRegex)
+                    Spacer(Modifier.width(6.dp))
+                    FindToggle("Aa", vm.findCase, vm::toggleFindCase)
+                    Spacer(Modifier.width(6.dp))
+                    FindToggle("Word", vm.findWholeWord, vm::toggleFindWholeWord)
+                }
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 8.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    OutlinedTextField(
+                        value = vm.findReplacement,
+                        onValueChange = vm::onReplaceChange,
+                        placeholder = { Text("Replace with") },
+                        singleLine = true,
+                        modifier = Modifier.weight(1f),
+                    )
+                    TextButton(onClick = vm::replaceCurrent) { Text("Replace") }
+                    TextButton(onClick = vm::replaceAll) { Text("All") }
+                }
+            }
+            Box(Modifier.weight(1f).fillMaxWidth()) {
             if (vm.preview) {
                 MarkdownWebView(
                     html = vm.previewHtml,
                     baseUrl = vm.baseUrl,
                     modifier = Modifier.fillMaxSize(),
+                    onOpenNote = { vm.openLinkedNote(it) },
+                    initialScroll = vm.previewScroll,
+                    onScroll = { vm.rememberPreviewScroll(it) },
+                    bodySize = vm.readerSize,
+                    measure = vm.readerMeasure,
+                    fontFamily = vm.readerFont,
+                    lineHeight = vm.readerLineHeight,
+                    darkTheme = vm.darkTheme,
                 )
             } else {
                 BasicTextField(
                     value = editorValue,
+                    visualTransformation = syntaxTransformation,
                     onValueChange = {
+                        val previous = editorValue.text
                         editorValue = it
                         vm.onSourceChange(it.text)
+                        vm.rememberSelection(relative, it.selection.min until it.selection.max)
+                        val caret = it.selection.end.coerceIn(0, it.text.length)
+                        val line = it.text.take(caret).count { ch -> ch == '\n' }
+                        val col = caret - (it.text.lastIndexOf('\n', caret - 1) + 1)
+                        vm.onCursorChange(line, col)
+                        // Typing `[[` opens the note picker for a wikilink.
+                        if (it.text.endsWith("[[") && !previous.endsWith("[[") && !vm.preview) {
+                            linkStart = (it.selection.min - 2).coerceAtLeast(0)
+                            linkPickerOpen = true
+                        }
+                        // `#` after whitespace opens the tag picker; `/` at line start the
+                        // slash-command picker.
+                        if (!vm.preview && it.text.length == previous.length + 1) {
+                            val caret = it.selection.min
+                            val typed = it.text.getOrNull(caret - 1)
+                            val before = if (caret >= 2) it.text[caret - 2] else '\n'
+                            if (typed == '#' && before.isWhitespace()) {
+                                tagStart = caret - 1
+                                tagPickerOpen = true
+                            } else if (typed == '/' && (caret == 1 || before == '\n')) {
+                                slashStart = caret - 1
+                                slashPickerOpen = true
+                            }
+                        }
                     },
                     modifier = Modifier
                         .fillMaxSize()
@@ -681,12 +1173,137 @@ private fun EditorScreen(vm: DragonGlassViewModel, relative: String) {
                         lineHeight = 22.sp,
                         color = MaterialTheme.colorScheme.onBackground,
                     ),
+                    // Markdown is punctuation, not prose: no autocorrect, no smart
+                    // capitalisation, and a newline key instead of a search key.
+                    keyboardOptions = KeyboardOptions(
+                        capitalization = KeyboardCapitalization.None,
+                        autoCorrectEnabled = false,
+                        keyboardType = KeyboardType.Text,
+                        imeAction = ImeAction.Default,
+                    ),
                     cursorBrush = SolidColor(MaterialTheme.colorScheme.primary),
                 )
+            }
+            }
+            if (!vm.preview) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .horizontalScroll(rememberScrollState())
+                        .padding(horizontal = 8.dp, vertical = 2.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    TextButton(onClick = { wrapSelection("**") }) { Text("B", fontWeight = FontWeight.Bold) }
+                    TextButton(onClick = { wrapSelection("*") }) { Text("I", fontStyle = androidx.compose.ui.text.font.FontStyle.Italic) }
+                    TextButton(onClick = { wrapSelection("==") }) { Text("==") }
+                    TextButton(onClick = { wrapSelection("`") }) { Text("`") }
+                    TextButton(onClick = { prefixLine("# ") }) { Text("H1") }
+                    TextButton(onClick = { prefixLine("- ") }) { Text("-") }
+                    TextButton(onClick = { prefixLine("- [ ] ") }) { Text("☐") }
+                    TextButton(
+                        onClick = {
+                            linkStart = editorValue.selection.min
+                            linkPickerOpen = true
+                        },
+                    ) { Text("[[ ]]") }
+                }
             }
         }
     }
 
+    if (linkPickerOpen) {
+        LinkPickerSheet(
+            vm = vm,
+            onDismiss = { linkPickerOpen = false },
+            onPick = { target ->
+                insertWikilink(target)
+                linkPickerOpen = false
+            },
+        )
+    }
+
+    if (tagPickerOpen) {
+        TagPickerSheet(
+            vm = vm,
+            onDismiss = { tagPickerOpen = false },
+            onPick = { tag ->
+                insertFrom(tagStart, "#$tag")
+                tagStart = null
+                tagPickerOpen = false
+            },
+        )
+    }
+
+    if (slashPickerOpen) {
+        SlashPickerSheet(
+            onDismiss = { slashPickerOpen = false },
+            onPick = { text ->
+                insertFrom(slashStart, text)
+                slashStart = null
+                slashPickerOpen = false
+            },
+        )
+    }
+
+    if (vm.saveFailedNote != null) {
+        AlertDialog(
+            onDismissRequest = { vm.dismissSaveFailure() },
+            title = { Text("Could not save") },
+            text = {
+                Text(
+                    "The note was left open. Retry, discard your edits, or keep working.",
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = vm::retryClose) { Text("Retry") }
+            },
+            dismissButton = {
+                Row {
+                    TextButton(onClick = vm::discardAndClose) { Text("Discard") }
+                    TextButton(onClick = { vm.dismissSaveFailure() }) { Text("Cancel") }
+                }
+            },
+        )
+    }
+    if (vm.conflictNote != null) {
+        ModalBottomSheet(onDismissRequest = {}) {
+            Column(
+                Modifier
+                    .fillMaxWidth()
+                    .navigationBarsPadding()
+                    .padding(horizontal = 16.dp)
+                    .padding(bottom = 24.dp),
+            ) {
+                Text("Changed on disk", style = MaterialTheme.typography.titleLarge)
+                Text(
+                    text = "This note was edited outside the app. Your text is still here; " +
+                        "choose what to do before it is lost.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(vertical = 8.dp),
+                )
+                Button(
+                    onClick = vm::reloadConflicted,
+                    modifier = Modifier.fillMaxWidth(),
+                ) { Text("Reload from disk") }
+                OutlinedButton(
+                    onClick = vm::keepMine,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(top = 8.dp),
+                ) { Text("Keep mine (overwrite)") }
+                OutlinedButton(
+                    onClick = vm::saveConflictCopy,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(top = 8.dp),
+                ) { Text("Save a copy") }
+            }
+        }
+    }
+    if (showSync) {
+        GitSyncSheet(vm, onDismiss = { showSync = false })
+    }
     if (showOutline) {
         OutlineSheet(
             vm = vm,
@@ -812,6 +1429,266 @@ private fun OutlineRow(heading: HeadingInfo, onClick: () -> Unit) {
     )
 }
 
+/// Reader text size and width, shared with the desktop reader.
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun ReaderSettingsSheet(vm: DragonGlassViewModel, onDismiss: () -> Unit) {
+    ModalBottomSheet(onDismissRequest = onDismiss) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 16.dp)
+                .padding(bottom = 24.dp),
+        ) {
+            Text(
+                "Reader settings",
+                style = MaterialTheme.typography.titleLarge,
+                modifier = Modifier.padding(vertical = 8.dp),
+            )
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text("Text size", Modifier.weight(1f))
+                TextButton(
+                    onClick = { vm.setReaderTypography(vm.readerSize - 1, vm.readerMeasure) },
+                ) { Text("−") }
+                Text("${vm.readerSize} px")
+                TextButton(
+                    onClick = { vm.setReaderTypography(vm.readerSize + 1, vm.readerMeasure) },
+                ) { Text("+") }
+            }
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text("Width", Modifier.weight(1f))
+                TextButton(
+                    onClick = { vm.setReaderTypography(vm.readerSize, vm.readerMeasure - 60) },
+                ) { Text("−") }
+                Text("${vm.readerMeasure} px")
+                TextButton(
+                    onClick = { vm.setReaderTypography(vm.readerSize, vm.readerMeasure + 60) },
+                ) { Text("+") }
+            }
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text("Line height", Modifier.weight(1f))
+                TextButton(onClick = { vm.chooseReaderLineHeight(vm.readerLineHeight - 10) }) {
+                    Text("−")
+                }
+                Text("${vm.readerLineHeight}%")
+                TextButton(onClick = { vm.chooseReaderLineHeight(vm.readerLineHeight + 10) }) {
+                    Text("+")
+                }
+            }
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(top = 8.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text("Typeface", Modifier.weight(1f))
+                listOf("sans" to "Sans", "serif" to "Serif", "mono" to "Mono").forEach {
+                    (key, label) ->
+                    if (vm.readerFont == key) {
+                        Button(
+                            onClick = { vm.chooseReaderFont(key) },
+                            modifier = Modifier.padding(start = 4.dp),
+                        ) { Text(label) }
+                    } else {
+                        OutlinedButton(
+                            onClick = { vm.chooseReaderFont(key) },
+                            modifier = Modifier.padding(start = 4.dp),
+                        ) { Text(label) }
+                    }
+                }
+            }
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(top = 8.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text("Theme", Modifier.weight(1f))
+                listOf("system" to "System", "light" to "Light", "dark" to "Dark").forEach {
+                    (key, label) ->
+                    if (vm.themeMode == key) {
+                        Button(
+                            onClick = { vm.chooseTheme(key) },
+                            modifier = Modifier.padding(start = 4.dp),
+                        ) { Text(label) }
+                    } else {
+                        OutlinedButton(
+                            onClick = { vm.chooseTheme(key) },
+                            modifier = Modifier.padding(start = 4.dp),
+                        ) { Text(label) }
+                    }
+                }
+            }
+            Text(
+                text = "The width and typeface are stored in the vault and shared with the " +
+                    "desktop app. The theme is kept on this device.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(top = 8.dp),
+            )
+        }
+    }
+}
+
+/// A tag picker for `#`.
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun TagPickerSheet(
+    vm: DragonGlassViewModel,
+    onDismiss: () -> Unit,
+    onPick: (String) -> Unit,
+) {
+    var query by remember { mutableStateOf("") }
+    val needle = query.trim().lowercase()
+    val results = vm.tags.filter {
+        needle.isEmpty() || it.tag.lowercase().contains(needle)
+    }.take(60)
+
+    ModalBottomSheet(onDismissRequest = onDismiss) {
+        Column(Modifier.fillMaxWidth().padding(horizontal = 16.dp)) {
+            Text("Insert tag", style = MaterialTheme.typography.titleLarge)
+            OutlinedTextField(
+                value = query,
+                onValueChange = { query = it },
+                placeholder = { Text("Search tags") },
+                singleLine = true,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(vertical = 8.dp),
+            )
+            LazyColumn(Modifier.heightIn(max = 360.dp)) {
+                items(results, key = { it.tag }) { tag ->
+                    ListItem(
+                        headlineContent = { Text("#${tag.tag}", maxLines = 1) },
+                        supportingContent = {
+                            Text("${tag.notes} notes", style = MaterialTheme.typography.labelSmall)
+                        },
+                        modifier = Modifier.clickable { onPick(tag.tag) },
+                    )
+                }
+                if (results.isEmpty()) {
+                    item { Muted("No tags in this vault.") }
+                }
+            }
+        }
+    }
+}
+
+/// Common markdown blocks, inserted from a `/` picker.
+private val SLASH_PRESETS = listOf(
+    "Heading 1" to "# ",
+    "Heading 2" to "## ",
+    "Heading 3" to "### ",
+    "Bullet list" to "- ",
+    "Numbered list" to "1. ",
+    "Task" to "- [ ] ",
+    "Quote" to "> ",
+    "Code block" to "```\n\n```",
+    "Math block" to "$$\n\n$$",
+    "Callout" to "> [!note] ",
+    "Table" to "| a | b |\n| --- | --- |\n|  |  |\n",
+)
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun SlashPickerSheet(onDismiss: () -> Unit, onPick: (String) -> Unit) {
+    var query by remember { mutableStateOf("") }
+    val needle = query.trim().lowercase()
+    val results = SLASH_PRESETS.filter {
+        needle.isEmpty() || it.first.lowercase().contains(needle)
+    }
+    ModalBottomSheet(onDismissRequest = onDismiss) {
+        Column(Modifier.fillMaxWidth().padding(horizontal = 16.dp)) {
+            Text("Insert block", style = MaterialTheme.typography.titleLarge)
+            OutlinedTextField(
+                value = query,
+                onValueChange = { query = it },
+                placeholder = { Text("Search blocks") },
+                singleLine = true,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(vertical = 8.dp),
+            )
+            LazyColumn(Modifier.heightIn(max = 360.dp)) {
+                items(results, key = { it.first }) { (label, insert) ->
+                    ListItem(
+                        headlineContent = { Text(label, maxLines = 1) },
+                        supportingContent = {
+                            Text(
+                                insert.replace("\n", "⏎"),
+                                style = MaterialTheme.typography.labelSmall,
+                            )
+                        },
+                        modifier = Modifier.clickable { onPick(insert) },
+                    )
+                }
+            }
+        }
+    }
+}
+
+/// Search the vault's notes and insert one as a wikilink.
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun LinkPickerSheet(
+    vm: DragonGlassViewModel,
+    onDismiss: () -> Unit,
+    onPick: (String) -> Unit,
+) {
+    var query by remember { mutableStateOf("") }
+    val needle = query.trim().lowercase()
+    val results = remember(needle, vm.notes) {
+        vm.notes
+            .filter {
+                needle.isEmpty() ||
+                    it.title.lowercase().contains(needle) ||
+                    it.relative.lowercase().contains(needle)
+            }
+            .take(60)
+    }
+
+    ModalBottomSheet(onDismissRequest = onDismiss) {
+        Column(Modifier.fillMaxWidth().padding(horizontal = 16.dp)) {
+            Text("Insert link", style = MaterialTheme.typography.titleLarge)
+            OutlinedTextField(
+                value = query,
+                onValueChange = { query = it },
+                placeholder = { Text("Search notes") },
+                singleLine = true,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(vertical = 8.dp),
+            )
+            LazyColumn(Modifier.heightIn(max = 360.dp)) {
+                items(results, key = { it.relative }) { note ->
+                    ListItem(
+                        headlineContent = { Text(note.title, maxLines = 1) },
+                        supportingContent = {
+                            Text(note.relative, style = MaterialTheme.typography.labelSmall)
+                        },
+                        modifier = Modifier.clickable {
+                            val stem = note.relative.substringAfterLast('/').removeSuffix(".md")
+                            onPick(stem)
+                        },
+                    )
+                }
+                if (results.isEmpty()) {
+                    item { Muted("No notes match.") }
+                }
+            }
+        }
+    }
+}
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun DetailsSheet(vm: DragonGlassViewModel, onDismiss: () -> Unit) {
@@ -844,12 +1721,20 @@ private fun DetailsSheet(vm: DragonGlassViewModel, onDismiss: () -> Unit) {
                 Muted("No frontmatter properties.")
             } else {
                 vm.properties.forEach { property ->
-                    Row(Modifier.fillMaxWidth().padding(vertical = 3.dp)) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable {
+                                onDismiss()
+                                vm.filterByProperty(property.key, property.value)
+                            }
+                            .padding(vertical = 4.dp),
+                    ) {
                         Text(
                             text = property.key,
                             modifier = Modifier.width(120.dp),
                             style = MaterialTheme.typography.labelMedium,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            color = MaterialTheme.colorScheme.primary,
                         )
                         Text(text = property.value)
                     }
@@ -864,6 +1749,10 @@ private fun DetailsSheet(vm: DragonGlassViewModel, onDismiss: () -> Unit) {
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
+                            .clickable {
+                                onDismiss()
+                                vm.openRelation(relation.target)
+                            }
                             .padding(vertical = 4.dp),
                     ) {
                         Text(
@@ -888,7 +1777,13 @@ private fun DetailsSheet(vm: DragonGlassViewModel, onDismiss: () -> Unit) {
                 vm.tags.forEach { tag ->
                     Text(
                         text = "#${tag.tag}  (${tag.notes})",
-                        modifier = Modifier.padding(vertical = 2.dp),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable {
+                                onDismiss()
+                                vm.filterByTag(tag.tag)
+                            }
+                            .padding(vertical = 4.dp),
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
                 }
@@ -945,6 +1840,13 @@ private fun GitSyncSheet(vm: DragonGlassViewModel, onDismiss: () -> Unit) {
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 style = MaterialTheme.typography.bodySmall,
             )
+            vm.lastSyncAt?.let { millis ->
+                Text(
+                    text = "Last sync: ${trashTime(millis)}",
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    style = MaterialTheme.typography.labelSmall,
+                )
+            }
 
             OutlinedTextField(
                 value = remote,
@@ -1106,11 +2008,17 @@ private fun GitSyncSheet(vm: DragonGlassViewModel, onDismiss: () -> Unit) {
                         color = MaterialTheme.colorScheme.error,
                     )
                 }
-                OutlinedButton(
-                    onClick = vm::abortGitRebase,
-                    enabled = !vm.gitBusy,
+                Row(
                     modifier = Modifier.padding(top = 8.dp),
-                ) { Text("Abort sync") }
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    Button(onClick = vm::syncGit, enabled = !vm.gitBusy) {
+                        Text("Retry")
+                    }
+                    OutlinedButton(onClick = vm::abortGitRebase, enabled = !vm.gitBusy) {
+                        Text("Abort sync")
+                    }
+                }
             }
         }
     }
@@ -1440,6 +2348,97 @@ private fun TemplatesSheet(
     }
 }
 
+/// Title plus folder for a new note; the folder list comes from the open vault.
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun NewNoteDialog(
+    vm: DragonGlassViewModel,
+    onDismiss: () -> Unit,
+    onCreate: () -> Unit,
+) {
+    var title by remember { mutableStateOf("") }
+    var folder by remember { mutableStateOf("") }
+    var folderMenu by remember { mutableStateOf(false) }
+    val folders = remember(vm.notes) {
+        vm.notes
+            .map { it.relative.substringBeforeLast('/', "") }
+            .filter { it.isNotEmpty() }
+            .distinct()
+            .sorted()
+    }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("New note") },
+        text = {
+            Column {
+                OutlinedTextField(
+                    value = title,
+                    onValueChange = { title = it },
+                    label = { Text("Title") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                Box {
+                    OutlinedTextField(
+                        value = folder,
+                        onValueChange = { folder = it },
+                        label = { Text("Folder") },
+                        singleLine = true,
+                        trailingIcon = {
+                            TextButton(onClick = { folderMenu = true }) { Text("\u25BE") }
+                        },
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(top = 8.dp),
+                    )
+                    DropdownMenu(
+                        expanded = folderMenu,
+                        onDismissRequest = { folderMenu = false },
+                    ) {
+                        DropdownMenuItem(
+                            text = { Text("Vault root") },
+                            onClick = {
+                                folder = ""
+                                folderMenu = false
+                            },
+                        )
+                        folders.forEach { path ->
+                            DropdownMenuItem(
+                                text = { Text(path) },
+                                onClick = {
+                                    folder = path
+                                    folderMenu = false
+                                },
+                            )
+                        }
+                    }
+                }
+                Text(
+                    text = "The title becomes the file name and first heading. The folder is " +
+                        "created when it does not exist yet; leave it empty for the vault root.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(top = 8.dp),
+                )
+            }
+        },
+        confirmButton = {
+            TextButton(
+                onClick = {
+                    vm.createNote(title, folder)
+                    onCreate()
+                },
+                enabled = title.isNotBlank(),
+            ) { Text("Create") }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text("Cancel") }
+        },
+    )
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun TextInputDialog(
     title: String,
@@ -1664,6 +2663,23 @@ private fun TrashSheet(vm: DragonGlassViewModel, onDismiss: () -> Unit) {
     }
 }
 
+/// One on/off find option.
+@Composable
+private fun FindToggle(label: String, on: Boolean, flip: () -> Unit) {
+    if (on) {
+        Button(onClick = flip) { Text(label) }
+    } else {
+        OutlinedButton(onClick = flip) { Text(label) }
+    }
+}
+
+/// A short, human-sized byte count for transfer progress.
+private fun formatBytes(bytes: Long): String = when {
+    bytes >= 1_048_576 -> String.format("%.1f MB", bytes / 1_048_576.0)
+    bytes >= 1_024 -> String.format("%.1f kB", bytes / 1_024.0)
+    else -> "$bytes B"
+}
+
 private fun trashTime(millis: Long): String {
     if (millis <= 0L) return "at an unknown time"
     val formatter = java.time.format.DateTimeFormatter
@@ -1677,32 +2693,155 @@ private fun MarkdownWebView(
     html: String,
     baseUrl: String,
     modifier: Modifier = Modifier,
+    onOpenNote: (String) -> Unit = {},
+    initialScroll: Int = 0,
+    onScroll: (Int) -> Unit = {},
+    bodySize: Int = 16,
+    measure: Int = 700,
+    fontFamily: String = "serif",
+    lineHeight: Int = 150,
+    /// Null follows the system; the app's theme setting overrides it.
+    darkTheme: Boolean? = null,
 ) {
-    val dark = isSystemInDarkTheme()
-    val themed = remember(html, dark) {
+    val dark = darkTheme ?: isSystemInDarkTheme()
+    // Comfortable defaults for a phone or tablet, plus the dark palette when needed.
+    val themed = remember(html, dark, bodySize, measure, fontFamily, lineHeight) {
+        val base = html.replace(
+            "</head>",
+            "<style>${previewCss(bodySize, measure, fontFamily, lineHeight)}</style></head>",
+        )
         if (dark) {
-            html.replace("</head>", "<style>$DARK_PREVIEW_CSS</style></head>")
+            base.replace("</head>", "<style>$DARK_PREVIEW_CSS</style></head>")
         } else {
-            html
+            base
         }
     }
 
     AndroidView(
         modifier = modifier,
-        factory = { context ->
-            WebView(context).apply {
+        factory = { viewContext ->
+            WebView(viewContext).apply {
                 settings.javaScriptEnabled = false
                 settings.allowFileAccess = true
                 settings.allowContentAccess = true
                 settings.loadWithOverviewMode = true
                 settings.useWideViewPort = true
+                // Pinch to zoom without the floating +/- buttons.
+                settings.builtInZoomControls = true
+                settings.displayZoomControls = false
                 setBackgroundColor(android.graphics.Color.TRANSPARENT)
+                webViewClient = object : WebViewClient() {
+                    override fun onPageFinished(view: WebView?, url: String?) {
+                        // Restore the previous preview position after a reload.
+                        view?.post { view.scrollTo(0, initialScroll) }
+                    }
+
+                    override fun shouldOverrideUrlLoading(
+                        view: WebView?,
+                        request: WebResourceRequest?,
+                    ): Boolean {
+                        val url = request?.url?.toString() ?: return false
+                        val handled = handlePreviewLink(
+                            url = url,
+                            baseUrl = baseUrl,
+                            onOpenNote = onOpenNote,
+                            openExternally = { external ->
+                                runCatching {
+                                    viewContext.startActivity(
+                                        Intent(Intent.ACTION_VIEW, Uri.parse(external)),
+                                    )
+                                }
+                            },
+                        )
+                        return handled
+                    }
+                }
             }
         },
         update = { webView ->
-            webView.loadDataWithBaseURL(baseUrl, themed, "text/html", "utf-8", null)
+            // Reloading on every recomposition used to reset the scroll and re-lay out the
+            // page; only load when the rendered document actually changed.
+            if (webView.tag != themed) {
+                webView.tag = themed
+                webView.loadDataWithBaseURL(baseUrl, themed, "text/html", "utf-8", null)
+            }
+        },
+        onRelease = { webView ->
+            onScroll(webView.scrollY)
         },
     )
+}
+
+/// Route a link tapped in the preview.
+///
+/// Internal `.html` pages map back to their `.md` note and open it in the app; external
+/// links leave for the system browser; anything else is blocked so the preview document
+/// is never replaced in place. Returns whether the navigation was handled.
+private fun handlePreviewLink(
+    url: String,
+    baseUrl: String,
+    onOpenNote: (String) -> Unit,
+    openExternally: (String) -> Unit,
+): Boolean {
+    if (url == "about:blank" || url.startsWith("data:")) {
+        return false
+    }
+
+    if (url.startsWith(baseUrl)) {
+        val relative = url
+            .removePrefix(baseUrl)
+            .substringBefore('#')
+            .substringBefore('?')
+        if (relative.isBlank()) {
+            // A same-page anchor: let the WebView scroll to it.
+            return false
+        }
+        val note = when {
+            relative.endsWith(".html", ignoreCase = true) ->
+                relative.dropLast(5) + ".md"
+            relative.endsWith(".htm", ignoreCase = true) ->
+                relative.dropLast(4) + ".md"
+            relative.endsWith(".md", ignoreCase = true) -> relative
+            // Attachments: leave the preview document alone.
+            else -> return true
+        }
+        onOpenNote(Uri.decode(note))
+        return true
+    }
+
+    // A file outside the vault must not replace the preview document.
+    if (url.startsWith("file:")) {
+        return true
+    }
+
+    if (url.startsWith("http://") || url.startsWith("https://") || url.startsWith("mailto:")) {
+        openExternally(url)
+        return true
+    }
+
+    // Unknown scheme or off-vault target: never navigate the preview away from the note.
+    return true
+}
+
+/// Reading defaults for the preview, following the shared reader settings.
+private fun previewCss(
+    bodySize: Int,
+    measure: Int,
+    fontFamily: String,
+    lineHeight: Int,
+): String {
+    val body = when (fontFamily) {
+        "sans" -> "-apple-system,'Segoe UI',Roboto,sans-serif"
+        "mono" -> "ui-monospace,SFMono-Regular,Menlo,monospace"
+        else -> "Georgia,'Times New Roman',serif"
+    }
+    return """
+body{max-width:${measure}px;margin:0 auto;padding:16px;font-size:${bodySize}px;
+  line-height:${lineHeight / 100.0};-webkit-text-size-adjust:100%;font-family:$body}
+img{max-width:100%;height:auto}
+pre,code,kbd{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+pre,table{max-width:100%;overflow-x:auto}
+"""
 }
 
 /// The engine's export CSS targets light pages, so dark mode overrides the few colors that

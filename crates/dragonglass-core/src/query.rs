@@ -65,7 +65,12 @@ pub fn parse(input: &str) -> Query {
 }
 
 pub fn run(notes: &[NoteRef], input: &str) -> Vec<Row> {
-    let query = parse(input);
+    run_query(notes, &parse(input))
+}
+
+/// Run an already-parsed query. Lets clients filter by a property value that contains
+/// spaces, which the string grammar cannot express.
+pub fn run_query(notes: &[NoteRef], query: &Query) -> Vec<Row> {
     let mut rows: Vec<(Row, String)> = Vec::new();
 
     for note_ref in notes {

@@ -7,35 +7,52 @@
 //! The editor also owns the in-note find/replace bar, optional Vim mode, and multi-cursor
 //! state. Selections and extra carets live here; the buffer only stores the primary caret.
 
-use std::collections::HashSet;
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::Arc;
 
+use dragonglass_core::drafts;
 use dragonglass_core::find as find_engine;
+use dragonglass_core::fingerprint::{self, DocumentFingerprint, SaveReport};
 use dragonglass_core::format as text_format;
 use dragonglass_core::frontmatter::{self, Property, PropertyValue};
 use dragonglass_core::inline;
 use dragonglass_core::markdown;
-use dragonglass_core::math::{self, MathOptions, MathStyle};
-use dragonglass_core::{blocks, git, history, stats, storage, syntax, templates, wrap, Buffer};
+use dragonglass_core::math::{self, MathOptions, MathScene, MathStyle};
+use dragonglass_core::{blocks, git, history, stats, syntax, templates, wrap, Buffer};
 use gpui::{
-    actions, div, fill, point, prelude::*, px, relative, size, AnyElement, App, Bounds,
-    ClipboardEntry, ClipboardItem, Context, CursorStyle, ElementId, ElementInputHandler, Entity,
-    EntityInputHandler, ExternalPaths, FocusHandle, Focusable, GlobalElementId, ImageFormat,
-    InspectorElementId, KeyBinding, KeyDownEvent, LayoutId, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point, Render, ScrollHandle, ShapedLine,
-    SharedString, Style, TextRun, UTF16Selection, Window,
+    actions, anchored, div, fill, point, prelude::*, px, relative, size, AnyElement, App, Bounds,
+    ClipboardEntry, ClipboardItem, Context, Corner, Corners, CursorStyle, ElementId,
+    ElementInputHandler, Entity, EntityInputHandler, ExternalPaths, FocusHandle, Focusable,
+    GlobalElementId, ImageFormat, InspectorElementId, KeyBinding, KeyDownEvent, LayoutId,
+    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point, Render,
+    RenderImage, ScrollHandle, ShapedLine, SharedString, Style, TextRun, Timer, UTF16Selection,
+    Window,
 };
 
-use crate::math_element::MathElement;
-use crate::reading::{LinkOpener, ReadingCache};
+use crate::math_element::{paint_scene, MathElement};
+use crate::reading::{word_range, LinkOpener, ReadingCache};
 use crate::theme::Theme;
 use crate::vim::{Mode as VimMode, Vim};
 
 /// How many leading lines are inspected for YAML frontmatter. Real frontmatter is a few
 /// lines; the cap keeps property refresh from copying a large note.
 const FRONTMATTER_LINE_WINDOW: usize = 256;
+
+/// Runs the app's Save As flow for an editor that has no file name yet.
+pub type SaveAsHandler = Rc<dyn Fn(&mut Window, &mut App)>;
+
+/// Asks the app to close the tab that owns this editor (Vim `:wq`).
+pub type CloseTabHandler = Rc<dyn Fn(&mut Window, &mut App)>;
+
+/// Reports a one-line result to the app's status bar.
+pub type StatusReporter = Rc<dyn Fn(crate::StatusKind, &str, &mut App)>;
+
+/// Tells the app that a save hit a conflict, so it can show the resolution bar.
+pub type ConflictHandler = Rc<dyn Fn(&mut App)>;
 
 actions!(
     editor_actions,
@@ -48,6 +65,8 @@ actions!(
         Right,
         Up,
         Down,
+        PageUp,
+        PageDown,
         WordLeft,
         WordRight,
         ParagraphUp,
@@ -96,7 +115,9 @@ actions!(
         ToggleHighlight,
         ToggleInlineCode,
         ToggleComment,
-        InsertWikilink
+        InsertWikilink,
+        Indent,
+        Outdent
     ]
 );
 
@@ -111,6 +132,8 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("right", Right, None),
         KeyBinding::new("up", Up, None),
         KeyBinding::new("down", Down, None),
+        KeyBinding::new("pageup", PageUp, None),
+        KeyBinding::new("pagedown", PageDown, None),
         // Word-wise movement (the `cmd` forms mirror the rest of the keymap on macOS).
         KeyBinding::new("ctrl-left", WordLeft, None),
         KeyBinding::new("ctrl-right", WordRight, None),
@@ -146,6 +169,8 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("ctrl-shift-z", Redo, None),
         KeyBinding::new("cmd-shift-z", Redo, None),
         KeyBinding::new("ctrl-y", Redo, None),
+        // Vim's redo key; harmless outside Vim mode and the only Control binding left.
+        KeyBinding::new("ctrl-r", Redo, None),
         KeyBinding::new("enter", Enter, None),
         KeyBinding::new("ctrl-v", Paste, None),
         KeyBinding::new("cmd-v", Paste, None),
@@ -165,6 +190,13 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("cmd-alt-f", OpenFindReplace, None),
         KeyBinding::new("f3", FindNext, None),
         KeyBinding::new("shift-f3", FindPrev, None),
+        // Let the find bar be driven from the keyboard once it is open: replace one/all and
+        // the regex/case/word toggles. The handlers ignore the keys when the bar is closed.
+        KeyBinding::new("secondary-alt-enter", FindReplaceOne, None),
+        KeyBinding::new("secondary-alt-a", FindReplaceAll, None),
+        KeyBinding::new("secondary-alt-r", FindToggleRegex, None),
+        KeyBinding::new("secondary-alt-c", FindToggleCase, None),
+        KeyBinding::new("secondary-alt-w", FindToggleWord, None),
         KeyBinding::new("ctrl-d", SelectNextOccurrence, None),
         KeyBinding::new("cmd-d", SelectNextOccurrence, None),
         KeyBinding::new("ctrl-alt-up", AddCursorAbove, None),
@@ -185,6 +217,9 @@ pub fn init(cx: &mut App) {
         // Start a wikilink from the caret, or from the selected text.
         KeyBinding::new("ctrl-k", InsertWikilink, None),
         KeyBinding::new("cmd-k", InsertWikilink, None),
+        // Tab indents; Shift+Tab outdents. Autocomplete still accepts with Tab.
+        KeyBinding::new("tab", Indent, None),
+        KeyBinding::new("shift-tab", Outdent, None),
     ]);
 
     // macOS conventions: Command jumps to the line or document edge, Option works by word.
@@ -297,11 +332,53 @@ pub struct Editor {
     doc_generation: u64,
     /// Virtualized reading-mode content.
     reading_content: ReadingCache,
+    /// Display-math blocks in the current document, with the rows they occupy.
+    display_math: Rc<Vec<DisplayMathLayout>>,
+    /// Standalone image embeds currently drawn in place of their source line.
+    editor_images: Vec<EditorImage>,
+    /// Callout blocks drawn as boxes behind their source rows.
+    layout_callouts: Rc<Vec<CalloutLayout>>,
+    /// Table blocks drawn as a grid.
+    layout_tables: Rc<Vec<TableLayout>>,
+    /// Live previews of formulas whose block contains the caret.
+    live_math: Vec<LiveMath>,
+    /// The buffer revision `display_math` was parsed from.
+    display_math_revision: u64,
+    /// Typeset display formulas, keyed by TeX source. `None` records a failed formula.
+    math_scenes: HashMap<String, Option<Rc<MathScene>>>,
+    /// The document text for one revision, shared by the heading and math parsers so a
+    /// keystroke copies the note once rather than once per consumer.
+    doc_text: ((u64, u64), Rc<String>),
     /// True while a splitter is being dragged: the text keeps its old wrap width so a
     /// resize does not re-shape the whole document on every mouse tick.
     resizing: bool,
     /// Opens a link clicked in reading mode.
     link_opener: Option<LinkOpener>,
+    /// Asks the app to run Save As when a save has no file name yet.
+    save_as: Option<SaveAsHandler>,
+    /// Asks the app to close this tab.
+    close_tab: Option<CloseTabHandler>,
+    /// Reports one-line results (copy, save failures) to the app's status bar.
+    status_reporter: Option<StatusReporter>,
+    /// The version of the file this buffer was loaded from or last saved to.
+    fingerprint: Option<DocumentFingerprint>,
+    /// Tells the app when a save would overwrite an external change.
+    conflict_handler: Option<ConflictHandler>,
+    /// Debounce generation for the draft writer; a newer edit invalidates an older timer.
+    draft_generation: u64,
+    /// True while a draft timer is waiting.
+    draft_armed: bool,
+    /// The buffer revision the last draft was written for.
+    draft_written: u64,
+    /// When the throttled document stats last ran, and whether a timer is armed.
+    stats_at: Option<std::time::Instant>,
+    stats_armed: bool,
+    /// Whether the note may be saved automatically after idle, when the disk still matches.
+    autosave: bool,
+    /// Window position of the open right-click menu, if any.
+    context_menu: Option<Point<Pixels>>,
+    /// Screen position of the caret from the last paint, for the autocomplete popup.
+    caret_origin: Rc<RefCell<Option<Point<Pixels>>>>,
     /// Cached document statistics, recomputed per buffer revision.
     stats_cache: (u64, stats::Stats),
     /// Git added/removed lines for the file, refreshed when the saved buffer changes.
@@ -317,6 +394,12 @@ pub struct Editor {
     folded: HashSet<usize>,
     /// Headings for the current document revision, used to compute fold ranges.
     heading_cache: (u64, u64, Rc<Vec<markdown::Heading>>),
+    /// The text the heading cache was built from, for the cheap "still valid" check.
+    heading_source: Option<Rc<String>>,
+    /// The paragraph the current layout kept raw.
+    layout_raw_block: (usize, usize),
+    /// Lines that are thematic breaks and are drawn as a rule instead of source.
+    layout_rules: Rc<HashSet<usize>>,
     /// Bumped when `folded` changes so `lay_out` reflows.
     fold_revision: u64,
     /// The fold revision the current layout was built for.
@@ -435,12 +518,423 @@ struct Autocomplete {
     selected: usize,
 }
 
-/// A wrapped visual row: `[start, end)` character columns of logical line `line`.
-#[derive(Debug, Clone, Copy)]
+/// The marker a new line continues, when Enter is pressed at the end of a list item.
+fn list_continuation(line: &str, col: usize) -> Option<String> {
+    if col != line.chars().count() {
+        return None;
+    }
+    let trimmed = line.trim_start();
+    let indent = &line[..line.len() - trimmed.len()];
+
+    // Bullets and task items.
+    for marker in ["- ", "* ", "+ "] {
+        if let Some(rest) = trimmed.strip_prefix(marker) {
+            if rest.trim().is_empty() {
+                return None;
+            }
+            if rest.starts_with("[ ] ") || rest.starts_with("[x] ") || rest.starts_with("[X] ") {
+                return Some(format!("{indent}{marker}[ ] "));
+            }
+            return Some(format!("{indent}{marker}"));
+        }
+    }
+
+    // Ordered items keep their delimiter and increment.
+    let digits: String = trimmed
+        .chars()
+        .take_while(|ch| ch.is_ascii_digit())
+        .collect();
+    if !digits.is_empty() {
+        let rest = &trimmed[digits.len()..];
+        if let Some(after) = rest.strip_prefix(". ").or_else(|| rest.strip_prefix(") ")) {
+            if after.trim().is_empty() {
+                return None;
+            }
+            let next = digits.parse::<u64>().ok()?.saturating_add(1);
+            let delimiter = if rest.starts_with(") ") { ")" } else { "." };
+            return Some(format!("{indent}{next}{delimiter} "));
+        }
+    }
+
+    // Blockquotes.
+    if let Some(rest) = trimmed.strip_prefix("> ") {
+        if rest.trim().is_empty() {
+            return None;
+        }
+        return Some(format!("{indent}> "));
+    }
+
+    None
+}
+
+/// A wrapped visual row: `[start, end)` character columns of logical line `line`, plus the
+/// matching range in the shaped display text.
+#[derive(Debug, Clone)]
 struct RowMeta {
     line: usize,
     start: usize,
     end: usize,
+    display_start: usize,
+    display_end: usize,
+    display_start_byte: usize,
+    map: Rc<LineMap>,
+}
+
+/// Maps a source line to the text that is actually shaped for it.
+///
+/// Markdown markers (`**`, `` ` ``, `[[`, …) are hidden outside the caret line. The shaped
+/// text is shorter than the source, so every cursor, selection, click and IME position goes
+/// through this map instead of assuming equal columns.
+#[derive(Debug, Default)]
+struct LineMap {
+    /// The shaped characters.
+    display: Vec<char>,
+    /// Byte offset of every display column (len + 1 entries).
+    display_offsets: Vec<usize>,
+    /// Display column of every source column (len + 1 entries).
+    source_display: Vec<usize>,
+    /// Byte offset into the display text for every source column (len + 1 entries).
+    source_byte: Vec<usize>,
+    /// Source column of every display column (len + 1 entries).
+    display_source: Vec<usize>,
+}
+
+impl LineMap {
+    /// Display byte offset for a source column.
+    fn byte_for_source(&self, col: usize) -> usize {
+        let col = col.min(self.source_byte.len().saturating_sub(1));
+        self.source_byte[col]
+    }
+
+    /// Source column for a display column.
+    fn source_for_display(&self, col: usize) -> usize {
+        let col = col.min(self.display_source.len().saturating_sub(1));
+        self.display_source[col]
+    }
+
+    /// Display column for a source column.
+    fn display_for_source(&self, col: usize) -> usize {
+        let col = col.min(self.source_display.len().saturating_sub(1));
+        self.source_display[col]
+    }
+
+    /// The display column containing a byte offset within one row segment.
+    fn display_col_in_row(
+        &self,
+        row_start: usize,
+        row_start_byte: usize,
+        local_byte: usize,
+    ) -> usize {
+        let target = row_start_byte + local_byte;
+        let mut col = row_start;
+        while col < self.display_offsets.len().saturating_sub(1)
+            && self.display_offsets[col] < target
+        {
+            col += 1;
+        }
+        col
+    }
+}
+
+/// Build the shaped display text and both directions of the column map.
+fn conceal_text(text: &str, conceal: bool, table: bool) -> LineMap {
+    let chars: Vec<char> = text.chars().collect();
+    let hidden = if conceal {
+        hidden_markers(&chars, table)
+    } else {
+        vec![false; chars.len()]
+    };
+
+    let mut display = Vec::with_capacity(chars.len());
+    let mut display_source = Vec::with_capacity(chars.len());
+    for (index, ch) in chars.iter().enumerate() {
+        if !hidden[index] {
+            display.push(*ch);
+            display_source.push(index);
+        }
+    }
+    display_source.push(chars.len());
+
+    let mut display_offsets = Vec::with_capacity(display.len() + 1);
+    let mut acc = 0usize;
+    for ch in &display {
+        display_offsets.push(acc);
+        acc += ch.len_utf8();
+    }
+    display_offsets.push(acc);
+
+    let mut source_display = Vec::with_capacity(chars.len() + 1);
+    let mut source_byte = Vec::with_capacity(chars.len() + 1);
+    let mut visible = 0usize;
+    for col in 0..=chars.len() {
+        while visible < display.len() && display_source[visible] < col {
+            visible += 1;
+        }
+        source_display.push(visible);
+        source_byte.push(display_offsets[visible]);
+    }
+
+    LineMap {
+        display,
+        display_offsets,
+        source_display,
+        source_byte,
+        display_source,
+    }
+}
+
+/// Which characters are markdown markers to hide when the line is not being edited.
+fn hidden_markers(chars: &[char], table: bool) -> Vec<bool> {
+    let mut hidden = vec![false; chars.len()];
+    let len = chars.len();
+    let mut i = 0usize;
+
+    // Leading quote markers are structure, not prose: hide `> ` levels and, directly
+    // after them, a callout tag like `[!note]`.
+    while i < len && chars[i] == '>' {
+        hidden[i] = true;
+        i += 1;
+        while i < len && chars[i] == ' ' {
+            hidden[i] = true;
+            i += 1;
+        }
+    }
+    if starts_at(chars, i, "[!") {
+        if let Some(close) = (i + 2..len).find(|&at| chars[at] == ']') {
+            for slot in &mut hidden[i..=close] {
+                *slot = true;
+            }
+            if chars.get(close + 1) == Some(&' ') {
+                hidden[close + 1] = true;
+            }
+            i = close + 2;
+        }
+    }
+
+    if table {
+        for (at, ch) in chars.iter().enumerate() {
+            if *ch == '|' {
+                hidden[at] = true;
+            }
+        }
+    }
+
+    while i < len {
+        // Inline code: hide both backticks; the content is literal.
+        if chars[i] == '`' {
+            if let Some(close) = (i + 1..len).find(|&at| chars[at] == '`') {
+                if close > i + 1 {
+                    hidden[i] = true;
+                    hidden[close] = true;
+                    i = close + 1;
+                    continue;
+                }
+            }
+            i += 1;
+            continue;
+        }
+
+        // `![[embed]]` and `[[link]]`: hide the brackets, keep the label.
+        let brackets = if starts_at(chars, i, "![[") {
+            Some((3, "]]"))
+        } else if starts_at(chars, i, "[[") {
+            Some((2, "]]"))
+        } else {
+            None
+        };
+        if let Some((open, close_token)) = brackets {
+            if let Some(close) = find_token(chars, i + open, close_token) {
+                for slot in &mut hidden[i..i + open] {
+                    *slot = true;
+                }
+                for slot in &mut hidden[close..close + close_token.chars().count()] {
+                    *slot = true;
+                }
+                i = close + close_token.chars().count();
+                continue;
+            }
+        }
+
+        // Paired emphasis/highlight/strike markers.
+        let pairs: [(&str, bool); 6] = [
+            ("**", false),
+            ("__", true),
+            ("~~", false),
+            ("==", false),
+            ("*", false),
+            ("_", true),
+        ];
+        let mut matched = false;
+        for (token, word_boundary) in pairs {
+            let width = token.chars().count();
+            if !starts_at(chars, i, token) {
+                continue;
+            }
+            if word_boundary {
+                let before = i.checked_sub(1).and_then(|at| chars.get(at)).copied();
+                if before.is_some_and(|ch| ch.is_alphanumeric()) {
+                    continue;
+                }
+            }
+            if chars.get(i + width).is_none_or(|ch| ch.is_whitespace()) {
+                continue;
+            }
+            let Some(close) = find_token(chars, i + width, token) else {
+                continue;
+            };
+            if close == i + width || chars[close - 1].is_whitespace() {
+                continue;
+            }
+            if word_boundary
+                && chars
+                    .get(close + width)
+                    .is_some_and(|ch| ch.is_alphanumeric())
+            {
+                continue;
+            }
+            for slot in &mut hidden[i..i + width] {
+                *slot = true;
+            }
+            for slot in &mut hidden[close..close + width] {
+                *slot = true;
+            }
+            i += width;
+            matched = true;
+            break;
+        }
+        if !matched {
+            i += 1;
+        }
+    }
+
+    hidden
+}
+
+fn starts_at(chars: &[char], at: usize, token: &str) -> bool {
+    let token: Vec<char> = token.chars().collect();
+    chars.len() >= at + token.len() && chars[at..at + token.len()] == token[..]
+}
+
+fn find_token(chars: &[char], from: usize, token: &str) -> Option<usize> {
+    let token: Vec<char> = token.chars().collect();
+    if token.is_empty() || chars.len() < token.len() {
+        return None;
+    }
+    (from..=chars.len() - token.len()).find(|&at| chars[at..at + token.len()] == token[..])
+}
+
+/// A live preview of the display formula being edited, drawn under its source block.
+#[derive(Debug, Clone)]
+struct LiveMath {
+    first_row: usize,
+    row_count: usize,
+    tex: String,
+}
+
+/// A table drawn as a grid over its rows. The separator row owns no rows of its own.
+#[derive(Debug, Clone)]
+struct TableLayout {
+    first_row: usize,
+    /// Exclusive.
+    last_row: usize,
+    /// Row where the header ends and the body begins.
+    divider_row: usize,
+}
+
+/// A callout block (`> [!note]` …) drawn as a tinted box over its rows.
+#[derive(Debug, Clone)]
+struct CalloutLayout {
+    first_row: usize,
+    /// Exclusive.
+    last_row: usize,
+    kind: String,
+}
+
+/// A standalone `![[image]]` line drawn over the rows it owns.
+#[derive(Debug, Clone)]
+struct EditorImage {
+    line: usize,
+    first_row: usize,
+    row_count: usize,
+    data: Arc<RenderImage>,
+    width: f32,
+    height: f32,
+}
+
+/// A `$$…$$` block in the source, before its rows are known.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DisplayMathSource {
+    first_line: usize,
+    last_line: usize,
+    tex: String,
+}
+
+/// A display-math block plus the rows it occupies in the laid-out document.
+#[derive(Debug, Clone)]
+struct DisplayMathLayout {
+    first_line: usize,
+    last_line: usize,
+    tex: String,
+    first_row: usize,
+    row_count: usize,
+}
+
+/// Find display-math blocks (`$$…$$`) by source line.
+///
+/// A block opens on a line that is exactly `$$` and closes on the next such line, or is a
+/// complete `$$tex$$` on one line. Fenced code and inline `$…$` are ignored. An unclosed
+/// block is not returned, so its source stays visible while it is being written.
+fn display_math_blocks(text: &str) -> Vec<DisplayMathSource> {
+    let mut blocks = Vec::new();
+    let mut in_fence = false;
+    let mut open: Option<(usize, Vec<&str>)> = None;
+
+    for (index, line) in text.lines().enumerate() {
+        let trimmed = line.trim();
+
+        if let Some((first_line, body)) = &mut open {
+            if trimmed == "$$" {
+                let tex = body.join("\n");
+                if !tex.trim().is_empty() {
+                    blocks.push(DisplayMathSource {
+                        first_line: *first_line,
+                        last_line: index,
+                        tex,
+                    });
+                }
+                open = None;
+            } else {
+                body.push(line);
+            }
+            continue;
+        }
+
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            in_fence = !in_fence;
+            continue;
+        }
+        if in_fence {
+            continue;
+        }
+
+        if trimmed == "$$" {
+            open = Some((index, Vec::new()));
+            continue;
+        }
+
+        if trimmed.len() > 4 && trimmed.starts_with("$$") && trimmed.ends_with("$$") {
+            let tex = trimmed[2..trimmed.len() - 2].trim();
+            if !tex.is_empty() {
+                blocks.push(DisplayMathSource {
+                    first_line: index,
+                    last_line: index,
+                    tex: tex.to_string(),
+                });
+            }
+        }
+    }
+
+    blocks
 }
 
 /// The shaped rows of one logical line, reused across frames.
@@ -456,8 +950,16 @@ struct LineLayout {
     in_code: bool,
     /// Fence language at the time the line was shaped, so a changed fence re-shapes.
     language: String,
+    /// Whether markers were hidden (the line was not the caret line).
+    concealed: bool,
+    /// Whether the line belongs to a table, so its cell pipes are hidden.
+    table: bool,
     /// Wrapped spans of the line, in character columns.
     spans: Rc<Vec<(usize, usize)>>,
+    /// The same spans in display columns, for building row metadata.
+    display_spans: Rc<Vec<(usize, usize)>>,
+    /// Source ↔ display column map for the line.
+    map: Rc<LineMap>,
     /// One shaped row per span. Shared with the flattened row list, so flattening the
     /// document costs a pointer per row rather than a copy of every shaped line.
     rows: Rc<Vec<Rc<ShapedLine>>>,
@@ -488,9 +990,30 @@ impl Editor {
             properties_revision: u64::MAX,
             doc_generation: 0,
             reading_content: ReadingCache::new(),
+            display_math: Rc::new(Vec::new()),
+            editor_images: Vec::new(),
+            layout_callouts: Rc::new(Vec::new()),
+            layout_tables: Rc::new(Vec::new()),
+            live_math: Vec::new(),
+            display_math_revision: u64::MAX,
+            math_scenes: HashMap::new(),
+            doc_text: ((u64::MAX, u64::MAX), Rc::new(String::new())),
             resizing: false,
             attachments_folder: "attachments".to_string(),
             link_opener: None,
+            save_as: None,
+            close_tab: None,
+            status_reporter: None,
+            fingerprint: None,
+            conflict_handler: None,
+            draft_generation: 0,
+            draft_armed: false,
+            draft_written: u64::MAX,
+            stats_at: None,
+            stats_armed: false,
+            autosave: false,
+            context_menu: None,
+            caret_origin: Rc::new(RefCell::new(None)),
             stats_cache: (u64::MAX, stats::Stats::default()),
             git_stat: None,
             git_stat_key: None,
@@ -499,6 +1022,9 @@ impl Editor {
             vim: Vim::new(),
             folded: HashSet::new(),
             heading_cache: (u64::MAX, u64::MAX, Rc::new(Vec::new())),
+            heading_source: None,
+            layout_raw_block: (usize::MAX, usize::MAX),
+            layout_rules: Rc::new(HashSet::new()),
             fold_revision: 0,
             layout_fold_revision: u64::MAX,
             fold_markers: Rc::new(Vec::new()),
@@ -518,28 +1044,98 @@ impl Editor {
         self.tag_suggestions = Rc::new(tags);
     }
 
+    /// Whether editing actions may change the buffer. Reading mode is view-only: every
+    /// mutating action checks this gate, while scrolling, selecting and copying stay on.
+    fn can_mutate(&self) -> bool {
+        !self.reading
+    }
+
     /// Wrap or unwrap the current selection (or insert a marker pair at the caret).
     fn apply_style(&mut self, style: text_format::Style) {
-        if self.reading || self.find.open {
+        if !self.can_mutate() || self.find.open {
             return;
         }
-        let range = self
-            .selection()
-            .unwrap_or_else(|| self.buffer.cursor()..self.buffer.cursor());
-        let text = self.buffer.text();
-        let edit = text_format::toggle(&text, range, style);
-        let base = edit.range.start;
-        self.buffer.replace(edit.range, &edit.text);
 
-        let start = base + edit.selection.start;
-        let end = base + edit.selection.end;
-        if start == end {
-            self.anchor = None;
-            self.buffer.set_cursor(start);
-        } else {
-            self.anchor = Some(start);
-            self.buffer.set_cursor(end);
+        // Toggle around every selection, not just the primary one. Edits are computed
+        // against the original text and applied as one batch, so multi-cursor formatting
+        // is one undo step and every caret lands in its own formatted run.
+        let states = self.all_cursor_states();
+        let text = self.buffer.text();
+        let mut requests: Vec<Range<usize>> = states
+            .iter()
+            .map(|state| match state.anchor {
+                Some(anchor) if anchor != state.cursor => {
+                    anchor.min(state.cursor)..anchor.max(state.cursor)
+                }
+                _ => state.cursor..state.cursor,
+            })
+            .collect();
+        requests.sort_by_key(|range| (range.start, range.end));
+        requests.dedup();
+
+        // (range, replacement, selection inside the replacement in characters)
+        let mut edits: Vec<(Range<usize>, String, Range<usize>)> = Vec::new();
+        let mut last_end = 0usize;
+        for range in requests {
+            if range.start < last_end {
+                // Overlapping selections format once, at the outer range.
+                continue;
+            }
+            let edit = text_format::toggle(&text, range.clone(), style);
+            last_end = edit.range.end.max(range.end);
+            edits.push((edit.range, edit.text, edit.selection));
         }
+        if edits.is_empty() {
+            return;
+        }
+
+        // Where each edit starts in the new document.
+        let mut new_starts: Vec<usize> = Vec::with_capacity(edits.len());
+        let mut delta: isize = 0;
+        for (range, replacement, _) in &edits {
+            let start = (range.start as isize + delta).max(0) as usize;
+            new_starts.push(start);
+            delta += replacement.chars().count() as isize - (range.end - range.start) as isize;
+        }
+
+        let map = |position: usize| -> (usize, usize) {
+            for (index, (range, _, selection)) in edits.iter().enumerate() {
+                if range.start <= position && position <= range.end {
+                    let start = new_starts[index];
+                    return (start + selection.start, start + selection.end);
+                }
+            }
+            let shift: isize = edits
+                .iter()
+                .filter(|(range, _, _)| range.start < position)
+                .map(|(range, replacement, _)| {
+                    replacement.chars().count() as isize - (range.end - range.start) as isize
+                })
+                .sum();
+            let mapped = position.saturating_add_signed(shift);
+            (mapped, mapped)
+        };
+
+        let mapped: Vec<CursorState> = states
+            .iter()
+            .map(|state| {
+                let (_, end) = map(state.cursor);
+                CursorState {
+                    cursor: end,
+                    anchor: state
+                        .anchor
+                        .map(|anchor| map(anchor).0)
+                        .filter(|at| *at != end),
+                }
+            })
+            .collect();
+
+        let batch = edits
+            .into_iter()
+            .map(|(range, replacement, _)| (range, replacement))
+            .collect();
+        self.buffer.replace_many(batch);
+        self.set_cursor_states(mapped);
         self.autocomplete = Autocomplete::default();
         self.pending_link_alias = None;
         self.pending_link_start = false;
@@ -680,35 +1276,55 @@ impl Editor {
         match kind {
             SuggestionKind::Link => {
                 let alias = self.pending_link_alias.clone();
+                // Rank prefix matches ahead of substring matches, so typing `da` offers
+                // `Daily` before `Monday`.
+                let mut ranked: Vec<(u8, Suggestion)> = Vec::new();
                 for (target, label) in self.note_suggestions.iter() {
-                    if needle.is_empty()
-                        || label.to_lowercase().contains(&needle)
-                        || target.to_lowercase().contains(&needle)
-                    {
-                        items.push(Suggestion {
+                    let label_lower = label.to_lowercase();
+                    let target_lower = target.to_lowercase();
+                    let rank = if needle.is_empty() || label_lower.starts_with(&needle) {
+                        0
+                    } else if target_lower.starts_with(&needle) {
+                        1
+                    } else if label_lower.contains(&needle) || target_lower.contains(&needle) {
+                        2
+                    } else {
+                        continue;
+                    };
+                    ranked.push((
+                        rank,
+                        Suggestion {
                             label: label.clone(),
                             detail: target.clone(),
                             insert: link_text(target, label, alias.as_deref()),
-                        });
-                        if items.len() == 8 {
-                            break;
-                        }
-                    }
+                        },
+                    ));
                 }
+                ranked.sort_by_key(|(rank, _)| *rank);
+                items = ranked.into_iter().take(8).map(|(_, item)| item).collect();
             }
             SuggestionKind::Tag => {
+                let mut ranked: Vec<(u8, Suggestion)> = Vec::new();
                 for tag in self.tag_suggestions.iter() {
-                    if needle.is_empty() || tag.to_lowercase().contains(&needle) {
-                        items.push(Suggestion {
+                    let lower = format!("#{}", tag).to_lowercase();
+                    let rank = if needle.is_empty() || lower.starts_with(&needle) {
+                        0
+                    } else if lower.contains(&needle) {
+                        1
+                    } else {
+                        continue;
+                    };
+                    ranked.push((
+                        rank,
+                        Suggestion {
                             label: format!("#{tag}"),
                             detail: "tag".to_string(),
                             insert: format!("#{tag}"),
-                        });
-                        if items.len() == 8 {
-                            break;
-                        }
-                    }
+                        },
+                    ));
                 }
+                ranked.sort_by_key(|(rank, _)| *rank);
+                items = ranked.into_iter().take(8).map(|(_, item)| item).collect();
             }
             SuggestionKind::Slash => {
                 for (insert, description) in SLASH_COMMANDS {
@@ -784,6 +1400,7 @@ impl Editor {
         let text = std::fs::read_to_string(path)?;
         self.buffer = Buffer::from_text(&text);
         self.buffer.mark_saved();
+        self.fingerprint = Some(DocumentFingerprint::of_text(&text));
         self.marked_range = None;
         self.anchor = None;
         self.selecting = false;
@@ -798,36 +1415,86 @@ impl Editor {
         self.scroll_handle = ScrollHandle::new();
         self.properties_revision = u64::MAX;
         self.doc_generation = self.doc_generation.wrapping_add(1);
+        self.math_scenes.clear();
+        self.draft_written = u64::MAX;
+        self.draft_generation = self.draft_generation.wrapping_add(1);
         self.path = Some(path.to_path_buf());
         Ok(())
     }
 
-    /// Write the buffer back to its file, atomically.
-    pub fn save(&mut self) -> std::io::Result<()> {
+    /// Write the buffer back to its file, atomically and only if the file on disk is still
+    /// the version this buffer is based on. Returns a report so the caller can offer the
+    /// conflict choices instead of losing either side.
+    pub fn save_checked(&mut self) -> SaveReport {
         let Some(path) = self.path.clone() else {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "note has no file name yet (use Save note as)",
-            ));
+            return SaveReport::Error {
+                message: "note has no file name yet (use Save note as)".to_string(),
+            };
         };
 
         let new_content = self.buffer.text();
+        // Read the old version before the write, so the history snapshot is the one that
+        // is about to be replaced.
+        let previous = std::fs::read_to_string(&path).ok();
 
-        // Keep a snapshot of whatever is about to be overwritten.
-        if let (Some(root), Ok(existing)) =
-            (self.vault_root.as_ref(), std::fs::read_to_string(&path))
-        {
-            if existing != new_content {
+        // Never overwrite a file that changed underneath the editor.
+        let report = fingerprint::save_if_unchanged(&path, &new_content, self.fingerprint.as_ref());
+
+        if let SaveReport::Saved { fingerprint } = &report {
+            // Keep a snapshot of whatever was overwritten.
+            if let (Some(root), Some(existing)) = (self.vault_root.as_ref(), previous) {
+                if existing != new_content {
+                    if let Ok(relative) = path.strip_prefix(root) {
+                        let relative = relative.to_string_lossy().replace('\\', "/");
+                        let _ = history::record(root, &relative, &existing);
+                    }
+                }
+            }
+            self.buffer.mark_saved();
+            self.fingerprint = Some(fingerprint.clone());
+            // The note on disk is now the typed text, so its draft is obsolete.
+            if let (Some(root), Some(path)) = (self.vault_root.as_ref(), self.path.as_ref()) {
                 if let Ok(relative) = path.strip_prefix(root) {
-                    let relative = relative.to_string_lossy().replace('\\', "/");
-                    let _ = history::record(root, &relative, &existing);
+                    let note = relative.to_string_lossy().replace('\\', "/");
+                    drafts::discard(root, &note);
                 }
             }
         }
 
-        storage::write_atomic(&path, &new_content)?;
-        self.buffer.mark_saved();
-        Ok(())
+        report
+    }
+
+    /// Write the buffer over whatever is on disk. Only "keep mine" calls this, after the
+    /// user has seen both versions and chosen this one.
+    pub fn save_forced(&mut self) -> SaveReport {
+        let Some(path) = self.path.clone() else {
+            return SaveReport::Error {
+                message: "note has no file name yet (use Save note as)".to_string(),
+            };
+        };
+        let report = fingerprint::save_forced(&path, &self.buffer.text());
+        if let SaveReport::Saved { fingerprint } = &report {
+            self.buffer.mark_saved();
+            self.fingerprint = Some(fingerprint.clone());
+        }
+        report
+    }
+
+    /// Write the buffer back to its file, atomically. Conflicts surface as an error; use
+    /// [`Editor::save_checked`] when the caller wants to tell them apart.
+    pub fn save(&mut self) -> std::io::Result<()> {
+        match self.save_checked() {
+            SaveReport::Saved { .. } => Ok(()),
+            SaveReport::Conflict { disk } => Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                if disk.is_some() {
+                    "the note changed on disk since it was opened"
+                } else {
+                    "the note was deleted on disk"
+                },
+            )),
+            SaveReport::Error { message } => Err(std::io::Error::other(message)),
+        }
     }
 
     pub fn is_dirty(&self) -> bool {
@@ -849,16 +1516,21 @@ impl Editor {
         // change, which would reset the editor and preview scroll positions.
         if text == self.buffer.text() {
             self.buffer.mark_saved();
+            self.fingerprint = Some(DocumentFingerprint::of_text(&text));
             return Ok(());
         }
         self.buffer = Buffer::from_text(&text);
         self.buffer.mark_saved();
+        self.fingerprint = Some(DocumentFingerprint::of_text(&text));
         self.anchor = None;
         self.marked_range = None;
         self.reset_layout_cache();
         self.scroll_handle = ScrollHandle::new();
         self.properties_revision = u64::MAX;
         self.doc_generation = self.doc_generation.wrapping_add(1);
+        self.math_scenes.clear();
+        self.draft_written = u64::MAX;
+        self.draft_generation = self.draft_generation.wrapping_add(1);
         self.reading_content.invalidate_attachments();
         Ok(())
     }
@@ -870,9 +1542,16 @@ impl Editor {
 
     /// Toggle between edit and reading mode (used by the command palette).
     pub fn toggle_reading_mode(&mut self) {
-        self.reading = !self.reading;
-        if self.reading {
-            self.find.open = false;
+        self.set_reading_mode(!self.reading);
+    }
+
+    /// Make the reading view reflect the current buffer before mapping positions.
+    fn prepare_reading(&mut self) {
+        let version = self.document_version();
+        if self.reading_content.needs_update(version) {
+            let text = self.buffer.text();
+            let root = self.vault_root.clone();
+            self.reading_content.update(version, &text, root.as_deref());
         }
     }
 
@@ -883,10 +1562,23 @@ impl Editor {
 
     /// Set reading mode explicitly (used when restoring a workspace).
     pub fn set_reading_mode(&mut self, reading: bool) {
-        self.reading = reading;
-        if reading {
-            self.find.open = false;
+        if reading == self.reading {
+            return;
         }
+        if reading {
+            // Enter reading at the block holding the caret.
+            self.prepare_reading();
+            let line = self.buffer.line_col().0;
+            if let Some(block) = self.reading_content.block_for_line(line) {
+                self.reading_content.scroll_to_block(block);
+            }
+            self.find.open = false;
+        } else if let Some(line) = self.reading_content.top_block_line() {
+            // Leave reading at the first line of the visible block; the render pass then
+            // scrolls the editor to the caret.
+            self.set_cursor_line(line);
+        }
+        self.reading = reading;
     }
 
     /// Insert text at the caret (used by plugins).
@@ -904,6 +1596,265 @@ impl Editor {
     /// 0-based line containing the caret.
     pub fn cursor_line(&self) -> usize {
         self.buffer.line_col().0
+    }
+
+    /// Caret line and column, 0-based.
+    pub fn cursor_position(&self) -> (usize, usize) {
+        self.buffer.line_col()
+    }
+
+    /// Put the caret at a line and column, clamped to the document.
+    pub fn set_cursor_position(&mut self, line: usize, col: usize) {
+        let line = line.min(self.buffer.line_count().saturating_sub(1));
+        self.buffer.set_cursor(self.buffer.char_index_at(line, col));
+        self.anchor = None;
+        self.extra_cursors.clear();
+    }
+
+    /// The editor's vertical scroll offset, in pixels.
+    pub fn scroll_offset(&self) -> f32 {
+        f32::from(self.scroll_handle.offset().y)
+    }
+
+    /// Restore the editor's vertical scroll offset.
+    pub fn set_scroll_offset(&mut self, offset: f32) {
+        let x = self.scroll_handle.offset().x;
+        self.scroll_handle.set_offset(point(x, px(offset.max(0.0))));
+    }
+
+    /// How far down the document the viewport sits, from 0.0 to 1.0.
+    pub fn scroll_progress(&self) -> f32 {
+        let content = f32::from(self.line_height) * self.last_rows.len() as f32;
+        let viewport = f32::from(self.scroll_handle.bounds().size.height);
+        progress_from_scroll(self.scroll_offset(), content, viewport)
+    }
+
+    /// Scroll to a fraction of the document, for preview scroll sync.
+    pub fn set_scroll_progress(&mut self, progress: f32) {
+        let content = f32::from(self.line_height) * self.last_rows.len() as f32;
+        let viewport = f32::from(self.scroll_handle.bounds().size.height);
+        self.set_scroll_offset(offset_for_progress(progress, content, viewport));
+    }
+
+    /// The selection anchor (a character index) when a non-empty selection exists.
+    pub fn selection_anchor(&self) -> Option<usize> {
+        let cursor = self.buffer.cursor();
+        self.anchor.filter(|anchor| *anchor != cursor)
+    }
+
+    /// Restore a selection anchor; the cursor end is set separately.
+    pub fn set_selection_anchor(&mut self, anchor: Option<usize>) {
+        let cursor = self.buffer.cursor();
+        let limit = self.buffer.len_chars();
+        self.anchor = anchor
+            .filter(|anchor| *anchor != cursor)
+            .map(|anchor| anchor.min(limit));
+    }
+
+    /// Heading indices folded in the reading view, for the session.
+    pub fn reading_folds(&self) -> Vec<usize> {
+        self.reading_content.reading_folds()
+    }
+
+    /// Restore reading folds when a session reopens the note.
+    pub fn set_reading_folds(&mut self, folds: &[usize]) {
+        self.reading_content.set_reading_folds(folds);
+    }
+
+    /// Heading indices whose sections are folded.
+    pub fn folded_headings(&self) -> Vec<usize> {
+        let mut folds: Vec<usize> = self.folded.iter().copied().collect();
+        folds.sort_unstable();
+        folds
+    }
+
+    /// Restore folded headings from a session.
+    pub fn set_folded_headings(&mut self, folds: &[usize]) {
+        self.folded = folds.iter().copied().collect();
+        self.fold_revision = self.fold_revision.wrapping_add(1);
+    }
+
+    /// The reading view's top block.
+    pub fn reading_block(&self) -> usize {
+        self.reading_content.top_block()
+    }
+
+    /// Restore the reading view's scroll position by block.
+    pub fn scroll_reading_to(&mut self, block: usize) {
+        self.reading_content.scroll_to_block(block);
+    }
+
+    /// The reading view's in-page find bar.
+    fn render_reading_find_bar(&self, theme: Theme, cx: &mut Context<Self>) -> AnyElement {
+        let pattern = self.reading_content.find_pattern().to_string();
+        let (current, total) = self.reading_content.find_position();
+        let (regex, case, word) = self.reading_content.find_options();
+        let error = self.reading_content.find_error().map(str::to_string);
+        let (status, status_color) = if let Some(error) = error {
+            (error, theme.warn)
+        } else if pattern.is_empty() {
+            ("type to search this note".to_string(), theme.muted)
+        } else if total == 0 {
+            ("no matches".to_string(), theme.warn)
+        } else {
+            (format!("{current}/{total}"), theme.muted)
+        };
+        let button = |id: &'static str, label: &'static str| {
+            div()
+                .id(id)
+                .px_2()
+                .py_1()
+                .rounded_md()
+                .bg(theme.chip)
+                .text_xs()
+                .text_color(theme.text_dim)
+                .cursor_pointer()
+                .hover(move |style| style.bg(theme.hover))
+                .child(label)
+        };
+
+        div()
+            .id("reading-find")
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2()
+            .h(px(36.0))
+            .px_3()
+            .flex_shrink_0()
+            .bg(theme.panel)
+            .border_b_1()
+            .border_color(theme.border)
+            .child(div().text_xs().text_color(theme.muted).child("FIND"))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(120.0))
+                    .px_2()
+                    .py_1()
+                    .rounded_md()
+                    .bg(theme.input_bg)
+                    .border_1()
+                    .border_color(theme.accent)
+                    .text_sm()
+                    .text_color(if pattern.is_empty() {
+                        theme.muted
+                    } else {
+                        theme.text
+                    })
+                    .child(format!(
+                        "{}│",
+                        if pattern.is_empty() {
+                            "Find in note".to_string()
+                        } else {
+                            pattern
+                        }
+                    )),
+            )
+            .child(
+                div()
+                    .px_2()
+                    .py_1()
+                    .rounded_md()
+                    .text_xs()
+                    .text_color(if regex {
+                        theme.accent_text
+                    } else {
+                        theme.muted
+                    })
+                    .bg(if regex { theme.chip } else { theme.panel })
+                    .child(".*"),
+            )
+            .child(
+                div()
+                    .px_2()
+                    .py_1()
+                    .rounded_md()
+                    .text_xs()
+                    .text_color(if case { theme.accent_text } else { theme.muted })
+                    .bg(if case { theme.chip } else { theme.panel })
+                    .child("Aa"),
+            )
+            .child(
+                div()
+                    .px_2()
+                    .py_1()
+                    .rounded_md()
+                    .text_xs()
+                    .text_color(if word { theme.accent_text } else { theme.muted })
+                    .bg(if word { theme.chip } else { theme.panel })
+                    .child("W"),
+            )
+            .child(
+                div()
+                    .min_w(px(56.0))
+                    .text_xs()
+                    .text_color(status_color)
+                    .child(status),
+            )
+            .child(button("reading-find-prev", "prev").on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _event, _window, cx| {
+                    this.reading_content.find_next(true);
+                    cx.notify();
+                }),
+            ))
+            .child(button("reading-find-next", "next").on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _event, _window, cx| {
+                    this.reading_content.find_next(false);
+                    cx.notify();
+                }),
+            ))
+            .child(button("reading-find-close", "x").on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _event, window, cx| {
+                    this.reading_content.close_find();
+                    window.focus(&this.focus_handle);
+                    cx.notify();
+                }),
+            ))
+            .into_any_element()
+    }
+
+    /// The reading view's current section and progress, for the status bar and outline.
+    pub fn reading_outline_state(&self) -> (Option<String>, f32) {
+        (
+            self.reading_content.current_heading(),
+            self.reading_content.progress(),
+        )
+    }
+
+    /// Put the caret at the start of a source line, clamped to the document.
+    pub fn set_cursor_line(&mut self, line: usize) {
+        let line = line.min(self.buffer.line_count().saturating_sub(1));
+        self.buffer.set_cursor(self.buffer.char_index_at(line, 0));
+        self.anchor = None;
+        self.extra_cursors.clear();
+    }
+
+    /// Put the caret on a source line and select `needle` when it appears there.
+    ///
+    /// Search results use this so the match is already selected when the note opens.
+    pub fn select_line_text(&mut self, line: usize, needle: &str) {
+        let line = line.min(self.buffer.line_count().saturating_sub(1));
+        self.buffer.set_cursor(self.buffer.char_index_at(line, 0));
+        self.anchor = None;
+        self.extra_cursors.clear();
+        if needle.is_empty() {
+            return;
+        }
+        let text = self.buffer.line(line);
+        let Some(byte) = text.find(needle) else {
+            return;
+        };
+        let start_col = text[..byte].chars().count();
+        let start = self.buffer.char_index_at(line, start_col);
+        let end = self
+            .buffer
+            .char_index_at(line, start_col + needle.chars().count());
+        self.anchor = Some(start);
+        self.buffer.set_cursor(end);
     }
 
     /// The selected text, if there is a non-empty selection.
@@ -946,7 +1897,7 @@ impl Editor {
         let text = self.buffer.text();
         match blocks::move_up(&text, self.cursor_line()) {
             Some(edit) => {
-                self.apply_block_edit(edit);
+                self.apply_block_edit(edit, true);
                 true
             }
             None => false,
@@ -958,7 +1909,7 @@ impl Editor {
         let text = self.buffer.text();
         match blocks::move_down(&text, self.cursor_line()) {
             Some(edit) => {
-                self.apply_block_edit(edit);
+                self.apply_block_edit(edit, true);
                 true
             }
             None => false,
@@ -970,7 +1921,7 @@ impl Editor {
         let text = self.buffer.text();
         match blocks::duplicate(&text, self.cursor_line()) {
             Some(edit) => {
-                self.apply_block_edit(edit);
+                self.apply_block_edit(edit, true);
                 true
             }
             None => false,
@@ -982,21 +1933,32 @@ impl Editor {
         let text = self.buffer.text();
         match blocks::delete(&text, self.cursor_line()) {
             Some(edit) => {
-                self.apply_block_edit(edit);
+                self.apply_block_edit(edit, false);
                 true
             }
             None => false,
         }
     }
 
-    fn apply_block_edit(&mut self, edit: blocks::BlockEdit) {
+    /// Replace the document with a block edit, keeping the caret on the same line of the
+    /// moved or duplicated block (`follow`) and the viewport where it was. A deletion puts
+    /// the caret at the start of the block that took its place.
+    fn apply_block_edit(&mut self, edit: blocks::BlockEdit, follow: bool) {
+        if !self.can_mutate() {
+            return;
+        }
+        let caret =
+            caret_after_block_edit(&self.buffer.text(), self.buffer.cursor(), &edit, follow);
+        let scroll = self.scroll_handle.offset();
         self.buffer.replace(0..self.buffer.len_chars(), &edit.text);
-        self.buffer
-            .set_cursor(self.buffer.char_index_at(edit.line, 0));
+        let caret = caret.min(self.buffer.len_chars());
+        self.buffer.set_cursor(caret);
         self.anchor = None;
         self.marked_range = None;
         self.properties_revision = u64::MAX;
         self.reset_layout_cache();
+        // The block moved, not the reader: restore the viewport the edit invalidated.
+        self.scroll_handle.set_offset(scroll);
     }
 
     /// Drop the shaped-line cache. The next prepaint re-shapes the whole document.
@@ -1054,10 +2016,31 @@ impl Editor {
     fn document_headings(&mut self) -> Rc<Vec<markdown::Heading>> {
         let key = (self.doc_generation, self.buffer.revision());
         if self.heading_cache.0 != key.0 || self.heading_cache.1 != key.1 {
-            let text = self.buffer.text();
-            self.heading_cache = (key.0, key.1, Rc::new(markdown::headings(&text)));
+            let text = self.document_text();
+            let same_generation = self.heading_cache.0 == key.0;
+            let reusable = same_generation
+                && self
+                    .heading_source
+                    .as_deref()
+                    .is_some_and(|old| headings_unchanged(old, &text));
+            let headings = if reusable {
+                self.heading_cache.2.clone()
+            } else {
+                Rc::new(markdown::headings(&text))
+            };
+            self.heading_source = Some(text);
+            self.heading_cache = (key.0, key.1, headings);
         }
         self.heading_cache.2.clone()
+    }
+
+    /// The document text, copied at most once per revision and shared by its consumers.
+    fn document_text(&mut self) -> Rc<String> {
+        let key = (self.doc_generation, self.buffer.revision());
+        if self.doc_text.0 != key {
+            self.doc_text = (key, Rc::new(self.buffer.text()));
+        }
+        self.doc_text.1.clone()
     }
 
     /// Whether a heading has at least one heading nested under it.
@@ -1224,13 +2207,25 @@ impl Editor {
         let revision = self.buffer.revision();
         let width_changed = (self.cache_width - width).abs() >= 0.5;
         let folds_changed = self.layout_fold_revision != self.fold_revision;
+        // The paragraph holding the caret stays raw, so moving to another paragraph
+        // changes which markers are hidden.
+        let caret_line = self.buffer.line_col().0;
+        let raw_block = self.raw_block_for_line(caret_line);
+        let block_changed = self.layout_raw_block != raw_block;
+        // Tables are drawn as a grid, so their pipes are structural while the caret is
+        // elsewhere.
+        let table_ranges = table_blocks(&self.buffer, raw_block);
+        let mut table_rows: Vec<(usize, usize)> = vec![(usize::MAX, 0); table_ranges.len()];
+        let mut table_dividers: Vec<usize> = vec![usize::MAX; table_ranges.len()];
         if !width_changed
             && self.cache_revision == revision
             && !folds_changed
+            && !block_changed
             && !self.last_shaped.is_empty()
         {
             return;
         }
+        self.layout_raw_block = raw_block;
         if width_changed {
             // Every row's wrapping depends on the width.
             self.line_cache.clear();
@@ -1273,6 +2268,94 @@ impl Editor {
         }
         let markers = Self::fold_markers(&headings, &self.folded, count);
 
+        // `$$…$$` blocks are drawn as typeset formulas whenever the caret is outside them.
+        // Blocks are re-parsed only when the text changes; their row spans are rebuilt on
+        // every full layout because folds and wrapping move rows.
+        let sources: Vec<DisplayMathSource> = if self.display_math_revision == revision {
+            self.display_math
+                .iter()
+                .map(|block| DisplayMathSource {
+                    first_line: block.first_line,
+                    last_line: block.last_line,
+                    tex: block.tex.clone(),
+                })
+                .collect()
+        } else {
+            let text = self.document_text();
+            display_math_blocks(text.as_str())
+        };
+        self.display_math_revision = revision;
+
+        let mut blocks: Vec<DisplayMathLayout> = sources
+            .into_iter()
+            .map(|source| DisplayMathLayout {
+                first_line: source.first_line,
+                last_line: source.last_line,
+                tex: source.tex,
+                first_row: usize::MAX,
+                row_count: 0,
+            })
+            .collect();
+        for block in &blocks {
+            if self.math_scenes.contains_key(&block.tex) {
+                continue;
+            }
+            let scene = math::typeset(
+                &block.tex,
+                &MathOptions {
+                    style: MathStyle::Display,
+                    color: [0.0, 0.0, 0.0, 1.0],
+                },
+            )
+            .ok()
+            .map(Rc::new);
+            self.math_scenes.insert(block.tex.clone(), scene);
+        }
+        let mut block_start: HashMap<usize, usize> = HashMap::new();
+        let mut block_end: HashMap<usize, usize> = HashMap::new();
+        for (index, block) in blocks.iter().enumerate() {
+            block_start.insert(block.first_line, index);
+            block_end.insert(block.last_line, index);
+        }
+
+        // Frontmatter delimiters are not thematic breaks.
+        let frontmatter_end = if self.buffer.line(0).trim() == "---" {
+            (1..count)
+                .find(|&line| matches!(self.buffer.line(line).trim(), "---" | "..."))
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        self.editor_images.clear();
+        self.live_math.clear();
+        // Callout blocks, outside the paragraph being edited, get a tinted box.
+        let mut callout_ranges: Vec<(usize, usize, String)> = Vec::new();
+        let mut scan = 0usize;
+        while scan < count {
+            let line = self.buffer.line(scan);
+            if let Some(kind) = callout_kind(&line) {
+                let start = scan;
+                scan += 1;
+                while scan < count && self.buffer.line(scan).trim_start().starts_with('>') {
+                    scan += 1;
+                }
+                let end = scan.saturating_sub(1);
+                let raw = raw_block.0 <= start && start <= raw_block.1;
+                if !raw {
+                    callout_ranges.push((start, end, kind));
+                }
+            } else {
+                scan += 1;
+            }
+        }
+        let mut callout_rows: Vec<(usize, usize)> = vec![(usize::MAX, 0); callout_ranges.len()];
+        let mut rules: HashSet<usize> = HashSet::new();
+        let blank_row = Rc::new(window.text_system().shape_line(
+            SharedString::from(""),
+            font_size,
+            &[],
+            None,
+        ));
         let mut in_code = false;
         let mut language = String::new();
         let mut rows: Vec<Rc<ShapedLine>> = Vec::new();
@@ -1286,6 +2369,12 @@ impl Editor {
                 Some(cached)
                     if cached.in_code == in_code
                         && cached.language == language
+                        && cached.concealed
+                            == (line_index < raw_block.0 || line_index > raw_block.1)
+                        && cached.table
+                            == table_ranges
+                                .iter()
+                                .any(|(start, end)| line_index >= *start && line_index <= *end)
                         && self.buffer.line_eq(line_index, &cached.text) =>
                 {
                     // Clone the layout, not the `&LineLayout`.
@@ -1298,11 +2387,59 @@ impl Editor {
                 Some(layout) => layout,
                 None => {
                     let text = self.buffer.line(line_index);
+                    let in_table = table_ranges
+                        .iter()
+                        .any(|(start, end)| line_index >= *start && line_index <= *end);
                     LineLayout::shape(
-                        &text, in_code, &language, &font, font_size, width, color, theme, window,
+                        &text,
+                        in_code,
+                        &language,
+                        line_index < raw_block.0 || line_index > raw_block.1,
+                        in_table,
+                        &font,
+                        font_size,
+                        width,
+                        color,
+                        theme,
+                        window,
                     )
                 }
             };
+
+            if let Some(position) = callout_ranges
+                .iter()
+                .position(|(start, _, _)| *start == line_index)
+            {
+                callout_rows[position].0 = rows.len();
+            }
+            let table_position = table_ranges
+                .iter()
+                .position(|(start, end)| line_index >= *start && line_index <= *end);
+            if let Some(position) = table_position {
+                if table_ranges[position].0 == line_index {
+                    table_rows[position].0 = rows.len();
+                }
+                if is_table_separator(&layout.text) {
+                    table_rows[position].1 = rows.len();
+                    table_dividers[position] = rows.len();
+                    if line_index < self.line_cache.len() {
+                        self.line_cache[line_index] = Some(layout);
+                    } else {
+                        self.line_cache.push(Some(layout));
+                    }
+                    continue;
+                }
+            }
+            let line_is_raw = line_index >= raw_block.0 && line_index <= raw_block.1;
+            if !in_code
+                && !syntax::is_fence(&layout.text)
+                && line_index > frontmatter_end
+                && !line_is_raw
+                && thematic_break(&layout.text)
+                && (line_index == 0 || self.buffer.line(line_index - 1).trim().is_empty())
+            {
+                rules.insert(line_index);
+            }
 
             if syntax::is_fence(&layout.text) {
                 if in_code {
@@ -1313,15 +2450,126 @@ impl Editor {
                 in_code = !in_code;
             }
 
-            for span in layout.spans.iter() {
+            // A standalone image embed outside the edited paragraph is drawn as an image,
+            // with empty rows reserved for its height.
+            if !line_is_raw && !in_code {
+                if let Some((target, requested)) = image_embed(&layout.text) {
+                    if let Some(path) = self.resolve_embed(&target) {
+                        if let Some((data, image_width, image_height)) =
+                            crate::reading::inline_image(&path)
+                        {
+                            let (display_width, display_height, row_count) = editor_image_layout(
+                                image_width,
+                                image_height,
+                                width - 16.0,
+                                f32::from(self.line_height),
+                                requested,
+                            );
+                            let first_row = rows.len();
+                            let source_len = layout.text.chars().count();
+                            let display_len = layout.map.display.len();
+                            let display_byte =
+                                layout.map.display_offsets.last().copied().unwrap_or(0);
+                            for _ in 0..row_count {
+                                rows.push(blank_row.clone());
+                                metas.push(RowMeta {
+                                    line: line_index,
+                                    start: source_len,
+                                    end: source_len,
+                                    display_start: display_len,
+                                    display_end: display_len,
+                                    display_start_byte: display_byte,
+                                    map: layout.map.clone(),
+                                });
+                            }
+                            self.editor_images.push(EditorImage {
+                                line: line_index,
+                                first_row,
+                                row_count,
+                                data,
+                                width: display_width,
+                                height: display_height,
+                            });
+                            if line_index < self.line_cache.len() {
+                                self.line_cache[line_index] = Some(layout);
+                            } else {
+                                self.line_cache.push(Some(layout));
+                            }
+                            continue;
+                        }
+                    }
+                }
+            }
+
+            if let Some(&block) = block_start.get(&line_index) {
+                blocks[block].first_row = rows.len();
+            }
+            for (index, span) in layout.spans.iter().enumerate() {
+                let (display_start, display_end) =
+                    layout.display_spans.get(index).copied().unwrap_or((0, 0));
                 metas.push(RowMeta {
                     line: line_index,
                     start: span.0,
                     end: span.1,
+                    display_start,
+                    display_end,
+                    display_start_byte: layout
+                        .map
+                        .display_offsets
+                        .get(display_start)
+                        .copied()
+                        .unwrap_or(0),
+                    map: layout.map.clone(),
                 });
             }
             rows.extend(layout.rows.iter().cloned());
+            if let Some(&block) = block_end.get(&line_index) {
+                let first_row = blocks[block].first_row;
+                if first_row != usize::MAX {
+                    blocks[block].row_count = rows.len().saturating_sub(first_row);
+                }
+                // While editing the block, show the typeset formula under the source.
+                let block_ref = &blocks[block];
+                if caret_line >= block_ref.first_line
+                    && caret_line <= block_ref.last_line
+                    && self
+                        .math_scenes
+                        .get(&block_ref.tex)
+                        .is_some_and(|scene| scene.is_some())
+                {
+                    let live_first = rows.len();
+                    let source_len = layout.text.chars().count();
+                    let display_len = layout.map.display.len();
+                    let display_byte = layout.map.display_offsets.last().copied().unwrap_or(0);
+                    for _ in 0..3 {
+                        rows.push(blank_row.clone());
+                        metas.push(RowMeta {
+                            line: line_index,
+                            start: source_len,
+                            end: source_len,
+                            display_start: display_len,
+                            display_end: display_len,
+                            display_start_byte: display_byte,
+                            map: layout.map.clone(),
+                        });
+                    }
+                    self.live_math.push(LiveMath {
+                        first_row: live_first,
+                        row_count: 3,
+                        tex: block_ref.tex.clone(),
+                    });
+                }
+            }
 
+            if let Some(position) = callout_ranges
+                .iter()
+                .position(|(_, end, _)| *end == line_index)
+            {
+                callout_rows[position].1 = rows.len();
+            }
+            if let Some(position) = table_position {
+                table_rows[position].1 = rows.len();
+            }
             if line_index < self.line_cache.len() {
                 self.line_cache[line_index] = Some(layout);
             } else {
@@ -1330,12 +2578,55 @@ impl Editor {
         }
         self.line_cache.truncate(count);
 
+        self.display_math = Rc::new(blocks);
+        self.layout_tables = Rc::new(
+            table_ranges
+                .iter()
+                .zip(table_rows)
+                .zip(table_dividers)
+                .filter(|((_, (first, last)), divider)| {
+                    *first != usize::MAX && *last > *first && *divider != usize::MAX
+                })
+                .map(|((_, (first, last)), divider)| TableLayout {
+                    first_row: first,
+                    last_row: last,
+                    divider_row: divider,
+                })
+                .collect(),
+        );
+        self.layout_callouts = Rc::new(
+            callout_ranges
+                .into_iter()
+                .zip(callout_rows)
+                .filter(|(_, (first, last))| *first != usize::MAX && *last > *first)
+                .map(|((_, _, kind), (first, last))| CalloutLayout {
+                    first_row: first,
+                    last_row: last,
+                    kind,
+                })
+                .collect(),
+        );
+        self.layout_rules = Rc::new(rules);
         self.last_rows = Rc::new(metas);
         self.last_shaped = Rc::new(rows);
         self.cache_revision = revision;
         self.cache_width = width;
         self.fold_markers = Rc::new(markers);
         self.layout_fold_revision = self.fold_revision;
+    }
+
+    /// The blank-line-delimited paragraph containing `line`, which stays raw while edited.
+    fn raw_block_for_line(&self, line: usize) -> (usize, usize) {
+        let count = self.buffer.line_count();
+        let mut first = line.min(count.saturating_sub(1));
+        while first > 0 && !self.buffer.line(first - 1).trim().is_empty() {
+            first -= 1;
+        }
+        let mut last = line.min(count.saturating_sub(1));
+        while last + 1 < count && !self.buffer.line(last + 1).trim().is_empty() {
+            last += 1;
+        }
+        (first, last)
     }
 
     /// Shift the per-line cache to match whole lines that were inserted or removed.
@@ -1363,11 +2654,190 @@ impl Editor {
         self.link_opener = Some(opener);
     }
 
+    /// Tell the editor how to run Save As when a note has no file name yet.
+    pub fn set_save_as(&mut self, save_as: SaveAsHandler) {
+        self.save_as = Some(save_as);
+    }
+
+    /// Tell the editor how to close its tab.
+    pub fn set_close_tab(&mut self, close_tab: CloseTabHandler) {
+        self.close_tab = Some(close_tab);
+    }
+
+    /// Tell the editor where to report one-line results.
+    pub fn set_status_reporter(&mut self, reporter: StatusReporter) {
+        self.status_reporter = Some(reporter);
+    }
+
+    /// Tell the editor what to do when a save would overwrite an external change.
+    pub fn set_conflict_handler(&mut self, handler: ConflictHandler) {
+        self.conflict_handler = Some(handler);
+    }
+
+    /// Enable saving the note itself after idle, not just its draft.
+    pub fn set_autosave(&mut self, autosave: bool) {
+        self.autosave = autosave;
+    }
+
+    /// Replace the buffer with a recovered draft, as one undoable edit.
+    pub fn apply_recovery(&mut self, text: &str, line: usize, col: usize) {
+        self.buffer.replace(0..self.buffer.len_chars(), text);
+        self.set_cursor_position(line, col);
+        self.reset_layout_cache();
+        self.properties_revision = u64::MAX;
+        self.doc_generation = self.doc_generation.wrapping_add(1);
+        self.math_scenes.clear();
+    }
+
+    /// Arm the debounced draft writer when the buffer is dirty.
+    ///
+    /// Called from `render`, which already runs on every edit. Each change bumps the
+    /// generation, so an outstanding timer either writes the newest text or arms one more
+    /// wait, giving a trailing debounce. A clean buffer arms nothing.
+    fn schedule_draft(&mut self, cx: &mut Context<Self>) {
+        if !self.buffer.is_dirty() || self.path.is_none() || self.vault_root.is_none() {
+            return;
+        }
+        let revision = self.buffer.revision();
+        if self.draft_written == revision {
+            return;
+        }
+
+        self.draft_generation = self.draft_generation.wrapping_add(1);
+        if self.draft_armed {
+            return;
+        }
+        self.draft_armed = true;
+        self.spawn_draft_timer(cx);
+    }
+
+    fn spawn_draft_timer(&mut self, cx: &mut Context<Self>) {
+        let generation = self.draft_generation;
+        cx.spawn(async move |this, cx| {
+            Timer::after(std::time::Duration::from_millis(1500)).await;
+            let _ = this.update(cx, |editor, cx| {
+                if editor.draft_generation != generation {
+                    // Something changed while waiting: wait once more.
+                    editor.spawn_draft_timer(cx);
+                    return;
+                }
+                editor.draft_armed = false;
+                editor.write_draft(cx);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Write the pending draft, and autosave the note when that is enabled and safe.
+    fn write_draft(&mut self, cx: &mut Context<Self>) {
+        let (Some(root), Some(path)) = (self.vault_root.clone(), self.path.clone()) else {
+            return;
+        };
+        let Ok(relative) = path.strip_prefix(&root) else {
+            return;
+        };
+        let note = relative.to_string_lossy().replace('\\', "/");
+        let (line, col) = self.buffer.line_col();
+        let revision = self.buffer.revision();
+        let draft = drafts::Draft {
+            note: note.clone(),
+            line,
+            col,
+            at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_millis() as u64)
+                .unwrap_or(0),
+            base: self.fingerprint.as_ref().map(|fp| fp.content_hash),
+            text: self.buffer.text(),
+        };
+        if drafts::save(&root, &draft).is_ok() {
+            self.draft_written = revision;
+        }
+
+        if !self.autosave {
+            return;
+        }
+        match self.save_checked() {
+            SaveReport::Saved { .. } => {
+                drafts::discard(&root, &note);
+                self.report(crate::StatusKind::Success, "autosaved", cx);
+            }
+            SaveReport::Conflict { .. } => {
+                // The conflict bar takes over; stop writing until it is resolved.
+                self.autosave = false;
+                self.report(
+                    crate::StatusKind::Warn,
+                    "autosave paused: the note changed on disk",
+                    cx,
+                );
+                if let Some(handler) = self.conflict_handler.clone() {
+                    handler(cx);
+                }
+            }
+            SaveReport::Error { message } => self.report(
+                crate::StatusKind::Error,
+                &format!("autosave failed: {message}"),
+                cx,
+            ),
+        }
+    }
+
+    /// Report to the app's status bar, if one is wired up.
+    fn report(&self, kind: crate::StatusKind, message: &str, cx: &mut App) {
+        if let Some(reporter) = &self.status_reporter {
+            reporter(kind, message, cx);
+        }
+    }
+
+    /// Save and/or close after a Vim `:` command asked for it.
+    fn run_vim_outcome(
+        &mut self,
+        outcome: &crate::vim::Outcome,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if outcome.save {
+            let _ = self.save();
+        }
+        if outcome.close {
+            if let Some(close) = self.close_tab.clone() {
+                close(window, cx);
+            }
+        }
+    }
+
     /// Recompute word counts when the buffer changes, and git stats when it is saved.
-    fn refresh_stats(&mut self) {
+    ///
+    /// Counting the whole note on every keystroke is O(note) work for a number only the
+    /// status bar shows, so it is throttled to ~7 passes a second with a trailing timer.
+    /// The git stat still refreshes whenever the saved revision moves.
+    fn refresh_stats(&mut self, cx: &mut Context<Self>) {
         let revision = self.buffer.revision();
         if self.stats_cache.0 != revision {
-            self.stats_cache = (revision, stats::compute(&self.buffer.text()));
+            let now = std::time::Instant::now();
+            let due = self.stats_at.is_none_or(|last| {
+                now.duration_since(last) >= std::time::Duration::from_millis(150)
+            });
+            if due {
+                self.stats_cache = (revision, stats::compute(&self.buffer.text()));
+                self.stats_at = Some(now);
+            } else if !self.stats_armed {
+                self.stats_armed = true;
+                let elapsed = self
+                    .stats_at
+                    .map(|last| now.duration_since(last))
+                    .unwrap_or_default();
+                let wait = std::time::Duration::from_millis(150).saturating_sub(elapsed);
+                cx.spawn(async move |this, cx| {
+                    Timer::after(wait).await;
+                    let _ = this.update(cx, |editor, cx| {
+                        editor.stats_armed = false;
+                        cx.notify();
+                    });
+                })
+                .detach();
+            }
         }
 
         // `git diff` is only meaningful for the saved file, so skip it while dirty.
@@ -1404,6 +2874,24 @@ impl Editor {
     }
 
     /// Set the folder pasted images are filed into (vault-relative).
+    /// Resolve an embed target to a file in the vault, its attachments folder or the index.
+    fn resolve_embed(&self, target: &str) -> Option<PathBuf> {
+        let root = self.vault_root.as_ref()?;
+        let direct = root.join(target);
+        if direct.is_file() {
+            return Some(direct);
+        }
+        let in_folder = root.join(&self.attachments_folder).join(target);
+        if in_folder.is_file() {
+            return Some(in_folder);
+        }
+        let index = dragonglass_core::assets::Attachments::index(root);
+        index
+            .resolve(target)
+            .map(|relative| root.join(relative))
+            .filter(|path| path.is_file())
+    }
+
     pub fn set_attachments_folder(&mut self, folder: &str) {
         if !folder.trim().is_empty() {
             self.attachments_folder = folder.trim().to_string();
@@ -1427,6 +2915,41 @@ impl Editor {
             let head = self.buffer.slice(0..end);
             self.properties = frontmatter::properties(&head).unwrap_or_default();
             self.properties_revision = revision;
+        }
+    }
+
+    /// Typeset every display block that will be drawn and has no scene yet.
+    ///
+    /// This runs per frame rather than per edit, because moving the caret changes which
+    /// block is drawn without changing the buffer revision. Successful and failed results
+    /// are both cached, so each formula is typeset once.
+    fn ensure_math_scenes(&mut self, caret_line: usize) {
+        let blocks = self.display_math.clone();
+        for block in blocks.iter() {
+            if caret_line >= block.first_line && caret_line <= block.last_line {
+                continue;
+            }
+            if self.math_scenes.contains_key(&block.tex) {
+                continue;
+            }
+            let scene = math::typeset(
+                &block.tex,
+                &MathOptions {
+                    style: MathStyle::Display,
+                    color: [0.0, 0.0, 0.0, 1.0],
+                },
+            )
+            .ok()
+            .map(Rc::new);
+            self.math_scenes.insert(block.tex.clone(), scene);
+        }
+
+        // A formula edited in place produces one cache entry per keystroke; drop the ones
+        // no block references any more so the cache stays bounded.
+        if self.math_scenes.len() > blocks.len() * 2 + 16 {
+            let live: HashSet<&str> = blocks.iter().map(|block| block.tex.as_str()).collect();
+            self.math_scenes
+                .retain(|tex, _| live.contains(tex.as_str()));
         }
     }
 
@@ -1464,6 +2987,54 @@ impl Editor {
         self.jump_to_line(line);
         if self.reading && !self.reading_content.scroll_to_heading_index(heading_index) {
             self.reading_content.scroll_to_heading(text);
+        }
+    }
+
+    /// Jump to the heading whose text matches `text` (case-insensitive).
+    ///
+    /// Returns false when the note has no such heading, so the caller can say so.
+    pub fn jump_to_heading_text(&mut self, text: &str) -> bool {
+        let wanted = text.trim().trim_start_matches('#').trim().to_lowercase();
+        if wanted.is_empty() {
+            return false;
+        }
+        let headings = self.document_headings();
+        let Some((index, heading)) = headings
+            .iter()
+            .enumerate()
+            .find(|(_, heading)| heading.text.trim().to_lowercase() == wanted)
+        else {
+            return false;
+        };
+        self.jump_to_heading(heading.line.saturating_sub(1), &heading.text, index);
+        true
+    }
+
+    /// Jump to the line carrying a `^block-id` marker. Returns false when it is absent.
+    pub fn jump_to_block_id(&mut self, id: &str) -> bool {
+        let id = id.trim().trim_start_matches('^').trim();
+        if id.is_empty() {
+            return false;
+        }
+        let marker = format!("^{id}");
+        for line in 0..self.buffer.line_count() {
+            if self.buffer.line(line).trim_end().ends_with(&marker) {
+                self.focus_source_line(line);
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Put the reader (or the editor) at a source line without changing the mode.
+    fn focus_source_line(&mut self, line: usize) {
+        if self.reading {
+            self.prepare_reading();
+            if let Some(block) = self.reading_content.block_for_line(line) {
+                self.reading_content.scroll_to_block(block);
+            }
+        } else {
+            self.set_cursor_line(line);
         }
     }
 
@@ -1779,13 +3350,18 @@ impl Editor {
         if target < 0 || target as usize >= self.last_rows.len() {
             return None;
         }
-        let current_meta = self.last_rows[current];
-        let target_meta = self.last_rows[target as usize];
-        let offset = (col - current_meta.start).min(target_meta.end - target_meta.start);
-        Some(
-            self.buffer
-                .char_index_at(target_meta.line, target_meta.start + offset),
-        )
+        let current_meta = &self.last_rows[current];
+        let target_meta = &self.last_rows[target as usize];
+        let visual = current_meta.map.display_for_source(col);
+        let offset = visual.saturating_sub(current_meta.display_start);
+        let target_display = target_meta.display_start
+            + offset.min(
+                target_meta
+                    .display_end
+                    .saturating_sub(target_meta.display_start),
+            );
+        let target_col = target_meta.map.source_for_display(target_display);
+        Some(self.buffer.char_index_at(target_meta.line, target_col))
     }
 
     /// Move every caret with a buffer movement, collapsing their selections.
@@ -1896,14 +3472,20 @@ impl Editor {
             return;
         }
 
-        let current_meta = self.last_rows[current];
-        let target_meta = self.last_rows[target as usize];
-        let offset = (col - current_meta.start).min(target_meta.end - target_meta.start);
+        let current_meta = &self.last_rows[current];
+        let target_meta = &self.last_rows[target as usize];
+        let visual = current_meta.map.display_for_source(col);
+        let offset = visual.saturating_sub(current_meta.display_start);
+        let target_display = target_meta.display_start
+            + offset.min(
+                target_meta
+                    .display_end
+                    .saturating_sub(target_meta.display_start),
+            );
+        let target_col = target_meta.map.source_for_display(target_display);
 
-        self.buffer.set_cursor(
-            self.buffer
-                .char_index_at(target_meta.line, target_meta.start + offset),
-        );
+        self.buffer
+            .set_cursor(self.buffer.char_index_at(target_meta.line, target_col));
     }
 
     fn delete_selection(&mut self) -> bool {
@@ -1934,6 +3516,16 @@ impl Editor {
     }
 
     fn backspace(&mut self, _: &Backspace, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.reading {
+            if self.reading_content.find_open() {
+                self.reading_content.find_backspace();
+                cx.notify();
+            }
+            return;
+        }
+        if !self.can_mutate() {
+            return;
+        }
         if self.find.open {
             self.find_backspace();
             cx.notify();
@@ -1961,6 +3553,9 @@ impl Editor {
     }
 
     fn delete(&mut self, _: &Delete, _window: &mut Window, cx: &mut Context<Self>) {
+        if !self.can_mutate() {
+            return;
+        }
         if self.find.open {
             return;
         }
@@ -1984,18 +3579,29 @@ impl Editor {
     }
 
     fn left(&mut self, _: &Left, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.reading {
+            return;
+        }
         self.dismiss_autocomplete();
         self.move_all_cursors(|buffer| buffer.move_left());
         cx.notify();
     }
 
     fn right(&mut self, _: &Right, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.reading {
+            return;
+        }
         self.dismiss_autocomplete();
         self.move_all_cursors(|buffer| buffer.move_right());
         cx.notify();
     }
 
     fn up(&mut self, _: &Up, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.reading {
+            self.reading_content.scroll_blocks(-1);
+            cx.notify();
+            return;
+        }
         if self.autocomplete.open {
             self.move_autocomplete(-1);
             cx.notify();
@@ -2006,6 +3612,11 @@ impl Editor {
     }
 
     fn down(&mut self, _: &Down, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.reading {
+            self.reading_content.scroll_blocks(1);
+            cx.notify();
+            return;
+        }
         if self.autocomplete.open {
             self.move_autocomplete(1);
             cx.notify();
@@ -2015,42 +3626,102 @@ impl Editor {
         cx.notify();
     }
 
+    fn page_up(&mut self, _: &PageUp, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.reading {
+            self.reading_content.scroll_screen(-1);
+            cx.notify();
+            return;
+        }
+        for _ in 0..10 {
+            self.move_all_vertical(-1);
+        }
+        cx.notify();
+    }
+
+    fn page_down(&mut self, _: &PageDown, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.reading {
+            self.reading_content.scroll_screen(1);
+            cx.notify();
+            return;
+        }
+        for _ in 0..10 {
+            self.move_all_vertical(1);
+        }
+        cx.notify();
+    }
+
     fn home(&mut self, _: &Home, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.reading {
+            self.reading_content.scroll_blocks(isize::MIN / 2);
+            cx.notify();
+            return;
+        }
         self.move_all_cursors(|buffer| buffer.move_home());
         cx.notify();
     }
 
     fn end(&mut self, _: &End, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.reading {
+            self.reading_content.scroll_blocks(isize::MAX / 2);
+            cx.notify();
+            return;
+        }
         self.move_all_cursors(|buffer| buffer.move_end());
         cx.notify();
     }
 
     fn word_left(&mut self, _: &WordLeft, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.reading {
+            return;
+        }
         self.move_all_cursors(|buffer| buffer.move_word_left());
         cx.notify();
     }
 
     fn word_right(&mut self, _: &WordRight, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.reading {
+            return;
+        }
         self.move_all_cursors(|buffer| buffer.move_word_right());
         cx.notify();
     }
 
     fn paragraph_up(&mut self, _: &ParagraphUp, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.reading {
+            self.reading_content.scroll_blocks(-1);
+            cx.notify();
+            return;
+        }
         self.move_all_cursors(|buffer| buffer.move_paragraph_up());
         cx.notify();
     }
 
     fn paragraph_down(&mut self, _: &ParagraphDown, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.reading {
+            self.reading_content.scroll_blocks(1);
+            cx.notify();
+            return;
+        }
         self.move_all_cursors(|buffer| buffer.move_paragraph_down());
         cx.notify();
     }
 
     fn document_start(&mut self, _: &DocumentStart, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.reading {
+            self.reading_content.scroll_blocks(isize::MIN / 2);
+            cx.notify();
+            return;
+        }
         self.move_all_cursors(|buffer| buffer.move_document_start());
         cx.notify();
     }
 
     fn document_end(&mut self, _: &DocumentEnd, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.reading {
+            self.reading_content.scroll_blocks(isize::MAX / 2);
+            cx.notify();
+            return;
+        }
         self.move_all_cursors(|buffer| buffer.move_document_end());
         cx.notify();
     }
@@ -2061,6 +3732,9 @@ impl Editor {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !self.can_mutate() {
+            return;
+        }
         if self.extra_cursors.is_empty() {
             if !self.delete_selection() {
                 self.buffer.delete_word_left();
@@ -2077,6 +3751,9 @@ impl Editor {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !self.can_mutate() {
+            return;
+        }
         if self.extra_cursors.is_empty() {
             if !self.delete_selection() {
                 self.buffer.delete_word_right();
@@ -2117,36 +3794,72 @@ impl Editor {
     }
 
     fn select_left(&mut self, _: &SelectLeft, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.reading {
+            self.reading_content
+                .extend_selection(crate::reading::SelectionMotion::Left);
+            cx.notify();
+            return;
+        }
         self.begin_selection();
         self.buffer.move_left();
         cx.notify();
     }
 
     fn select_right(&mut self, _: &SelectRight, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.reading {
+            self.reading_content
+                .extend_selection(crate::reading::SelectionMotion::Right);
+            cx.notify();
+            return;
+        }
         self.begin_selection();
         self.buffer.move_right();
         cx.notify();
     }
 
     fn select_up(&mut self, _: &SelectUp, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.reading {
+            self.reading_content
+                .extend_selection(crate::reading::SelectionMotion::Up);
+            cx.notify();
+            return;
+        }
         self.begin_selection();
         self.move_vertical(-1);
         cx.notify();
     }
 
     fn select_down(&mut self, _: &SelectDown, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.reading {
+            self.reading_content
+                .extend_selection(crate::reading::SelectionMotion::Down);
+            cx.notify();
+            return;
+        }
         self.begin_selection();
         self.move_vertical(1);
         cx.notify();
     }
 
     fn select_home(&mut self, _: &SelectHome, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.reading {
+            self.reading_content
+                .extend_selection(crate::reading::SelectionMotion::LineStart);
+            cx.notify();
+            return;
+        }
         self.begin_selection();
         self.buffer.move_home();
         cx.notify();
     }
 
     fn select_end(&mut self, _: &SelectEnd, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.reading {
+            self.reading_content
+                .extend_selection(crate::reading::SelectionMotion::LineEnd);
+            cx.notify();
+            return;
+        }
         self.begin_selection();
         self.buffer.move_end();
         cx.notify();
@@ -2180,6 +3893,12 @@ impl Editor {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.reading {
+            self.reading_content
+                .extend_selection(crate::reading::SelectionMotion::DocumentStart);
+            cx.notify();
+            return;
+        }
         self.begin_selection();
         self.buffer.move_document_start();
         cx.notify();
@@ -2191,6 +3910,12 @@ impl Editor {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.reading {
+            self.reading_content
+                .extend_selection(crate::reading::SelectionMotion::DocumentEnd);
+            cx.notify();
+            return;
+        }
         self.begin_selection();
         self.buffer.move_document_end();
         cx.notify();
@@ -2209,9 +3934,23 @@ impl Editor {
     }
 
     fn copy(&mut self, _: &Copy, _window: &mut Window, cx: &mut Context<Self>) {
+        self.copy_selection(cx);
+    }
+
+    /// Copy the current selection (reading or editing) and report what happened.
+    pub fn copy_selection(&mut self, cx: &mut Context<Self>) {
         if self.reading {
-            if let Some(text) = self.reading_content.selected_text() {
-                cx.write_to_clipboard(ClipboardItem::new_string(text));
+            match self.reading_content.selected_text() {
+                Some(text) => {
+                    let count = text.chars().count();
+                    cx.write_to_clipboard(ClipboardItem::new_string(text));
+                    self.report(
+                        crate::StatusKind::Info,
+                        &format!("copied {count} character(s)"),
+                        cx,
+                    );
+                }
+                None => self.report(crate::StatusKind::Warn, "nothing selected to copy", cx),
             }
             return;
         }
@@ -2224,10 +3963,19 @@ impl Editor {
             .map(|range| self.buffer.slice(range))
             .collect::<Vec<_>>()
             .join("\n");
+        let count = text.chars().count();
         cx.write_to_clipboard(ClipboardItem::new_string(text));
+        self.report(
+            crate::StatusKind::Info,
+            &format!("copied {count} character(s)"),
+            cx,
+        );
     }
 
     fn cut(&mut self, _: &Cut, _window: &mut Window, cx: &mut Context<Self>) {
+        if !self.can_mutate() {
+            return;
+        }
         let ranges = self.selection_ranges();
         if ranges.is_empty() {
             return;
@@ -2243,6 +3991,9 @@ impl Editor {
     }
 
     fn undo(&mut self, _: &Undo, _window: &mut Window, cx: &mut Context<Self>) {
+        if !self.can_mutate() {
+            return;
+        }
         if self.buffer.undo() {
             self.anchor = None;
             self.extra_cursors.clear();
@@ -2253,6 +4004,9 @@ impl Editor {
     }
 
     fn redo(&mut self, _: &Redo, _window: &mut Window, cx: &mut Context<Self>) {
+        if !self.can_mutate() {
+            return;
+        }
         if self.buffer.redo() {
             self.anchor = None;
             self.extra_cursors.clear();
@@ -2262,26 +4016,61 @@ impl Editor {
         }
     }
 
-    fn enter(&mut self, _: &Enter, _window: &mut Window, cx: &mut Context<Self>) {
+    fn enter(&mut self, _: &Enter, window: &mut Window, cx: &mut Context<Self>) {
+        if self.reading {
+            if self.reading_content.find_open() {
+                let backwards = window.modifiers().shift;
+                self.reading_content.find_next(backwards);
+                cx.notify();
+                return;
+            }
+            // Enter follows the link under the reading selection.
+            if let Some(target) = self
+                .reading_content
+                .selection_head()
+                .and_then(|head| self.reading_content.link_at(head))
+            {
+                if let Some(opener) = self.link_opener.take() {
+                    opener(&target, window, cx);
+                    self.link_opener = Some(opener);
+                }
+            }
+            return;
+        }
         if self.accept_autocomplete() {
             cx.notify();
             return;
         }
         if self.find.open {
-            self.find_next(false);
+            let backwards = window.modifiers().shift;
+            if self.find.field == FindField::Replacement && !backwards {
+                self.find_replace_one();
+            } else {
+                self.find_next(backwards);
+            }
             cx.notify();
+            return;
+        }
+        if !self.can_mutate() {
             return;
         }
         if self.vim.enabled() && self.vim.mode() != VimMode::Insert {
             let mut anchor = self.anchor;
             let outcome = self.vim.handle_key("enter", &mut self.buffer, &mut anchor);
             self.anchor = anchor;
-            self.vim.set_message(outcome.message);
-            if outcome.save {
-                let _ = self.save();
-            }
+            self.vim.set_message(outcome.message.clone());
+            self.run_vim_outcome(&outcome, window, cx);
             cx.notify();
             return;
+        }
+        // Enter at the end of a list item continues its marker (and increments numbers).
+        if self.selection().is_none() && self.extra_cursors.is_empty() {
+            let (line, col) = self.buffer.line_col();
+            if let Some(prefix) = list_continuation(&self.buffer.line(line), col) {
+                self.insert_text(&format!("\n{prefix}"));
+                cx.notify();
+                return;
+            }
         }
         self.delete_selections();
         self.insert_text("\n");
@@ -2289,6 +4078,9 @@ impl Editor {
     }
 
     fn paste(&mut self, _: &Paste, _window: &mut Window, cx: &mut Context<Self>) {
+        if !self.can_mutate() {
+            return;
+        }
         if self.paste_clipboard_image(cx) {
             cx.notify();
             return;
@@ -2386,6 +4178,9 @@ impl Editor {
     /// File dropped paths: images and other files are copied into the attachments folder and
     /// embedded, while markdown files are linked. One insertion per path, on its own line.
     pub fn drop_files(&mut self, paths: &[PathBuf], cx: &mut Context<Self>) {
+        if !self.can_mutate() {
+            return;
+        }
         let mut inserted = 0usize;
 
         for path in paths {
@@ -2444,8 +4239,38 @@ impl Editor {
         cx.notify();
     }
 
-    fn on_save(&mut self, _: &Save, _window: &mut Window, cx: &mut Context<Self>) {
-        let _ = self.save();
+    fn on_save(&mut self, _: &Save, window: &mut Window, cx: &mut Context<Self>) {
+        // An untitled buffer has nowhere to write yet: ask for a name instead of failing
+        // with a message the user never sees.
+        if !self.has_path() {
+            if let Some(save_as) = self.save_as.clone() {
+                save_as(window, cx);
+            }
+            return;
+        }
+
+        match self.save_checked() {
+            SaveReport::Saved { .. } => self.report(crate::StatusKind::Success, "saved", cx),
+            SaveReport::Conflict { disk } => {
+                self.report(
+                    crate::StatusKind::Error,
+                    if disk.is_some() {
+                        "the note changed on disk — reload it or keep mine"
+                    } else {
+                        "the note was deleted on disk — saving puts it back"
+                    },
+                    cx,
+                );
+                if let Some(handler) = self.conflict_handler.clone() {
+                    handler(cx);
+                }
+            }
+            SaveReport::Error { message } => self.report(
+                crate::StatusKind::Error,
+                &format!("could not save: {message}"),
+                cx,
+            ),
+        }
         cx.notify();
     }
 
@@ -2504,8 +4329,122 @@ impl Editor {
         cx.notify();
     }
 
+    /// Tab: accept an autocomplete suggestion, otherwise indent the selection or caret.
+    fn indent(&mut self, _: &Indent, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.reading {
+            // Tab steps through links in reading mode; Enter follows the selected one.
+            self.reading_content.focus_next_link(false);
+            cx.notify();
+            return;
+        }
+        if !self.can_mutate() || self.find.open {
+            return;
+        }
+        if self.accept_autocomplete() {
+            cx.notify();
+            return;
+        }
+        self.indent_selection(false);
+        cx.notify();
+    }
+
+    /// Shift+Tab: remove one indent step from the selected lines or the caret's line.
+    fn outdent(&mut self, _: &Outdent, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.reading {
+            self.reading_content.focus_next_link(true);
+            cx.notify();
+            return;
+        }
+        if !self.can_mutate() || self.find.open {
+            return;
+        }
+        self.indent_selection(true);
+        cx.notify();
+    }
+
+    /// Add or remove one indent step (four spaces) for every line the selection touches.
+    ///
+    /// With a bare caret, Tab inserts at the caret and Shift+Tab removes the line's leading
+    /// whitespace, which is what a plain text editor does.
+    fn indent_selection(&mut self, outdent: bool) {
+        const STEP: usize = 4;
+
+        let Some(range) = self.selection() else {
+            if outdent {
+                let (line, _) = self.buffer.line_col();
+                let line_start = self.buffer.char_index_at(line, 0);
+                let leading: Vec<char> = self.buffer.line(line).chars().take(STEP).collect();
+                let remove = if leading.first() == Some(&'\t') {
+                    1
+                } else {
+                    leading.iter().take_while(|ch| **ch == ' ').count()
+                };
+                if remove > 0 {
+                    self.buffer.replace(line_start..line_start + remove, "");
+                    self.buffer
+                        .set_cursor(self.buffer.cursor().saturating_sub(remove).max(line_start));
+                    self.anchor = None;
+                }
+            } else {
+                self.insert_text(&" ".repeat(STEP));
+            }
+            return;
+        };
+
+        let (start_line, _) = self.buffer.line_col_at(range.start);
+        let (end_line, end_col) = self.buffer.line_col_at(range.end);
+        // A selection that ends at column 0 of a line does not include that line.
+        let last_line = if end_col == 0 && end_line > start_line {
+            end_line - 1
+        } else {
+            end_line
+        };
+
+        let mut edits: Vec<(Range<usize>, String)> = Vec::new();
+        for line in start_line..=last_line {
+            let line_start = self.buffer.char_index_at(line, 0);
+            if outdent {
+                let leading: Vec<char> = self.buffer.line(line).chars().take(STEP).collect();
+                let remove = if leading.first() == Some(&'\t') {
+                    1
+                } else {
+                    leading.iter().take_while(|ch| **ch == ' ').count()
+                };
+                if remove > 0 {
+                    edits.push((line_start..line_start + remove, String::new()));
+                }
+            } else {
+                edits.push((line_start..line_start, " ".repeat(STEP)));
+            }
+        }
+        if edits.is_empty() {
+            return;
+        }
+
+        // Map the selection through the edits so the same text stays selected.
+        let map = |position: usize| -> usize {
+            let mut mapped = position as isize;
+            for (range, text) in &edits {
+                if range.start <= position {
+                    let inserted = text.chars().count() as isize;
+                    let removed = (range.end - range.start) as isize;
+                    mapped += inserted - removed;
+                }
+            }
+            mapped.max(0) as usize
+        };
+        let anchor = map(range.start);
+        let head = map(range.end);
+
+        self.buffer.replace_many(edits);
+        self.anchor = Some(anchor);
+        self.buffer.set_cursor(head);
+        self.extra_cursors.clear();
+        self.refresh_autocomplete();
+    }
+
     fn toggle_reading(&mut self, _: &ToggleReading, _window: &mut Window, cx: &mut Context<Self>) {
-        self.reading = !self.reading;
+        self.toggle_reading_mode();
         cx.notify();
     }
 
@@ -2526,7 +4465,9 @@ impl Editor {
     /// Open the in-note find bar, optionally with the replacement field.
     pub fn open_find(&mut self, replace: bool) {
         if self.reading {
-            self.set_reading_mode(false);
+            // In-page find: it never leaves reading mode and never edits the note.
+            self.reading_content.open_find();
+            return;
         }
         if !self.find.open {
             let selection = self.selection().map(|range| self.buffer.slice(range));
@@ -2545,7 +4486,23 @@ impl Editor {
 
     /// Escape closes the find bar, leaves Vim insert/visual mode, or drops extra carets.
     /// Returns whether the editor consumed the key.
-    pub fn handle_escape(&mut self) -> bool {
+    pub fn handle_escape(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.context_menu.take().is_some() {
+            return true;
+        }
+        if self.reading && self.reading_content.close_lightbox() {
+            return true;
+        }
+        if self.reading && self.reading_content.find_open() {
+            self.reading_content.close_find();
+            return true;
+        }
+        if self.reading && self.reading_content.dismiss_popup(cx) {
+            return true;
+        }
+        if self.reading && self.reading_content.clear_selection() {
+            return true;
+        }
         if self.autocomplete.open {
             self.dismiss_autocomplete();
             return true;
@@ -2661,6 +4618,9 @@ impl Editor {
     }
 
     fn find_replace_one(&mut self) {
+        if !self.can_mutate() {
+            return;
+        }
         if self.find.matches.is_empty() {
             self.refresh_find(true);
         }
@@ -2697,6 +4657,9 @@ impl Editor {
     }
 
     fn find_replace_all(&mut self) {
+        if !self.can_mutate() {
+            return;
+        }
         let text = self.buffer.text();
         match find_engine::replace_all(
             &text,
@@ -2737,11 +4700,25 @@ impl Editor {
     }
 
     fn find_next_action(&mut self, _: &FindNext, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.reading {
+            if self.reading_content.find_open() {
+                self.reading_content.find_next(false);
+                cx.notify();
+            }
+            return;
+        }
         self.find_next(false);
         cx.notify();
     }
 
     fn find_prev_action(&mut self, _: &FindPrev, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.reading {
+            if self.reading_content.find_open() {
+                self.reading_content.find_next(true);
+                cx.notify();
+            }
+            return;
+        }
         self.find_next(true);
         cx.notify();
     }
@@ -2752,6 +4729,9 @@ impl Editor {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !self.find.open {
+            return;
+        }
         self.find_replace_one();
         cx.notify();
     }
@@ -2762,6 +4742,9 @@ impl Editor {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !self.find.open {
+            return;
+        }
         self.find_replace_all();
         cx.notify();
     }
@@ -2772,6 +4755,16 @@ impl Editor {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.reading {
+            if self.reading_content.find_open() {
+                self.reading_content.find_toggle_regex();
+                cx.notify();
+            }
+            return;
+        }
+        if !self.find.open {
+            return;
+        }
         self.find.regex = !self.find.regex;
         self.refresh_find(true);
         cx.notify();
@@ -2783,6 +4776,16 @@ impl Editor {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.reading {
+            if self.reading_content.find_open() {
+                self.reading_content.find_toggle_case();
+                cx.notify();
+            }
+            return;
+        }
+        if !self.find.open {
+            return;
+        }
         self.find.case_sensitive = !self.find.case_sensitive;
         self.refresh_find(true);
         cx.notify();
@@ -2794,6 +4797,16 @@ impl Editor {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.reading {
+            if self.reading_content.find_open() {
+                self.reading_content.find_toggle_word();
+                cx.notify();
+            }
+            return;
+        }
+        if !self.find.open {
+            return;
+        }
         self.find.whole_word = !self.find.whole_word;
         self.refresh_find(true);
         cx.notify();
@@ -2846,6 +4859,8 @@ impl Editor {
         let replacement_active = self.find.field == FindField::Replacement;
         let status = if let Some(error) = &self.find.error {
             error.clone()
+        } else if let Some(message) = &self.find.message {
+            message.clone()
         } else if !self.find.pattern.is_empty() && self.find.matches.is_empty() {
             "no matches".to_string()
         } else if !self.find.matches.is_empty() {
@@ -3102,23 +5117,15 @@ impl Editor {
         let row = (f32::from(local.y) / f32::from(self.line_height))
             .floor()
             .max(0.0) as usize;
-        let meta = *self.last_rows.get(row)?;
+        let meta = self.last_rows.get(row)?;
         let shaped = self.last_shaped.get(row)?;
 
-        let row_text: String = self
-            .buffer
-            .line(meta.line)
-            .chars()
-            .skip(meta.start)
-            .take(meta.end.saturating_sub(meta.start))
-            .collect();
-
-        let byte = shaped.closest_index_for_x(local.x);
-        let col_in_row = row_text[..byte.min(row_text.len())].chars().count();
-        Some(
-            self.buffer
-                .char_index_at(meta.line, meta.start + col_in_row),
-        )
+        let local_byte = shaped.closest_index_for_x(local.x);
+        let display_col =
+            meta.map
+                .display_col_in_row(meta.display_start, meta.display_start_byte, local_byte);
+        let source_col = meta.map.source_for_display(display_col);
+        Some(self.buffer.char_index_at(meta.line, source_col))
     }
 
     /// Fold or unfold a heading when its gutter marker is clicked.
@@ -3157,9 +5164,22 @@ impl Editor {
         &mut self,
         event: &KeyDownEvent,
         _window: &mut Window,
-        _cx: &mut Context<Self>,
+        cx: &mut Context<Self>,
     ) {
-        if self.reading || self.find.open {
+        if self.reading {
+            return;
+        }
+        if self.find.open {
+            // Tab and Shift+Tab move between the pattern and the replacement field.
+            if event.keystroke.key == "tab" && self.find.replace {
+                self.find.field = if event.keystroke.modifiers.shift {
+                    FindField::Pattern
+                } else {
+                    FindField::Replacement
+                };
+                cx.stop_propagation();
+                cx.notify();
+            }
             return;
         }
         match event.keystroke.key_char.as_deref() {
@@ -3189,6 +5209,7 @@ impl Editor {
         cx: &mut Context<Self>,
     ) {
         self.dismiss_autocomplete();
+        self.context_menu = None;
         window.focus(&self.focus_handle);
         if self.fold_from_gutter(event.position, cx) {
             return;
@@ -3196,6 +5217,26 @@ impl Editor {
         let Some(index) = self.index_for_point(event.position) else {
             return;
         };
+
+        // Double click selects a word, triple click the line under the pointer.
+        if event.click_count >= 2 {
+            self.extra_cursors.clear();
+            let (line, col) = self.buffer.line_col_at(index);
+            let line_start = self.buffer.char_index_at(line, 0);
+            let text = self.buffer.line(line);
+            if event.click_count == 2 {
+                let byte = self.buffer.char_col_to_byte(line, col);
+                let (start, end) = word_columns(&text, byte);
+                self.anchor = Some(line_start + start);
+                self.buffer.set_cursor(line_start + end);
+            } else {
+                self.anchor = Some(line_start);
+                self.buffer.set_cursor(line_start + text.chars().count());
+            }
+            self.selecting = false;
+            cx.notify();
+            return;
+        }
 
         if self.find.open {
             self.find.open = false;
@@ -3222,6 +5263,19 @@ impl Editor {
         }
         self.buffer.set_cursor(index);
         self.selecting = true;
+        cx.notify();
+    }
+
+    /// Right-click opens cut/copy/paste and formatting at the pointer, without moving the
+    /// caret or dropping the selection.
+    fn on_context_menu(
+        &mut self,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        window.focus(&self.focus_handle);
+        self.context_menu = Some(event.position);
         cx.notify();
     }
 
@@ -3263,12 +5317,19 @@ impl Render for Editor {
         // the bottom of a long note.
         self.unfold_cursor_section();
         self.keep_cursor_visible();
+        self.schedule_draft(cx);
 
         // Text style for rich runs (highlights) in reading mode.
         let style = window.text_style();
+        let mut reader_font = style.font();
+        if let Some(settings) = cx.try_global::<crate::reading::ReaderSettings>() {
+            if let Some(family) = settings.font.family() {
+                reader_font.family = family.into();
+            }
+        }
         let run_template = TextRun {
             len: 0,
-            font: style.font(),
+            font: reader_font,
             color: style.color,
             background_color: None,
             underline: None,
@@ -3285,7 +5346,7 @@ impl Render for Editor {
         let reading = self.reading;
 
         self.refresh_properties();
-        self.refresh_stats();
+        self.refresh_stats(cx);
 
         let body: AnyElement = if reading {
             let version = self.document_version();
@@ -3295,9 +5356,17 @@ impl Render for Editor {
                 self.reading_content.update(version, &text, root.as_deref());
             }
 
+            let find_bar = self
+                .reading_content
+                .find_open()
+                .then(|| self.render_reading_find_bar(theme, cx));
+
             div()
                 .flex_1()
                 .min_h(px(0.0))
+                .flex()
+                .flex_col()
+                .children(find_bar)
                 .child({
                     let fold: crate::reading::FoldToggle = {
                         let weak = cx.entity().downgrade();
@@ -3328,6 +5397,7 @@ impl Render for Editor {
                 .overflow_y_scroll()
                 .track_scroll(&self.scroll_handle)
                 .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
+                .on_mouse_down(MouseButton::Right, cx.listener(Self::on_context_menu))
                 .on_mouse_move(cx.listener(Self::on_mouse_move))
                 .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
                 .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
@@ -3430,7 +5500,12 @@ impl Render for Editor {
             None
         };
 
-        let format_bar = if !reading && self.selection().is_some() {
+        // The format bar keeps a fixed height whether or not it has buttons, so selecting
+        // text never resizes the editor underneath the caret.
+        const FORMAT_BAR_HEIGHT: f32 = 30.0;
+        let format_bar = if reading {
+            None
+        } else if self.selection().is_some() {
             let entity = cx.entity();
             let buttons: Vec<(&str, text_format::Style, &str)> = vec![
                 ("B", text_format::Style::Bold, "format-bold"),
@@ -3490,8 +5565,8 @@ impl Render for Editor {
                     .flex_row()
                     .items_center()
                     .gap_1()
+                    .h(px(FORMAT_BAR_HEIGHT))
                     .px_3()
-                    .py_1()
                     .flex_shrink_0()
                     .bg(theme.panel_alt)
                     .border_t_1()
@@ -3504,12 +5579,117 @@ impl Render for Editor {
                     .into_any_element(),
             )
         } else {
-            None
+            Some(
+                div()
+                    .id("format-bar-spacer")
+                    .h(px(FORMAT_BAR_HEIGHT))
+                    .flex_shrink_0()
+                    .bg(theme.panel_alt)
+                    .border_t_1()
+                    .border_color(theme.border)
+                    .into_any_element(),
+            )
         };
+
+        let context_menu = self.context_menu.map(|position| {
+            let row = |id: &'static str, label: &'static str| {
+                div()
+                    .id(id)
+                    .px_3()
+                    .py_1()
+                    .text_sm()
+                    .text_color(theme.text)
+                    .cursor_pointer()
+                    .hover(move |style| style.bg(theme.hover))
+                    .child(label)
+            };
+            anchored()
+                .position(position)
+                .anchor(Corner::TopLeft)
+                .snap_to_window_with_margin(px(8.0))
+                .child(
+                    div()
+                        .id("editor-context-menu")
+                        .flex()
+                        .flex_col()
+                        .w(px(180.0))
+                        .py_1()
+                        .rounded_md()
+                        .bg(theme.panel)
+                        .border_1()
+                        .border_color(theme.border)
+                        .text_color(theme.text)
+                        .on_mouse_down(MouseButton::Left, |_event, _window, cx| {
+                            cx.stop_propagation();
+                        })
+                        .child(row("ctx-cut", "Cut").on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _event, window, cx| {
+                                this.context_menu = None;
+                                this.cut(&Cut, window, cx);
+                            }),
+                        ))
+                        .child(row("ctx-copy", "Copy").on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _event, window, cx| {
+                                this.context_menu = None;
+                                this.copy(&Copy, window, cx);
+                            }),
+                        ))
+                        .child(row("ctx-paste", "Paste").on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _event, window, cx| {
+                                this.context_menu = None;
+                                this.paste(&Paste, window, cx);
+                            }),
+                        ))
+                        .child(div().h(px(1.0)).my_1().bg(theme.border))
+                        .child(row("ctx-bold", "Bold").on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _event, _window, cx| {
+                                this.context_menu = None;
+                                this.apply_style(text_format::Style::Bold);
+                                cx.notify();
+                            }),
+                        ))
+                        .child(row("ctx-italic", "Italic").on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _event, _window, cx| {
+                                this.context_menu = None;
+                                this.apply_style(text_format::Style::Italic);
+                                cx.notify();
+                            }),
+                        ))
+                        .child(row("ctx-highlight", "Highlight").on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _event, _window, cx| {
+                                this.context_menu = None;
+                                this.apply_style(text_format::Style::Highlight);
+                                cx.notify();
+                            }),
+                        ))
+                        .child(row("ctx-link", "Wikilink…").on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _event, _window, cx| {
+                                this.context_menu = None;
+                                this.start_wikilink();
+                                cx.notify();
+                            }),
+                        )),
+                )
+                .into_any_element()
+        });
 
         let (line, column) = self.buffer.line_col();
         let line_count = self.buffer.line_count();
         let words = self.stats_cache.1.words;
+        // Reading replaces the line/column readout with the section and how far in it is.
+        let reading_status = if reading {
+            let (heading, progress) = self.reading_outline_state();
+            Some((heading, progress))
+        } else {
+            None
+        };
         let git_stat = self.git_stat;
         let selection = self.selection_stats();
         let vim_status = self.vim_enabled().then(|| self.vim_status());
@@ -3535,7 +5715,13 @@ impl Render for Editor {
             .border_color(theme.border)
             .text_xs()
             .text_color(theme.muted)
-            .child(format!("Ln {}, Col {}", line + 1, column + 1))
+            .child(match &reading_status {
+                Some((Some(heading), progress)) => {
+                    format!("{heading} · {:.0}%", progress * 100.0)
+                }
+                Some((None, progress)) => format!("{:.0}% read", progress * 100.0),
+                None => format!("Ln {}, Col {}", line + 1, column + 1),
+            })
             .child(format!("{line_count} lines"))
             .child(format!("{words} words"))
             .when_some(extra_cursors, |d, label| {
@@ -3598,6 +5784,8 @@ impl Render for Editor {
             .on_action(cx.listener(Self::toggle_inline_code))
             .on_action(cx.listener(Self::toggle_comment))
             .on_action(cx.listener(Self::insert_wikilink))
+            .on_action(cx.listener(Self::indent))
+            .on_action(cx.listener(Self::outdent))
             .on_key_down(cx.listener(Self::on_pre_key_down))
             .on_action(cx.listener(Self::backspace))
             .on_action(cx.listener(Self::delete))
@@ -3607,6 +5795,8 @@ impl Render for Editor {
             .on_action(cx.listener(Self::right))
             .on_action(cx.listener(Self::up))
             .on_action(cx.listener(Self::down))
+            .on_action(cx.listener(Self::page_up))
+            .on_action(cx.listener(Self::page_down))
             .on_action(cx.listener(Self::word_left))
             .on_action(cx.listener(Self::word_right))
             .on_action(cx.listener(Self::paragraph_up))
@@ -3695,7 +5885,7 @@ impl Render for Editor {
                                 .on_mouse_down(
                                     MouseButton::Left,
                                     cx.listener(|this, _ev, _window, cx| {
-                                        this.reading = !this.reading;
+                                        this.toggle_reading_mode();
                                         cx.notify();
                                     }),
                                 )
@@ -3704,10 +5894,57 @@ impl Render for Editor {
                 ),
             )
             .when_some(find_bar, |d, bar| d.child(bar))
-            .child(body)
+            .child(
+                // The autocomplete list floats over the bottom of the text instead of
+                // pushing it up, so opening it never moves the document under the caret.
+                div()
+                    .relative()
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .min_h(px(0.0))
+                    .child(body)
+                    .children(autocomplete_bar.map(|bar| {
+                        // Anchor at the caret; the first frame has no caret position yet.
+                        match *self.caret_origin.borrow() {
+                            Some(origin) => anchored()
+                                .position(origin)
+                                .anchor(Corner::TopLeft)
+                                .offset(point(px(0.0), px(4.0)))
+                                .snap_to_window_with_margin(px(8.0))
+                                .child(bar)
+                                .into_any_element(),
+                            None => div()
+                                .absolute()
+                                .left_0()
+                                .right_0()
+                                .bottom_0()
+                                .child(bar)
+                                .into_any_element(),
+                        }
+                    })),
+            )
             .when_some(format_bar, |d, bar| d.child(bar))
-            .when_some(autocomplete_bar, |d, bar| d.child(bar))
+            .when(self.context_menu.is_some(), |d| {
+                d.child(
+                    div()
+                        .id("editor-context-backdrop")
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .right_0()
+                        .bottom_0()
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _event, _window, cx| {
+                                this.context_menu = None;
+                                cx.notify();
+                            }),
+                        ),
+                )
+            })
             .child(status)
+            .children(context_menu)
     }
 }
 
@@ -3756,9 +5993,33 @@ impl EntityInputHandler for Editor {
         &mut self,
         range_utf16: Option<Range<usize>>,
         new_text: &str,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.reading {
+            if self.reading_content.find_open() {
+                self.reading_content.find_append(new_text);
+                self.marked_range = None;
+                cx.notify();
+                return;
+            }
+            // Reading mode owns its own navigation: j/k and g/G scroll the view, and every
+            // other keystroke is swallowed so it cannot reach the hidden buffer.
+            match new_text {
+                "j" => self.reading_content.scroll_blocks(1),
+                "k" => self.reading_content.scroll_blocks(-1),
+                "g" => self.reading_content.scroll_blocks(isize::MIN / 2),
+                "G" => self.reading_content.scroll_blocks(isize::MAX / 2),
+                " " => self.reading_content.scroll_screen(1),
+                _ => return,
+            }
+            self.marked_range = None;
+            cx.notify();
+            return;
+        }
+        if !self.can_mutate() {
+            return;
+        }
         if self.find.open {
             self.find_append(new_text);
             self.marked_range = None;
@@ -3771,10 +6032,8 @@ impl EntityInputHandler for Editor {
                 .vim
                 .handle_text(new_text, &mut self.buffer, &mut anchor);
             self.anchor = anchor;
-            self.vim.set_message(outcome.message);
-            if outcome.save {
-                let _ = self.save();
-            }
+            self.vim.set_message(outcome.message.clone());
+            self.run_vim_outcome(&outcome, window, cx);
             if outcome.handled {
                 self.marked_range = None;
                 cx.notify();
@@ -3831,6 +6090,9 @@ impl EntityInputHandler for Editor {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !self.can_mutate() {
+            return;
+        }
         if self.find.open {
             self.find_append(new_text);
             cx.notify();
@@ -3903,12 +6165,14 @@ impl EntityInputHandler for Editor {
             .last_rows
             .iter()
             .rposition(|meta| meta.line == line && meta.start <= col)?;
-        let meta = self.last_rows[row];
+        let meta = &self.last_rows[row];
         let shaped = self.last_shaped.get(row)?;
 
         let col = col.min(meta.end);
-        let byte = self.buffer.char_col_to_byte(line, col)
-            - self.buffer.char_col_to_byte(line, meta.start);
+        let byte = meta
+            .map
+            .byte_for_source(col)
+            .saturating_sub(meta.display_start_byte);
         let x = shaped.x_for_index(byte);
         let top = bounds.top() + self.line_height * row as f32;
 
@@ -3942,6 +6206,8 @@ impl LineLayout {
         text: &str,
         in_code: bool,
         language: &str,
+        conceal: bool,
+        table: bool,
         font: &gpui::Font,
         font_size: Pixels,
         width: f32,
@@ -3949,28 +6215,48 @@ impl LineLayout {
         theme: Theme,
         window: &mut Window,
     ) -> Self {
-        let chars: Vec<char> = text.chars().collect();
-        let tokens = syntax::line_tokens(text, in_code);
+        let source_chars: Vec<char> = text.chars().collect();
+        let map = Rc::new(conceal_text(
+            text,
+            conceal && !in_code && !syntax::is_fence(text),
+            table,
+        ));
+        let chars = map.display.clone();
+        let concealed = conceal;
+        let source_tokens = syntax::line_tokens(text, in_code);
+        let tokens: Vec<syntax::TokenKind> = map.display_source[..chars.len()]
+            .iter()
+            .map(|&source| {
+                source_tokens
+                    .get(source)
+                    .copied()
+                    .unwrap_or(syntax::TokenKind::Text)
+            })
+            .collect();
 
         // Inside a fence with a known language, colour the line with the code lexer.
         let code_kinds: Option<Vec<syntax::CodeKind>> = if in_code && !language.is_empty() {
-            let mut kinds = Vec::with_capacity(chars.len());
+            let mut source_kinds = Vec::with_capacity(source_chars.len());
             for span in syntax::code_spans(text, language) {
-                kinds.extend(std::iter::repeat_n(span.kind, span.text.chars().count()));
+                source_kinds.extend(std::iter::repeat_n(span.kind, span.text.chars().count()));
             }
-            (kinds.len() == chars.len()).then_some(kinds)
+            (source_kinds.len() == source_chars.len()).then(|| {
+                map.display_source[..chars.len()]
+                    .iter()
+                    .map(|&source| {
+                        source_kinds
+                            .get(source)
+                            .copied()
+                            .unwrap_or(syntax::CodeKind::Text)
+                    })
+                    .collect()
+            })
         } else {
             None
         };
 
-        // Byte offset of every character column, for measuring and slicing.
-        let mut offsets = Vec::with_capacity(chars.len() + 1);
-        let mut acc = 0usize;
-        for ch in &chars {
-            offsets.push(acc);
-            acc += ch.len_utf8();
-        }
-        offsets.push(acc);
+        // Byte offset of every display character column, for measuring and slicing.
+        let offsets = map.display_offsets.clone();
 
         let shape = |text: &str, runs: &[TextRun]| {
             window.text_system().shape_line(
@@ -3981,19 +6267,20 @@ impl LineLayout {
             )
         };
 
-        let spans: Vec<(usize, usize)> = if chars.is_empty() {
+        let display_text: String = chars.iter().collect();
+        let display_spans: Vec<(usize, usize)> = if chars.is_empty() {
             vec![(0, 0)]
         } else {
             // Measure the line once in a single run, then break it into visual rows.
             let full_run = TextRun {
-                len: text.len(),
+                len: display_text.len(),
                 font: font.clone(),
                 color,
                 background_color: None,
                 underline: None,
                 strikethrough: None,
             };
-            let full = shape(text, &[full_run]);
+            let full = shape(&display_text, &[full_run]);
             let width_of = |from: usize, to: usize| -> f32 {
                 f32::from(full.x_for_index(offsets[to]))
                     - f32::from(full.x_for_index(offsets[from]))
@@ -4001,8 +6288,10 @@ impl LineLayout {
             wrap::wrap(&chars, width_of, width)
         };
 
-        let mut rows: Vec<Rc<ShapedLine>> = Vec::with_capacity(spans.len());
-        for &(start, end) in &spans {
+        let spans = row_source_spans(&display_spans, &map, source_chars.len());
+
+        let mut rows: Vec<Rc<ShapedLine>> = Vec::with_capacity(display_spans.len());
+        for &(start, end) in &display_spans {
             let segment: String = chars[start..end].iter().collect();
             let runs = match &code_kinds {
                 Some(kinds) => {
@@ -4023,7 +6312,11 @@ impl LineLayout {
             text: text.to_string(),
             in_code,
             language: language.to_string(),
+            concealed,
+            table,
             spans: Rc::new(spans),
+            display_spans: Rc::new(display_spans),
+            map,
             rows: Rc::new(rows),
         }
     }
@@ -4257,7 +6550,7 @@ pub(crate) fn metadata_panel(
         }
 
         let value = if key == "tags" {
-            metadata_tags(&property.value, theme)
+            metadata_tags(&property.value, theme, &opener)
         } else {
             metadata_value(&property.value, theme, &opener, reading)
         };
@@ -4393,7 +6686,7 @@ impl Render for MetadataView {
     }
 }
 
-fn metadata_tags(value: &PropertyValue, theme: Theme) -> AnyElement {
+fn metadata_tags(value: &PropertyValue, theme: Theme, opener: &Option<LinkOpener>) -> AnyElement {
     let items: Vec<String> = match value {
         PropertyValue::Scalar(text) => vec![text.clone()],
         PropertyValue::List(items) => items.clone(),
@@ -4401,6 +6694,12 @@ fn metadata_tags(value: &PropertyValue, theme: Theme) -> AnyElement {
     };
     let mut row = div().flex().flex_wrap().gap_1();
     for item in items {
+        let label = item.trim().trim_start_matches('#').to_string();
+        if label.is_empty() {
+            continue;
+        }
+        let tag = item.trim().to_string();
+        let opener = opener.clone();
         row = row.child(
             div()
                 .px_2()
@@ -4409,7 +6708,15 @@ fn metadata_tags(value: &PropertyValue, theme: Theme) -> AnyElement {
                 .bg(theme.chip)
                 .text_xs()
                 .text_color(theme.text_dim)
-                .child(item),
+                .cursor_pointer()
+                .hover(move |style| style.bg(theme.hover).text_color(theme.text))
+                .child(item)
+                .on_mouse_down(MouseButton::Left, move |_event, window, cx| {
+                    if let Some(opener) = &opener {
+                        // The app turns `tag:` into a search for that tag.
+                        opener(&format!("tag:{tag}"), window, cx);
+                    }
+                }),
         );
     }
     row.into_any_element()
@@ -4559,8 +6866,8 @@ fn metadata_inline(text: &str, theme: Theme, opener: &Option<LinkOpener>, size: 
             element = element.bg(theme.code_bg).text_color(theme.code_text);
         }
 
-        if style.wiki {
-            if let Some(href) = span.href.clone() {
+        if let Some(href) = span.href.clone() {
+            if style.wiki || style.link {
                 let opener = opener.clone();
                 let target = href.clone();
                 element = element
@@ -4573,7 +6880,6 @@ fn metadata_inline(text: &str, theme: Theme, opener: &Option<LinkOpener>, size: 
                     });
             }
         }
-        // `style.link && !style.wiki` deliberately falls through as plain text.
 
         row = row.child(element);
     }
@@ -4668,7 +6974,7 @@ impl Element for LineNumbers {
 
         let mut shaped = Vec::new();
         for row in visible {
-            let meta = metas[row];
+            let meta = &metas[row];
             if meta.start != 0 {
                 continue;
             }
@@ -4830,6 +7136,10 @@ struct Prepaint {
     extra_cursors: Vec<PaintQuad>,
     /// Rows intersecting the viewport; only these are painted.
     visible: Range<usize>,
+    /// Source lines whose text is replaced by a rendered formula.
+    hidden_lines: HashSet<usize>,
+    /// Source lines drawn as a thematic rule instead of source text.
+    rules: Rc<HashSet<usize>>,
 }
 
 impl Element for EditorText {
@@ -4883,12 +7193,40 @@ impl Element for EditorText {
         let editor_entity = self.editor.clone();
         editor_entity.update(cx, |editor, _cx| {
             editor.lay_out(window, theme, available, color);
+            let caret_line = editor.buffer.line_col().0;
+            editor.ensure_math_scenes(caret_line);
         });
 
+        let caret_slot = self.editor.read(cx).caret_origin.clone();
         let editor = self.editor.read(cx);
         let line_height = editor.line_height;
         let rows = editor.last_shaped.clone();
         let metas = editor.last_rows.clone();
+
+        // A block renders only while the caret is outside it, so editing a formula always
+        // shows its source. Every line of a rendered block loses its glyphs; the rows keep
+        // their height, which is what keeps scroll, click and caret geometry unchanged.
+        let caret_line = editor.buffer.line_col().0;
+        let mut hidden_lines: HashSet<usize> = HashSet::new();
+        for block in editor.display_math.iter() {
+            if block.row_count == 0 {
+                continue;
+            }
+            if caret_line >= block.first_line && caret_line <= block.last_line {
+                continue;
+            }
+            // Nothing is hidden unless there is a formula to put in its place, so a
+            // formula the typesetter rejects stays visible as source instead of leaving
+            // a blank gap.
+            if !editor
+                .math_scenes
+                .get(&block.tex)
+                .is_some_and(|scene| scene.is_some())
+            {
+                continue;
+            }
+            hidden_lines.extend(block.first_line..=block.last_line);
+        }
 
         // Only the rows inside the scroll viewport need quads and glyphs. On a long note
         // this turns each scroll frame from "paint the whole document" into "paint a
@@ -4900,15 +7238,20 @@ impl Element for EditorText {
             metas.len(),
         );
 
-        let row_byte = |line: usize, row_start: usize, col: usize| -> usize {
-            editor.buffer.char_col_to_byte(line, col)
-                - editor.buffer.char_col_to_byte(line, row_start)
+        // A source column's byte offset inside its row's shaped display segment.
+        let row_byte = |meta: &RowMeta, col: usize| -> usize {
+            meta.map
+                .byte_for_source(col)
+                .saturating_sub(meta.display_start_byte)
         };
 
         let mut selection_quads = Vec::new();
         for selection in editor.selection_ranges() {
             for row_index in visible.clone() {
-                let meta = metas[row_index];
+                let meta = &metas[row_index];
+                if hidden_lines.contains(&meta.line) {
+                    continue;
+                }
                 let line_start = editor.buffer.char_index_at(meta.line, 0);
                 let start = selection.start.max(line_start + meta.start);
                 let end = selection.end.min(line_start + meta.end);
@@ -4916,13 +7259,8 @@ impl Element for EditorText {
                     continue;
                 }
 
-                let x0 = rows[row_index].x_for_index(row_byte(
-                    meta.line,
-                    meta.start,
-                    start - line_start,
-                ));
-                let x1 =
-                    rows[row_index].x_for_index(row_byte(meta.line, meta.start, end - line_start));
+                let x0 = rows[row_index].x_for_index(row_byte(meta, start - line_start));
+                let x1 = rows[row_index].x_for_index(row_byte(meta, end - line_start));
                 let top = bounds.top() + line_height * row_index as f32;
                 selection_quads.push(fill(
                     Bounds::from_corners(
@@ -4942,20 +7280,18 @@ impl Element for EditorText {
                 theme.accent.opacity(0.20)
             };
             for row_index in visible.clone() {
-                let meta = metas[row_index];
+                let meta = &metas[row_index];
+                if hidden_lines.contains(&meta.line) {
+                    continue;
+                }
                 let line_start = editor.buffer.char_index_at(meta.line, 0);
                 let start = matched.start.max(line_start + meta.start);
                 let end = matched.end.min(line_start + meta.end);
                 if start >= end {
                     continue;
                 }
-                let x0 = rows[row_index].x_for_index(row_byte(
-                    meta.line,
-                    meta.start,
-                    start - line_start,
-                ));
-                let x1 =
-                    rows[row_index].x_for_index(row_byte(meta.line, meta.start, end - line_start));
+                let x0 = rows[row_index].x_for_index(row_byte(meta, start - line_start));
+                let x1 = rows[row_index].x_for_index(row_byte(meta, end - line_start));
                 let top = bounds.top() + line_height * row_index as f32;
                 find_quads.push(fill(
                     Bounds::from_corners(
@@ -4970,15 +7306,15 @@ impl Element for EditorText {
         let (line_idx, col) = editor.buffer.line_col();
         let mut cursor_row = None;
         for row_index in visible.clone() {
-            let meta = metas[row_index];
+            let meta = &metas[row_index];
             if meta.line == line_idx && meta.start <= col {
                 cursor_row = Some(row_index);
             }
         }
         let cursor = cursor_row.map(|row_index| {
-            let meta = metas[row_index];
+            let meta = &metas[row_index];
             let col = col.min(meta.end);
-            let x = rows[row_index].x_for_index(row_byte(meta.line, meta.start, col));
+            let x = rows[row_index].x_for_index(row_byte(meta, col));
             fill(
                 Bounds::new(
                     point(
@@ -4990,19 +7326,22 @@ impl Element for EditorText {
                 color,
             )
         });
+        *caret_slot.borrow_mut() = cursor
+            .as_ref()
+            .map(|quad| point(quad.bounds.left(), quad.bounds.bottom()));
 
         let mut extra_cursor_quads = Vec::new();
         for state in &editor.extra_cursors {
             let (state_line, state_col) = editor.buffer.line_col_at(state.cursor);
             let Some(row_index) = visible.clone().find(|row_index| {
-                let meta = metas[*row_index];
+                let meta = &metas[*row_index];
                 meta.line == state_line && meta.start <= state_col && state_col <= meta.end
             }) else {
                 continue;
             };
-            let meta = metas[row_index];
+            let meta = &metas[row_index];
             let col = state_col.min(meta.end);
-            let x = rows[row_index].x_for_index(row_byte(meta.line, meta.start, col));
+            let x = rows[row_index].x_for_index(row_byte(meta, col));
             extra_cursor_quads.push(fill(
                 Bounds::new(
                     point(
@@ -5034,6 +7373,8 @@ impl Element for EditorText {
             cursor,
             extra_cursors: extra_cursor_quads,
             visible,
+            hidden_lines,
+            rules: self.editor.read(cx).layout_rules.clone(),
         }
     }
 
@@ -5060,6 +7401,103 @@ impl Element for EditorText {
             window.paint_quad(quad);
         }
 
+        // Callout boxes sit behind their rows and in front of the current-line highlight.
+        {
+            let editor = self.editor.read(cx);
+            let theme = *cx.global::<Theme>();
+            let width = bounds.size.width;
+            for callout in editor.layout_callouts.iter() {
+                if callout.last_row <= prepaint.visible.start
+                    || callout.first_row >= prepaint.visible.end
+                {
+                    continue;
+                }
+                let first = callout.first_row.max(prepaint.visible.start);
+                let last = callout.last_row.min(prepaint.visible.end);
+                if last <= first {
+                    continue;
+                }
+                let top = bounds.top() + line_height * first as f32;
+                let height = line_height * (last - first) as f32;
+                let accent = match callout.kind.as_str() {
+                    "warning" | "caution" | "danger" | "error" => theme.warn,
+                    "tip" | "success" => theme.code_text,
+                    _ => theme.accent_text,
+                };
+                window.paint_quad(fill(
+                    Bounds::new(point(bounds.left(), top), size(width, height)),
+                    theme.chip,
+                ));
+                window.paint_quad(fill(
+                    Bounds::new(point(bounds.left(), top), size(px(3.0), height)),
+                    accent,
+                ));
+            }
+        }
+
+        // Tables: a tinted header, a divider under it and a quiet outer frame. The cells
+        // stay source text with their pipes concealed; per-pipe vertical lines made the
+        // block noisy and ragged when the source columns were not aligned.
+        {
+            let editor = self.editor.read(cx);
+            let theme = *cx.global::<Theme>();
+            let width = bounds.size.width;
+            for table in editor.layout_tables.iter() {
+                if table.last_row <= prepaint.visible.start
+                    || table.first_row >= prepaint.visible.end
+                {
+                    continue;
+                }
+                let first = table.first_row.max(prepaint.visible.start);
+                let last = table.last_row.min(prepaint.visible.end);
+                if last <= first {
+                    continue;
+                }
+                let top = bounds.top() + line_height * first as f32;
+                let height = line_height * (last - first) as f32;
+                let header_end = table.divider_row.clamp(first, last);
+
+                // A soft backdrop for the whole block.
+                window.paint_quad(fill(
+                    Bounds::new(point(bounds.left(), top), size(width, height)),
+                    theme.panel_alt.opacity(0.6),
+                ));
+                if header_end > first {
+                    window.paint_quad(fill(
+                        Bounds::new(
+                            point(bounds.left(), bounds.top() + line_height * first as f32),
+                            size(width, line_height * (header_end - first) as f32),
+                        ),
+                        theme.chip,
+                    ));
+                }
+
+                // A single divider under the header, plus the outer frame.
+                if table.divider_row >= first && table.divider_row <= last {
+                    let y = bounds.top() + line_height * table.divider_row as f32;
+                    window.paint_quad(fill(
+                        Bounds::new(point(bounds.left(), y), size(width, px(1.0))),
+                        theme.border,
+                    ));
+                }
+                window.paint_quad(fill(
+                    Bounds::new(point(bounds.left(), top), size(width, px(1.0))),
+                    theme.border,
+                ));
+                if table.last_row <= prepaint.visible.end {
+                    let y = bounds.top() + line_height * table.last_row as f32 - px(1.0);
+                    window.paint_quad(fill(
+                        Bounds::new(point(bounds.left(), y), size(width, px(1.0))),
+                        theme.border,
+                    ));
+                }
+                window.paint_quad(fill(
+                    Bounds::new(point(bounds.left(), top), size(px(2.0), height)),
+                    theme.accent.opacity(0.6),
+                ));
+            }
+        }
+
         for quad in prepaint.find_matches.drain(..) {
             window.paint_quad(quad);
         }
@@ -5070,12 +7508,143 @@ impl Element for EditorText {
 
         let visible = prepaint.visible.clone();
         let rows = prepaint.rows.clone();
-        for i in visible {
+        let metas = prepaint.metas.clone();
+        for i in visible.clone() {
             let Some(row) = rows.get(i) else {
                 continue;
             };
+            let Some(meta) = metas.get(i) else {
+                continue;
+            };
+            if prepaint.hidden_lines.contains(&meta.line) {
+                continue;
+            }
+            if prepaint.rules.contains(&meta.line) {
+                continue;
+            }
             let origin = point(bounds.left(), bounds.top() + line_height * i as f32);
             let _ = row.paint(origin, line_height, window, cx);
+        }
+
+        let theme = *cx.global::<Theme>();
+        let mut rule_rows: HashSet<usize> = HashSet::new();
+        for i in visible.clone() {
+            let Some(meta) = metas.get(i) else {
+                continue;
+            };
+            if meta.start == 0 && prepaint.rules.contains(&meta.line) && rule_rows.insert(meta.line)
+            {
+                let y = bounds.top() + line_height * i as f32 + line_height * 0.5;
+                window.paint_quad(fill(
+                    Bounds::new(
+                        point(bounds.left() + px(8.0), y),
+                        size(bounds.size.width - px(16.0), px(1.0)),
+                    ),
+                    theme.border,
+                ));
+            }
+        }
+
+        // Draw each rendered `$$…$$` block over the blank rows it owns.
+        {
+            let editor = self.editor.read(cx);
+            let theme = *cx.global::<Theme>();
+            let column_width = f32::from(bounds.size.width);
+            for block in editor.display_math.iter() {
+                if block.row_count == 0 || prepaint.hidden_lines.contains(&block.first_line) {
+                    continue;
+                }
+                let first_row = block.first_row;
+                let last_row = first_row + block.row_count;
+                if last_row <= visible.start || first_row >= visible.end {
+                    continue;
+                }
+                let Some(Some(scene)) = editor.math_scenes.get(&block.tex) else {
+                    continue;
+                };
+
+                // Display size, scaled down when the formula is wider than the text column.
+                let natural = 18.0f32;
+                let scene_width = scene.width() as f32;
+                let font_size = if scene_width > 0.0 && scene_width * natural > column_width - 24.0
+                {
+                    ((column_width - 24.0) / scene_width).clamp(9.0, natural)
+                } else {
+                    natural
+                };
+                let width = px(scene_width * font_size);
+                let height = px(scene.total_height() as f32 * font_size);
+                let block_height = line_height * block.row_count as f32;
+                let left = bounds.left() + px(((column_width - f32::from(width)) / 2.0).max(0.0));
+                let top = bounds.top()
+                    + line_height * first_row as f32
+                    + px(((f32::from(block_height) - f32::from(height)) / 2.0).max(0.0));
+                paint_scene(window, scene, font_size, theme.text, point(left, top));
+            }
+        }
+
+        // Draw the live formula preview under the block being edited.
+        {
+            let editor = self.editor.read(cx);
+            let theme = *cx.global::<Theme>();
+            let column_width = f32::from(bounds.size.width);
+            for live in editor.live_math.iter() {
+                let last_row = live.first_row + live.row_count;
+                if last_row <= visible.start || live.first_row >= visible.end {
+                    continue;
+                }
+                let Some(Some(scene)) = editor.math_scenes.get(&live.tex) else {
+                    continue;
+                };
+                let natural = 17.0f32;
+                let scene_width = scene.width() as f32;
+                let scene_height = scene.total_height() as f32;
+                let block_height = line_height * live.row_count as f32;
+                let mut font_size = natural;
+                if scene_width > 0.0 {
+                    font_size = font_size.min((column_width - 24.0) / scene_width);
+                }
+                if scene_height > 0.0 {
+                    font_size = font_size.min(f32::from(block_height - px(4.0)) / scene_height);
+                }
+                let font_size = font_size.clamp(8.0, natural);
+                let width = px(scene_width * font_size);
+                let height = px(scene_height * font_size);
+                let left = bounds.left() + px(((column_width - f32::from(width)) / 2.0).max(0.0));
+                let top = bounds.top()
+                    + line_height * live.first_row as f32
+                    + px(((f32::from(block_height) - f32::from(height)) / 2.0).max(0.0));
+                paint_scene(window, scene, font_size, theme.text, point(left, top));
+            }
+        }
+
+        // Draw standalone image embeds over the rows reserved for them.
+        {
+            let editor = self.editor.read(cx);
+            let column_width = f32::from(bounds.size.width);
+            for image in editor.editor_images.iter() {
+                if prepaint.hidden_lines.contains(&image.line) {
+                    continue;
+                }
+                let last_row = image.first_row + image.row_count;
+                if last_row <= visible.start || image.first_row >= visible.end {
+                    continue;
+                }
+                let width = px(image.width).min(bounds.size.width - px(16.0));
+                let height = px(image.height);
+                let left = bounds.left() + px(((column_width - f32::from(width)) / 2.0).max(0.0));
+                let block_height = line_height * image.row_count as f32;
+                let top = bounds.top()
+                    + line_height * image.first_row as f32
+                    + px(((f32::from(block_height) - f32::from(height)) / 2.0).max(0.0));
+                let _ = window.paint_image(
+                    Bounds::new(point(left, top), size(width, height)),
+                    Corners::default(),
+                    image.data.clone(),
+                    0,
+                    false,
+                );
+            }
         }
 
         if focus_handle.is_focused(window) {
@@ -5096,6 +7665,17 @@ impl Element for EditorText {
             editor.last_shaped = rows;
         });
     }
+}
+
+/// Fraction of the scrollable range for a pixel offset.
+fn progress_from_scroll(offset: f32, content: f32, viewport: f32) -> f32 {
+    let scrollable = (content - viewport).max(1.0);
+    (offset.max(0.0) / scrollable).clamp(0.0, 1.0)
+}
+
+/// Pixel offset for a fraction of the scrollable range.
+fn offset_for_progress(progress: f32, content: f32, viewport: f32) -> f32 {
+    (content - viewport).max(0.0) * progress.clamp(0.0, 1.0)
 }
 
 /// The vertical scroll delta that brings `[top, bottom)` back inside the viewport.
@@ -5144,10 +7724,538 @@ fn visible_row_range(
     start.min(row_count)..end.min(row_count)
 }
 
+/// Convert wrapped display spans into contiguous source row ranges. Hidden markers belong
+/// to the row they precede/follow, so every source column falls inside exactly one row.
+/// The callout kind of a `> [!kind]` line (`note`, `warning`, …), if it is one.
+fn callout_kind(line: &str) -> Option<String> {
+    let rest = line.trim_start().strip_prefix('>')?.trim_start();
+    let inner = rest.strip_prefix("[!")?;
+    let end = inner.find(']')?;
+    let kind = inner[..end].trim().to_lowercase();
+    (!kind.is_empty()).then_some(kind)
+}
+
+/// Whether a line is a table's `|---|:--:|` separator row.
+fn is_table_separator(line: &str) -> bool {
+    let trimmed = line.trim();
+    if !trimmed.contains('-') || !trimmed.contains('|') {
+        return false;
+    }
+    let cells: Vec<&str> = trimmed
+        .trim_matches('|')
+        .split('|')
+        .map(str::trim)
+        .collect();
+    !cells.is_empty()
+        && cells.iter().all(|cell| {
+            let cell = cell.trim_start_matches(':').trim_end_matches(':');
+            !cell.is_empty() && cell.chars().all(|ch| ch == '-')
+        })
+}
+
+/// Table blocks outside the caret paragraph: `(first line, last line)`, inclusive.
+fn table_blocks(buffer: &Buffer, raw_block: (usize, usize)) -> Vec<(usize, usize)> {
+    let count = buffer.line_count();
+    let mut blocks = Vec::new();
+    let mut line = 0usize;
+    while line + 1 < count {
+        let header = buffer.line(line);
+        if !header.contains('|') || !is_table_separator(&buffer.line(line + 1)) {
+            line += 1;
+            continue;
+        }
+        let start = line;
+        let mut end = line + 1;
+        while end + 1 < count {
+            let candidate = buffer.line(end + 1);
+            if candidate.trim().is_empty() || !candidate.contains('|') {
+                break;
+            }
+            end += 1;
+        }
+        if !(raw_block.0 <= start && start <= raw_block.1) {
+            blocks.push((start, end));
+        }
+        line = end + 1;
+    }
+    blocks
+}
+
+/// A standalone image embed: `![[target]]`, `![[target|300]]` or `![[target|alt text]]`.
+/// Returns the target and a pixel width when the size parses as a number.
+fn image_embed(text: &str) -> Option<(String, Option<f32>)> {
+    let inner = text.trim().strip_prefix("![[")?.strip_suffix("]]")?;
+    if inner.contains('\n') {
+        return None;
+    }
+    let (target, size) = match inner.split_once('|') {
+        Some((target, rest)) => (target.trim(), Some(rest.trim())),
+        None => (inner.trim(), None),
+    };
+    if target.is_empty() {
+        return None;
+    }
+    let width = size
+        .and_then(|size| size.parse::<f32>().ok())
+        .filter(|width| *width > 0.0);
+    Some((target.to_string(), width))
+}
+
+/// Display size for an image drawn in the editor, and how many rows it needs.
+///
+/// A bare embed gets a preview about five lines tall; `![[img|300]]` asks for a width.
+/// The result never exceeds the column and keeps the image's aspect ratio.
+fn editor_image_layout(
+    image_width: f32,
+    image_height: f32,
+    max_width: f32,
+    line_height: f32,
+    requested_width: Option<f32>,
+) -> (f32, f32, usize) {
+    let aspect = if image_height > 0.0 {
+        image_width / image_height
+    } else {
+        1.0
+    };
+    let aspect = aspect.clamp(0.02, 50.0);
+    let max_width = max_width.max(48.0);
+    let mut height = requested_width
+        .filter(|width| *width > 0.0)
+        .map(|width| width / aspect)
+        .unwrap_or(line_height * 5.0);
+    let mut width = height * aspect;
+    if width > max_width {
+        width = max_width;
+        height = width / aspect;
+    }
+    let row_count = ((height / line_height).ceil() as usize).clamp(1, 30);
+    (width, height, row_count)
+}
+
+/// The character columns of the word around a byte offset, for double-click selection.
+fn word_columns(text: &str, byte: usize) -> (usize, usize) {
+    let range = word_range(text, byte);
+    (
+        text[..range.start].chars().count(),
+        text[..range.end].chars().count(),
+    )
+}
+
+/// A thematic break: three or more of `-`, `*` or `_`, with nothing else.
+fn thematic_break(line: &str) -> bool {
+    let trimmed = line.trim();
+    let mut chars = trimmed.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !matches!(first, '-' | '*' | '_') {
+        return false;
+    }
+    trimmed.chars().count() >= 3 && chars.all(|ch| ch == first)
+}
+
+fn row_source_spans(
+    display_spans: &[(usize, usize)],
+    map: &LineMap,
+    source_len: usize,
+) -> Vec<(usize, usize)> {
+    let mut spans: Vec<(usize, usize)> = display_spans
+        .iter()
+        .map(|&(start, end)| (map.source_for_display(start), map.source_for_display(end)))
+        .collect();
+    if let Some(first) = spans.first_mut() {
+        first.0 = 0;
+    }
+    for at in 0..spans.len().saturating_sub(1) {
+        spans[at].1 = spans[at + 1].0.max(spans[at].0);
+    }
+    if let Some(last) = spans.last_mut() {
+        last.1 = source_len.max(last.0);
+    }
+    spans
+}
+
+/// Whether an edit cannot change the document's headings: same length, no newline and no
+/// heading/fence character in the changed bytes, and the edited line is not a heading, a
+/// fence or the text line of a setext heading.
+fn headings_unchanged(old: &str, new: &str) -> bool {
+    if old.len() != new.len() {
+        return false;
+    }
+    let bytes = old.as_bytes();
+    let mut start = 0;
+    while start < bytes.len() && bytes[start] == new.as_bytes()[start] {
+        start += 1;
+    }
+    if start == bytes.len() {
+        return true;
+    }
+    let mut end = 0;
+    while end < bytes.len() - start
+        && bytes[bytes.len() - 1 - end] == new.as_bytes()[bytes.len() - 1 - end]
+    {
+        end += 1;
+    }
+    let (Some(old_changed), Some(new_changed)) = (
+        old.get(start..old.len() - end),
+        new.get(start..new.len() - end),
+    ) else {
+        return false;
+    };
+    let risky = |text: &str| {
+        text.contains('\n')
+            || text.contains('#')
+            || text.contains('`')
+            || text.contains('~')
+            || text.contains('=')
+    };
+    if risky(old_changed) || risky(new_changed) {
+        return false;
+    }
+
+    let line_start = old[..start].rfind('\n').map(|at| at + 1).unwrap_or(0);
+    let line_end = old[start..]
+        .find('\n')
+        .map(|at| start + at)
+        .unwrap_or(old.len());
+    let line_is_structural = |line: &str| {
+        let trimmed = line.trim_start();
+        trimmed.starts_with('#') || trimmed.starts_with("```") || trimmed.starts_with("~~~")
+    };
+    if line_is_structural(&old[line_start..line_end])
+        || line_is_structural(&new[line_start..line_end])
+    {
+        return false;
+    }
+
+    // A setext underline turns the line above it into a heading.
+    fn next_line(text: &str, line_end: usize) -> &str {
+        text[line_end..].split('\n').nth(1).unwrap_or("")
+    }
+    let is_setext = |line: &str| {
+        let trimmed = line.trim();
+        (!trimmed.is_empty() && trimmed.chars().all(|ch| ch == '='))
+            || (trimmed.len() > 1 && trimmed.chars().all(|ch| ch == '-'))
+    };
+    if is_setext(next_line(old, line_end)) || is_setext(next_line(new, line_end)) {
+        return false;
+    }
+
+    // The frontmatter block is not prose.
+    if let Some(body) = old.strip_prefix("---") {
+        if let Some(close) = body.find("\n---") {
+            if start < 3 + close + 4 {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// The caret after a block edit. `follow` keeps the same line and column inside the moved or
+/// duplicated block; otherwise (a deletion) the caret goes to the start of the following
+/// block. Pure text math so it can be tested without an editor.
+fn caret_after_block_edit(
+    text: &str,
+    cursor: usize,
+    edit: &blocks::BlockEdit,
+    follow: bool,
+) -> usize {
+    let before = Buffer::from_text(text);
+    let (line, col) = before.line_col_at(cursor);
+    let block_start = blocks::block_at(text, line)
+        .map(|block| block.start)
+        .unwrap_or(line);
+    let offset = line.saturating_sub(block_start);
+    let after = Buffer::from_text(&edit.text);
+    let target = if follow {
+        edit.line + offset
+    } else {
+        edit.line
+    };
+    let target = target.min(after.line_count().saturating_sub(1));
+    after.char_index_at(target, if follow { col } else { 0 })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use gpui::{point, size};
+
+    #[test]
+    fn concealed_markers_map_between_source_and_display() {
+        let text = "a **bold** b";
+        let map = conceal_text(text, true, false);
+        assert_eq!(map.display.iter().collect::<String>(), "a bold b");
+
+        // Every visible display character maps to the same source character, both ways.
+        let source: Vec<char> = text.chars().collect();
+        for (display_col, ch) in map.display.iter().enumerate() {
+            let source_col = map.source_for_display(display_col);
+            assert_eq!(source[source_col], *ch);
+            assert_eq!(map.display_for_source(source_col), display_col);
+        }
+
+        // A caret before the opening marker sits where the content starts.
+        assert_eq!(map.display_for_source(2), 2);
+        assert_eq!(map.byte_for_source(2), 2);
+        assert_eq!(map.source_for_display(2), 4);
+
+        // Turning concealment off is the identity.
+        let plain = conceal_text(text, false, false);
+        assert_eq!(plain.display, source);
+        for col in 0..source.len() {
+            assert_eq!(plain.display_for_source(col), col);
+            assert_eq!(plain.source_for_display(col), col);
+        }
+    }
+
+    #[test]
+    fn scroll_progress_round_trips() {
+        // 2000 px of content in a 500 px viewport: 1500 px of travel.
+        assert_eq!(progress_from_scroll(0.0, 2000.0, 500.0), 0.0);
+        assert_eq!(progress_from_scroll(750.0, 2000.0, 500.0), 0.5);
+        assert_eq!(progress_from_scroll(1500.0, 2000.0, 500.0), 1.0);
+        // Overscroll and undersized documents clamp.
+        assert_eq!(progress_from_scroll(4000.0, 2000.0, 500.0), 1.0);
+        assert_eq!(progress_from_scroll(-30.0, 2000.0, 500.0), 0.0);
+        assert_eq!(progress_from_scroll(10.0, 400.0, 500.0), 1.0);
+        assert_eq!(offset_for_progress(0.25, 2000.0, 500.0), 375.0);
+        assert_eq!(offset_for_progress(2.0, 2000.0, 500.0), 1500.0);
+    }
+
+    #[test]
+    fn table_separators_and_blocks_are_recognised() {
+        assert!(is_table_separator("| --- | --- |"));
+        assert!(is_table_separator("|---|:--:|"));
+        assert!(is_table_separator("| :--- | ---: |"));
+        assert!(!is_table_separator("| a | b |"));
+        assert!(!is_table_separator("---"));
+        assert!(!is_table_separator("| -- | xx |"));
+
+        let table = Buffer::from_text("| a | b |\n|---|---|\n| 1 | 2 |\n\ntext\n");
+        assert_eq!(table_blocks(&table, (usize::MAX, usize::MAX)), vec![(0, 2)]);
+        // The table containing the caret stays raw.
+        assert!(table_blocks(&table, (0, 0)).is_empty());
+        let prose = Buffer::from_text("a | b\nplain\n");
+        assert!(table_blocks(&prose, (usize::MAX, usize::MAX)).is_empty());
+    }
+
+    #[test]
+    fn table_pipes_are_concealed() {
+        let map = conceal_text("| a | b |", true, true);
+        assert_eq!(map.display.iter().collect::<String>(), " a  b ");
+        // Without the table flag the pipes stay.
+        let plain = conceal_text("| a | b |", true, false);
+        assert_eq!(plain.display.iter().collect::<String>(), "| a | b |");
+    }
+
+    #[test]
+    fn callout_kinds_are_recognised() {
+        assert_eq!(callout_kind("> [!note]"), Some("note".to_string()));
+        assert_eq!(
+            callout_kind("> [!Warning] Be careful"),
+            Some("warning".to_string())
+        );
+        assert_eq!(callout_kind("> plain quote"), None);
+        assert_eq!(callout_kind("plain"), None);
+        assert_eq!(callout_kind("> [!]"), None);
+    }
+
+    #[test]
+    fn standalone_image_embeds_parse_target_and_width() {
+        assert_eq!(
+            image_embed("![[shot.png]]"),
+            Some(("shot.png".to_string(), None))
+        );
+        assert_eq!(
+            image_embed("  ![[shot.png|300]]  "),
+            Some(("shot.png".to_string(), Some(300.0)))
+        );
+        // A non-numeric size is alt text, not a width.
+        assert_eq!(
+            image_embed("![[shot.png|a wide shot]]"),
+            Some(("shot.png".to_string(), None))
+        );
+        // Only a whole line is substituted.
+        assert_eq!(image_embed("see ![[shot.png]]"), None);
+        assert_eq!(image_embed("![[shot.png"), None);
+        assert_eq!(image_embed("![[|300]]"), None);
+    }
+
+    #[test]
+    fn image_previews_keep_aspect_and_fit_the_column() {
+        // A 2:1 image with no width: five lines tall, twice as wide.
+        assert_eq!(
+            editor_image_layout(200.0, 100.0, 600.0, 20.0, None),
+            (200.0, 100.0, 5)
+        );
+        // `|300` sets the width; the height follows the ratio.
+        assert_eq!(
+            editor_image_layout(200.0, 100.0, 600.0, 20.0, Some(300.0)),
+            (300.0, 150.0, 8)
+        );
+        // A narrow column caps the width and scales the height with it.
+        assert_eq!(
+            editor_image_layout(200.0, 100.0, 120.0, 20.0, None),
+            (120.0, 60.0, 3)
+        );
+    }
+
+    #[test]
+    fn double_click_columns_handle_multibyte_lines() {
+        assert_eq!(word_columns("hello world", 7), (6, 11));
+        assert_eq!(word_columns("café au lait", 6), (5, 7));
+        assert_eq!(word_columns("a  b", 2), (2, 3));
+    }
+
+    #[test]
+    fn thematic_breaks_are_recognised() {
+        assert!(thematic_break("---"));
+        assert!(thematic_break("***"));
+        assert!(thematic_break("  ___  "));
+        assert!(!thematic_break("--"));
+        assert!(!thematic_break("--- x"));
+        assert!(!thematic_break("***bold***"));
+    }
+
+    #[test]
+    fn concealment_keeps_utf8_byte_offsets_aligned() {
+        let text = "é **b**";
+        let map = conceal_text(text, true, false);
+        assert_eq!(map.display.iter().collect::<String>(), "é b");
+        // `é` is two bytes; the display offsets and the caret byte must agree.
+        assert_eq!(map.display_offsets, vec![0, 2, 3, 4]);
+        assert_eq!(map.byte_for_source(3), 3);
+        assert_eq!(map.source_for_display(2), 4);
+        assert_eq!(map.byte_for_source(5), 4);
+    }
+
+    #[test]
+    fn concealing_leaves_code_and_unclosed_markers_alone() {
+        let map = conceal_text("`a**b**` and **c**", true, false);
+        assert_eq!(map.display.iter().collect::<String>(), "a**b** and c");
+        let map = conceal_text("2 * 3 * 4", true, false);
+        assert_eq!(map.display.iter().collect::<String>(), "2 * 3 * 4");
+        let map = conceal_text("[[Note]] and ![[shot.png]]", true, false);
+        assert_eq!(map.display.iter().collect::<String>(), "Note and shot.png");
+    }
+
+    #[test]
+    fn wrapped_rows_cover_every_source_column_once() {
+        let text = "a **bold** b";
+        let map = conceal_text(text, true, false);
+        let source_len = text.chars().count();
+        // Two display rows split inside the hidden markers.
+        let spans = row_source_spans(&[(0, 4), (4, 8)], &map, source_len);
+        assert_eq!(spans.first().map(|span| span.0), Some(0));
+        assert_eq!(spans.last().map(|span| span.1), Some(source_len));
+        for pair in spans.windows(2) {
+            assert_eq!(pair[0].1, pair[1].0);
+        }
+    }
+
+    #[test]
+    fn prose_edits_keep_the_heading_cache_valid() {
+        let old = "# One\n\nsome prose here\n";
+        assert!(headings_unchanged(old, "# One\n\nsome proze here\n"));
+        // A newline shifts every following heading line.
+        assert!(!headings_unchanged(old, "# One\n\nsome\nprose here\n"));
+        // Editing the heading itself must re-parse.
+        assert!(!headings_unchanged(old, "# Two\n\nsome prose here\n"));
+        // A fence marker changes block state.
+        assert!(!headings_unchanged(old, "# One\n\n``` prose here\n"));
+        assert!(!headings_unchanged(old, "# One\n\n== prose here\n"));
+    }
+
+    #[test]
+    fn a_moved_block_keeps_the_caret_on_the_same_line() {
+        let text = "# A\n\nline one\nline two\n\n# B\n";
+        let cursor = text.find("line two").unwrap() + "line two".len();
+        let edit = blocks::move_down(text, 3).expect("move");
+        let after = Buffer::from_text(&edit.text);
+        let caret = caret_after_block_edit(text, cursor, &edit, true);
+        let (line, col) = after.line_col_at(caret);
+        assert_eq!(after.line(line).trim_end().to_string(), "line two");
+        // The column inside the line is kept too.
+        assert_eq!(col, "line two".len());
+    }
+
+    #[test]
+    fn a_deleted_block_puts_the_caret_at_the_next_block() {
+        let text = "# A\n\nfirst\n\nsecond\n";
+        let cursor = text.find("first").unwrap();
+        let edit = blocks::delete(text, 2).expect("delete");
+        let after = Buffer::from_text(&edit.text);
+        let caret = caret_after_block_edit(text, cursor, &edit, false);
+        let (line, col) = after.line_col_at(caret);
+        assert_eq!(col, 0);
+        assert_eq!(after.line(line).trim_end().to_string(), "second");
+    }
+
+    #[test]
+    fn lists_continue_on_enter() {
+        assert_eq!(list_continuation("- item", 6).as_deref(), Some("- "));
+        assert_eq!(list_continuation("  - item", 8).as_deref(), Some("  - "));
+        assert_eq!(
+            list_continuation("- [x] done", 10).as_deref(),
+            Some("- [ ] ")
+        );
+        assert_eq!(list_continuation("3. three", 8).as_deref(), Some("4. "));
+        assert_eq!(list_continuation("1) one", 6).as_deref(), Some("2) "));
+        assert_eq!(list_continuation("> quote", 7).as_deref(), Some("> "));
+    }
+
+    #[test]
+    fn list_continuation_stops_where_it_should() {
+        // Plain text, an empty item, and a caret that is not at the end.
+        assert_eq!(list_continuation("plain text", 10), None);
+        assert_eq!(list_continuation("- ", 2), None);
+        assert_eq!(list_continuation("- item", 2), None);
+        assert_eq!(list_continuation("# heading", 9), None);
+    }
+
+    #[test]
+    fn display_math_blocks_span_their_lines() {
+        let blocks = display_math_blocks("before\n$$\na + b\n$$\nafter");
+        assert_eq!(
+            blocks,
+            vec![DisplayMathSource {
+                first_line: 1,
+                last_line: 3,
+                tex: "a + b".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn a_single_line_display_block_counts() {
+        let blocks = display_math_blocks("x\n$$e^{i\\pi}$$\n");
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].first_line, 1);
+        assert_eq!(blocks[0].last_line, 1);
+        assert_eq!(blocks[0].tex, "e^{i\\pi}");
+    }
+
+    #[test]
+    fn inline_math_is_not_a_block() {
+        assert!(display_math_blocks("a $x$ b\n$$\n").is_empty());
+        assert!(display_math_blocks("price $$ 5").is_empty());
+    }
+
+    #[test]
+    fn fenced_code_hides_its_dollars() {
+        let text = "```\n$$\nnot math\n$$\n```\n$$\ny = x\n$$";
+        let blocks = display_math_blocks(text);
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].first_line, 5);
+        assert_eq!(blocks[0].tex, "y = x");
+    }
+
+    #[test]
+    fn an_unclosed_block_stays_source() {
+        assert!(display_math_blocks("$$\nx + y\n").is_empty());
+    }
 
     #[test]
     fn a_selection_becomes_the_wikilink_alias() {

@@ -11,11 +11,13 @@ use std::io::Write as _;
 use std::path::PathBuf;
 use std::sync::{Mutex, MutexGuard};
 
+use dragonglass_core::assets::Attachments;
+use dragonglass_core::fingerprint::{self, DocumentFingerprint, SaveReport};
 use dragonglass_core::graph::{self, EdgeKind, Graph};
 use dragonglass_core::relations::{self, NoteRelations};
 use dragonglass_core::{
-    bookmarks, frontmatter, html, markdown, query, search, stats, storage, templates, tree,
-    vaultfs, NodeKind, Note, NoteRef, TreeNode, Vault,
+    bookmarks, config, drafts, find, frontmatter, html, markdown, query, resolve, search, stats,
+    storage, templates, tree, vaultfs, NodeKind, Note, NoteRef, TreeNode, Vault,
 };
 
 #[derive(Debug, thiserror::Error, uniffi::Error)]
@@ -164,6 +166,183 @@ pub struct MobileVault {
     state: Mutex<State>,
 }
 
+/// The identity of one version of a note on disk.
+#[derive(Debug, Clone, Copy, uniffi::Record)]
+pub struct FingerprintInfo {
+    pub size: u64,
+    /// Modification time in Unix milliseconds (0 when unknown).
+    pub modified_ms: u64,
+    pub content_hash: u64,
+}
+
+/// The result of a conflict-safe save.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct SaveReportInfo {
+    /// `saved`, `conflict` or `error`.
+    pub status: String,
+    pub fingerprint: Option<FingerprintInfo>,
+    /// Content hash of the version on disk when the save conflicted.
+    pub disk_hash: Option<u64>,
+    pub message: Option<String>,
+}
+
+/// A recovery draft for one note.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct DraftInfo {
+    pub text: String,
+    pub line: u32,
+    pub col: u32,
+    pub written_at_ms: u64,
+    pub base_hash: Option<u64>,
+}
+
+/// Reading typography, shared with the desktop reader.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct ReaderSettingsInfo {
+    pub body_size: u32,
+    pub measure: u32,
+    /// `sans`, `serif` or `mono`.
+    pub font: String,
+    /// Line height as a percentage of the body size (120–220).
+    pub line_height: u32,
+}
+
+fn fingerprint_info(info: DocumentFingerprint) -> FingerprintInfo {
+    let modified_ms = info
+        .modified
+        .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|elapsed| elapsed.as_millis() as u64)
+        .unwrap_or(0);
+    FingerprintInfo {
+        size: info.size,
+        modified_ms,
+        content_hash: info.content_hash,
+    }
+}
+
+fn now_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// One coloured run of the editor's markdown highlighting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum SyntaxKindInfo {
+    Heading,
+    Emphasis,
+    Code,
+    CodeBlock,
+    Link,
+    Markup,
+    Math,
+    Comment,
+}
+
+/// One highlighted span, in UTF-16 code units (what Android text fields index by).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Record)]
+pub struct SyntaxSpanInfo {
+    pub start: u32,
+    pub end: u32,
+    pub kind: SyntaxKindInfo,
+}
+
+/// Highlight a whole document for the editor: token kinds from `core::syntax`, merged into
+/// runs and with fenced code state tracked across lines. Offsets are UTF-16 code units.
+#[uniffi::export]
+pub fn syntax_spans(source: String) -> Vec<SyntaxSpanInfo> {
+    let spans = dragonglass_core::syntax::document_spans(&source);
+    if spans.is_empty() {
+        return Vec::new();
+    }
+
+    let mut offsets = Vec::with_capacity(source.chars().count() + 1);
+    let mut total = 0u32;
+    offsets.push(0);
+    for character in source.chars() {
+        total += character.len_utf16() as u32;
+        offsets.push(total);
+    }
+    let last = offsets.len() - 1;
+
+    spans
+        .into_iter()
+        .map(|span| SyntaxSpanInfo {
+            start: offsets[span.start.min(last)],
+            end: offsets[span.end.min(last)],
+            kind: match span.kind {
+                dragonglass_core::syntax::TokenKind::Heading => SyntaxKindInfo::Heading,
+                dragonglass_core::syntax::TokenKind::Emphasis => SyntaxKindInfo::Emphasis,
+                dragonglass_core::syntax::TokenKind::Code => SyntaxKindInfo::Code,
+                dragonglass_core::syntax::TokenKind::CodeBlock => SyntaxKindInfo::CodeBlock,
+                dragonglass_core::syntax::TokenKind::Link => SyntaxKindInfo::Link,
+                dragonglass_core::syntax::TokenKind::Markup => SyntaxKindInfo::Markup,
+                dragonglass_core::syntax::TokenKind::Math => SyntaxKindInfo::Math,
+                dragonglass_core::syntax::TokenKind::Comment => SyntaxKindInfo::Comment,
+                dragonglass_core::syntax::TokenKind::Text => SyntaxKindInfo::Emphasis,
+            },
+        })
+        .collect()
+}
+
+/// The shared sync state, so Android and iOS render one state machine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum SyncStateInfo {
+    Idle,
+    Dirty,
+    Syncing,
+    Conflict,
+    Error,
+}
+
+#[uniffi::export]
+pub fn sync_state(
+    changed: u32,
+    untracked: u32,
+    ahead: u32,
+    behind: u32,
+    conflicts: u32,
+    busy: bool,
+    failed: bool,
+) -> SyncStateInfo {
+    let snapshot = dragonglass_core::git::SyncSnapshot {
+        changed: changed as usize,
+        untracked: untracked as usize,
+        ahead: ahead as usize,
+        behind: behind as usize,
+        conflicts: conflicts as usize,
+    };
+    match dragonglass_core::git::SyncState::of(snapshot, busy, failed) {
+        dragonglass_core::git::SyncState::Idle => SyncStateInfo::Idle,
+        dragonglass_core::git::SyncState::Dirty => SyncStateInfo::Dirty,
+        dragonglass_core::git::SyncState::Syncing => SyncStateInfo::Syncing,
+        dragonglass_core::git::SyncState::Conflict => SyncStateInfo::Conflict,
+        dragonglass_core::git::SyncState::Error => SyncStateInfo::Error,
+    }
+}
+
+/// The 1-based source line a `#Heading` or `#^block` fragment points at, if present.
+#[uniffi::export]
+pub fn resolve_link_fragment(source: String, fragment: String) -> Option<u32> {
+    let fragment = fragment.trim().trim_start_matches('#').trim();
+    if fragment.is_empty() {
+        return None;
+    }
+    if let Some(id) = fragment.strip_prefix('^') {
+        let marker = format!("^{id}");
+        return source
+            .lines()
+            .position(|line| line.trim_end().ends_with(&marker))
+            .map(|index| index as u32 + 1);
+    }
+    let wanted = fragment.to_lowercase();
+    markdown::headings(&source)
+        .into_iter()
+        .find(|heading| heading.text.trim().to_lowercase() == wanted)
+        .map(|heading| heading.line as u32)
+}
+
 #[uniffi::export]
 impl MobileVault {
     /// Open an existing directory of markdown notes. Mobile apps normally pass their
@@ -223,6 +402,166 @@ impl MobileVault {
         let mut rows = Vec::new();
         flatten_tree(&tree, 0, &mut rows);
         rows
+    }
+
+    /// Resolve a wikilink or relation target (path, stem, slug or frontmatter alias) to a
+    /// vault-relative note path.
+    pub fn resolve_target(&self, target: String) -> Option<String> {
+        let Ok(state) = self.lock() else {
+            return None;
+        };
+        let index = resolve::NoteIndex::new(&state.notes);
+        index
+            .resolve_relative(&target)
+            .map(|relative| relative.to_string())
+    }
+
+    /// Notes whose frontmatter property `key` equals `value` (case-insensitive).
+    pub fn filter_by_property(&self, key: String, value: String) -> Vec<NoteSummary> {
+        let Ok(state) = self.lock() else {
+            return Vec::new();
+        };
+        let filter = query::Query {
+            filters: vec![(key, value)],
+            ..query::Query::default()
+        };
+        query::run_query(&state.notes, &filter)
+            .into_iter()
+            .map(|row| NoteSummary {
+                relative: row.relative,
+                title: row.title,
+            })
+            .collect()
+    }
+
+    /// Fingerprint a note on disk, for a later conflict-safe save.
+    pub fn document_fingerprint(&self, relative: String) -> Result<FingerprintInfo, MobileError> {
+        let path = self.readable_path(&relative)?;
+        Ok(fingerprint_info(DocumentFingerprint::of_path(&path)?))
+    }
+
+    /// Save a note only if its content still hashes to `expected_hash`.
+    ///
+    /// `expected_hash = None` means "no baseline" and writes. A conflict leaves the disk
+    /// version untouched and reports its hash so the app can offer Reload / Keep mine.
+    pub fn save_document_with_fingerprint(
+        &self,
+        relative: String,
+        text: String,
+        expected_hash: Option<u64>,
+    ) -> SaveReportInfo {
+        let path = match self.writable_path(&relative) {
+            Ok(path) => path,
+            Err(error) => {
+                return SaveReportInfo {
+                    status: "error".to_string(),
+                    fingerprint: None,
+                    disk_hash: None,
+                    message: Some(error.to_string()),
+                };
+            }
+        };
+        let expected = expected_hash.map(|content_hash| DocumentFingerprint {
+            size: 0,
+            modified: None,
+            content_hash,
+        });
+        match fingerprint::save_if_unchanged(&path, &text, expected.as_ref()) {
+            SaveReport::Saved { fingerprint } => {
+                let _ = self.refresh();
+                SaveReportInfo {
+                    status: "saved".to_string(),
+                    fingerprint: Some(fingerprint_info(fingerprint)),
+                    disk_hash: None,
+                    message: None,
+                }
+            }
+            SaveReport::Conflict { disk } => SaveReportInfo {
+                status: "conflict".to_string(),
+                fingerprint: None,
+                disk_hash: disk.map(|fingerprint| fingerprint.content_hash),
+                message: None,
+            },
+            SaveReport::Error { message } => SaveReportInfo {
+                status: "error".to_string(),
+                fingerprint: None,
+                disk_hash: None,
+                message: Some(message),
+            },
+        }
+    }
+
+    /// Write a recovery draft for a note (call from an idle/lifecycle hook).
+    pub fn save_draft(
+        &self,
+        relative: String,
+        text: String,
+        line: u32,
+        col: u32,
+    ) -> Result<(), MobileError> {
+        let base = self
+            .readable_path(&relative)
+            .ok()
+            .and_then(|path| DocumentFingerprint::of_path(&path).ok())
+            .map(|fingerprint| fingerprint.content_hash);
+        drafts::save(
+            &self.root,
+            &drafts::Draft {
+                note: relative,
+                line: line as usize,
+                col: col as usize,
+                at: now_millis(),
+                base,
+                text,
+            },
+        )?;
+        Ok(())
+    }
+
+    /// The draft for a note, if one is newer than what the app last saw.
+    pub fn load_draft(&self, relative: String) -> Option<DraftInfo> {
+        drafts::load(&self.root, &relative).map(|draft| DraftInfo {
+            text: draft.text,
+            line: draft.line as u32,
+            col: draft.col as u32,
+            written_at_ms: draft.at,
+            base_hash: draft.base,
+        })
+    }
+
+    pub fn discard_draft(&self, relative: String) {
+        drafts::discard(&self.root, &relative);
+    }
+
+    /// Reading typography from the vault config.
+    pub fn reader_settings(&self) -> ReaderSettingsInfo {
+        let config = config::load(&self.root);
+        ReaderSettingsInfo {
+            body_size: config.reader_size as u32,
+            measure: config.reader_width as u32,
+            font: config.reader_font,
+            line_height: config.reader_line_height as u32,
+        }
+    }
+
+    pub fn set_reader_settings(
+        &self,
+        body_size: u32,
+        measure: u32,
+        font: String,
+        line_height: u32,
+    ) -> Result<(), MobileError> {
+        let mut config = config::load(&self.root);
+        config.reader_size = body_size.clamp(11, 24) as u16;
+        config.reader_width = measure.clamp(480, 1200) as u16;
+        config.reader_line_height = line_height.clamp(120, 220) as u16;
+        config.reader_font = match font.to_lowercase().as_str() {
+            "sans" => "sans".to_string(),
+            "mono" => "mono".to_string(),
+            _ => "serif".to_string(),
+        };
+        config::save(&self.root, &config)?;
+        Ok(())
     }
 
     pub fn note_source(&self, relative: String) -> Result<String, MobileError> {
@@ -670,13 +1009,73 @@ pub fn properties(source: String) -> Vec<PropertyInfo> {
 /// Render markdown to a complete HTML document, including the engine's export CSS.
 #[uniffi::export]
 pub fn render_html(source: String) -> String {
-    let body = html::render_body(&source);
+    wrap_html(html::render_body(&source))
+}
+
+/// Render markdown with the vault's attachment index, so `![[shot.png]]` resolves to a
+/// subfolder path the WebView can load relative to the vault root.
+#[uniffi::export]
+pub fn render_html_from_vault(source: String, root: String) -> String {
+    let index = Attachments::index(std::path::Path::new(&root));
+    let body = html::render_body_with(&source, Some(&index), &mut Vec::new());
+    wrap_html(body)
+}
+
+fn wrap_html(body: String) -> String {
     format!(
         "<!doctype html><html><head><meta charset=\"utf-8\">\
          <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
          <style>{}</style></head><body>{body}</body></html>",
         html::STYLE
     )
+}
+
+/// One in-note find match, in UTF-16 code units (what Android text fields index by).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Record)]
+pub struct FindRange {
+    pub start: u32,
+    pub end: u32,
+}
+
+/// Find matches in `source` with the engine's finder: literal or regex, case and whole-word
+/// options. Offsets are UTF-16 code units so Kotlin can use them for a text selection.
+#[uniffi::export]
+pub fn find_in_text(
+    source: String,
+    pattern: String,
+    regex: bool,
+    case_sensitive: bool,
+    whole_word: bool,
+) -> Vec<FindRange> {
+    let options = find::Options {
+        regex,
+        case_sensitive,
+        whole_word,
+    };
+    let Ok(matches) = find::find_all(&source, &pattern, options) else {
+        return Vec::new();
+    };
+    if matches.is_empty() {
+        return Vec::new();
+    }
+
+    // Character index -> UTF-16 offset, once for the whole document.
+    let mut offsets = Vec::with_capacity(source.chars().count() + 1);
+    let mut total = 0u32;
+    offsets.push(0);
+    for character in source.chars() {
+        total += character.len_utf16() as u32;
+        offsets.push(total);
+    }
+
+    let last = offsets.len() - 1;
+    matches
+        .into_iter()
+        .map(|found| FindRange {
+            start: offsets[found.range.start.min(last)],
+            end: offsets[found.range.end.min(last)],
+        })
+        .collect()
 }
 
 /// Word/character counts for the current document.
@@ -701,6 +1100,176 @@ pub fn engine_version() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn find_offsets_are_utf16_units() {
+        // The emoji is two UTF-16 units, so the second match starts at 5, not 4.
+        let found = find_in_text("a😀b a".to_string(), "a".to_string(), false, true, false);
+        assert_eq!(
+            found,
+            vec![
+                FindRange { start: 0, end: 1 },
+                FindRange { start: 5, end: 6 }
+            ]
+        );
+    }
+
+    #[test]
+    fn find_honours_options_and_bad_patterns() {
+        assert_eq!(
+            find_in_text(
+                "Beta beta".to_string(),
+                "beta".to_string(),
+                false,
+                true,
+                false
+            )
+            .len(),
+            1
+        );
+        assert_eq!(
+            find_in_text("a1 b2".to_string(), r"\d".to_string(), true, false, false).len(),
+            2
+        );
+        assert!(find_in_text("a".to_string(), "(".to_string(), true, false, false).is_empty());
+    }
+
+    #[test]
+    fn property_filters_and_targets_resolve() {
+        let root = temp_vault("filter");
+        fs::write(
+            root.join("a.md"),
+            "---\nstatus: done\ntitle: Alpha\n---\n# A\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("b.md"),
+            "---\nstatus: todo\nslug: beta-slug\n---\n# B\n",
+        )
+        .unwrap();
+        let vault = MobileVault::open(root.to_string_lossy().to_string()).unwrap();
+
+        let done = vault.filter_by_property("status".to_string(), "done".to_string());
+        assert_eq!(done.len(), 1);
+        assert_eq!(done[0].relative, "a.md");
+        assert!(vault
+            .filter_by_property("status".to_string(), "missing".to_string())
+            .is_empty());
+
+        assert_eq!(
+            vault.resolve_target("beta-slug".to_string()).as_deref(),
+            Some("b.md")
+        );
+        assert_eq!(vault.resolve_target("nope".to_string()), None);
+    }
+
+    #[test]
+    fn syntax_offsets_are_utf16_units() {
+        // The emoji is two UTF-16 units, so the `**` after it starts at 4, not 3.
+        let spans = syntax_spans("x😀 **b**\n".to_string());
+        let emphasis: Vec<&SyntaxSpanInfo> = spans
+            .iter()
+            .filter(|span| span.kind == SyntaxKindInfo::Emphasis)
+            .collect();
+        assert_eq!(emphasis.len(), 2);
+        assert_eq!((emphasis[0].start, emphasis[0].end), (4, 6));
+        assert!(syntax_spans("plain".to_string()).is_empty());
+    }
+
+    #[test]
+    fn link_fragments_resolve_headings_and_blocks() {
+        let source = "# One\ntext\n## Sub\nbody ^note-1\n";
+        assert_eq!(
+            resolve_link_fragment(source.to_string(), "One".to_string()),
+            Some(1)
+        );
+        assert_eq!(
+            resolve_link_fragment(source.to_string(), "#sub".to_string()),
+            Some(3)
+        );
+        assert_eq!(
+            resolve_link_fragment(source.to_string(), "^note-1".to_string()),
+            Some(4)
+        );
+        assert_eq!(
+            resolve_link_fragment(source.to_string(), "Nope".to_string()),
+            None
+        );
+    }
+
+    #[test]
+    fn a_fingerprinted_save_detects_an_external_edit() {
+        let root = temp_vault("fingerprint");
+        fs::write(root.join("note.md"), "original").unwrap();
+        let vault = MobileVault::open(root.to_string_lossy().to_string()).unwrap();
+        let loaded = vault.document_fingerprint("note.md".to_string()).unwrap();
+
+        let saved = vault.save_document_with_fingerprint(
+            "note.md".to_string(),
+            "mine".to_string(),
+            Some(loaded.content_hash),
+        );
+        assert_eq!(saved.status, "saved");
+        assert!(saved.fingerprint.is_some());
+
+        let stale = loaded.content_hash;
+        fs::write(root.join("note.md"), "someone else").unwrap();
+        let conflicted = vault.save_document_with_fingerprint(
+            "note.md".to_string(),
+            "mine again".to_string(),
+            Some(stale),
+        );
+        assert_eq!(conflicted.status, "conflict");
+        assert!(conflicted.disk_hash.is_some());
+        assert_eq!(
+            fs::read_to_string(root.join("note.md")).unwrap(),
+            "someone else"
+        );
+    }
+
+    #[test]
+    fn drafts_roundtrip_through_the_vault() {
+        let root = temp_vault("drafts");
+        fs::write(root.join("note.md"), "body").unwrap();
+        let vault = MobileVault::open(root.to_string_lossy().to_string()).unwrap();
+        vault
+            .save_draft("note.md".to_string(), "typed text".to_string(), 3, 0)
+            .unwrap();
+        let draft = vault.load_draft("note.md".to_string()).expect("draft");
+        assert_eq!(draft.text, "typed text");
+        assert_eq!(draft.line, 3);
+        assert!(draft.base_hash.is_some());
+        assert!(vault.load_draft("other.md".to_string()).is_none());
+        vault.discard_draft("note.md".to_string());
+        assert!(vault.load_draft("note.md".to_string()).is_none());
+    }
+
+    #[test]
+    fn reader_settings_roundtrip_and_clamp() {
+        let root = temp_vault("reader");
+        let vault = MobileVault::open(root.to_string_lossy().to_string()).unwrap();
+        let default = vault.reader_settings();
+        assert_eq!(default.body_size, 15);
+        assert_eq!(default.measure, 780);
+        assert_eq!(default.font, "serif");
+        assert_eq!(default.line_height, 150);
+        vault
+            .set_reader_settings(18, 900, "mono".to_string(), 180)
+            .unwrap();
+        let loaded = vault.reader_settings();
+        assert_eq!(loaded.body_size, 18);
+        assert_eq!(loaded.measure, 900);
+        assert_eq!(loaded.font, "mono");
+        assert_eq!(loaded.line_height, 180);
+        vault
+            .set_reader_settings(1, 9999, "nonsense".to_string(), 999)
+            .unwrap();
+        let clamped = vault.reader_settings();
+        assert_eq!(clamped.body_size, 11);
+        assert_eq!(clamped.measure, 1200);
+        assert_eq!(clamped.font, "serif");
+        assert_eq!(clamped.line_height, 220);
+    }
 
     fn temp_vault(name: &str) -> PathBuf {
         let root = std::env::temp_dir().join(format!(

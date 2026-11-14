@@ -66,6 +66,87 @@ impl Render for MathTooltip {
     }
 }
 
+/// A small tooltip that says where a link goes.
+struct LinkTooltip {
+    label: String,
+}
+
+impl Render for LinkTooltip {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = *cx.global::<Theme>();
+        div()
+            .px_2()
+            .py_1()
+            .max_w(px(420.0))
+            .rounded_md()
+            .bg(theme.chip)
+            .border_1()
+            .border_color(theme.border)
+            .text_xs()
+            .text_color(theme.text)
+            .child(self.label.clone())
+    }
+}
+
+/// How a link target reads in its hover tooltip.
+fn link_tooltip_label(target: &str) -> String {
+    if let Some(id) = target.strip_prefix("#fn:") {
+        return format!("Footnote {id}");
+    }
+    if let Some(fragment) = target.strip_prefix('#') {
+        if let Some(block) = fragment.strip_prefix('^') {
+            return format!("Jump to block ^{block}");
+        }
+        return format!("Jump to #{fragment}");
+    }
+    if let Some(tag) = target.strip_prefix("tag:") {
+        return format!("Tag #{tag}");
+    }
+    if target.starts_with("http://")
+        || target.starts_with("https://")
+        || target.starts_with("mailto:")
+        || target.starts_with("tel:")
+        || target.starts_with("file://")
+    {
+        return target.to_string();
+    }
+    match target.split_once('#') {
+        Some((note, fragment)) => {
+            let note = if note.is_empty() {
+                "this note".to_string()
+            } else {
+                note.to_string()
+            };
+            if let Some(block) = fragment.trim().strip_prefix('^') {
+                format!("{note} → block ^{block}")
+            } else {
+                format!("{note} → #{fragment}")
+            }
+        }
+        None => format!("Note: {target}"),
+    }
+}
+
+/// Ask GPUI to show a link tooltip at the current mouse position.
+pub(crate) fn set_link_tooltip(
+    window: &mut Window,
+    cx: &mut App,
+    target: &str,
+    bounds: Bounds<Pixels>,
+) {
+    let view = cx.new(|_| LinkTooltip {
+        label: link_tooltip_label(target),
+    });
+    let view: AnyView = view.into();
+    window.set_tooltip(AnyTooltip {
+        view,
+        mouse_position: window.mouse_position(),
+        check_visible_and_update: Rc::new(move |_, window, _| {
+            bounds.contains(&window.mouse_position())
+        }),
+    });
+}
+
 /// Ask GPUI to show `tex` as a tooltip at the current mouse position.
 ///
 /// Called from `prepaint`, which is where `Window::set_tooltip` is allowed. While the pointer
@@ -475,4 +556,31 @@ fn build_path(
         return None;
     }
     builder.build().ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn link_tooltips_name_their_target() {
+        assert_eq!(
+            link_tooltip_label("https://example.com"),
+            "https://example.com"
+        );
+        assert_eq!(link_tooltip_label("mailto:a@b.c"), "mailto:a@b.c");
+        assert_eq!(link_tooltip_label("Daily"), "Note: Daily");
+        assert_eq!(
+            link_tooltip_label("Notes/Page#Intro"),
+            "Notes/Page → #Intro"
+        );
+        assert_eq!(
+            link_tooltip_label("Notes/Page#^block-1"),
+            "Notes/Page → block ^block-1"
+        );
+        assert_eq!(link_tooltip_label("#Local"), "Jump to #Local");
+        assert_eq!(link_tooltip_label("#^block-1"), "Jump to block ^block-1");
+        assert_eq!(link_tooltip_label("#fn:3"), "Footnote 3");
+        assert_eq!(link_tooltip_label("tag:project"), "Tag #project");
+    }
 }

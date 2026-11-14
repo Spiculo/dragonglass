@@ -4,14 +4,17 @@
 //! Inline text goes through `dragonglass_core::inline`, so emphasis, code, links, math
 //! and highlights all render inside paragraphs, list items, headings and table cells.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::Arc;
+use std::time::SystemTime;
 
 use dragonglass_core::assets::Attachments;
+use dragonglass_core::find as find_engine;
 use dragonglass_core::frontmatter::{self, Property};
 use dragonglass_core::inline;
 use dragonglass_core::markdown::{self, Align, Block};
@@ -20,11 +23,12 @@ use dragonglass_core::shared;
 use dragonglass_core::syntax;
 
 use gpui::{
-    div, fill, img, list, point, prelude::*, px, relative, AnyElement, App, Bounds, CursorStyle,
-    DispatchPhase, Element, ElementId, Entity, FontStyle, GlobalElementId, Hitbox, HitboxBehavior,
-    InspectorElementId, IntoElement, LayoutId, ListAlignment, ListState, MouseButton,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point, StrikethroughStyle,
-    StyledText, TextLayout, TextRun, UnderlineStyle, Window,
+    anchored, div, fill, img, list, point, prelude::*, px, relative, AnyElement, App, Bounds,
+    ClipboardItem, Corner, CursorStyle, DispatchPhase, Element, ElementId, Entity, FontStyle,
+    GlobalElementId, Hitbox, HitboxBehavior, InspectorElementId, IntoElement, LayoutId,
+    ListAlignment, ListState, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad,
+    Pixels, Point, RenderImage, StrikethroughStyle, StyledText, TextLayout, TextRun,
+    UnderlineStyle, Window,
 };
 
 use crate::flow::{FlowContent, FlowKind, FlowPiece, FlowText};
@@ -41,11 +45,133 @@ pub type LinkOpener = Rc<dyn Fn(&str, &mut Window, &mut App)>;
 /// Called when a heading's fold chevron is clicked. The index is the heading's block.
 pub type FoldToggle = Rc<dyn Fn(usize, &mut Window, &mut App)>;
 
+/// Typography for the reading view, stored as a GPUI global so open readers pick up a
+/// change on the next frame.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ReaderSettings {
+    /// Body text size in points.
+    pub body_size: f32,
+    /// Maximum width of the reading column, in pixels.
+    pub measure: f32,
+    /// Line height as a multiple of the body size.
+    pub line_height: f32,
+    /// Reading typeface.
+    pub font: ReaderFont,
+}
+
+/// Reading typefaces. `Sans` keeps the application's UI font.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ReaderFont {
+    #[default]
+    Sans,
+    Serif,
+    Mono,
+}
+
+impl ReaderFont {
+    /// The family to apply, or `None` to keep the template's own family.
+    pub fn family(self) -> Option<&'static str> {
+        match self {
+            ReaderFont::Sans => None,
+            ReaderFont::Serif => Some("Georgia"),
+            ReaderFont::Mono => Some("Menlo"),
+        }
+    }
+
+    pub fn from_name(name: &str) -> Self {
+        match name.to_lowercase().as_str() {
+            "serif" => ReaderFont::Serif,
+            "mono" => ReaderFont::Mono,
+            _ => ReaderFont::Sans,
+        }
+    }
+}
+
+impl Default for ReaderSettings {
+    fn default() -> Self {
+        Self {
+            body_size: 15.0,
+            measure: 780.0,
+            line_height: 1.5,
+            font: ReaderFont::Sans,
+        }
+    }
+}
+
+impl gpui::Global for ReaderSettings {}
+
+/// Zen mode's reading focus: dim paragraphs outside the current section.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FocusMode(pub bool);
+
+impl gpui::Global for FocusMode {}
+
+/// Writes text to the clipboard for the reading view's copy buttons.
+pub type CopyHandler = Rc<dyn Fn(&str, &mut Window, &mut App)>;
+
+/// Opens an image in the reading lightbox.
+pub type ImageOpener = Rc<dyn Fn(&str, &mut Window, &mut App)>;
+
+/// Opens a non-image attachment with the operating system's default application.
+pub type FileOpener = Rc<dyn Fn(&str, &mut Window, &mut App)>;
+
 /// A point in the reading view: a block and a byte offset into its display text.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ReadPoint {
     pub block: usize,
     pub offset: usize,
+}
+
+/// One in-page find hit: a block and a byte range in its display text.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReadingMatch {
+    pub block: usize,
+    pub range: Range<usize>,
+}
+
+/// The reading view's own find state. It searches block display text, so the note is never
+/// touched and the mode never changes.
+#[derive(Clone, Debug)]
+struct ReadingFind {
+    open: bool,
+    pattern: String,
+    options: find_engine::Options,
+    matches: Vec<ReadingMatch>,
+    current: usize,
+    error: Option<String>,
+    /// Top block when the bar opened, restored by Escape.
+    return_block: usize,
+}
+
+impl Default for ReadingFind {
+    fn default() -> Self {
+        Self {
+            open: false,
+            pattern: String::new(),
+            options: find_engine::Options {
+                regex: false,
+                case_sensitive: false,
+                whole_word: false,
+            },
+            matches: Vec::new(),
+            current: 0,
+            error: None,
+            return_block: 0,
+        }
+    }
+}
+
+/// A keyboard motion that extends the reading selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SelectionMotion {
+    Left,
+    Right,
+    Up,
+    Down,
+    LineStart,
+    LineEnd,
+    DocumentStart,
+    DocumentEnd,
 }
 
 /// Character-level selection shared by every text piece in the reading view.
@@ -92,6 +218,19 @@ pub struct SelectionStats {
 }
 
 /// Everything a block needs to render, threaded through the recursive embed renderer.
+/// A parsed transcluded note, keyed by path and fragment and revalidated by mtime.
+struct EmbeddedNote {
+    modified: Option<SystemTime>,
+    blocks: Rc<Vec<Block>>,
+}
+
+type EmbedCache = Rc<RefCell<HashMap<(PathBuf, Option<String>), EmbeddedNote>>>;
+
+/// Typeset formulas, keyed by TeX source and style.
+type MathScenes = HashMap<(String, MathStyle), Rc<MathScene>>;
+/// Formulas typeset for embedded notes, filled lazily during render.
+type EmbedMath = Rc<RefCell<MathScenes>>;
+
 struct RenderCtx<'a> {
     vault_root: Option<&'a Path>,
     attachments: Option<&'a Attachments>,
@@ -103,11 +242,35 @@ struct RenderCtx<'a> {
     folded: &'a HashSet<usize>,
     /// Called with a heading's block index when its fold chevron is clicked.
     on_fold: Option<&'a FoldToggle>,
+    /// Copies text to the clipboard (code fences have a copy button).
+    copy: Option<&'a CopyHandler>,
+    /// In-page find, so matches can be painted behind the text.
+    find: Option<&'a ReadingFind>,
+    /// Opens a clicked image in the lightbox.
+    on_image: Option<&'a ImageOpener>,
+    /// Opens a PDF/audio/video attachment with the OS.
+    open_file: Option<&'a FileOpener>,
+    /// Parsed embedded notes, cached by path and mtime.
+    embeds: Option<&'a EmbedCache>,
+    /// Formulas typeset for embedded notes, filled lazily.
+    embed_math: Option<&'a EmbedMath>,
+    /// Allocator for synthetic block ids inside embeds.
+    next_block: Option<&'a Cell<usize>>,
+    /// The reading list, so dragging past the viewport can scroll it.
+    list_state: Option<&'a ListState>,
+    /// How many blocks the list holds, to clamp drag auto-scroll.
+    block_count: usize,
     /// All blocks, so a heading can tell whether it has a nested section.
     blocks: &'a [Block],
     depth: usize,
     theme: Theme,
     template: &'a TextRun,
+    /// Body text size for this reader.
+    body_size: f32,
+    /// Maximum width of the reading column.
+    measure: f32,
+    /// Line height as a multiple of the body size.
+    line_height: f32,
 }
 
 /// One place a footnote is referenced, used by the footnote picker.
@@ -124,6 +287,10 @@ pub(crate) struct FootnotePopup {
     refs: Rc<RefCell<HashMap<String, Vec<FootnoteRef>>>>,
     defs: Rc<RefCell<HashMap<String, usize>>>,
     list_state: ListState,
+    /// Asking the reader to unfold whatever hides a block before scrolling to it.
+    reveal: Rc<RefCell<Option<usize>>>,
+    /// Window position of the reference that opened the popup, so it can sit beside it.
+    anchor: Option<Point<Pixels>>,
     open: Option<(String, Vec<FootnoteRef>, Option<usize>)>,
 }
 
@@ -132,12 +299,15 @@ impl FootnotePopup {
         refs: Rc<RefCell<HashMap<String, Vec<FootnoteRef>>>>,
         defs: Rc<RefCell<HashMap<String, usize>>>,
         list_state: ListState,
+        reveal: Rc<RefCell<Option<usize>>>,
     ) -> Self {
         Self {
             title: "This note".to_string(),
             refs,
             defs,
             list_state,
+            reveal,
+            anchor: None,
             open: None,
         }
     }
@@ -151,14 +321,25 @@ impl FootnotePopup {
         }
     }
 
-    fn show(&mut self, id: &str) {
+    /// Open the popup for `id`, anchored at the clicked reference in window coordinates.
+    fn show_at(&mut self, id: &str, anchor: Option<Point<Pixels>>) {
         let refs = self.refs.borrow().get(id).cloned().unwrap_or_default();
         let definition = self.defs.borrow().get(id).copied();
+        self.anchor = anchor;
         self.open = Some((id.to_string(), refs, definition));
+    }
+
+    fn anchor(&self) -> Option<Point<Pixels>> {
+        self.anchor
     }
 
     fn close(&mut self) {
         self.open = None;
+        self.anchor = None;
+    }
+
+    fn is_open(&self) -> bool {
+        self.open.is_some()
     }
 }
 
@@ -223,6 +404,7 @@ impl Render for FootnotePopup {
             let snippet = reference.snippet.clone();
             let title = title.clone();
             let state = this.clone();
+            let reveal = self.reveal.clone();
             let list_state = self.list_state.clone();
             panel = panel.child(
                 div()
@@ -238,7 +420,10 @@ impl Render for FootnotePopup {
                     .child(div().child(format!("Title: {title}")))
                     .child(div().text_xs().text_color(theme.muted).child(snippet))
                     .on_mouse_down(MouseButton::Left, move |_ev, window, cx| {
+                        // Scroll now when the target is visible; the reader unfolds and
+                        // scrolls again on the next render when a fold hides it.
                         list_state.scroll_to_reveal_item(block);
+                        *reveal.borrow_mut() = Some(block);
                         if let Some(this) = state.upgrade() {
                             this.update(cx, |this, cx| {
                                 this.close();
@@ -253,6 +438,7 @@ impl Render for FootnotePopup {
         if let Some(block) = definition {
             let block = *block;
             let state = this.clone();
+            let reveal = self.reveal.clone();
             let list_state = self.list_state.clone();
             panel = panel.child(
                 div()
@@ -265,7 +451,10 @@ impl Render for FootnotePopup {
                     .hover(move |style| style.bg(theme.hover))
                     .child("Go to footnote definition")
                     .on_mouse_down(MouseButton::Left, move |_ev, window, cx| {
+                        // Scroll now when the target is visible; the reader unfolds and
+                        // scrolls again on the next render when a fold hides it.
                         list_state.scroll_to_reveal_item(block);
+                        *reveal.borrow_mut() = Some(block);
                         if let Some(this) = state.upgrade() {
                             this.update(cx, |this, cx| {
                                 this.close();
@@ -351,6 +540,24 @@ pub struct ReadingCache {
     footnote_popup: Option<Entity<FootnotePopup>>,
     /// Heading blocks whose sections are folded.
     folded: HashSet<usize>,
+    /// Folds restored from a session, applied when the document is parsed.
+    pending_folds: Option<HashSet<usize>>,
+    /// Source lines for each block, so the editor can map caret ↔ reader.
+    spans: Rc<Vec<markdown::BlockSpan>>,
+    /// False when shared-block expansion rewrote the text, which moves the spans away
+    /// from the buffer's own line numbers.
+    spans_valid: bool,
+    /// In-page find over block display text. `Rc` so the virtualized list can borrow it
+    /// without copying the match list every frame.
+    find: Rc<ReadingFind>,
+    /// Image shown in the lightbox overlay, if any.
+    lightbox: Rc<RefCell<Option<PathBuf>>>,
+    /// A block a popup asked the reader to reveal on the next render.
+    reveal_block: Rc<RefCell<Option<usize>>>,
+    /// Parsed transcluded notes, revalidated by modification time.
+    embeds: EmbedCache,
+    /// Formulas typeset for transcluded notes.
+    embed_math: EmbedMath,
 }
 
 impl ReadingCache {
@@ -367,9 +574,32 @@ impl ReadingCache {
             metadata: None,
             footnote_refs: Rc::new(RefCell::new(HashMap::new())),
             footnote_defs: Rc::new(RefCell::new(HashMap::new())),
+            spans: Rc::new(Vec::new()),
+            spans_valid: false,
+            find: Rc::new(ReadingFind::default()),
+            lightbox: Rc::new(RefCell::new(None)),
+            reveal_block: Rc::new(RefCell::new(None)),
+            embeds: Rc::new(RefCell::new(HashMap::new())),
+            embed_math: Rc::new(RefCell::new(HashMap::new())),
             footnote_popup: None,
             folded: HashSet::new(),
+            pending_folds: None,
         }
+    }
+
+    /// Heading indices folded in the reading view, for the session.
+    pub fn reading_folds(&self) -> Vec<usize> {
+        let mut folds: Vec<usize> = self.folded.iter().copied().collect();
+        folds.sort_unstable();
+        folds
+    }
+
+    /// Restore reading folds from a session. They take effect once the document parses,
+    /// because a new note clears the current set.
+    pub fn set_reading_folds(&mut self, folds: &[usize]) {
+        let folds: HashSet<usize> = folds.iter().copied().collect();
+        self.folded = folds.clone();
+        self.pending_folds = Some(folds);
     }
 
     /// Fold or unfold the section under a heading block.
@@ -406,12 +636,17 @@ impl ReadingCache {
         if self.version.0 != version.0 {
             self.folded.clear();
         }
+        if let Some(folds) = self.pending_folds.take() {
+            self.folded = folds;
+        }
 
+        let original = source.to_string();
         let source = match root {
             Some(root) => shared::expand(source, root),
             None => source.to_string(),
         };
-        let blocks = markdown::parse_blocks(&source);
+        let spans_valid = source == original;
+        let (blocks, spans) = markdown::parse_blocks_spanned(&source);
         self.properties = frontmatter::display_properties(&source);
 
         // Typeset every formula once per document version. Scenes are in em, so the painter
@@ -468,7 +703,183 @@ impl ReadingCache {
 
         self.selection.borrow_mut().clear();
         self.blocks = Rc::new(blocks);
+        self.spans = Rc::new(spans);
+        self.spans_valid = spans_valid;
         self.version = version;
+    }
+
+    /// The block that owns `line` (0-based), or the nearest block above it.
+    pub fn block_for_line(&self, line: usize) -> Option<usize> {
+        if !self.spans_valid {
+            return None;
+        }
+        let mut fallback = None;
+        for (index, span) in self.spans.iter().enumerate() {
+            if span.first_line <= line && line <= span.last_line {
+                return Some(index);
+            }
+            if span.first_line <= line {
+                fallback = Some(index);
+            }
+        }
+        fallback.or_else(|| (!self.blocks.is_empty()).then_some(0))
+    }
+
+    /// The first source line of a block, 0-based.
+    pub fn block_start_line(&self, index: usize) -> Option<usize> {
+        if !self.spans_valid {
+            return None;
+        }
+        self.spans.get(index).map(|span| span.first_line)
+    }
+
+    /// The first source line of the top visible block.
+    pub fn top_block_line(&self) -> Option<usize> {
+        self.block_start_line(self.top_block())
+    }
+
+    /// Close the image lightbox. Returns whether one was open.
+    pub fn close_lightbox(&mut self) -> bool {
+        self.lightbox.borrow_mut().take().is_some()
+    }
+
+    pub fn find_open(&self) -> bool {
+        self.find.open
+    }
+
+    pub fn find_pattern(&self) -> &str {
+        &self.find.pattern
+    }
+
+    pub fn find_error(&self) -> Option<&str> {
+        self.find.error.as_deref()
+    }
+
+    /// `(current, total)`, both 0 when there are no matches.
+    pub fn find_position(&self) -> (usize, usize) {
+        if self.find.matches.is_empty() {
+            (0, 0)
+        } else {
+            (self.find.current + 1, self.find.matches.len())
+        }
+    }
+
+    /// Start (or focus) in-page find, remembering where to return on Escape.
+    pub fn open_find(&mut self) {
+        let return_block = self.top_block();
+        let find = Rc::make_mut(&mut self.find);
+        find.return_block = return_block;
+        find.open = true;
+        self.recompute_find();
+    }
+
+    /// Close the bar and put the reader back where it was.
+    pub fn close_find(&mut self) {
+        let return_block = Rc::make_mut(&mut self.find).return_block;
+        Rc::make_mut(&mut self.find).open = false;
+        if !self.blocks.is_empty() {
+            let target = return_block.min(self.blocks.len().saturating_sub(1));
+            self.list_state.scroll_to_reveal_item(target);
+        }
+    }
+
+    pub fn find_append(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        Rc::make_mut(&mut self.find).pattern.push_str(text);
+        self.recompute_find();
+    }
+
+    pub fn find_backspace(&mut self) {
+        Rc::make_mut(&mut self.find).pattern.pop();
+        self.recompute_find();
+    }
+
+    pub fn find_toggle_regex(&mut self) {
+        let find = Rc::make_mut(&mut self.find);
+        find.options.regex = !find.options.regex;
+        self.recompute_find();
+    }
+
+    pub fn find_toggle_case(&mut self) {
+        let find = Rc::make_mut(&mut self.find);
+        find.options.case_sensitive = !find.options.case_sensitive;
+        self.recompute_find();
+    }
+
+    pub fn find_toggle_word(&mut self) {
+        let find = Rc::make_mut(&mut self.find);
+        find.options.whole_word = !find.options.whole_word;
+        self.recompute_find();
+    }
+
+    pub fn find_options(&self) -> (bool, bool, bool) {
+        (
+            self.find.options.regex,
+            self.find.options.case_sensitive,
+            self.find.options.whole_word,
+        )
+    }
+
+    pub fn find_next(&mut self, backwards: bool) {
+        let block = {
+            let find = Rc::make_mut(&mut self.find);
+            if find.matches.is_empty() {
+                return;
+            }
+            let len = find.matches.len();
+            find.current = if backwards {
+                (find.current + len - 1) % len
+            } else {
+                (find.current + 1) % len
+            };
+            find.matches[find.current].block
+        };
+        self.list_state.scroll_to_reveal_item(block);
+    }
+
+    fn recompute_find(&mut self) {
+        let top = self.top_block();
+        let find = Rc::make_mut(&mut self.find);
+        find.matches.clear();
+        find.current = 0;
+        find.error = None;
+        if find.pattern.is_empty() {
+            return;
+        }
+
+        let options = find.options;
+        let pattern = find.pattern.clone();
+        'blocks: for (index, block) in self.blocks.iter().enumerate() {
+            let text = block_display(block);
+            match find_engine::find_all(&text, &pattern, options) {
+                Ok(found) => {
+                    for found in found {
+                        find.matches.push(ReadingMatch {
+                            block: index,
+                            range: found.range,
+                        });
+                        if find.matches.len() >= 1000 {
+                            break 'blocks;
+                        }
+                    }
+                }
+                Err(error) => {
+                    find.error = Some(error);
+                    find.matches.clear();
+                    return;
+                }
+            }
+        }
+
+        if let Some(first) = find.matches.iter().position(|found| found.block >= top) {
+            find.current = first;
+        }
+        if let Some(found) = find.matches.get(find.current) {
+            let block = found.block;
+            self.list_state.scroll_to_reveal_item(block);
+        }
     }
 
     /// The selected reading text, with blocks joined by newlines.
@@ -480,19 +891,29 @@ impl ReadingCache {
             if index < start.block || index > end.block {
                 continue;
             }
-            let text = block_display(block);
-            let from = if index == start.block {
-                start.offset.min(text.len())
+            if let Block::Embed {
+                target, fragment, ..
+            } = block
+            {
+                // A transcluded note contributes its own display text to a copy.
+                if let Some(embedded) = self.embedded_display_text(target, fragment.as_deref()) {
+                    out.push_str(&embedded);
+                }
             } else {
-                0
-            };
-            let to = if index == end.block {
-                end.offset.min(text.len())
-            } else {
-                text.len()
-            };
-            if from < to {
-                out.push_str(&text[from..to]);
+                let text = block_display(block);
+                let from = if index == start.block {
+                    start.offset.min(text.len())
+                } else {
+                    0
+                };
+                let to = if index == end.block {
+                    end.offset.min(text.len())
+                } else {
+                    text.len()
+                };
+                if from < to {
+                    out.push_str(&text[from..to]);
+                }
             }
             if index < end.block {
                 out.push('\n');
@@ -500,6 +921,41 @@ impl ReadingCache {
         }
 
         (!out.is_empty()).then_some(out)
+    }
+
+    /// The display text of a transcluded note or section, for copying a selection that
+    /// spans an embed.
+    fn embedded_display_text(&self, target: &str, fragment: Option<&str>) -> Option<String> {
+        let root = self.attachments_root.as_deref()?;
+        let path = resolve_note(root, self.attachments.as_deref(), target);
+        let key = (path.clone(), fragment.map(str::to_string));
+        let cached = self
+            .embeds
+            .borrow()
+            .get(&key)
+            .map(|entry| entry.blocks.clone());
+        let blocks = match cached {
+            Some(blocks) => blocks,
+            None => {
+                let text = std::fs::read_to_string(&path).ok()?;
+                let text = shared::expand(&text, root);
+                let (mut blocks, spans) = markdown::parse_blocks_spanned(&text);
+                blocks = match fragment {
+                    Some(fragment) if fragment.starts_with('^') => {
+                        vec![block_by_id(&blocks, &spans, &text, fragment)?]
+                    }
+                    Some(fragment) => section_blocks(blocks, fragment)?,
+                    None => blocks,
+                };
+                Rc::new(blocks)
+            }
+        };
+        let text = blocks
+            .iter()
+            .map(block_display)
+            .collect::<Vec<_>>()
+            .join("\n");
+        Some(text)
     }
 
     /// Select the whole document, for Ctrl+A in reading mode.
@@ -540,6 +996,326 @@ impl ReadingCache {
         selection.moved = true;
     }
 
+    /// Drop the reading selection. Returns whether there was one to drop.
+    pub fn clear_selection(&mut self) -> bool {
+        let mut selection = self.selection.borrow_mut();
+        let had = selection.ordered().is_some();
+        if had {
+            selection.clear();
+        }
+        had
+    }
+
+    /// Extend (or start) the reading selection with a keyboard motion.
+    pub fn extend_selection(&mut self, motion: SelectionMotion) {
+        let start = {
+            let selection = self.selection.borrow();
+            selection.head.or(selection.anchor)
+        };
+        let Some(start) = start else {
+            return;
+        };
+        let target = self.move_point(start, motion);
+        let mut selection = self.selection.borrow_mut();
+        if selection.anchor.is_none() {
+            selection.anchor = Some(start);
+        }
+        selection.head = Some(target);
+        selection.dragging = false;
+        selection.moved = true;
+    }
+
+    /// The next point in the requested direction, walking across block boundaries.
+    fn move_point(&self, point: ReadPoint, motion: SelectionMotion) -> ReadPoint {
+        let len = self.block_len(point.block);
+        match motion {
+            SelectionMotion::Left => {
+                let text = self.block_text(point.block);
+                if point.offset > 0 {
+                    let offset = text.as_str()[..point.offset.min(text.len())]
+                        .char_indices()
+                        .next_back()
+                        .map(|(index, _)| index)
+                        .unwrap_or(0);
+                    ReadPoint {
+                        block: point.block,
+                        offset,
+                    }
+                } else if let Some(block) = self.previous_block(point.block) {
+                    ReadPoint {
+                        block,
+                        offset: self.block_len(block),
+                    }
+                } else {
+                    point
+                }
+            }
+            SelectionMotion::Right => {
+                let text = self.block_text(point.block);
+                if point.offset < len {
+                    let offset = text.as_str()[point.offset.min(text.len())..]
+                        .chars()
+                        .next()
+                        .map(|ch| point.offset + ch.len_utf8())
+                        .unwrap_or(len);
+                    ReadPoint {
+                        block: point.block,
+                        offset,
+                    }
+                } else if let Some(block) = self.next_block(point.block) {
+                    ReadPoint { block, offset: 0 }
+                } else {
+                    point
+                }
+            }
+            SelectionMotion::Up => {
+                let block = self.previous_block(point.block).unwrap_or(point.block);
+                ReadPoint {
+                    block,
+                    offset: point.offset.min(self.block_len(block)),
+                }
+            }
+            SelectionMotion::Down => {
+                let block = self.next_block(point.block).unwrap_or(point.block);
+                ReadPoint {
+                    block,
+                    offset: point.offset.min(self.block_len(block)),
+                }
+            }
+            SelectionMotion::LineStart => ReadPoint {
+                block: point.block,
+                offset: 0,
+            },
+            SelectionMotion::LineEnd => ReadPoint {
+                block: point.block,
+                offset: len,
+            },
+            SelectionMotion::DocumentStart => ReadPoint {
+                block: 0,
+                offset: 0,
+            },
+            SelectionMotion::DocumentEnd => {
+                let block = self.blocks.len().saturating_sub(1);
+                ReadPoint {
+                    block,
+                    offset: self.block_len(block),
+                }
+            }
+        }
+    }
+
+    fn block_text(&self, block: usize) -> String {
+        self.blocks
+            .get(block)
+            .map(block_display)
+            .unwrap_or_default()
+    }
+
+    fn block_len(&self, block: usize) -> usize {
+        self.blocks
+            .get(block)
+            .map(|block| block_display(block).len())
+            .unwrap_or(0)
+    }
+
+    fn previous_block(&self, block: usize) -> Option<usize> {
+        (0..block).rev().find(|index| self.block_len(*index) > 0)
+    }
+
+    fn next_block(&self, block: usize) -> Option<usize> {
+        (block + 1..self.blocks.len()).find(|index| self.block_len(*index) > 0)
+    }
+
+    /// The block currently at the top of the reading view.
+    pub fn top_block(&self) -> usize {
+        if self.blocks.is_empty() {
+            0
+        } else {
+            self.list_state.logical_scroll_top().item_ix
+        }
+    }
+
+    /// Scroll the reading view by whole blocks, clamped to the document.
+    pub fn scroll_blocks(&mut self, delta: isize) {
+        if self.blocks.is_empty() {
+            return;
+        }
+        let top = self.top_block() as isize;
+        let last = self.blocks.len().saturating_sub(1) as isize;
+        let target = (top + delta).clamp(0, last) as usize;
+        self.list_state.scroll_to_reveal_item(target);
+    }
+
+    /// Select the next (or previous) link so Tab/Shift+Tab can walk them; Enter then
+    /// follows the selected link. Returns whether a link was found.
+    pub fn focus_next_link(&mut self, backwards: bool) -> bool {
+        let mut links: Vec<(ReadPoint, ReadPoint)> = Vec::new();
+        for (index, block) in self.blocks.iter().enumerate() {
+            let texts: Vec<&str> = match block {
+                Block::Heading { text, .. } | Block::Paragraph(text) | Block::Quote(text) => {
+                    vec![text]
+                }
+                Block::ListItem { text, .. } => vec![text],
+                Block::Callout { title, text, .. } => vec![title, text],
+                _ => continue,
+            };
+            let mut offset = 0usize;
+            for (at, text) in texts.iter().enumerate() {
+                if at > 0 {
+                    offset += 1;
+                }
+                for span in inline::parse(text) {
+                    if span.href.is_some() && !span.text.is_empty() {
+                        let start = ReadPoint {
+                            block: index,
+                            offset,
+                        };
+                        let end = ReadPoint {
+                            block: index,
+                            offset: offset + span.text.len(),
+                        };
+                        links.push((start, end));
+                    }
+                    offset += span.text.len();
+                }
+            }
+        }
+        if links.is_empty() {
+            return false;
+        }
+
+        let current = self.selection.borrow().head;
+        let next = match current {
+            Some(head) => match links
+                .iter()
+                .position(|(start, end)| head >= *start && head < *end)
+            {
+                Some(index) if backwards => (index + links.len() - 1) % links.len(),
+                Some(index) => (index + 1) % links.len(),
+                None => {
+                    let first = links.iter().position(|(start, _)| *start >= head);
+                    match (backwards, first) {
+                        (true, _) => 0,
+                        (false, Some(index)) => index,
+                        (false, None) => 0,
+                    }
+                }
+            },
+            None if backwards => links.len() - 1,
+            None => 0,
+        };
+
+        let (start, end) = links[next];
+        let mut selection = self.selection.borrow_mut();
+        selection.anchor = Some(ReadPoint {
+            block: end.block,
+            offset: end.offset.saturating_sub(1),
+        });
+        selection.head = Some(start);
+        selection.down = None;
+        selection.dragging = false;
+        selection.moved = true;
+        true
+    }
+
+    /// The current reading selection head, if any.
+    pub fn selection_head(&self) -> Option<ReadPoint> {
+        self.selection.borrow().head
+    }
+
+    /// The link target at a selection point, for Enter in reading mode. Covers the prose
+    /// blocks; tables and code do not carry links.
+    pub fn link_at(&self, point: ReadPoint) -> Option<String> {
+        let block = self.blocks.get(point.block)?;
+        let texts: Vec<&str> = match block {
+            Block::Heading { text, .. } | Block::Paragraph(text) | Block::Quote(text) => {
+                vec![text]
+            }
+            Block::ListItem { text, .. } => vec![text],
+            Block::Callout { title, text, .. } => vec![title, text],
+            _ => return None,
+        };
+        let mut offset = 0usize;
+        let mut links: Vec<(Range<usize>, String)> = Vec::new();
+        for (index, text) in texts.iter().enumerate() {
+            if index > 0 {
+                offset += 1;
+            }
+            for span in inline::parse(text) {
+                if let Some(href) = &span.href {
+                    links.push((offset..offset + span.text.len(), href.clone()));
+                }
+                offset += span.text.len();
+            }
+        }
+        links
+            .into_iter()
+            .find(|(range, _)| range.contains(&point.offset))
+            .map(|(_, href)| href)
+    }
+
+    /// Scroll roughly one screen of prose, for PageUp/PageDown and Space in reading mode.
+    pub fn scroll_screen(&mut self, direction: isize) {
+        self.scroll_blocks(8 * direction);
+    }
+
+    /// The nearest heading at or above the top visible block.
+    pub fn current_heading(&self) -> Option<String> {
+        if self.blocks.is_empty() {
+            return None;
+        }
+        let top = self.top_block().min(self.blocks.len() - 1);
+        self.blocks[..=top]
+            .iter()
+            .rev()
+            .find_map(|block| match block {
+                Block::Heading { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+    }
+
+    /// How far down the document the viewport sits, from 0.0 to 1.0.
+    pub fn progress(&self) -> f32 {
+        if self.blocks.len() <= 1 {
+            return 0.0;
+        }
+        (self.top_block() as f32 / (self.blocks.len() - 1) as f32).clamp(0.0, 1.0)
+    }
+
+    /// Scroll to a fraction of the document, for editor ↔ preview sync.
+    pub fn scroll_to_progress(&mut self, progress: f32) {
+        if self.blocks.is_empty() {
+            return;
+        }
+        let index = block_for_progress(progress, self.blocks.len());
+        self.scroll_to_block(index);
+    }
+
+    /// Scroll the reading view so `index` is visible. Restoring a session uses this.
+    pub fn scroll_to_block(&mut self, index: usize) {
+        if self.blocks.is_empty() {
+            return;
+        }
+        self.list_state
+            .scroll_to_reveal_item(index.min(self.blocks.len() - 1));
+    }
+
+    /// Close the footnote popup if it is open. Returns whether it was open, so Escape can
+    /// consume the key before falling through to the panels.
+    pub fn dismiss_popup(&mut self, cx: &mut App) -> bool {
+        let Some(popup) = &self.footnote_popup else {
+            return false;
+        };
+        if !popup.read(cx).is_open() {
+            return false;
+        }
+        popup.update(cx, |popup, cx| {
+            popup.close();
+            cx.notify();
+        });
+        true
+    }
+
     /// Scroll the reading view so the heading with this text is visible.
     pub fn scroll_to_heading(&self, text: &str) {
         if let Some(index) = self.blocks.iter().position(
@@ -574,6 +1350,19 @@ impl ReadingCache {
         on_fold: Option<FoldToggle>,
         cx: &mut App,
     ) -> impl IntoElement {
+        // A popup can ask for a block hidden by a fold: unfold, reflow, then scroll to it.
+        if let Some(block) = self.reveal_block.borrow_mut().take() {
+            let hidden = hidden_blocks(&self.blocks, &self.folded);
+            if hidden.get(block).copied().unwrap_or(false) {
+                self.folded.clear();
+                let scroll = self.list_state.logical_scroll_top();
+                let count = self.blocks.len();
+                self.list_state.splice(0..count, count);
+                self.list_state.scroll_to(scroll);
+            }
+            self.list_state.scroll_to_reveal_item(block);
+        }
+
         if vault_root.as_deref() != self.attachments_root.as_deref() {
             self.attachments = vault_root
                 .as_deref()
@@ -585,7 +1374,9 @@ impl ReadingCache {
             let refs = self.footnote_refs.clone();
             let defs = self.footnote_defs.clone();
             let list_state = self.list_state.clone();
-            self.footnote_popup = Some(cx.new(move |_| FootnotePopup::new(refs, defs, list_state)));
+            let reveal = self.reveal_block.clone();
+            self.footnote_popup =
+                Some(cx.new(move |_| FootnotePopup::new(refs, defs, list_state, reveal)));
         }
         let title = note_title(&self.properties, self.blocks.as_slice());
         if let Some(popup) = &self.footnote_popup {
@@ -598,10 +1389,11 @@ impl ReadingCache {
         let app_opener = opener.clone();
         let opener: Option<LinkOpener> = Some(Rc::new(move |target, window, cx| {
             if let Some(id) = target.strip_prefix("#fn:") {
+                let anchor = window.mouse_position();
                 if let Some(popup) = &popup_for_links {
                     let id = id.to_string();
                     popup.update(cx, |popup, cx| {
-                        popup.show(&id);
+                        popup.show_at(&id, Some(anchor));
                         cx.notify();
                     });
                 }
@@ -623,13 +1415,39 @@ impl ReadingCache {
             });
         }
 
+        let focus = cx.try_global::<FocusMode>().is_some_and(|mode| mode.0);
+        let reader = cx
+            .try_global::<ReaderSettings>()
+            .copied()
+            .unwrap_or_default();
         let footnote_popup = self.footnote_popup.clone();
         let blocks = self.blocks.clone();
         let attachments = self.attachments.clone();
         let selection = self.selection.clone();
         let math = self.math.clone();
+        let copy: CopyHandler = Rc::new(|text, window, cx| {
+            cx.write_to_clipboard(ClipboardItem::new_string(text.to_string()));
+            window.refresh();
+        });
+        let find = self.find.clone();
+        let lightbox = self.lightbox.clone();
+        let embeds = self.embeds.clone();
+        let embed_math = self.embed_math.clone();
+        let next_block = Cell::new(self.blocks.len());
+        let on_image: ImageOpener = {
+            let lightbox = lightbox.clone();
+            Rc::new(move |path, window, _cx| {
+                *lightbox.borrow_mut() = Some(PathBuf::from(path));
+                window.refresh();
+            })
+        };
+        let open_file: FileOpener = Rc::new(|path, window, cx| {
+            cx.open_url(&format!("file://{path}"));
+            window.refresh();
+        });
         let hidden = Rc::new(hidden_blocks(self.blocks.as_slice(), &self.folded));
         let folded = self.folded.clone();
+        let list_state = self.list_state.clone();
         div()
             .relative()
             .size_full()
@@ -639,49 +1457,149 @@ impl ReadingCache {
             .py_6()
             .text_color(theme.text)
             .children(metadata)
-            .child(
-                div().flex_1().min_h(px(0.0)).child(
-                    list(self.list_state.clone(), move |index, _window, _cx| {
-                        let Some(block) = blocks.get(index).cloned() else {
-                            return div().into_any_element();
-                        };
-                        if hidden.get(index).copied().unwrap_or(false) {
-                            return div().w_full().h(px(0.0)).into_any_element();
-                        }
-
-                        let ctx = RenderCtx {
-                            vault_root: vault_root.as_deref(),
-                            attachments: attachments.as_deref(),
-                            selection: &selection,
-                            opener: opener.as_ref(),
-                            math: &math,
-                            folded: &folded,
-                            on_fold: on_fold.as_ref(),
-                            blocks: blocks.as_slice(),
-                            depth: 0,
-                            theme,
-                            template: &template,
-                        };
-
-                        let mut item = div().w_full().max_w(px(780.0)).mx_auto().px_2().pb_3();
-                        // Display math is centred by the item itself: the list gives each
-                        // item the full column width, but a shrink-to-fit child would
-                        // otherwise sit at the left edge.
-                        if matches!(block, Block::Math { .. }) {
-                            item = item.flex().justify_center().py_3();
-                        }
-                        item.child(render_block(block, Some(index), &ctx))
-                            .into_any_element()
+            .child(div().flex_1().min_h(px(0.0)).child({
+                // Zen mode dims everything outside the section being read.
+                let active_section = if focus {
+                    self.current_heading().and_then(|name| {
+                        let headings: Vec<(usize, u8, String)> = blocks
+                            .iter()
+                            .enumerate()
+                            .filter_map(|(at, block)| match block {
+                                Block::Heading { level, text } => Some((at, *level, text.clone())),
+                                _ => None,
+                            })
+                            .collect();
+                        let position = headings.iter().position(|(_, _, text)| *text == name)?;
+                        let (start, level, _) = headings[position];
+                        let end = headings[position + 1..]
+                            .iter()
+                            .find(|(_, other, _)| *other <= level)
+                            .map(|(at, _, _)| *at)
+                            .unwrap_or(blocks.len());
+                        Some(start..end)
                     })
-                    .size_full(),
-                ),
+                } else {
+                    None
+                };
+                list(list_state.clone(), move |index, _window, _cx| {
+                    let Some(block) = blocks.get(index).cloned() else {
+                        return div().into_any_element();
+                    };
+                    if hidden.get(index).copied().unwrap_or(false) {
+                        return div().w_full().h(px(0.0)).into_any_element();
+                    }
+
+                    let ctx = RenderCtx {
+                        vault_root: vault_root.as_deref(),
+                        attachments: attachments.as_deref(),
+                        selection: &selection,
+                        opener: opener.as_ref(),
+                        math: &math,
+                        folded: &folded,
+                        on_fold: on_fold.as_ref(),
+                        copy: Some(&copy),
+                        find: Some(&find),
+                        on_image: Some(&on_image),
+                        open_file: Some(&open_file),
+                        embeds: Some(&embeds),
+                        embed_math: Some(&embed_math),
+                        next_block: Some(&next_block),
+                        list_state: Some(&list_state),
+                        block_count: blocks.len(),
+                        blocks: blocks.as_slice(),
+                        depth: 0,
+                        theme,
+                        template: &template,
+                        body_size: reader.body_size,
+                        measure: reader.measure,
+                        line_height: reader.line_height,
+                    };
+
+                    let dimmed = active_section
+                        .as_ref()
+                        .is_some_and(|range| !range.contains(&index));
+
+                    let mut item = div()
+                        .w_full()
+                        .max_w(px(reader.measure))
+                        .mx_auto()
+                        .px_2()
+                        .pb_3()
+                        .when(dimmed, |d| d.opacity(0.35));
+                    // Display math is centred by the item itself: the list gives each
+                    // item the full column width, but a shrink-to-fit child would
+                    // otherwise sit at the left edge.
+                    if matches!(block, Block::Math { .. }) {
+                        item = item.flex().justify_center().py_3();
+                    }
+                    item.child(render_block(block, Some(index), &ctx))
+                        .into_any_element()
+                })
+                .size_full()
+            }))
+            .children(
+                footnote_popup
+                    .clone()
+                    .filter(|popup| popup.read(cx).is_open())
+                    .map(|popup| {
+                        let close = popup.clone();
+                        div()
+                            .id("footnote-backdrop")
+                            .absolute()
+                            .top_0()
+                            .left_0()
+                            .right_0()
+                            .bottom_0()
+                            .on_mouse_down(MouseButton::Left, move |_event, window, cx| {
+                                // A click outside the popup dismisses it.
+                                close.update(cx, |popup, cx| {
+                                    popup.close();
+                                    cx.notify();
+                                });
+                                window.refresh();
+                            })
+                            .into_any_element()
+                    }),
             )
             .children(footnote_popup.map(|popup| {
-                div()
-                    .absolute()
-                    .top(px(96.0))
-                    .left(px(24.0))
+                let anchor = popup
+                    .read(cx)
+                    .anchor()
+                    .unwrap_or_else(|| point(px(24.0), px(96.0)));
+                anchored()
+                    .position(anchor)
+                    .anchor(Corner::TopLeft)
+                    .offset(point(px(8.0), px(12.0)))
+                    .snap_to_window_with_margin(px(8.0))
                     .child(popup)
+                    .into_any_element()
+            }))
+            .children(self.lightbox.borrow().as_ref().map(|path| {
+                let close = lightbox.clone();
+                div()
+                    .id("lightbox")
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .right_0()
+                    .bottom_0()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .bg(gpui::hsla(0.0, 0.0, 0.0, 0.82))
+                    .on_mouse_down(MouseButton::Left, move |_event, window, _cx| {
+                        // Clicking the backdrop (not the image) closes the viewer.
+                        *close.borrow_mut() = None;
+                        window.refresh();
+                    })
+                    .child(
+                        div()
+                            .p_4()
+                            .on_mouse_down(MouseButton::Left, |_event, _window, cx| {
+                                cx.stop_propagation();
+                            })
+                            .child(img(path.clone()).max_w(px(1200.0)).max_h(px(900.0))),
+                    )
                     .into_any_element()
             }))
     }
@@ -730,32 +1648,82 @@ fn hidden_blocks(blocks: &[Block], folded: &HashSet<usize>) -> Vec<bool> {
 
 /// A non-virtualized column, used for nested `![[note]]` embeds where a second scroll
 /// container would be wrong.
-fn reading_column(src: &str, ctx: &RenderCtx) -> impl IntoElement {
-    let source = match ctx.vault_root {
-        Some(root) => shared::expand(src, root),
-        None => src.to_string(),
-    };
-    let blocks = markdown::parse_blocks(&source);
+/// Render a list of parsed blocks, giving each a synthetic id so links and selection work.
+fn render_blocks(blocks: &Rc<Vec<Block>>, ctx: &RenderCtx) -> AnyElement {
     let template = ctx.template.clone();
     let nested = RenderCtx {
         vault_root: ctx.vault_root,
-        attachments: ctx.attachments,
-        selection: ctx.selection,
-        opener: ctx.opener,
-        math: ctx.math,
-        folded: ctx.folded,
         on_fold: None,
         blocks: &[],
         depth: ctx.depth + 1,
-        theme: ctx.theme,
         template: &template,
+        ..*ctx
     };
 
-    div().flex().flex_col().gap_3().children(
-        blocks
-            .into_iter()
-            .map(move |block| render_block(block, None, &nested)),
-    )
+    div()
+        .flex()
+        .flex_col()
+        .gap_3()
+        .children(blocks.iter().cloned().map(|block| {
+            let id = ctx.next_block.map(|next| {
+                let value = next.get();
+                next.set(value + 1);
+                value
+            });
+            render_block(block, id, &nested)
+        }))
+        .into_any_element()
+}
+
+/// The block whose last line carries `^id`, for `![[Note#^id]]`.
+fn block_by_id(
+    blocks: &[Block],
+    spans: &[markdown::BlockSpan],
+    source: &str,
+    fragment: &str,
+) -> Option<Block> {
+    let id = fragment.trim().trim_start_matches('^').trim();
+    if id.is_empty() {
+        return None;
+    }
+    let marker = format!("^{id}");
+    let line = source
+        .lines()
+        .position(|line| line.trim_end().ends_with(&marker))?;
+    let index = spans
+        .iter()
+        .position(|span| span.first_line <= line && line <= span.last_line)?;
+    blocks.get(index).cloned()
+}
+
+/// Only the blocks of one `#Heading` section, for `![[Note#Section]]`.
+fn section_blocks(blocks: Vec<Block>, fragment: &str) -> Option<Vec<Block>> {
+    let wanted = fragment
+        .trim()
+        .trim_start_matches('#')
+        .trim()
+        .to_lowercase();
+    if wanted.is_empty() {
+        return None;
+    }
+    let start = blocks.iter().position(|block| match block {
+        Block::Heading { text, .. } => text.trim().to_lowercase() == wanted,
+        _ => false,
+    })?;
+    let level = match &blocks[start] {
+        Block::Heading { level, .. } => *level,
+        _ => return None,
+    };
+    let mut end = blocks.len();
+    for (index, block) in blocks.iter().enumerate().skip(start + 1) {
+        if let Block::Heading { level: next, .. } = block {
+            if *next <= level {
+                end = index;
+                break;
+            }
+        }
+    }
+    Some(blocks[start..end].to_vec())
 }
 
 fn render_block(block: Block, block_index: Option<usize>, ctx: &RenderCtx) -> AnyElement {
@@ -811,7 +1779,7 @@ fn render_block(block: Block, block_index: Option<usize>, ctx: &RenderCtx) -> An
                 )))
                 .into_any_element()
         }
-        Block::Paragraph(text) => rich_text(&text, 15.0, block_index, 0, ctx),
+        Block::Paragraph(text) => rich_text(&text, ctx.body_size, block_index, 0, ctx),
         Block::ListItem {
             depth,
             marker,
@@ -847,7 +1815,7 @@ fn render_block(block: Block, block_index: Option<usize>, ctx: &RenderCtx) -> An
                 // reading column, and every later block loses the column's alignment.
                 .child(div().flex_1().min_w(px(0.0)).child(rich_text(
                     &text,
-                    15.0,
+                    ctx.body_size,
                     block_index,
                     0,
                     ctx,
@@ -863,7 +1831,7 @@ fn render_block(block: Block, block_index: Option<usize>, ctx: &RenderCtx) -> An
                 .border_l_1()
                 .border_color(theme.border)
                 .pl_3()
-                .child(rich_text(&text, 15.0, block_index, 0, &muted_ctx))
+                .child(rich_text(&text, ctx.body_size, block_index, 0, &muted_ctx))
                 .into_any_element()
         }
         Block::Rule => div()
@@ -930,7 +1898,7 @@ fn render_block(block: Block, block_index: Option<usize>, ctx: &RenderCtx) -> An
                 .gap_1()
                 .child(rich_text_styled(
                     &title,
-                    15.0,
+                    ctx.body_size,
                     block_index,
                     0,
                     &title_ctx,
@@ -938,7 +1906,7 @@ fn render_block(block: Block, block_index: Option<usize>, ctx: &RenderCtx) -> An
                     1.3,
                 ))
                 .when(!text.trim().is_empty(), |d| {
-                    d.child(rich_text(&text, 15.0, block_index, body_base, ctx))
+                    d.child(rich_text(&text, ctx.body_size, block_index, body_base, ctx))
                 })
                 .into_any_element()
         }
@@ -947,11 +1915,55 @@ fn render_block(block: Block, block_index: Option<usize>, ctx: &RenderCtx) -> An
             headers,
             rows,
         } => render_table(&align, &headers, &rows, block_index, ctx),
-        Block::Embed { target } => render_embed(&target, ctx),
+        Block::Embed {
+            target,
+            width,
+            alt,
+            fragment,
+        } => render_embed(&target, width, alt.as_deref(), fragment.as_deref(), ctx),
     }
 }
 
 impl<'a> RenderCtx<'a> {
+    /// In-page find matches in one block, as `(range, is_current)`.
+    fn find_matches(&self, block: Option<usize>) -> Vec<(Range<usize>, bool)> {
+        let (Some(block), Some(find)) = (block, self.find) else {
+            return Vec::new();
+        };
+        if !find.open || find.pattern.is_empty() {
+            return Vec::new();
+        }
+        find.matches
+            .iter()
+            .enumerate()
+            .filter(|(_, found)| found.block == block)
+            .map(|(index, found)| (found.range.clone(), index == find.current))
+            .collect()
+    }
+
+    /// A typeset scene: host formulas first, then lazily typeset embed formulas.
+    fn math_scene(&self, tex: &str, style: MathStyle) -> Option<Rc<MathScene>> {
+        let key = (tex.to_string(), style);
+        if let Some(scene) = self.math.get(&key) {
+            return Some(scene.clone());
+        }
+        let cache = self.embed_math?;
+        if let Some(scene) = cache.borrow().get(&key) {
+            return Some(scene.clone());
+        }
+        let scene = math::typeset(
+            tex,
+            &MathOptions {
+                style,
+                color: [0.0, 0.0, 0.0, 1.0],
+            },
+        )
+        .ok()
+        .map(Rc::new)?;
+        cache.borrow_mut().insert(key, scene.clone());
+        Some(scene)
+    }
+
     fn with_template<'b>(&'b self, template: &'b TextRun) -> RenderCtx<'b> {
         RenderCtx {
             vault_root: self.vault_root,
@@ -961,10 +1973,22 @@ impl<'a> RenderCtx<'a> {
             math: self.math,
             folded: self.folded,
             on_fold: self.on_fold,
+            copy: self.copy,
+            find: self.find,
+            on_image: self.on_image,
+            open_file: self.open_file,
+            embeds: self.embeds,
+            embed_math: self.embed_math,
+            next_block: self.next_block,
+            list_state: self.list_state,
+            block_count: self.block_count,
             blocks: self.blocks,
             depth: self.depth,
             theme: self.theme,
             template,
+            body_size: self.body_size,
+            measure: self.measure,
+            line_height: self.line_height,
         }
     }
 }
@@ -1010,20 +2034,16 @@ fn block_texts(block: &Block) -> Vec<&str> {
 /// A display formula, centred and scaled down when it is wider than the reading column.
 fn render_math(tex: &str, ctx: &RenderCtx) -> AnyElement {
     const FONT_SIZE: f32 = 17.0;
-    /// Usable width inside the reading column (780 max width, 8 px padding each side).
-    const MAX_WIDTH: f32 = 736.0;
+    // Usable width inside the reading column.
+    let max_width: f32 = (ctx.measure - 44.0).max(320.0);
 
-    let Some(scene) = ctx
-        .math
-        .get(&(tex.to_string(), MathStyle::Display))
-        .cloned()
-    else {
+    let Some(scene) = ctx.math_scene(tex, MathStyle::Display) else {
         return math_error(tex, ctx.theme);
     };
 
     let width = scene.width() as f32 * FONT_SIZE;
-    let scale = if width > MAX_WIDTH {
-        (MAX_WIDTH / width).max(0.6)
+    let scale = if width > max_width {
+        (max_width / width).max(0.6)
     } else {
         1.0
     };
@@ -1059,7 +2079,15 @@ fn rich_text(
     base: usize,
     ctx: &RenderCtx,
 ) -> AnyElement {
-    rich_text_styled(text, size, block, base, ctx, gpui::FontWeight::NORMAL, 1.5)
+    rich_text_styled(
+        text,
+        size,
+        block,
+        base,
+        ctx,
+        gpui::FontWeight::NORMAL,
+        ctx.line_height,
+    )
 }
 
 /// Inline text â€” emphasis, code, links, math, highlights â€” at a given size, weight and
@@ -1084,7 +2112,7 @@ fn rich_text_styled(
     // the faster single-run path below.
     if spans
         .iter()
-        .any(|span| span.style.math && span.math.is_some())
+        .any(|span| (span.style.math && span.math.is_some()) || span.style.image)
     {
         let len = spans
             .iter()
@@ -1095,14 +2123,25 @@ fn rich_text_styled(
                     .unwrap_or(span.text.len())
             })
             .sum();
-        let content = flow_content(&spans, size, weight, line_height, ctx);
+        let content = flow_content(&spans, block, size, weight, line_height, ctx);
+        let display: String = spans
+            .iter()
+            .map(|span| {
+                span.math
+                    .as_ref()
+                    .map(|tex| format!("${tex}$"))
+                    .unwrap_or_else(|| span.text.clone())
+            })
+            .collect();
         return FlowText::new(
             content,
             block,
             base,
             len,
+            Rc::new(display),
             ctx.selection.clone(),
             ctx.opener.cloned(),
+            ctx.on_image.cloned(),
             ctx.theme,
         )
         .into_any_element();
@@ -1192,12 +2231,19 @@ fn rich_text_styled(
         Some(block) => container
             .child(SelectableText {
                 text: styled,
+                display: Rc::new(display.clone()),
                 block,
                 base,
                 len: display.len(),
                 selection: ctx.selection.clone(),
                 links,
                 opener: ctx.opener.cloned(),
+                list_state: ctx.list_state.cloned(),
+                block_count: ctx.block_count,
+                find: ctx
+                    .find
+                    .map(|_| ctx.find_matches(Some(block)))
+                    .unwrap_or_default(),
             })
             .into_any_element(),
         None => container.child(styled).into_any_element(),
@@ -1208,6 +2254,7 @@ fn rich_text_styled(
 /// split at spaces so the flow layout can break lines between words.
 fn flow_content(
     spans: &[inline::Inline],
+    block: Option<usize>,
     size: f32,
     weight: gpui::FontWeight,
     line_height: f32,
@@ -1220,7 +2267,7 @@ fn flow_content(
     for span in spans {
         if span.style.math {
             if let Some(tex) = &span.math {
-                if let Some(scene) = ctx.math.get(&(tex.clone(), MathStyle::Inline)).cloned() {
+                if let Some(scene) = ctx.math_scene(tex, MathStyle::Inline) {
                     // `block_display` copies math as `$tex$`; keep the piece range in sync.
                     let display_len = tex.len() + 2;
                     pieces.push(FlowPiece {
@@ -1253,6 +2300,37 @@ fn flow_content(
                 });
                 offset += display.len();
                 continue;
+            }
+        }
+
+        // An inline image: decode it once and place it as an atomic piece. The display text
+        // stays the label, so selection and copy are unchanged.
+        if span.style.image {
+            if let (Some(root), Some(href)) = (ctx.vault_root, span.href.as_deref()) {
+                if !href.starts_with("http://") && !href.starts_with("https://") {
+                    if let Some(path) = resolve_file(root, ctx.attachments, href) {
+                        if let Some((data, image_width, image_height)) = inline_image(&path) {
+                            let height = (size * 2.4).max(12.0);
+                            let width = if image_height > 0.0 {
+                                height * (image_width / image_height)
+                            } else {
+                                height
+                            };
+                            pieces.push(FlowPiece {
+                                kind: FlowKind::Image {
+                                    data,
+                                    width: px(width),
+                                    height: px(height),
+                                    href: span.href.clone(),
+                                },
+                                offset,
+                                len: span.text.len(),
+                            });
+                            offset += span.text.len();
+                            continue;
+                        }
+                    }
+                }
             }
         }
 
@@ -1314,6 +2392,10 @@ fn flow_content(
         font_size: size,
         line_height,
         link_color: theme.accent_text,
+        find: ctx
+            .find
+            .map(|_| ctx.find_matches(block))
+            .unwrap_or_default(),
     })
 }
 
@@ -1366,12 +2448,19 @@ fn code_block(text: &str, language: &str, block: Option<usize>, ctx: &RenderCtx)
         let piece: AnyElement = match block {
             Some(block) => SelectableText {
                 text: styled,
+                display: Rc::new(display.clone()),
                 block,
                 base,
                 len: display.len(),
                 selection: ctx.selection.clone(),
                 links: Vec::new(),
                 opener: ctx.opener.cloned(),
+                list_state: ctx.list_state.cloned(),
+                block_count: ctx.block_count,
+                find: ctx
+                    .find
+                    .map(|_| ctx.find_matches(Some(block)))
+                    .unwrap_or_default(),
             }
             .into_any_element(),
             None => div().whitespace_nowrap().child(styled).into_any_element(),
@@ -1387,6 +2476,27 @@ fn code_block(text: &str, language: &str, block: Option<usize>, ctx: &RenderCtx)
     let id = format!("reading-code-{:x}", hasher.finish());
 
     let language = language.trim();
+    let copy_button = {
+        let content = content.to_string();
+        let copy = ctx.copy.cloned();
+        div()
+            .id(ElementId::Name(format!("{id}-copy").into()))
+            .px_2()
+            .py_1()
+            .rounded_sm()
+            .text_xs()
+            .text_color(theme.muted)
+            .bg(theme.chip)
+            .cursor_pointer()
+            .hover(move |style| style.bg(theme.hover).text_color(theme.text))
+            .child("copy")
+            .when_some(copy, |button, copy| {
+                button.on_mouse_down(MouseButton::Left, move |_event, window, cx| {
+                    copy(&content, window, cx);
+                })
+            })
+    };
+
     div()
         .id(ElementId::Name(id.clone().into()))
         .w_full()
@@ -1400,18 +2510,24 @@ fn code_block(text: &str, language: &str, block: Option<usize>, ctx: &RenderCtx)
         .text_color(theme.code_text)
         .flex()
         .flex_col()
-        .when(!language.is_empty(), |d| {
-            d.child(
-                div()
-                    .flex()
-                    .justify_between()
-                    .pb_2()
-                    .text_xs()
-                    .text_color(theme.muted)
-                    .child(language.to_string())
-                    .child(format!("{} lines", lines.len())),
-            )
-        })
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .pb_2()
+                .text_xs()
+                .text_color(theme.muted)
+                .child(language.to_string())
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(format!("{} lines", lines.len()))
+                        .child(copy_button),
+                ),
+        )
         .child(
             div()
                 .id(ElementId::Name(format!("{id}-scroll").into()))
@@ -1425,15 +2541,67 @@ fn code_block(text: &str, language: &str, block: Option<usize>, ctx: &RenderCtx)
 
 fn code_font(base: &gpui::Font) -> gpui::Font {
     let mut font = base.clone();
-    font.family = "Cascadia Mono".into();
+    // Pick a family that exists on the platform first. A missing primary family otherwise
+    // falls back to the UI font, which makes code look proportional.
+    #[cfg(target_os = "macos")]
+    let primary = "Menlo";
+    #[cfg(target_os = "windows")]
+    let primary = "Consolas";
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let primary = "DejaVu Sans Mono";
+    font.family = primary.into();
     font.fallbacks = Some(gpui::FontFallbacks(std::sync::Arc::new(vec![
+        "SF Mono".to_string(),
+        "Menlo".to_string(),
+        "Cascadia Mono".to_string(),
         "Consolas".to_string(),
         "DejaVu Sans Mono".to_string(),
         "Liberation Mono".to_string(),
-        "Menlo".to_string(),
         "monospace".to_string(),
     ])));
     font
+}
+
+/// Byte range of the word around `index`, for double-click selection.
+///
+/// Letters, digits and `_` form a word. Clicking on the space after a word selects that
+/// word; clicking between two non-word characters selects the character under the pointer,
+/// so a double click always selects something visible.
+pub(crate) fn word_range(text: &str, index: usize) -> Range<usize> {
+    let index = index.min(text.len());
+    let mut start = index;
+    let mut end = index;
+
+    while start > 0 {
+        let Some((previous, ch)) = text[..start].char_indices().next_back() else {
+            break;
+        };
+        if !is_word_char(ch) {
+            break;
+        }
+        start = previous;
+    }
+    while end < text.len() {
+        let ch = text[end..].chars().next().unwrap_or(' ');
+        if !is_word_char(ch) {
+            break;
+        }
+        end += ch.len_utf8();
+    }
+
+    if start == end {
+        if let Some(ch) = text[end..].chars().next() {
+            end += ch.len_utf8();
+        } else if let Some((previous, _)) = text[..start].char_indices().next_back() {
+            start = previous;
+        }
+    }
+
+    start..end
+}
+
+fn is_word_char(ch: char) -> bool {
+    ch.is_alphanumeric() || ch == '_'
 }
 
 /// A GFM pipe table, with the same inline math/highlight treatment as prose.
@@ -1555,7 +2723,13 @@ fn table_row(
     row.children(rendered).into_any_element()
 }
 
-fn render_embed(target: &str, ctx: &RenderCtx) -> AnyElement {
+fn render_embed(
+    target: &str,
+    width: Option<u32>,
+    alt: Option<&str>,
+    fragment: Option<&str>,
+    ctx: &RenderCtx,
+) -> AnyElement {
     let theme = ctx.theme;
     let Some(root) = ctx.vault_root else {
         return placeholder(target, "no vault root", theme);
@@ -1563,35 +2737,175 @@ fn render_embed(target: &str, ctx: &RenderCtx) -> AnyElement {
     let attachments = ctx.attachments;
 
     if is_image(target) {
+        if target.starts_with("http://") || target.starts_with("https://") {
+            // The app is offline by default, so remote images are not fetched.
+            return placeholder(target, "remote image (network is off)", theme);
+        }
         return match resolve_file(root, attachments, target) {
-            Some(path) => img(path)
-                .max_w(px(480.0))
-                .max_h(px(360.0))
-                .into_any_element(),
+            Some(path) => {
+                let requested = width.map(|width| width as f32);
+                let mut picture = img(path.clone()).max_w(px(requested.unwrap_or(480.0)));
+                if requested.is_none() {
+                    picture = picture.max_h(px(360.0));
+                }
+                let picture = picture.into_any_element();
+                let on_image = ctx.on_image.cloned();
+                let path_string = path.to_string_lossy().to_string();
+                let caption = alt.map(str::to_string);
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(
+                        div()
+                            .id(ElementId::Name(
+                                format!("embed-image-{}", path_string).into(),
+                            ))
+                            .cursor_pointer()
+                            .on_mouse_down(MouseButton::Left, move |_event, window, cx| {
+                                if let Some(on_image) = &on_image {
+                                    on_image(&path_string, window, cx);
+                                }
+                            })
+                            .child(picture),
+                    )
+                    .when_some(caption, |d, caption| {
+                        d.child(div().text_xs().text_color(theme.muted).child(caption))
+                    })
+                    .into_any_element()
+            }
             None => placeholder(target, "image not found", theme),
         };
     }
 
     if is_attachment(target) {
-        return match resolve_file(root, attachments, target) {
-            Some(_) => placeholder(target, "attachment â€” not previewed", theme),
-            None => placeholder(target, "attachment not found", theme),
+        let Some(path) = resolve_file(root, attachments, target) else {
+            return placeholder(target, "attachment not found", theme);
         };
+        let kind = Path::new(target)
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .map(|extension| extension.to_ascii_uppercase())
+            .unwrap_or_else(|| "FILE".to_string());
+        let name = Path::new(target)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or(target)
+            .to_string();
+        let open_file = ctx.open_file.cloned();
+        let path_string = path.to_string_lossy().to_string();
+        return div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2()
+            .p_3()
+            .rounded_md()
+            .border_1()
+            .border_color(theme.border)
+            .bg(theme.panel_alt)
+            .child(
+                div()
+                    .px_2()
+                    .py_1()
+                    .rounded_sm()
+                    .bg(theme.chip)
+                    .text_xs()
+                    .text_color(theme.muted)
+                    .child(kind),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .overflow_hidden()
+                    .text_sm()
+                    .text_color(theme.text)
+                    .child(name),
+            )
+            .child(
+                div()
+                    .id(ElementId::Name(
+                        format!("embed-open-{}", path_string).into(),
+                    ))
+                    .px_2()
+                    .py_1()
+                    .rounded_md()
+                    .bg(theme.chip)
+                    .text_xs()
+                    .text_color(theme.text_dim)
+                    .cursor_pointer()
+                    .hover(move |style| style.bg(theme.hover))
+                    .child("Open")
+                    .on_mouse_down(MouseButton::Left, move |_event, window, cx| {
+                        if let Some(open_file) = &open_file {
+                            open_file(&path_string, window, cx);
+                        }
+                    }),
+            )
+            .into_any_element();
     }
 
     if ctx.depth >= MAX_EMBED_DEPTH {
         return placeholder(target, "embed depth limit", theme);
     }
 
-    match std::fs::read_to_string(resolve_note(root, attachments, target)) {
-        Ok(text) => div()
-            .border_l_1()
-            .border_color(theme.border)
-            .pl_3()
-            .child(reading_column(&text, ctx))
-            .into_any_element(),
-        Err(_) => placeholder(target, "note not found", theme),
-    }
+    let path = resolve_note(root, attachments, target);
+    let Some(cache) = ctx.embeds else {
+        return placeholder(target, "embed cache unavailable", theme);
+    };
+    let modified = std::fs::metadata(&path)
+        .ok()
+        .and_then(|metadata| metadata.modified().ok());
+    let key = (path.clone(), fragment.map(str::to_string));
+
+    let blocks = {
+        let mut embeds = cache.borrow_mut();
+        match embeds.get(&key) {
+            Some(entry) if entry.modified == modified => entry.blocks.clone(),
+            _ => {
+                let Ok(text) = std::fs::read_to_string(&path) else {
+                    return placeholder(target, "note not found", theme);
+                };
+                // Shared blocks are expanded once per parse, not per frame.
+                let text = shared::expand(&text, root);
+                let (parsed, spans) = markdown::parse_blocks_spanned(&text);
+                let parsed = match fragment {
+                    Some(fragment) if fragment.starts_with('^') => {
+                        match block_by_id(&parsed, &spans, &text, fragment) {
+                            Some(block) => vec![block],
+                            None => {
+                                return placeholder(target, "block not found", theme);
+                            }
+                        }
+                    }
+                    Some(fragment) => match section_blocks(parsed, fragment) {
+                        Some(section) => section,
+                        None => {
+                            return placeholder(target, "section not found", theme);
+                        }
+                    },
+                    None => parsed,
+                };
+                let blocks = Rc::new(parsed);
+                embeds.insert(
+                    key,
+                    EmbeddedNote {
+                        modified,
+                        blocks: blocks.clone(),
+                    },
+                );
+                blocks
+            }
+        }
+    };
+
+    div()
+        .border_l_1()
+        .border_color(theme.border)
+        .pl_3()
+        .child(render_blocks(&blocks, ctx))
+        .into_any_element()
 }
 
 /// Resolve a link target to a file: the direct path first, then the vault-wide name index.
@@ -1603,6 +2917,47 @@ fn resolve_file(root: &Path, attachments: Option<&Attachments>, target: &str) ->
     let resolved = attachments?.resolve(target)?;
     let path = root.join(resolved);
     path.is_file().then_some(path)
+}
+
+/// A decoded inline image: pixel data and intrinsic size.
+pub(crate) type DecodedImage = Option<(Arc<RenderImage>, f32, f32)>;
+
+thread_local! {
+    /// Decoded inline images, keyed by path and modification time.
+    static INLINE_IMAGES: RefCell<HashMap<(PathBuf, SystemTime), DecodedImage>> =
+        RefCell::new(HashMap::new());
+}
+
+/// Decode an image for inline rendering. Returns `(data, width, height)` in image pixels.
+pub(crate) fn inline_image(path: &Path) -> DecodedImage {
+    let modified = std::fs::metadata(path)
+        .and_then(|meta| meta.modified())
+        .ok()?;
+    let key = (path.to_path_buf(), modified);
+    INLINE_IMAGES.with(|cache| {
+        if let Some(hit) = cache.borrow().get(&key) {
+            return hit.clone();
+        }
+        let loaded = std::fs::read(path)
+            .ok()
+            .and_then(|bytes| image::load_from_memory(&bytes).ok())
+            .map(|decoded| {
+                let width = decoded.width() as f32;
+                let height = decoded.height() as f32;
+                let frame = image::Frame::new(decoded.into_rgba8());
+                let data = Arc::new(RenderImage::new(smallvec::SmallVec::from_buf_and_len(
+                    [frame],
+                    1,
+                )));
+                (data, width, height)
+            });
+        let mut cache = cache.borrow_mut();
+        if cache.len() >= 64 {
+            cache.clear();
+        }
+        cache.insert(key, loaded.clone());
+        loaded
+    })
 }
 
 fn is_image(target: &str) -> bool {
@@ -1652,12 +3007,28 @@ fn placeholder(target: &str, reason: &str, theme: Theme) -> AnyElement {
 }
 
 /// The text a block contributes to a reading-mode selection.
+/// Hide a trailing `^block-id` marker: it labels the block, it is not prose.
+fn strip_block_id(text: String) -> String {
+    if let Some(space) = text.rfind(' ') {
+        let tail = &text[space + 1..];
+        if tail.len() > 1
+            && tail.starts_with('^')
+            && tail[1..]
+                .chars()
+                .all(|ch| ch.is_alphanumeric() || ch == '-' || ch == '_')
+        {
+            return text[..space].to_string();
+        }
+    }
+    text
+}
+
 fn block_display(block: &Block) -> String {
     match block {
-        Block::Heading { text, .. }
-        | Block::Paragraph(text)
-        | Block::Quote(text)
-        | Block::ListItem { text, .. } => inline_display(text),
+        Block::Heading { text, .. } => inline_display(text),
+        Block::Paragraph(text) | Block::Quote(text) | Block::ListItem { text, .. } => {
+            strip_block_id(inline_display(text))
+        }
         Block::Code { text, .. } => text.strip_suffix('\n').unwrap_or(text).to_string(),
         Block::Math { tex } => format!("$${tex}$$"),
         Block::Callout { title, text, .. } => {
@@ -1709,12 +3080,19 @@ fn inline_display(text: &str) -> String {
 /// its block, which lets a selection run across wrapped code lines and callout titles.
 struct SelectableText {
     text: StyledText,
+    /// The display text this piece was shaped from, for word and paragraph selection.
+    display: Rc<String>,
     block: usize,
     base: usize,
     len: usize,
     selection: Rc<RefCell<ReadSelection>>,
     links: Vec<(Range<usize>, String)>,
     opener: Option<LinkOpener>,
+    /// The reading list and its size, so dragging past the viewport can scroll.
+    list_state: Option<ListState>,
+    block_count: usize,
+    /// In-page find matches in this piece, as `(range, is_current)`.
+    find: Vec<(Range<usize>, bool)>,
 }
 
 impl IntoElement for SelectableText {
@@ -1758,6 +3136,16 @@ impl Element for SelectableText {
     ) -> Hitbox {
         self.text
             .prepaint(id, inspector_id, bounds, state, window, cx);
+        // A resting pointer over a link says where it goes.
+        let mouse = window.mouse_position();
+        if bounds.contains(&mouse) {
+            if let Ok(index) = self.text.layout().index_for_position(mouse) {
+                if let Some((_, href)) = self.links.iter().find(|(range, _)| range.contains(&index))
+                {
+                    crate::math_element::set_link_tooltip(window, cx, href, bounds);
+                }
+            }
+        }
         window.insert_hitbox(bounds, HitboxBehavior::Normal)
     }
 
@@ -1778,6 +3166,9 @@ impl Element for SelectableText {
         // Mouse listeners must be registered during paint, not prepaint.
         let down_selection = self.selection.clone();
         let down_layout = layout.clone();
+        let down_text = self.display.clone();
+        let down_list = self.list_state.clone();
+        let down_blocks = self.block_count;
         window.on_mouse_event(
             move |event: &MouseDownEvent, phase, window: &mut Window, _cx: &mut App| {
                 if phase != DispatchPhase::Bubble || event.button != MouseButton::Left {
@@ -1789,23 +3180,78 @@ impl Element for SelectableText {
                 let Ok(index) = down_layout.index_for_position(event.position) else {
                     return;
                 };
+                let index = index.min(len);
                 let point = ReadPoint {
                     block,
-                    offset: base + index.min(len),
+                    offset: base + index,
                 };
                 let mut selection = down_selection.borrow_mut();
-                selection.anchor = Some(point);
-                selection.head = Some(point);
-                selection.down = Some(event.position);
-                selection.dragging = true;
-                selection.moved = false;
+
+                // Shift-click extends from the existing anchor; a double click selects the
+                // word under the pointer; a triple click selects the whole piece (the
+                // paragraph, cell, callout line or code line).
+                match event.click_count {
+                    _ if event.modifiers.shift && selection.anchor.is_some() => {
+                        selection.head = Some(point);
+                        selection.dragging = true;
+                        selection.moved = true;
+                    }
+                    2 => {
+                        let word = word_range(down_text.as_str(), index);
+                        selection.anchor = Some(ReadPoint {
+                            block,
+                            offset: base + word.start,
+                        });
+                        selection.head = Some(ReadPoint {
+                            block,
+                            offset: base + word.end,
+                        });
+                        selection.dragging = false;
+                        selection.moved = true;
+                        selection.down = None;
+                    }
+                    3 => {
+                        selection.anchor = Some(ReadPoint {
+                            block,
+                            offset: base,
+                        });
+                        selection.head = Some(ReadPoint {
+                            block,
+                            offset: base + len,
+                        });
+                        selection.dragging = false;
+                        selection.moved = true;
+                        selection.down = None;
+                    }
+                    _ => {
+                        selection.anchor = Some(point);
+                        selection.head = Some(point);
+                        selection.down = Some(event.position);
+                        selection.dragging = true;
+                        selection.moved = false;
+                    }
+                }
                 drop(selection);
+
+                // Keep the anchor block visible while dragging beyond the viewport.
+                if event.position.y < bounds.top() || event.position.y > bounds.bottom() {
+                    if let Some(list_state) = &down_list {
+                        let target = if event.position.y < bounds.top() {
+                            block.saturating_sub(1)
+                        } else {
+                            block + 1
+                        };
+                        list_state.scroll_to_reveal_item(target.min(down_blocks.saturating_sub(1)));
+                    }
+                }
                 window.refresh();
             },
         );
 
         let move_selection = self.selection.clone();
         let move_layout = layout.clone();
+        let move_list = self.list_state.clone();
+        let move_blocks = self.block_count;
         window.on_mouse_event(
             move |event: &MouseMoveEvent, phase, window: &mut Window, _cx: &mut App| {
                 if phase != DispatchPhase::Bubble {
@@ -1815,13 +3261,24 @@ impl Element for SelectableText {
                 if !selection.dragging {
                     return;
                 }
-                // Vertical hit-testing only: dragging past the end of a line still
-                // extends the selection to that line's end.
-                if event.position.y < bounds.top() - px(2.0)
-                    || event.position.y > bounds.bottom() + px(2.0)
-                {
+                // Dragging past the top or bottom scrolls the reading list one block per
+                // move event; the pointer no longer needs to stay on text.
+                if event.position.y < bounds.top() || event.position.y > bounds.bottom() {
+                    if let Some(list_state) = &move_list {
+                        let target = if event.position.y < bounds.top() {
+                            block.saturating_sub(1)
+                        } else {
+                            block + 1
+                        };
+                        list_state.scroll_to_reveal_item(target.min(move_blocks.saturating_sub(1)));
+                        selection.moved = true;
+                        drop(selection);
+                        window.refresh();
+                    }
                     return;
                 }
+                // Vertical hit-testing only: dragging past the end of a line still
+                // extends the selection to that line's end.
                 let index = match move_layout.index_for_position(event.position) {
                     Ok(index) | Err(index) => index,
                 };
@@ -1877,6 +3334,37 @@ impl Element for SelectableText {
                 window.refresh();
             },
         );
+
+        // In-page find highlights sit behind the text and under the selection.
+        for (range, current) in &self.find {
+            let from = range.start.max(base);
+            let to = range.end.min(base + len);
+            if from >= to {
+                continue;
+            }
+            let color = if *current {
+                theme.star.opacity(0.55)
+            } else {
+                theme.accent.opacity(0.22)
+            };
+            for quad in selection_quads(
+                &layout,
+                self.block,
+                self.base,
+                self.len,
+                ReadPoint {
+                    block: self.block,
+                    offset: from,
+                },
+                ReadPoint {
+                    block: self.block,
+                    offset: to,
+                },
+                color,
+            ) {
+                window.paint_quad(quad);
+            }
+        }
 
         if let Some((start, end)) = self.selection.borrow().ordered() {
             for quad in selection_quads(
@@ -1975,9 +3463,37 @@ fn selection_quads(
     quads
 }
 
+/// The block index nearest a 0..1 document fraction.
+fn block_for_progress(progress: f32, block_count: usize) -> usize {
+    if block_count <= 1 {
+        return 0;
+    }
+    ((progress.clamp(0.0, 1.0) * (block_count - 1) as f32).round() as usize).min(block_count - 1)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn restored_reading_folds_survive_the_first_parse() {
+        let mut cache = ReadingCache::new();
+        cache.set_reading_folds(&[2]);
+        cache.update((7, 1), "# One\n\ntext\n## Two\n\nbody\n", None);
+        assert_eq!(cache.reading_folds(), vec![2]);
+        cache.toggle_fold(2);
+        assert!(cache.reading_folds().is_empty());
+    }
+
+    #[test]
+    fn preview_progress_maps_to_a_block() {
+        assert_eq!(block_for_progress(0.0, 11), 0);
+        assert_eq!(block_for_progress(0.5, 11), 5);
+        assert_eq!(block_for_progress(1.0, 11), 10);
+        assert_eq!(block_for_progress(0.9, 1), 0);
+        assert_eq!(block_for_progress(-1.0, 4), 0);
+        assert_eq!(block_for_progress(3.0, 4), 3);
+    }
 
     #[test]
     fn reading_cache_reparses_only_when_the_version_changes() {
@@ -2022,6 +3538,25 @@ mod tests {
     }
 
     #[test]
+    fn the_footnote_popup_remembers_and_clears_its_reference() {
+        let refs = Rc::new(RefCell::new(HashMap::new()));
+        let defs = Rc::new(RefCell::new(HashMap::new()));
+        let mut popup = FootnotePopup::new(
+            refs,
+            defs,
+            ListState::new(0, ListAlignment::Top, px(600.0)),
+            Rc::new(RefCell::new(None)),
+        );
+        let anchor = point(px(120.0), px(80.0));
+        popup.show_at("1", Some(anchor));
+        assert!(popup.is_open());
+        assert_eq!(popup.anchor(), Some(anchor));
+        popup.close();
+        assert!(!popup.is_open());
+        assert_eq!(popup.anchor(), None);
+    }
+
+    #[test]
     fn footnote_references_are_grouped_for_the_picker() {
         let mut cache = ReadingCache::new();
         cache.update((1, 0), "One[^1].\n\nTwo[^1].\n\n[^1]: the note\n", None);
@@ -2039,8 +3574,9 @@ mod tests {
             cache.footnote_refs.clone(),
             cache.footnote_defs.clone(),
             ListState::new(0, ListAlignment::Top, px(600.0)),
+            Rc::new(RefCell::new(None)),
         );
-        popup.show("1");
+        popup.show_at("1", None);
         let (id, options, definition) = popup.open.as_ref().expect("picker opened");
         assert_eq!(id, "1");
         assert_eq!(options.len(), 2);
@@ -2123,5 +3659,194 @@ mod tests {
         let hidden = hidden_blocks(&blocks, &folded);
 
         assert_eq!(hidden, vec![false, true, true, true, false]);
+    }
+
+    #[test]
+    fn double_click_selects_the_word_under_the_pointer() {
+        assert_eq!(word_range("hello world", 7), 6..11);
+        assert_eq!(word_range("hello world", 0), 0..5);
+        // On the space after a word, that word is selected.
+        assert_eq!(word_range("hello world", 5), 0..5);
+        // Punctuation still selects one visible character.
+        assert_eq!(word_range("a  b", 2), 2..3);
+        // Multi-byte text keeps byte boundaries.
+        assert_eq!(word_range("café au lait", 1), 0..5);
+        assert_eq!(word_range("café au lait", 6), 6..8);
+    }
+
+    #[test]
+    fn keyboard_selection_moves_between_characters_and_blocks() {
+        let mut cache = ReadingCache::new();
+        cache.update((1, 1), "alpha\n\nbeta", None);
+        {
+            let mut selection = cache.selection.borrow_mut();
+            selection.anchor = Some(ReadPoint {
+                block: 1,
+                offset: 0,
+            });
+            selection.head = Some(ReadPoint {
+                block: 1,
+                offset: 0,
+            });
+        }
+
+        cache.extend_selection(SelectionMotion::Right);
+        assert_eq!(
+            cache.selection.borrow().head,
+            Some(ReadPoint {
+                block: 1,
+                offset: 1
+            })
+        );
+        cache.extend_selection(SelectionMotion::LineEnd);
+        assert_eq!(
+            cache.selection.borrow().head,
+            Some(ReadPoint {
+                block: 1,
+                offset: 4
+            })
+        );
+        assert_eq!(cache.selected_text().as_deref(), Some("beta"));
+
+        // Walking left at the start of a block continues at the previous block's end.
+        cache.extend_selection(SelectionMotion::LineStart);
+        cache.extend_selection(SelectionMotion::Left);
+        assert_eq!(
+            cache.selection.borrow().head,
+            Some(ReadPoint {
+                block: 0,
+                offset: 5
+            })
+        );
+    }
+
+    #[test]
+    fn blocks_map_back_to_source_lines() {
+        let mut cache = ReadingCache::new();
+        cache.update((1, 1), "alpha\n\nbeta\n\ngamma", None);
+        assert_eq!(cache.block_for_line(0), Some(0));
+        assert_eq!(cache.block_for_line(2), Some(1));
+        assert_eq!(cache.block_for_line(4), Some(2));
+        assert_eq!(cache.block_start_line(1), Some(2));
+        assert_eq!(cache.block_start_line(2), Some(4));
+        // A blank line between blocks belongs to the block above it.
+        assert_eq!(cache.block_for_line(3), Some(1));
+        // Past the end is the last block.
+        assert_eq!(cache.block_for_line(99), Some(2));
+    }
+
+    #[test]
+    fn a_note_embed_section_stops_at_the_next_sibling_heading() {
+        let (blocks, _) = markdown::parse_blocks_spanned("# One\na\n## Sub\nb\n# Two\nc\n");
+        let section = section_blocks(blocks.clone(), "One").expect("section");
+        assert_eq!(section.len(), 4, "{section:?}");
+        assert!(matches!(section.last(), Some(Block::Paragraph(text)) if text == "b"));
+
+        let section = section_blocks(blocks, "Sub").expect("section");
+        assert_eq!(section.len(), 2);
+        assert!(matches!(&section[0], Block::Heading { text, .. } if text == "Sub"));
+    }
+
+    #[test]
+    fn a_note_embed_block_targets_the_block_with_its_id() {
+        let text = "# One\nfirst ^a\n\nsecond ^b\n";
+        let (blocks, spans) = markdown::parse_blocks_spanned(text);
+        let block = block_by_id(&blocks, &spans, text, "^b").expect("block");
+        assert_eq!(block_display(&block), "second");
+        assert!(block_by_id(&blocks, &spans, text, "^gone").is_none());
+    }
+
+    #[test]
+    fn a_missing_embed_section_is_reported() {
+        let (blocks, _) = markdown::parse_blocks_spanned("# One\ntext\n");
+        assert!(section_blocks(blocks, "Nope").is_none());
+        assert!(section_blocks(markdown::parse_blocks("# One\ntext\n"), "").is_none());
+    }
+
+    #[test]
+    fn an_in_page_find_counts_and_cycles_matches() {
+        let mut cache = ReadingCache::new();
+        cache.update((1, 1), "alpha beta\n\nbeta gamma", None);
+        cache.open_find();
+        cache.find_append("beta");
+
+        let (current, total) = cache.find_position();
+        assert_eq!(total, 2);
+        assert_eq!(current, 1);
+        assert!(cache.find.matches.iter().any(|found| found.block == 0));
+        assert!(cache.find.matches.iter().any(|found| found.block == 1));
+
+        cache.find_next(false);
+        assert_eq!(cache.find_position().0, 2);
+        // Wraps around.
+        cache.find_next(false);
+        assert_eq!(cache.find_position().0, 1);
+        cache.find_next(true);
+        assert_eq!(cache.find_position().0, 2);
+
+        // Backspace follows the pattern.
+        cache.find_backspace();
+        cache.find_backspace();
+        cache.find_backspace();
+        cache.find_backspace();
+        assert_eq!(cache.find_pattern(), "");
+        assert_eq!(cache.find_position(), (0, 0));
+
+        cache.close_find();
+        assert!(!cache.find_open());
+    }
+
+    #[test]
+    fn an_in_page_find_honours_regex_case_and_whole_word() {
+        let mut cache = ReadingCache::new();
+        cache.update((1, 1), "Beta beta betamax", None);
+        cache.open_find();
+        cache.find_append("beta");
+        assert_eq!(cache.find_position().1, 3);
+
+        cache.find_toggle_case();
+        assert_eq!(cache.find_position().1, 2);
+
+        cache.find_toggle_word();
+        assert_eq!(cache.find_position().1, 1);
+
+        // An invalid regex reports instead of panicking.
+        cache.find_toggle_word();
+        cache.find_toggle_regex();
+        cache.find_append("(");
+        assert!(cache.find_error().is_some());
+    }
+
+    #[test]
+    fn an_in_page_find_never_touches_the_document() {
+        let mut cache = ReadingCache::new();
+        cache.update((1, 1), "alpha beta", None);
+        let before: Vec<String> = cache.blocks.iter().map(block_display).collect();
+        cache.open_find();
+        cache.find_append("beta");
+        cache.find_next(false);
+        let after: Vec<String> = cache.blocks.iter().map(block_display).collect();
+        assert_eq!(before, after);
+    }
+
+    #[test]
+    fn the_reading_selection_can_be_cleared() {
+        let mut cache = ReadingCache::new();
+        cache.update((1, 1), "alpha beta", None);
+        assert!(!cache.clear_selection());
+
+        {
+            let mut selection = cache.selection.borrow_mut();
+            selection.anchor = Some(ReadPoint {
+                block: 0,
+                offset: 0,
+            });
+            selection.head = Some(ReadPoint {
+                block: 0,
+                offset: 5,
+            });
+        }
+        assert!(cache.clear_selection());
+        assert!(cache.selection.borrow().ordered().is_none());
     }
 }

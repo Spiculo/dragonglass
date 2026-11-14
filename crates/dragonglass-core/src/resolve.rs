@@ -197,6 +197,32 @@ mod tests {
     }
 
     #[test]
+    fn path_only_index_is_a_deterministic_fallback() {
+        let dir = vault("fallback");
+        let notes = vec![note(
+            &dir,
+            "Articles/Big Page.md",
+            "---\nslug: big-page\n---\n# Big\n",
+        )];
+        let fast = NoteIndex::from_paths(notes.iter().map(|note| note.relative.clone()));
+        assert_eq!(
+            fast.resolve_relative("Big Page"),
+            Some("Articles/Big Page.md")
+        );
+        assert_eq!(
+            fast.resolve_relative("Articles/Big Page"),
+            Some("Articles/Big Page.md")
+        );
+        // Aliases need the frontmatter pass, which is the deferred full build.
+        assert_eq!(fast.resolve_relative("big-page"), None);
+        let full = NoteIndex::new(&notes);
+        assert_eq!(
+            full.resolve_relative("big-page"),
+            Some("Articles/Big Page.md")
+        );
+    }
+
+    #[test]
     fn frontmatter_names_and_aliases_resolve() {
         let dir = vault("aliases");
         let notes = vec![

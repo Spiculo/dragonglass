@@ -339,9 +339,11 @@ Launching the app with no argument now reopens the last vault instead of assumin
 lives outside any vault (`%APPDATA%\DragonGlass\vaults.txt`, `~/.config/dragon-glass/vaults.txt`,
 or `$DRAGON_GLASS_CONFIG_DIR` when set). On a first run, or when the last vault has moved, a
 chooser lists the recent vaults and offers a native folder picker; hovering a row highlights
-it, and stale entries can be removed without touching the folder. The active note and reading
-mode are remembered per vault in `.dragon-glass/session.txt`, so the app reopens the note you
-were last in. "Open vault" in the command palette opens the chooser while the app is running;
+it, and stale entries can be removed without touching the folder. The open tabs are
+remembered per vault in `.dragon-glass/session.txt` (version 2: note, mode, caret line and
+column, editor scroll and reading block per tab, plus the active tab), so the app reopens the
+tabs you left, at the same position. Tabs for notes that no longer exist are dropped; a
+version 1 session file still loads. "Open vault" in the command palette opens the chooser while the app is running;
 the chosen vault starts in its own process so each window keeps its vault, theme and keymap.
 An explicit path (a shortcut or a `dragonglass://` URI) still wins over the remembered vault.
 
@@ -372,6 +374,70 @@ bundle on `macos-latest`, on manual dispatch only so it does not spend runner mi
 every push. Still open: Developer ID signing and notarization, so Gatekeeper needs one
 manual approval per download.
 
+### Editing and reading quality of life
+
+Saves are now conflict-safe. `core::fingerprint` defines `DocumentFingerprint` (FNV-1a
+content hash, with size and mtime as hints) and `SaveReport`, and `save_if_unchanged` refuses
+to write when the file changed underneath the editor, was deleted, or cannot be read. The
+editor captures a fingerprint on load, reload and save; `Ctrl+S` on a changed file keeps the
+buffer and shows a bar with **Reload**, **Keep mine**, **Compare** (line diff) and **Save as
+copy**. Closing, quitting and Save all stop on a conflict instead of dropping or overwriting
+the note.
+
+Drafts cover the crash case. `core::drafts` keeps one readable file per note under
+`.dragon-glass/drafts/`; the editor writes it 1.5 s after the last keystroke, only while the
+buffer is dirty, and deletes it on a successful save. Opening a note whose draft differs from
+the file offers **Recover / Compare / Discard**. Note autosave is a per-vault setting
+(`autosave=on`, also in Settings): after the same idle it saves when the fingerprint still
+matches, and stops at the conflict bar otherwise. It is off by default because silent writes
+interact with git commits.
+
+Cmd+Q and the window close button share one exit gate: a dirty buffer offers **Save and
+quit**, **Quit without saving** or **Cancel**, and a save that fails or conflicts keeps the
+app open with the error and the conflict bar.
+
+The first batch from [`docs/qol-plan.md`](docs/qol-plan.md) is in. Reading mode is now
+strictly read-only: every mutating action and both IME insert paths check one `can_mutate()`
+gate, so keyboard input, paste, cut, undo/redo and formatting leave the source untouched
+while selection and copy still work. Reading also joins soft line breaks into paragraphs and
+keeps the hard breaks (two trailing spaces or a backslash), and every code fence has a copy
+button.
+
+Feedback is typed and transient: the header status line carries a kind (info, success,
+warning, error), expires on its own with a one-shot timer, and errors stay until they are
+clicked or dismissed with Escape. A conflict marks every affected tab with a warning glyph,
+not just the active one, and clears once the note is saved.
+
+Tabs and shortcuts: the window title is the active note plus a dirty marker; `Ctrl+Shift+T`
+reopens the last closed tab (with its mode and cursor line, ten deep); `Ctrl+Shift+S` opens
+Save As and `Ctrl+S` on an untitled note opens it too instead of failing silently; searching
+for an existing name in Save As saves in place. The find bar is keyboard-complete
+(replace one/all, regex/case/word toggles, Tab between fields, Enter in replacement replaces,
+Shift+Enter finds backwards) and renders `find.message`. Vim `:wq`/`:x`/`:q` close the tab,
+`Ctrl+R` redoes, and a failed `/` search or bad pattern reports in the status line. Pressing
+Escape closes, in order: the quit prompt, a sidebar menu, the switcher or input panel, the
+settings page, the diff, query and graph views, the relations pane, the footnote popover, the
+editor's autocomplete/find/Vim state, and finally the status line.
+
+### Live preview in the editor
+
+Display math is the first block type the source editor renders in place. A `$$…$$` block
+(or a one-line `$$tex$$`) is typeset with the same RaTeX scene the reading view uses, centred
+and scaled to the text column, whenever the caret is outside the block. The moment the caret
+enters it — a click, an arrow key, a search hit — the LaTeX source is shown again for
+editing, and leaving it restores the render. Empty, unclosed or invalid formulas keep their
+source instead of leaving a blank gap.
+
+The drawing is geometry-neutral on purpose: the block keeps its rows and its shaped source
+lines, only the glyphs are skipped. Scroll offsets, click-to-caret placement, selection and
+find matches therefore keep working exactly as before, and a click on the formula simply
+reveals the source under the pointer.
+
+The rest of Obsidian's live preview — hiding `**`/`==`/`[[…]]` markers and rendering images,
+tables and callouts for the blocks the caret is not in — needs a per-line display-to-source
+column map first, so clicks, selection, wrapping and IME all survive the substitution. That
+is tracked as Q2.12 in [`docs/qol-plan.md`](docs/qol-plan.md).
+
 ### Editor tooling
 
 The editor now has an in-note find/replace bar (`Ctrl+F`, `Ctrl+H` for replace) with
@@ -401,6 +467,9 @@ as `[[selected text]]` without opening the picker.
 **Settings** (`Ctrl+,`) is an in-app page for the theme, accent colour, editor font size, Vim
 mode, snippets and the daily/weekly/monthly/templates/attachments folders. Values are written
 to `.dragon-glass/config.txt`, so they remain plain text and per vault.
+
+It also carries the reading typography: text size and column width (`reader_size`,
+`reader_width`), applied to every open reader and the split preview as soon as they change.
 
 Vim mode is optional and per vault (`vim_mode=true` in `.dragon-glass/config.txt`, the
 command palette, or `Ctrl+Alt+V`). It covers normal/visual/visual-line/insert modes,

@@ -39,6 +39,8 @@ pub struct Outcome {
     pub handled: bool,
     /// `:w` / `:wq` asked the editor to save.
     pub save: bool,
+    /// `:wq` / `:q` asked the app to close the tab.
+    pub close: bool,
     /// A short message for the status bar.
     pub message: Option<String>,
 }
@@ -185,6 +187,9 @@ impl Vim {
             }
             if result.save {
                 outcome.save = true;
+            }
+            if result.close {
+                outcome.close = true;
             }
             if let Some(message) = result.message {
                 outcome.message = Some(message);
@@ -527,18 +532,22 @@ impl Vim {
                 self.command.clear();
                 Outcome::handled()
             }
-            'n' => {
-                if let Some(pattern) = self.last_search.clone() {
-                    self.search(&pattern, false, buffer);
-                }
-                Outcome::handled()
-            }
-            'N' => {
-                if let Some(pattern) = self.last_search.clone() {
-                    self.search(&pattern, true, buffer);
-                }
-                Outcome::handled()
-            }
+            'n' => match self.last_search.clone() {
+                Some(pattern) => match self.search(&pattern, false, buffer) {
+                    Ok(true) => Outcome::handled(),
+                    Ok(false) => Outcome::message(format!("pattern not found: {pattern}")),
+                    Err(error) => Outcome::message(error),
+                },
+                None => Outcome::message("no previous search"),
+            },
+            'N' => match self.last_search.clone() {
+                Some(pattern) => match self.search(&pattern, true, buffer) {
+                    Ok(true) => Outcome::handled(),
+                    Ok(false) => Outcome::message(format!("pattern not found: {pattern}")),
+                    Err(error) => Outcome::message(error),
+                },
+                None => Outcome::message("no previous search"),
+            },
             _ => Outcome {
                 handled: true,
                 ..Outcome::default()
@@ -903,13 +912,16 @@ impl Vim {
                 handled: true,
                 save: true,
                 message: Some("saved".to_string()),
+                ..Outcome::default()
             },
-            "wq" | "x" | "xit" => Outcome {
+            "wq" | "x" | "xit" | "q" | "quit" | "q!" | "qa" | "qa!" => Outcome {
                 handled: true,
-                save: true,
-                message: Some("saved (close with Ctrl+W)".to_string()),
+                save: command.starts_with('w') || command.starts_with('x'),
+                // Closing saves first through the app's normal close path, so even a
+                // plain `:q` cannot drop unsaved text.
+                close: true,
+                message: None,
             },
-            "q" | "quit" => Outcome::message("use Ctrl+W to close the tab"),
             _ => {
                 if let Some(rest) = command
                     .strip_prefix("%s")
@@ -1006,26 +1018,26 @@ impl Vim {
             self.last_search = Some(pattern.clone());
         }
         match self.last_search.clone() {
-            Some(pattern) => {
-                self.search(&pattern, false, buffer);
-                Outcome::handled()
-            }
+            Some(pattern) => match self.search(&pattern, false, buffer) {
+                Ok(true) => Outcome::handled(),
+                Ok(false) => Outcome::message(format!("pattern not found: {pattern}")),
+                Err(error) => Outcome::message(error),
+            },
             None => Outcome::message("no previous search"),
         }
     }
 
-    fn search(&self, pattern: &str, backwards: bool, buffer: &mut Buffer) {
+    /// Move to the next match. Returns whether the caret moved, or the reason it did not.
+    fn search(&self, pattern: &str, backwards: bool, buffer: &mut Buffer) -> Result<bool, String> {
         let text = buffer.text();
         let options = find::Options {
             regex: true,
             case_sensitive: true,
             whole_word: false,
         };
-        let Ok(matches) = find::find_all(&text, pattern, options) else {
-            return;
-        };
+        let matches = find::find_all(&text, pattern, options)?;
         if matches.is_empty() {
-            return;
+            return Ok(false);
         }
         let cursor = buffer.cursor();
         let target = if backwards {
@@ -1043,6 +1055,7 @@ impl Vim {
         if let Some(found) = target {
             buffer.set_cursor(found.range.start);
         }
+        Ok(true)
     }
 }
 
@@ -1204,7 +1217,41 @@ mod tests {
         vim.handle_text("wq", &mut buffer, &mut anchor);
         let outcome = vim.handle_key("enter", &mut buffer, &mut anchor);
         assert!(outcome.save);
+        assert!(outcome.close);
         assert_eq!(vim.mode(), Mode::Normal);
+    }
+
+    #[test]
+    fn colon_quit_asks_the_app_to_close() {
+        let mut vim = vim();
+        let mut buffer = Buffer::from_text("x");
+        let mut anchor = None;
+        vim.handle_text(":", &mut buffer, &mut anchor);
+        vim.handle_text("q", &mut buffer, &mut anchor);
+        let outcome = vim.handle_key("enter", &mut buffer, &mut anchor);
+        assert!(outcome.close);
+        assert!(!outcome.save);
+    }
+
+    #[test]
+    fn a_failed_search_reports_instead_of_doing_nothing() {
+        let mut vim = vim();
+        let mut buffer = Buffer::from_text("one two");
+        let mut anchor = None;
+        vim.handle_text("/missing", &mut buffer, &mut anchor);
+        let outcome = vim.handle_key("enter", &mut buffer, &mut anchor);
+        assert!(outcome.message.unwrap_or_default().contains("not found"));
+        assert_eq!(buffer.cursor(), 0);
+    }
+
+    #[test]
+    fn an_invalid_regex_search_reports_the_error() {
+        let mut vim = vim();
+        let mut buffer = Buffer::from_text("one two");
+        let mut anchor = None;
+        vim.handle_text("/(", &mut buffer, &mut anchor);
+        let outcome = vim.handle_key("enter", &mut buffer, &mut anchor);
+        assert!(outcome.message.is_some());
     }
 
     #[test]
