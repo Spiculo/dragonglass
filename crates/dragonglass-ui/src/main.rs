@@ -109,10 +109,10 @@ fn bind_named(cx: &mut App, key: &str, action: &str) {
 use dragonglass_plugins as plugins;
 use editor::Editor;
 use gpui::{
-    actions, div, prelude::*, px, size, uniform_list, AnyElement, App, Application, Bounds,
-    Context, CursorStyle, ElementId, Entity, FocusHandle, Focusable, KeyBinding, KeyDownEvent,
-    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Render, Timer, WeakEntity, Window,
-    WindowBounds, WindowOptions,
+    actions, anchored, div, point, prelude::*, px, size, uniform_list, AnyElement, App,
+    Application, Bounds, Context, Corner, CursorStyle, ElementId, Entity, FocusHandle, Focusable,
+    KeyBinding, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels,
+    Point, Render, Timer, WeakEntity, Window, WindowBounds, WindowOptions,
 };
 use graph_view::GraphView;
 use reading::ReaderSettings;
@@ -713,6 +713,8 @@ struct DragonGlassApp {
     pending_path: Option<String>,
     /// The name panel is choosing a file for the active untitled buffer.
     pending_save_as: bool,
+    /// Window position of the open tab overflow menu, if any.
+    tab_menu: Option<Point<Pixels>>,
 }
 
 impl DragonGlassApp {
@@ -3395,6 +3397,12 @@ impl DragonGlassApp {
         }
 
         // Menus and popups close before the panels they belong to.
+        if self.tab_menu.is_some() {
+            self.tab_menu = None;
+            cx.notify();
+            return;
+        }
+
         if self.tree_menu.is_some() {
             self.tree_menu = None;
             cx.notify();
@@ -4240,6 +4248,7 @@ impl DragonGlassApp {
                 pending_dir: None,
                 pending_path: None,
                 pending_save_as: false,
+                tab_menu: None,
                 conflict: false,
                 watcher: None,
                 update_source: self.update_source.clone(),
@@ -7616,9 +7625,99 @@ impl Render for DragonGlassApp {
                         middle.update(cx, |this, cx| this.close_tab(index, window, cx));
                     })
                     .into_any_element()
-            }));
+            }))
+            .child(
+                div()
+                    .id("tab-overflow")
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .w(px(28.0))
+                    .h(px(34.0))
+                    .text_color(theme.muted)
+                    .cursor_pointer()
+                    .hover(move |style| style.bg(theme.hover).text_color(theme.text))
+                    .child("\u{25BE}")
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, event: &MouseDownEvent, _window, cx| {
+                            cx.stop_propagation();
+                            this.tab_menu = Some(event.position);
+                            cx.notify();
+                        }),
+                    ),
+            );
+
+        // The tab bar scrolls horizontally; the overflow menu lists every tab so a tab
+        // scrolled out of view is still reachable.
+        let tab_menu = self.tab_menu.map(|position| {
+            let rows: Vec<AnyElement> = self
+                .tabs
+                .iter()
+                .enumerate()
+                .map(|(index, tab)| {
+                    let title = tab.title.clone();
+                    let dirty = tab.editor.read(cx).is_dirty();
+                    let active = index == self.active_tab;
+                    let host = tab_host.clone();
+                    div()
+                        .id(ElementId::Name(format!("tab-menu-{index}").into()))
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .w_full()
+                        .px_3()
+                        .py_1()
+                        .text_sm()
+                        .cursor_pointer()
+                        .when(active, |d| d.bg(theme.chip).text_color(theme.text))
+                        .when(!active, |d| d.text_color(theme.muted))
+                        .hover(move |style| style.bg(theme.hover).text_color(theme.text))
+                        .child(title)
+                        .when(dirty, |d| {
+                            d.child(div().text_color(theme.warn).child("\u{25CF}"))
+                        })
+                        .on_mouse_down(MouseButton::Left, move |_event, window, cx| {
+                            host.update(cx, |this, cx| {
+                                this.tab_menu = None;
+                                this.activate_tab(index, cx);
+                                let handle = this.editor.focus_handle(cx);
+                                window.focus(&handle);
+                            });
+                        })
+                        .into_any_element()
+                })
+                .collect();
+
+            anchored()
+                .position(position)
+                .anchor(Corner::TopLeft)
+                .snap_to_window_with_margin(px(8.0))
+                .child(
+                    div()
+                        .id("tab-menu")
+                        .flex()
+                        .flex_col()
+                        .w(px(240.0))
+                        .max_h(px(320.0))
+                        .overflow_y_scroll()
+                        .py_1()
+                        .rounded_md()
+                        .bg(theme.panel)
+                        .border_1()
+                        .border_color(theme.border)
+                        .text_color(theme.text)
+                        .on_mouse_down(MouseButton::Left, |_event, _window, cx| {
+                            cx.stop_propagation();
+                        })
+                        .children(rows),
+                )
+                .into_any_element()
+        });
 
         div()
+            .relative()
             .flex()
             .flex_col()
             .size_full()
@@ -7779,6 +7878,25 @@ impl Render for DragonGlassApp {
                         })
                     }),
             )
+            .when(self.tab_menu.is_some(), |d| {
+                d.child(
+                    div()
+                        .id("tab-menu-backdrop")
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .right_0()
+                        .bottom_0()
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _event, _window, cx| {
+                                this.tab_menu = None;
+                                cx.notify();
+                            }),
+                        ),
+                )
+            })
+            .children(tab_menu)
     }
 }
 
@@ -8369,6 +8487,7 @@ fn open_vault_window(vault_path: PathBuf, uri_note: Option<String>, cx: &mut App
             pending_dir: None,
             pending_path: None,
             pending_save_as: false,
+            tab_menu: None,
             conflict: false,
             watcher: None,
             update_source,

@@ -668,8 +668,11 @@ shows the note and a dirty dot. Tabs close on middle-click. Copy/link actions re
 outcome. A right-click opens a context menu at the pointer with Cut, Copy, Paste, Bold,
 Italic, Highlight and Wikilink; it never moves the caret or drops the selection, and closes
 on Escape or an outside click.
-**Remaining:** a tab overflow menu, and block move/duplicate/delete keeping the exact caret
-and scroll.
+**Landed (tab overflow):** a `▾` button at the right of the tab bar opens a menu listing every
+open tab with its dirty dot; the active tab is highlighted and clicking a row activates it.
+The menu is anchored at the button, snaps inside the window, and closes on Escape or an
+outside click.
+**Remaining:** block move/duplicate/delete keeping the exact caret and scroll.
 
 #### Q3.13 Dirty state reflects content — D · S
 Compare against the saved text/revision rather than flipping a bool. Type-then-delete and
