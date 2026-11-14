@@ -184,6 +184,11 @@ struct EmbeddedNote {
 
 type EmbedCache = Rc<RefCell<HashMap<(PathBuf, Option<String>), EmbeddedNote>>>;
 
+/// Typeset formulas, keyed by TeX source and style.
+type MathScenes = HashMap<(String, MathStyle), Rc<MathScene>>;
+/// Formulas typeset for embedded notes, filled lazily during render.
+type EmbedMath = Rc<RefCell<MathScenes>>;
+
 struct RenderCtx<'a> {
     vault_root: Option<&'a Path>,
     attachments: Option<&'a Attachments>,
@@ -206,7 +211,7 @@ struct RenderCtx<'a> {
     /// Parsed embedded notes, cached by path and mtime.
     embeds: Option<&'a EmbedCache>,
     /// Formulas typeset for embedded notes, filled lazily.
-    embed_math: Option<&'a RefCell<HashMap<(String, MathStyle), Rc<MathScene>>>>,
+    embed_math: Option<&'a EmbedMath>,
     /// Allocator for synthetic block ids inside embeds.
     next_block: Option<&'a Cell<usize>>,
     /// The reading list, so dragging past the viewport can scroll it.
@@ -496,7 +501,7 @@ pub struct ReadingCache {
     /// Parsed transcluded notes, revalidated by modification time.
     embeds: EmbedCache,
     /// Formulas typeset for transcluded notes.
-    embed_math: Rc<RefCell<HashMap<(String, MathStyle), Rc<MathScene>>>>,
+    embed_math: EmbedMath,
 }
 
 impl ReadingCache {

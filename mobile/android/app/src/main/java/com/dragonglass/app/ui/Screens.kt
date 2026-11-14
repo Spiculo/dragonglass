@@ -663,9 +663,21 @@ private fun EditorScreen(vm: DragonGlassViewModel, relative: String) {
     var showSync by remember { mutableStateOf(false) }
     var editorValue by remember(relative) { mutableStateOf(TextFieldValue(vm.source)) }
     val focusRequester = remember { FocusRequester() }
+    val focusManager = LocalFocusManager.current
     val title = relative.substringAfterLast('/').removeSuffix(".md")
 
     LaunchedEffect(relative) { focusRequester.requestFocus() }
+
+    // Select the current match so the editor scrolls it into view.
+    LaunchedEffect(vm.findOpen, vm.findIndex, vm.findRanges) {
+        if (!vm.findOpen) return@LaunchedEffect
+        val range = vm.findRanges.getOrNull(vm.findIndex) ?: return@LaunchedEffect
+        editorValue = TextFieldValue(
+            text = vm.source,
+            selection = TextRange(range.first, range.last + 1),
+        )
+        focusRequester.requestFocus()
+    }
 
     // Jump to a full-text search hit once the note source has loaded.
     LaunchedEffect(relative, vm.pendingLine) {
@@ -708,6 +720,13 @@ private fun EditorScreen(vm: DragonGlassViewModel, relative: String) {
                             onDismissRequest = { menuOpen = false },
                         ) {
                             DropdownMenuItem(
+                                text = { Text("Find in note") },
+                                onClick = {
+                                    menuOpen = false
+                                    vm.openFind()
+                                },
+                            )
+                            DropdownMenuItem(
                                 text = { Text("Outline") },
                                 onClick = {
                                     menuOpen = false
@@ -744,11 +763,40 @@ private fun EditorScreen(vm: DragonGlassViewModel, relative: String) {
         },
         bottomBar = { StatusBar(vm) },
     ) { padding ->
-        Box(
+        Column(
             Modifier
                 .fillMaxSize()
                 .padding(padding),
         ) {
+            if (vm.findOpen) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 8.dp, vertical = 4.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    OutlinedTextField(
+                        value = vm.findPattern,
+                        onValueChange = vm::onFindChange,
+                        placeholder = { Text("Find in note") },
+                        singleLine = true,
+                        keyboardOptions = KeyboardOptions(imeAction = ImeAction.Search),
+                        keyboardActions = KeyboardActions(
+                            onSearch = { focusManager.clearFocus() },
+                        ),
+                        modifier = Modifier.weight(1f),
+                    )
+                    Text(
+                        vm.findLabel,
+                        modifier = Modifier.padding(horizontal = 8.dp),
+                        style = MaterialTheme.typography.labelSmall,
+                    )
+                    TextButton(onClick = { vm.findNext(backwards = true) }) { Text("\u2191") }
+                    TextButton(onClick = { vm.findNext() }) { Text("\u2193") }
+                    TextButton(onClick = vm::closeFind) { Text("x") }
+                }
+            }
+            Box(Modifier.weight(1f).fillMaxWidth()) {
             if (vm.preview) {
                 MarkdownWebView(
                     html = vm.previewHtml,
@@ -785,6 +833,7 @@ private fun EditorScreen(vm: DragonGlassViewModel, relative: String) {
                     ),
                     cursorBrush = SolidColor(MaterialTheme.colorScheme.primary),
                 )
+            }
             }
         }
     }

@@ -690,6 +690,14 @@ Add find (and replace, if the editor remains plain text) with a compact bar abov
 match count, next/previous and scroll-to-match. Reuse the engine's find options.
 **Done when:** finding a phrase in a long note is possible without scrolling manually.
 
+**Landed:** "Find in note" in the editor menu opens a compact bar above the text: the
+pattern, an `n/m` count, previous/next and close. Matches come from the engine's finder
+through the new FFI `find_in_text`, which returns UTF-16 ranges for the text field; stepping
+puts the match in the editor selection and focuses the editor, so it scrolls into view.
+Matches refresh as the note changes.
+**Remaining:** replace, and regex/case/whole-word toggles in the mobile bar (the FFI already
+accepts those options).
+
 #### Q4.3 Mobile editing toolbar and autocomplete — A · L
 Add a keyboard accessory row: bold, italic, highlight, link, heading, list, task, code;
 insert wikilinks, tags and slash commands from a caret/selection-aware picker. Add basic

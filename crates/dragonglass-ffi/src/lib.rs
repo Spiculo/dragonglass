@@ -15,7 +15,7 @@ use dragonglass_core::assets::Attachments;
 use dragonglass_core::graph::{self, EdgeKind, Graph};
 use dragonglass_core::relations::{self, NoteRelations};
 use dragonglass_core::{
-    bookmarks, frontmatter, html, markdown, query, search, stats, storage, templates, tree,
+    bookmarks, find, frontmatter, html, markdown, query, search, stats, storage, templates, tree,
     vaultfs, NodeKind, Note, NoteRef, TreeNode, Vault,
 };
 
@@ -692,6 +692,54 @@ fn wrap_html(body: String) -> String {
     )
 }
 
+/// One in-note find match, in UTF-16 code units (what Android text fields index by).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Record)]
+pub struct FindRange {
+    pub start: u32,
+    pub end: u32,
+}
+
+/// Find matches in `source` with the engine's finder: literal or regex, case and whole-word
+/// options. Offsets are UTF-16 code units so Kotlin can use them for a text selection.
+#[uniffi::export]
+pub fn find_in_text(
+    source: String,
+    pattern: String,
+    regex: bool,
+    case_sensitive: bool,
+    whole_word: bool,
+) -> Vec<FindRange> {
+    let options = find::Options {
+        regex,
+        case_sensitive,
+        whole_word,
+    };
+    let Ok(matches) = find::find_all(&source, &pattern, options) else {
+        return Vec::new();
+    };
+    if matches.is_empty() {
+        return Vec::new();
+    }
+
+    // Character index -> UTF-16 offset, once for the whole document.
+    let mut offsets = Vec::with_capacity(source.chars().count() + 1);
+    let mut total = 0u32;
+    offsets.push(0);
+    for character in source.chars() {
+        total += character.len_utf16() as u32;
+        offsets.push(total);
+    }
+
+    let last = offsets.len() - 1;
+    matches
+        .into_iter()
+        .map(|found| FindRange {
+            start: offsets[found.range.start.min(last)],
+            end: offsets[found.range.end.min(last)],
+        })
+        .collect()
+}
+
 /// Word/character counts for the current document.
 #[uniffi::export]
 pub fn document_stats(source: String) -> StatsInfo {
@@ -714,6 +762,39 @@ pub fn engine_version() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn find_offsets_are_utf16_units() {
+        // The emoji is two UTF-16 units, so the second match starts at 5, not 4.
+        let found = find_in_text("a😀b a".to_string(), "a".to_string(), false, true, false);
+        assert_eq!(
+            found,
+            vec![
+                FindRange { start: 0, end: 1 },
+                FindRange { start: 5, end: 6 }
+            ]
+        );
+    }
+
+    #[test]
+    fn find_honours_options_and_bad_patterns() {
+        assert_eq!(
+            find_in_text(
+                "Beta beta".to_string(),
+                "beta".to_string(),
+                false,
+                true,
+                false
+            )
+            .len(),
+            1
+        );
+        assert_eq!(
+            find_in_text("a1 b2".to_string(), r"\d".to_string(), true, false, false).len(),
+            2
+        );
+        assert!(find_in_text("a".to_string(), "(".to_string(), true, false, false).is_empty());
+    }
 
     fn temp_vault(name: &str) -> PathBuf {
         let root = std::env::temp_dir().join(format!(

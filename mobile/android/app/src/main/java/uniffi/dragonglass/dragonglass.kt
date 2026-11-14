@@ -679,6 +679,8 @@ internal object IntegrityCheckingUniffiLib {
     ): Int
     external fun uniffi_dragonglass_ffi_checksum_func_engine_version(
     ): Int
+    external fun uniffi_dragonglass_ffi_checksum_func_find_in_text(
+    ): Int
     external fun uniffi_dragonglass_ffi_checksum_func_headings(
     ): Int
     external fun uniffi_dragonglass_ffi_checksum_func_properties(
@@ -827,6 +829,8 @@ internal object UniffiLib {
     ): RustBuffer.ByValue
     external fun uniffi_dragonglass_ffi_fn_func_engine_version(uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
+    external fun uniffi_dragonglass_ffi_fn_func_find_in_text(`source`: RustBuffer.ByValue,`pattern`: RustBuffer.ByValue,`regex`: Byte,`caseSensitive`: Byte,`wholeWord`: Byte,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
     external fun uniffi_dragonglass_ffi_fn_func_headings(`source`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
     external fun uniffi_dragonglass_ffi_fn_func_properties(`source`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
@@ -958,6 +962,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if ((lib.uniffi_dragonglass_ffi_checksum_func_engine_version() and 0xFFFF) != 39834) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if ((lib.uniffi_dragonglass_ffi_checksum_func_find_in_text() and 0xFFFF) != 20025) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if ((lib.uniffi_dragonglass_ffi_checksum_func_headings() and 0xFFFF) != 8491) {
@@ -1211,6 +1218,29 @@ private class JavaLangRefCleanable(
     val cleanable: java.lang.ref.Cleaner.Cleanable
 ) : UniffiCleaner.Cleanable {
     override fun clean() = cleanable.clean()
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterUInt: FfiConverter<UInt, Int> {
+    override fun lift(value: Int): UInt {
+        return value.toUInt()
+    }
+
+    override fun read(buf: ByteBuffer): UInt {
+        return lift(buf.getInt())
+    }
+
+    override fun lower(value: UInt): Int {
+        return value.toInt()
+    }
+
+    override fun allocationSize(value: UInt) = 4UL
+
+    override fun write(value: UInt, buf: ByteBuffer) {
+        buf.putInt(value.toInt())
+    }
 }
 
 /**
@@ -2172,6 +2202,47 @@ public object FfiConverterTypeMobileVault: FfiConverter<MobileVault, Long> {
 
 
 
+/**
+ * One in-note find match, in UTF-16 code units (what Android text fields index by).
+ */
+data class FindRange (
+    var `start`: kotlin.UInt
+    , 
+    var `end`: kotlin.UInt
+    
+){
+    
+
+    
+
+    
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeFindRange: FfiConverterRustBuffer<FindRange> {
+    override fun read(buf: ByteBuffer): FindRange {
+        return FindRange(
+            FfiConverterUInt.read(buf),
+            FfiConverterUInt.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: FindRange) = (
+            FfiConverterUInt.allocationSize(value.`start`) +
+            FfiConverterUInt.allocationSize(value.`end`)
+    )
+
+    override fun write(value: FindRange, buf: ByteBuffer) {
+            FfiConverterUInt.write(value.`start`, buf)
+            FfiConverterUInt.write(value.`end`, buf)
+    }
+}
+
+
+
 data class GraphEdge (
     var `from`: kotlin.Int
     , 
@@ -2961,6 +3032,34 @@ public object FfiConverterSequenceString: FfiConverterRustBuffer<List<kotlin.Str
 /**
  * @suppress
  */
+public object FfiConverterSequenceTypeFindRange: FfiConverterRustBuffer<List<FindRange>> {
+    override fun read(buf: ByteBuffer): List<FindRange> {
+        val len = buf.getInt()
+        return List<FindRange>(len) {
+            FfiConverterTypeFindRange.read(buf)
+        }
+    }
+
+    override fun allocationSize(value: List<FindRange>): ULong {
+        val sizeForLength = 4UL
+        val sizeForItems = value.map { FfiConverterTypeFindRange.allocationSize(it) }.sum()
+        return sizeForLength + sizeForItems
+    }
+
+    override fun write(value: List<FindRange>, buf: ByteBuffer) {
+        buf.putInt(value.size)
+        value.iterator().forEach {
+            FfiConverterTypeFindRange.write(it, buf)
+        }
+    }
+}
+
+
+
+
+/**
+ * @suppress
+ */
 public object FfiConverterSequenceTypeGraphEdge: FfiConverterRustBuffer<List<GraphEdge>> {
     override fun read(buf: ByteBuffer): List<GraphEdge> {
         val len = buf.getInt()
@@ -3312,6 +3411,25 @@ public object FfiConverterSequenceTypeTreeRow: FfiConverterRustBuffer<List<TreeR
     UniffiLib.uniffi_dragonglass_ffi_fn_func_engine_version(
     
         _status)
+}
+    )
+    }
+    
+
+        /**
+         * Find matches in `source` with the engine's finder: literal or regex, case and whole-word
+         * options. Offsets are UTF-16 code units so Kotlin can use them for a text selection.
+         */ fun `findInText`(`source`: kotlin.String, `pattern`: kotlin.String, `regex`: kotlin.Boolean, `caseSensitive`: kotlin.Boolean, `wholeWord`: kotlin.Boolean): List<FindRange> {
+            return FfiConverterSequenceTypeFindRange.lift(
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_dragonglass_ffi_fn_func_find_in_text(
+    
+        
+        FfiConverterString.lower(`source`),
+        FfiConverterString.lower(`pattern`),
+        FfiConverterBoolean.lower(`regex`),
+        FfiConverterBoolean.lower(`caseSensitive`),
+        FfiConverterBoolean.lower(`wholeWord`),_status)
 }
     )
     }

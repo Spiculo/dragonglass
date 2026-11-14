@@ -34,6 +34,7 @@ import uniffi.dragonglass.TreeRow
 import uniffi.dragonglass.documentStats
 import uniffi.dragonglass.headings as parseHeadings
 import uniffi.dragonglass.properties as parseProperties
+import uniffi.dragonglass.findInText
 import uniffi.dragonglass.renderHtmlFromVault
 import java.io.File
 
@@ -107,6 +108,59 @@ class DragonGlassViewModel(application: Application) : AndroidViewModel(applicat
     /// WebView scroll offset, kept when switching between Edit and Preview.
     var previewScroll by mutableStateOf(0)
         private set
+
+    /// In-note find: pattern, matches (UTF-16 ranges) and the current one.
+    var findOpen by mutableStateOf(false)
+        private set
+    var findPattern by mutableStateOf("")
+        private set
+    var findRanges by mutableStateOf<List<IntRange>>(emptyList())
+        private set
+    var findIndex by mutableStateOf(0)
+        private set
+
+    val findLabel: String
+        get() = if (findRanges.isEmpty()) "0/0" else "${findIndex + 1}/${findRanges.size}"
+
+    fun openFind() {
+        findOpen = true
+        findPattern = ""
+        findRanges = emptyList()
+        findIndex = 0
+    }
+
+    fun closeFind() {
+        findOpen = false
+        findPattern = ""
+        findRanges = emptyList()
+        findIndex = 0
+    }
+
+    fun onFindChange(value: String) {
+        findPattern = value
+        refreshFind()
+    }
+
+    fun findNext(backwards: Boolean = false) {
+        if (findRanges.isEmpty()) return
+        findIndex = if (backwards) {
+            (findIndex + findRanges.size - 1) % findRanges.size
+        } else {
+            (findIndex + 1) % findRanges.size
+        }
+    }
+
+    private fun refreshFind() {
+        findRanges = if (findPattern.isEmpty()) {
+            emptyList()
+        } else {
+            runCatching {
+                findInText(source, findPattern, false, false, false)
+                    .map { it.start.toInt() until it.end.toInt() }
+            }.getOrDefault(emptyList())
+        }
+        findIndex = 0
+    }
 
     /// One-line sync state for the chrome.
     val syncLabel: String
@@ -558,6 +612,7 @@ class DragonGlassViewModel(application: Application) : AndroidViewModel(applicat
     fun onSourceChange(value: String) {
         source = value
         dirty = true
+        if (findOpen) refreshFind()
     }
 
     fun save(showMessage: Boolean = true) {
