@@ -477,11 +477,12 @@ inside a fold.
 **Done when:** every reference opens a readable popup that dismisses predictably and does
 not cover the reference itself.
 
-**Landed:** the popup lists every reference with its snippet and the definition link; Escape
-closes it; and a jump to a reference or definition that a folded heading hides first unfolds
-the section and reflows, so the page actually moves.
-**Remaining:** anchoring the popup at the clicked reference (it still opens at a fixed
-top-left position) and closing it by clicking outside.
+**Landed:** the popup opens beside the clicked reference — the marker's window position is
+captured and the panel is placed with GPUI's `anchored` element, offset below it, snapped
+inside the window — and a full-view backdrop closes it on any outside click; Escape also
+closes it. It lists every reference with its snippet and the definition link, and a jump to a
+reference or definition that a folded heading hides first unfolds the section and reflows, so
+the page actually moves. A unit test covers the remembered anchor and its reset on close.
 
 #### Q2.9 Transclusion fidelity — D · L
 Give embedded blocks synthetic ids so link hit-testing and selection work, cache parsed

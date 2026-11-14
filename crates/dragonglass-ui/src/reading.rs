@@ -22,11 +22,11 @@ use dragonglass_core::shared;
 use dragonglass_core::syntax;
 
 use gpui::{
-    div, fill, img, list, point, prelude::*, px, relative, AnyElement, App, Bounds, ClipboardItem,
-    CursorStyle, DispatchPhase, Element, ElementId, Entity, FontStyle, GlobalElementId, Hitbox,
-    HitboxBehavior, InspectorElementId, IntoElement, LayoutId, ListAlignment, ListState,
-    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point,
-    StrikethroughStyle, StyledText, TextLayout, TextRun, UnderlineStyle, Window,
+    anchored, div, fill, img, list, point, prelude::*, px, relative, AnyElement, App, Bounds,
+    ClipboardItem, Corner, CursorStyle, DispatchPhase, Element, ElementId, Entity, FontStyle,
+    GlobalElementId, Hitbox, HitboxBehavior, InspectorElementId, IntoElement, LayoutId,
+    ListAlignment, ListState, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad,
+    Pixels, Point, StrikethroughStyle, StyledText, TextLayout, TextRun, UnderlineStyle, Window,
 };
 
 use crate::flow::{FlowContent, FlowKind, FlowPiece, FlowText};
@@ -245,6 +245,8 @@ pub(crate) struct FootnotePopup {
     list_state: ListState,
     /// Asking the reader to unfold whatever hides a block before scrolling to it.
     reveal: Rc<RefCell<Option<usize>>>,
+    /// Window position of the reference that opened the popup, so it can sit beside it.
+    anchor: Option<Point<Pixels>>,
     open: Option<(String, Vec<FootnoteRef>, Option<usize>)>,
 }
 
@@ -261,6 +263,7 @@ impl FootnotePopup {
             defs,
             list_state,
             reveal,
+            anchor: None,
             open: None,
         }
     }
@@ -274,14 +277,21 @@ impl FootnotePopup {
         }
     }
 
-    fn show(&mut self, id: &str) {
+    /// Open the popup for `id`, anchored at the clicked reference in window coordinates.
+    fn show_at(&mut self, id: &str, anchor: Option<Point<Pixels>>) {
         let refs = self.refs.borrow().get(id).cloned().unwrap_or_default();
         let definition = self.defs.borrow().get(id).copied();
+        self.anchor = anchor;
         self.open = Some((id.to_string(), refs, definition));
+    }
+
+    fn anchor(&self) -> Option<Point<Pixels>> {
+        self.anchor
     }
 
     fn close(&mut self) {
         self.open = None;
+        self.anchor = None;
     }
 
     fn is_open(&self) -> bool {
@@ -1147,10 +1157,11 @@ impl ReadingCache {
         let app_opener = opener.clone();
         let opener: Option<LinkOpener> = Some(Rc::new(move |target, window, cx| {
             if let Some(id) = target.strip_prefix("#fn:") {
+                let anchor = window.mouse_position();
                 if let Some(popup) = &popup_for_links {
                     let id = id.to_string();
                     popup.update(cx, |popup, cx| {
-                        popup.show(&id);
+                        popup.show_at(&id, Some(anchor));
                         cx.notify();
                     });
                 }
@@ -1266,11 +1277,40 @@ impl ReadingCache {
                     .size_full(),
                 ),
             )
+            .children(
+                footnote_popup
+                    .clone()
+                    .filter(|popup| popup.read(cx).is_open())
+                    .map(|popup| {
+                        let close = popup.clone();
+                        div()
+                            .id("footnote-backdrop")
+                            .absolute()
+                            .top_0()
+                            .left_0()
+                            .right_0()
+                            .bottom_0()
+                            .on_mouse_down(MouseButton::Left, move |_event, window, cx| {
+                                // A click outside the popup dismisses it.
+                                close.update(cx, |popup, cx| {
+                                    popup.close();
+                                    cx.notify();
+                                });
+                                window.refresh();
+                            })
+                            .into_any_element()
+                    }),
+            )
             .children(footnote_popup.map(|popup| {
-                div()
-                    .absolute()
-                    .top(px(96.0))
-                    .left(px(24.0))
+                let anchor = popup
+                    .read(cx)
+                    .anchor()
+                    .unwrap_or_else(|| point(px(24.0), px(96.0)));
+                anchored()
+                    .position(anchor)
+                    .anchor(Corner::TopLeft)
+                    .offset(point(px(8.0), px(12.0)))
+                    .snap_to_window_with_margin(px(8.0))
                     .child(popup)
                     .into_any_element()
             }))
@@ -3050,6 +3090,25 @@ mod tests {
     }
 
     #[test]
+    fn the_footnote_popup_remembers_and_clears_its_reference() {
+        let refs = Rc::new(RefCell::new(HashMap::new()));
+        let defs = Rc::new(RefCell::new(HashMap::new()));
+        let mut popup = FootnotePopup::new(
+            refs,
+            defs,
+            ListState::new(0, ListAlignment::Top, px(600.0)),
+            Rc::new(RefCell::new(None)),
+        );
+        let anchor = point(px(120.0), px(80.0));
+        popup.show_at("1", Some(anchor));
+        assert!(popup.is_open());
+        assert_eq!(popup.anchor(), Some(anchor));
+        popup.close();
+        assert!(!popup.is_open());
+        assert_eq!(popup.anchor(), None);
+    }
+
+    #[test]
     fn footnote_references_are_grouped_for_the_picker() {
         let mut cache = ReadingCache::new();
         cache.update((1, 0), "One[^1].\n\nTwo[^1].\n\n[^1]: the note\n", None);
@@ -3069,7 +3128,7 @@ mod tests {
             ListState::new(0, ListAlignment::Top, px(600.0)),
             Rc::new(RefCell::new(None)),
         );
-        popup.show("1");
+        popup.show_at("1", None);
         let (id, options, definition) = popup.open.as_ref().expect("picker opened");
         assert_eq!(id, "1");
         assert_eq!(options.len(), 2);
