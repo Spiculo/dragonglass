@@ -581,9 +581,11 @@ equal columns. The paragraph (blank-line-delimited) holding the caret stays raw,
 reappear as you move into it; moving between paragraphs invalidates only the affected lines
 through the per-line cache. Tests cover both directions, UTF-8 byte offsets, wrapping that
 splits inside hidden markers, code spans and unclosed markers.
-**Remaining:** images, tables, callouts and rules are still shown as source (their syntax is
-not substituted by an element), and a display formula appears when the caret leaves the
-block rather than live while typing.
+**Landed (rules):** a thematic break (`---`, `***`, `___` on a blank-line-delimited line,
+outside frontmatter and code fences) paints as a horizontal rule instead of source while it
+is outside the caret paragraph.
+**Remaining:** images, tables and callouts are still shown as source, and a display formula
+appears when the caret leaves the block rather than live while typing.
 **Done when:** a note with emphasis, an image and a table shows the caret's line as source
 and the rest as preview, and every click lands on the source column the user aimed at.
 

@@ -388,6 +388,8 @@ pub struct Editor {
     heading_source: Option<Rc<String>>,
     /// The paragraph the current layout kept raw.
     layout_raw_block: (usize, usize),
+    /// Lines that are thematic breaks and are drawn as a rule instead of source.
+    layout_rules: Rc<HashSet<usize>>,
     /// Bumped when `folded` changes so `lay_out` reflows.
     fold_revision: u64,
     /// The fold revision the current layout was built for.
@@ -938,6 +940,7 @@ impl Editor {
             heading_cache: (u64::MAX, u64::MAX, Rc::new(Vec::new())),
             heading_source: None,
             layout_raw_block: (usize::MAX, usize::MAX),
+            layout_rules: Rc::new(HashSet::new()),
             fold_revision: 0,
             layout_fold_revision: u64::MAX,
             fold_markers: Rc::new(Vec::new()),
@@ -2187,6 +2190,15 @@ impl Editor {
             block_end.insert(block.last_line, index);
         }
 
+        // Frontmatter delimiters are not thematic breaks.
+        let frontmatter_end = if self.buffer.line(0).trim() == "---" {
+            (1..count)
+                .find(|&line| matches!(self.buffer.line(line).trim(), "---" | "..."))
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        let mut rules: HashSet<usize> = HashSet::new();
         let mut in_code = false;
         let mut language = String::new();
         let mut rows: Vec<Rc<ShapedLine>> = Vec::new();
@@ -2228,6 +2240,17 @@ impl Editor {
                     )
                 }
             };
+
+            let line_is_raw = line_index >= raw_block.0 && line_index <= raw_block.1;
+            if !in_code
+                && !syntax::is_fence(&layout.text)
+                && line_index > frontmatter_end
+                && !line_is_raw
+                && thematic_break(&layout.text)
+                && (line_index == 0 || self.buffer.line(line_index - 1).trim().is_empty())
+            {
+                rules.insert(line_index);
+            }
 
             if syntax::is_fence(&layout.text) {
                 if in_code {
@@ -2276,6 +2299,7 @@ impl Editor {
         self.line_cache.truncate(count);
 
         self.display_math = Rc::new(blocks);
+        self.layout_rules = Rc::new(rules);
         self.last_rows = Rc::new(metas);
         self.last_shaped = Rc::new(rows);
         self.cache_revision = revision;
@@ -6766,6 +6790,8 @@ struct Prepaint {
     visible: Range<usize>,
     /// Source lines whose text is replaced by a rendered formula.
     hidden_lines: HashSet<usize>,
+    /// Source lines drawn as a thematic rule instead of source text.
+    rules: Rc<HashSet<usize>>,
 }
 
 impl Element for EditorText {
@@ -7000,6 +7026,7 @@ impl Element for EditorText {
             extra_cursors: extra_cursor_quads,
             visible,
             hidden_lines,
+            rules: self.editor.read(cx).layout_rules.clone(),
         }
     }
 
@@ -7041,14 +7068,36 @@ impl Element for EditorText {
             let Some(row) = rows.get(i) else {
                 continue;
             };
-            if metas
-                .get(i)
-                .is_some_and(|meta| prepaint.hidden_lines.contains(&meta.line))
-            {
+            let Some(meta) = metas.get(i) else {
+                continue;
+            };
+            if prepaint.hidden_lines.contains(&meta.line) {
+                continue;
+            }
+            if prepaint.rules.contains(&meta.line) {
                 continue;
             }
             let origin = point(bounds.left(), bounds.top() + line_height * i as f32);
             let _ = row.paint(origin, line_height, window, cx);
+        }
+
+        let theme = *cx.global::<Theme>();
+        let mut rule_rows: HashSet<usize> = HashSet::new();
+        for i in visible.clone() {
+            let Some(meta) = metas.get(i) else {
+                continue;
+            };
+            if meta.start == 0 && prepaint.rules.contains(&meta.line) && rule_rows.insert(meta.line)
+            {
+                let y = bounds.top() + line_height * i as f32 + line_height * 0.5;
+                window.paint_quad(fill(
+                    Bounds::new(
+                        point(bounds.left() + px(8.0), y),
+                        size(bounds.size.width - px(16.0), px(1.0)),
+                    ),
+                    theme.border,
+                ));
+            }
         }
 
         // Draw each rendered `$$…$$` block over the blank rows it owns.
@@ -7157,6 +7206,19 @@ fn visible_row_range(
 
 /// Convert wrapped display spans into contiguous source row ranges. Hidden markers belong
 /// to the row they precede/follow, so every source column falls inside exactly one row.
+/// A thematic break: three or more of `-`, `*` or `_`, with nothing else.
+fn thematic_break(line: &str) -> bool {
+    let trimmed = line.trim();
+    let mut chars = trimmed.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !matches!(first, '-' | '*' | '_') {
+        return false;
+    }
+    trimmed.chars().count() >= 3 && chars.all(|ch| ch == first)
+}
+
 fn row_source_spans(
     display_spans: &[(usize, usize)],
     map: &LineMap,
@@ -7311,6 +7373,16 @@ mod tests {
             assert_eq!(plain.display_for_source(col), col);
             assert_eq!(plain.source_for_display(col), col);
         }
+    }
+
+    #[test]
+    fn thematic_breaks_are_recognised() {
+        assert!(thematic_break("---"));
+        assert!(thematic_break("***"));
+        assert!(thematic_break("  ___  "));
+        assert!(!thematic_break("--"));
+        assert!(!thematic_break("--- x"));
+        assert!(!thematic_break("***bold***"));
     }
 
     #[test]
