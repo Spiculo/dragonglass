@@ -498,8 +498,11 @@ selection paints across its text. Math inside embeds is typeset lazily into a sh
 map and reused. `![[Note#Section]]` renders only that heading's section (it stops at the next
 same-or-higher heading), a missing section and a missing note each show a placeholder, and
 nested embeds stay depth-limited.
-**Remaining:** a selection that spans an embed copies only host text (the copy path walks the
-host block list); `#^block` transclusion renders the whole note.
+**Landed (copy and blocks):** a selection that spans a transclusion copies the embedded
+note's display text in place (from the cached parse, or by parsing the file once), and
+`![[Note#^block]]` renders just the block whose last line carries `^id` (a missing block id
+shows a placeholder). Trailing `^id` markers are hidden from display text and therefore from
+copies.
 
 #### Q2.10 Reading progress and typography details — D · S
 Show section name and percent read in the status bar (replace edit-mode Ln/Col), join soft

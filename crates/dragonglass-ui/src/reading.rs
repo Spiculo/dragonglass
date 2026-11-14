@@ -826,19 +826,29 @@ impl ReadingCache {
             if index < start.block || index > end.block {
                 continue;
             }
-            let text = block_display(block);
-            let from = if index == start.block {
-                start.offset.min(text.len())
+            if let Block::Embed {
+                target, fragment, ..
+            } = block
+            {
+                // A transcluded note contributes its own display text to a copy.
+                if let Some(embedded) = self.embedded_display_text(target, fragment.as_deref()) {
+                    out.push_str(&embedded);
+                }
             } else {
-                0
-            };
-            let to = if index == end.block {
-                end.offset.min(text.len())
-            } else {
-                text.len()
-            };
-            if from < to {
-                out.push_str(&text[from..to]);
+                let text = block_display(block);
+                let from = if index == start.block {
+                    start.offset.min(text.len())
+                } else {
+                    0
+                };
+                let to = if index == end.block {
+                    end.offset.min(text.len())
+                } else {
+                    text.len()
+                };
+                if from < to {
+                    out.push_str(&text[from..to]);
+                }
             }
             if index < end.block {
                 out.push('\n');
@@ -846,6 +856,41 @@ impl ReadingCache {
         }
 
         (!out.is_empty()).then_some(out)
+    }
+
+    /// The display text of a transcluded note or section, for copying a selection that
+    /// spans an embed.
+    fn embedded_display_text(&self, target: &str, fragment: Option<&str>) -> Option<String> {
+        let root = self.attachments_root.as_deref()?;
+        let path = resolve_note(root, self.attachments.as_deref(), target);
+        let key = (path.clone(), fragment.map(str::to_string));
+        let cached = self
+            .embeds
+            .borrow()
+            .get(&key)
+            .map(|entry| entry.blocks.clone());
+        let blocks = match cached {
+            Some(blocks) => blocks,
+            None => {
+                let text = std::fs::read_to_string(&path).ok()?;
+                let text = shared::expand(&text, root);
+                let (mut blocks, spans) = markdown::parse_blocks_spanned(&text);
+                blocks = match fragment {
+                    Some(fragment) if fragment.starts_with('^') => {
+                        vec![block_by_id(&blocks, &spans, &text, fragment)?]
+                    }
+                    Some(fragment) => section_blocks(blocks, fragment)?,
+                    None => blocks,
+                };
+                Rc::new(blocks)
+            }
+        };
+        let text = blocks
+            .iter()
+            .map(block_display)
+            .collect::<Vec<_>>()
+            .join("\n");
+        Some(text)
     }
 
     /// Select the whole document, for Ctrl+A in reading mode.
@@ -1413,6 +1458,27 @@ fn render_blocks(blocks: &Rc<Vec<Block>>, ctx: &RenderCtx) -> AnyElement {
             render_block(block, id, &nested)
         }))
         .into_any_element()
+}
+
+/// The block whose last line carries `^id`, for `![[Note#^id]]`.
+fn block_by_id(
+    blocks: &[Block],
+    spans: &[markdown::BlockSpan],
+    source: &str,
+    fragment: &str,
+) -> Option<Block> {
+    let id = fragment.trim().trim_start_matches('^').trim();
+    if id.is_empty() {
+        return None;
+    }
+    let marker = format!("^{id}");
+    let line = source
+        .lines()
+        .position(|line| line.trim_end().ends_with(&marker))?;
+    let index = spans
+        .iter()
+        .position(|span| span.first_line <= line && line <= span.last_line)?;
+    blocks.get(index).cloned()
 }
 
 /// Only the blocks of one `#Heading` section, for `![[Note#Section]]`.
@@ -2522,17 +2588,23 @@ fn render_embed(
                 };
                 // Shared blocks are expanded once per parse, not per frame.
                 let text = shared::expand(&text, root);
-                let (parsed, _) = markdown::parse_blocks_spanned(&text);
+                let (parsed, spans) = markdown::parse_blocks_spanned(&text);
                 let parsed = match fragment {
-                    Some(fragment) if !fragment.starts_with('^') => {
-                        match section_blocks(parsed, fragment) {
-                            Some(section) => section,
+                    Some(fragment) if fragment.starts_with('^') => {
+                        match block_by_id(&parsed, &spans, &text, fragment) {
+                            Some(block) => vec![block],
                             None => {
-                                return placeholder(target, "section not found", theme);
+                                return placeholder(target, "block not found", theme);
                             }
                         }
                     }
-                    _ => parsed,
+                    Some(fragment) => match section_blocks(parsed, fragment) {
+                        Some(section) => section,
+                        None => {
+                            return placeholder(target, "section not found", theme);
+                        }
+                    },
+                    None => parsed,
                 };
                 let blocks = Rc::new(parsed);
                 embeds.insert(
@@ -2613,12 +2685,28 @@ fn placeholder(target: &str, reason: &str, theme: Theme) -> AnyElement {
 }
 
 /// The text a block contributes to a reading-mode selection.
+/// Hide a trailing `^block-id` marker: it labels the block, it is not prose.
+fn strip_block_id(text: String) -> String {
+    if let Some(space) = text.rfind(' ') {
+        let tail = &text[space + 1..];
+        if tail.len() > 1
+            && tail.starts_with('^')
+            && tail[1..]
+                .chars()
+                .all(|ch| ch.is_alphanumeric() || ch == '-' || ch == '_')
+        {
+            return text[..space].to_string();
+        }
+    }
+    text
+}
+
 fn block_display(block: &Block) -> String {
     match block {
-        Block::Heading { text, .. }
-        | Block::Paragraph(text)
-        | Block::Quote(text)
-        | Block::ListItem { text, .. } => inline_display(text),
+        Block::Heading { text, .. } => inline_display(text),
+        Block::Paragraph(text) | Block::Quote(text) | Block::ListItem { text, .. } => {
+            strip_block_id(inline_display(text))
+        }
         Block::Code { text, .. } => text.strip_suffix('\n').unwrap_or(text).to_string(),
         Block::Math { tex } => format!("$${tex}$$"),
         Block::Callout { title, text, .. } => {
@@ -3297,6 +3385,15 @@ mod tests {
         let section = section_blocks(blocks, "Sub").expect("section");
         assert_eq!(section.len(), 2);
         assert!(matches!(&section[0], Block::Heading { text, .. } if text == "Sub"));
+    }
+
+    #[test]
+    fn a_note_embed_block_targets_the_block_with_its_id() {
+        let text = "# One\nfirst ^a\n\nsecond ^b\n";
+        let (blocks, spans) = markdown::parse_blocks_spanned(text);
+        let block = block_by_id(&blocks, &spans, text, "^b").expect("block");
+        assert_eq!(block_display(&block), "second");
+        assert!(block_by_id(&blocks, &spans, text, "^gone").is_none());
     }
 
     #[test]
