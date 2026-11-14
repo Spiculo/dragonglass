@@ -931,9 +931,11 @@ target (note, heading/block fragment, footnote, tag or URL), for both plain and 
 (flow) paragraphs. Reading-view folds are part of session v2, so folded sections reopen
 folded. The vault's frontmatter/alias index is built off the startup path: a path/stem-only
 index is usable immediately and the full index (slugs and aliases) replaces it when a
-background pass finishes, with a generation check dropping stale builds. Android keeps its
-list/preview scroll, loads restored tabs lazily and has the shared reader settings. The rest
-of the list is still open.
+background pass finishes, with a generation check dropping stale builds. The desktop graph
+view pans by dragging, zooms at the pointer with the wheel or trackpad (0.35×–4×, with a reset
+control) and fits the canvas uniformly instead of stretching it to the window's aspect ratio.
+Android keeps its list/preview scroll, loads restored tabs lazily and has the shared reader
+settings. The rest of the list is still open.
 
 ---
 
