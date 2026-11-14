@@ -738,8 +738,12 @@ searchable note picker that inserts `[[stem]]` at the caret. Typing `#` after wh
 a searchable tag picker (inserts `#tag`) and typing `/` at the start of a line opens a
 slash-command picker for headings, lists, tasks, quotes, code, math, callouts and tables; each
 picker replaces the trigger character it was opened from.
-**Remaining:** syntax highlighting in the editor (line numbers are judged harmful on a
-phone).
+**Landed (highlighting):** the editor colours markdown as you type. The tokenizer is the
+engine's own line tokenizer (`core::syntax`), now exposed through `syntax_spans` (UTF-16
+runs, merged, with fenced-code state tracked across lines), so Android and the desktop editor
+agree on what is a heading, link, code span, math, highlight, comment or emphasis marker. A
+`VisualTransformation` adds styles only, so the cursor and selection offsets are unchanged.
+**Remaining:** line numbers (judged harmful on a phone).
 
 #### Q4.4 Sync is visible and recoverable — A · M
 Show a sync chip/state in the editor and list (synced/unsaved/syncing/error/last sync),

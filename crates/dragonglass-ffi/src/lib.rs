@@ -223,6 +223,65 @@ fn now_millis() -> u64 {
         .unwrap_or(0)
 }
 
+/// One coloured run of the editor's markdown highlighting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum SyntaxKindInfo {
+    Heading,
+    Emphasis,
+    Code,
+    CodeBlock,
+    Link,
+    Markup,
+    Math,
+    Comment,
+}
+
+/// One highlighted span, in UTF-16 code units (what Android text fields index by).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Record)]
+pub struct SyntaxSpanInfo {
+    pub start: u32,
+    pub end: u32,
+    pub kind: SyntaxKindInfo,
+}
+
+/// Highlight a whole document for the editor: token kinds from `core::syntax`, merged into
+/// runs and with fenced code state tracked across lines. Offsets are UTF-16 code units.
+#[uniffi::export]
+pub fn syntax_spans(source: String) -> Vec<SyntaxSpanInfo> {
+    let spans = dragonglass_core::syntax::document_spans(&source);
+    if spans.is_empty() {
+        return Vec::new();
+    }
+
+    let mut offsets = Vec::with_capacity(source.chars().count() + 1);
+    let mut total = 0u32;
+    offsets.push(0);
+    for character in source.chars() {
+        total += character.len_utf16() as u32;
+        offsets.push(total);
+    }
+    let last = offsets.len() - 1;
+
+    spans
+        .into_iter()
+        .map(|span| SyntaxSpanInfo {
+            start: offsets[span.start.min(last)],
+            end: offsets[span.end.min(last)],
+            kind: match span.kind {
+                dragonglass_core::syntax::TokenKind::Heading => SyntaxKindInfo::Heading,
+                dragonglass_core::syntax::TokenKind::Emphasis => SyntaxKindInfo::Emphasis,
+                dragonglass_core::syntax::TokenKind::Code => SyntaxKindInfo::Code,
+                dragonglass_core::syntax::TokenKind::CodeBlock => SyntaxKindInfo::CodeBlock,
+                dragonglass_core::syntax::TokenKind::Link => SyntaxKindInfo::Link,
+                dragonglass_core::syntax::TokenKind::Markup => SyntaxKindInfo::Markup,
+                dragonglass_core::syntax::TokenKind::Math => SyntaxKindInfo::Math,
+                dragonglass_core::syntax::TokenKind::Comment => SyntaxKindInfo::Comment,
+                dragonglass_core::syntax::TokenKind::Text => SyntaxKindInfo::Emphasis,
+            },
+        })
+        .collect()
+}
+
 /// The shared sync state, so Android and iOS render one state machine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
 pub enum SyncStateInfo {
@@ -1025,6 +1084,19 @@ mod tests {
             2
         );
         assert!(find_in_text("a".to_string(), "(".to_string(), true, false, false).is_empty());
+    }
+
+    #[test]
+    fn syntax_offsets_are_utf16_units() {
+        // The emoji is two UTF-16 units, so the `**` after it starts at 4, not 3.
+        let spans = syntax_spans("x😀 **b**\n".to_string());
+        let emphasis: Vec<&SyntaxSpanInfo> = spans
+            .iter()
+            .filter(|span| span.kind == SyntaxKindInfo::Emphasis)
+            .collect();
+        assert_eq!(emphasis.len(), 2);
+        assert_eq!((emphasis[0].start, emphasis[0].end), (4, 6));
+        assert!(syntax_spans("plain".to_string()).is_empty());
     }
 
     #[test]

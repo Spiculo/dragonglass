@@ -75,15 +75,20 @@ import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.TextRange
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.input.OffsetMapping
 import androidx.compose.ui.text.input.KeyboardCapitalization
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.TextFieldValue
+import androidx.compose.ui.text.input.TransformedText
+import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -97,7 +102,9 @@ import uniffi.dragonglass.GraphView
 import uniffi.dragonglass.HeadingInfo
 import uniffi.dragonglass.NoteSummary
 import uniffi.dragonglass.SearchHit
+import uniffi.dragonglass.SyntaxKindInfo
 import uniffi.dragonglass.TreeRow
+import uniffi.dragonglass.syntaxSpans
 import kotlin.math.PI
 import kotlin.math.cos
 import kotlin.math.min
@@ -779,6 +786,39 @@ private fun EditorScreen(vm: DragonGlassViewModel, relative: String) {
     val focusManager = LocalFocusManager.current
     val title = relative.substringAfterLast('/').removeSuffix(".md")
 
+    // Markdown colouring comes from the shared tokenizer so Android and the desktop editor
+    // agree on what a heading, link or code span is. Only styles are added, never text, so
+    // the offset mapping stays the identity.
+    val syntax = remember(vm.source) {
+        runCatching { syntaxSpans(vm.source) }.getOrDefault(emptyList())
+    }
+    val colors = MaterialTheme.colorScheme
+    val syntaxTransformation = remember(syntax, colors) {
+        VisualTransformation { text ->
+            val builder = AnnotatedString.Builder(text)
+            for (span in syntax) {
+                val start = span.start.toInt().coerceIn(0, text.length)
+                val end = span.end.toInt().coerceIn(start, text.length)
+                if (start == end) continue
+                val style = when (span.kind) {
+                    SyntaxKindInfo.HEADING -> SpanStyle(
+                        color = colors.primary,
+                        fontWeight = FontWeight.SemiBold,
+                    )
+                    SyntaxKindInfo.EMPHASIS -> SpanStyle(color = colors.onSurfaceVariant)
+                    SyntaxKindInfo.CODE,
+                    SyntaxKindInfo.CODE_BLOCK,
+                    SyntaxKindInfo.MATH -> SpanStyle(color = colors.tertiary)
+                    SyntaxKindInfo.LINK -> SpanStyle(color = colors.primary)
+                    SyntaxKindInfo.MARKUP -> SpanStyle(color = colors.secondary)
+                    SyntaxKindInfo.COMMENT -> SpanStyle(color = colors.outline)
+                }
+                builder.addStyle(style, start, end)
+            }
+            TransformedText(builder.toAnnotatedString(), OffsetMapping.Identity)
+        }
+    }
+
     // Toolbar edits act on the current selection and write through to the buffer.
     fun applyValue(value: TextFieldValue) {
         editorValue = value
@@ -1023,6 +1063,7 @@ private fun EditorScreen(vm: DragonGlassViewModel, relative: String) {
             } else {
                 BasicTextField(
                     value = editorValue,
+                    visualTransformation = syntaxTransformation,
                     onValueChange = {
                         val previous = editorValue.text
                         editorValue = it

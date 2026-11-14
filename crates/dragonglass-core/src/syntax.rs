@@ -79,6 +79,54 @@ pub fn line_tokens(line: &str, in_code_block: bool) -> Vec<TokenKind> {
     kinds
 }
 
+/// One coloured run in a document, as character indices from its start.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Span {
+    pub start: usize,
+    pub end: usize,
+    pub kind: TokenKind,
+}
+
+/// Colour a whole document, merging each line's per-character kinds into runs and keeping
+/// the fenced-code state across lines. Runs of plain text are omitted.
+pub fn document_spans(source: &str) -> Vec<Span> {
+    let mut spans: Vec<Span> = Vec::new();
+    let mut base = 0usize;
+    let mut in_code_block = false;
+
+    for line in source.split_inclusive('\n') {
+        let kinds = line_tokens(line, in_code_block);
+        let mut index = 0usize;
+        while index < kinds.len() {
+            let kind = kinds[index];
+            let start = index;
+            while index < kinds.len() && kinds[index] == kind {
+                index += 1;
+            }
+            if kind == TokenKind::Text {
+                continue;
+            }
+            let start = base + start;
+            let end = base + index;
+            // Extend a run that continues the previous one (for example emphasis that ends
+            // one line and reopens the next is not merged, but adjacent runs are).
+            if let Some(last) = spans.last_mut() {
+                if last.end == start && last.kind == kind {
+                    last.end = end;
+                    continue;
+                }
+            }
+            spans.push(Span { start, end, kind });
+        }
+        if is_fence(line) {
+            in_code_block = !in_code_block;
+        }
+        base += line.chars().count();
+    }
+
+    spans
+}
+
 fn starts_at(chars: &[char], at: usize, needle: &str) -> bool {
     let needle: Vec<char> = needle.chars().collect();
     chars.len() >= at + needle.len() && chars[at..at + needle.len()] == needle[..]
@@ -466,6 +514,37 @@ mod tests {
 
     fn kinds(line: &str) -> Vec<TokenKind> {
         line_tokens(line, false)
+    }
+
+    #[test]
+    fn document_spans_merge_runs_and_track_fences() {
+        let source = "# Title\n\n**bold** and `code`\n```\n// x\n```\n";
+        let spans = document_spans(source);
+        let kinds: Vec<TokenKind> = spans.iter().map(|span| span.kind).collect();
+        // The tokenizer colours the `*` delimiters, not the text between them, and adjacent
+        // code-block lines merge into one run.
+        assert_eq!(
+            kinds,
+            vec![
+                TokenKind::Heading,
+                TokenKind::Emphasis,
+                TokenKind::Emphasis,
+                TokenKind::Code,
+                TokenKind::CodeBlock,
+            ]
+        );
+        let heading = spans[0];
+        assert_eq!(heading.start, 0);
+        assert_eq!(heading.end, "# Title\n".chars().count());
+        // The first `**` delimiter is its own run.
+        assert_eq!(spans[1].end - spans[1].start, 2);
+        // The single code-block run covers the fence, the code line and the closing fence.
+        let block = spans.last().copied().unwrap();
+        assert_eq!(
+            block.start,
+            source[..source.find("```").unwrap()].chars().count()
+        );
+        assert_eq!(block.end, source.chars().count());
     }
 
     #[test]

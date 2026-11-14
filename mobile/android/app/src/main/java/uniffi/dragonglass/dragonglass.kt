@@ -693,6 +693,8 @@ internal object IntegrityCheckingUniffiLib {
     ): Int
     external fun uniffi_dragonglass_ffi_checksum_func_sync_state(
     ): Int
+    external fun uniffi_dragonglass_ffi_checksum_func_syntax_spans(
+    ): Int
     external fun uniffi_dragonglass_ffi_checksum_method_mobilevault_bookmarks(
     ): Int
     external fun uniffi_dragonglass_ffi_checksum_method_mobilevault_create_folder(
@@ -875,6 +877,8 @@ internal object UniffiLib {
     ): RustBuffer.ByValue
     external fun uniffi_dragonglass_ffi_fn_func_sync_state(`changed`: Int,`untracked`: Int,`ahead`: Int,`behind`: Int,`conflicts`: Int,`busy`: Byte,`failed`: Byte,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
+    external fun uniffi_dragonglass_ffi_fn_func_syntax_spans(`source`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
     external fun ffi_dragonglass_ffi_rustbuffer_alloc(`size`: Long,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
     external fun ffi_dragonglass_ffi_rustbuffer_from_bytes(`bytes`: ForeignBytes.ByValue,uniffi_out_err: UniffiRustCallStatus, 
@@ -1019,6 +1023,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if ((lib.uniffi_dragonglass_ffi_checksum_func_sync_state() and 0xFFFF) != 17630) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if ((lib.uniffi_dragonglass_ffi_checksum_func_syntax_spans() and 0xFFFF) != 7) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if ((lib.uniffi_dragonglass_ffi_checksum_method_mobilevault_bookmarks() and 0xFFFF) != 6789) {
@@ -3134,6 +3141,52 @@ public object FfiConverterTypeStatsInfo: FfiConverterRustBuffer<StatsInfo> {
 
 
 
+/**
+ * One highlighted span, in UTF-16 code units (what Android text fields index by).
+ */
+data class SyntaxSpanInfo (
+    var `start`: kotlin.UInt
+    , 
+    var `end`: kotlin.UInt
+    , 
+    var `kind`: SyntaxKindInfo
+    
+){
+    
+
+    
+
+    
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeSyntaxSpanInfo: FfiConverterRustBuffer<SyntaxSpanInfo> {
+    override fun read(buf: ByteBuffer): SyntaxSpanInfo {
+        return SyntaxSpanInfo(
+            FfiConverterUInt.read(buf),
+            FfiConverterUInt.read(buf),
+            FfiConverterTypeSyntaxKindInfo.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: SyntaxSpanInfo) = (
+            FfiConverterUInt.allocationSize(value.`start`) +
+            FfiConverterUInt.allocationSize(value.`end`) +
+            FfiConverterTypeSyntaxKindInfo.allocationSize(value.`kind`)
+    )
+
+    override fun write(value: SyntaxSpanInfo, buf: ByteBuffer) {
+            FfiConverterUInt.write(value.`start`, buf)
+            FfiConverterUInt.write(value.`end`, buf)
+            FfiConverterTypeSyntaxKindInfo.write(value.`kind`, buf)
+    }
+}
+
+
+
 data class TagCount (
     var `tag`: kotlin.String
     , 
@@ -3410,6 +3463,49 @@ public object FfiConverterTypeSyncStateInfo: FfiConverterRustBuffer<SyncStateInf
     override fun allocationSize(value: SyncStateInfo) = 4UL
 
     override fun write(value: SyncStateInfo, buf: ByteBuffer) {
+        buf.putInt(value.ordinal + 1)
+    }
+}
+
+
+
+
+
+/**
+ * One coloured run of the editor's markdown highlighting.
+ */
+
+enum class SyntaxKindInfo {
+    
+    HEADING,
+    EMPHASIS,
+    CODE,
+    CODE_BLOCK,
+    LINK,
+    MARKUP,
+    MATH,
+    COMMENT;
+
+    
+
+
+    companion object
+}
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeSyntaxKindInfo: FfiConverterRustBuffer<SyntaxKindInfo> {
+    override fun read(buf: ByteBuffer) = try {
+        SyntaxKindInfo.values()[buf.getInt() - 1]
+    } catch (e: IndexOutOfBoundsException) {
+        throw RuntimeException("invalid enum value, something is very wrong!!", e)
+    }
+
+    override fun allocationSize(value: SyntaxKindInfo) = 4UL
+
+    override fun write(value: SyntaxKindInfo, buf: ByteBuffer) {
         buf.putInt(value.ordinal + 1)
     }
 }
@@ -3894,6 +3990,34 @@ public object FfiConverterSequenceTypeSearchHit: FfiConverterRustBuffer<List<Sea
 /**
  * @suppress
  */
+public object FfiConverterSequenceTypeSyntaxSpanInfo: FfiConverterRustBuffer<List<SyntaxSpanInfo>> {
+    override fun read(buf: ByteBuffer): List<SyntaxSpanInfo> {
+        val len = buf.getInt()
+        return List<SyntaxSpanInfo>(len) {
+            FfiConverterTypeSyntaxSpanInfo.read(buf)
+        }
+    }
+
+    override fun allocationSize(value: List<SyntaxSpanInfo>): ULong {
+        val sizeForLength = 4UL
+        val sizeForItems = value.map { FfiConverterTypeSyntaxSpanInfo.allocationSize(it) }.sum()
+        return sizeForLength + sizeForItems
+    }
+
+    override fun write(value: List<SyntaxSpanInfo>, buf: ByteBuffer) {
+        buf.putInt(value.size)
+        value.iterator().forEach {
+            FfiConverterTypeSyntaxSpanInfo.write(it, buf)
+        }
+    }
+}
+
+
+
+
+/**
+ * @suppress
+ */
 public object FfiConverterSequenceTypeTagCount: FfiConverterRustBuffer<List<TagCount>> {
     override fun read(buf: ByteBuffer): List<TagCount> {
         val len = buf.getInt()
@@ -4130,6 +4254,21 @@ public object FfiConverterSequenceTypeTreeRow: FfiConverterRustBuffer<List<TreeR
         FfiConverterUInt.lower(`conflicts`),
         FfiConverterBoolean.lower(`busy`),
         FfiConverterBoolean.lower(`failed`),_status)
+}
+    )
+    }
+    
+
+        /**
+         * Highlight a whole document for the editor: token kinds from `core::syntax`, merged into
+         * runs and with fenced code state tracked across lines. Offsets are UTF-16 code units.
+         */ fun `syntaxSpans`(`source`: kotlin.String): List<SyntaxSpanInfo> {
+            return FfiConverterSequenceTypeSyntaxSpanInfo.lift(
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_dragonglass_ffi_fn_func_syntax_spans(
+    
+        
+        FfiConverterString.lower(`source`),_status)
 }
     )
     }
