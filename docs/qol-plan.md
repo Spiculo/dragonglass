@@ -596,8 +596,15 @@ with a left accent coloured by kind (warning/error amber, tip/success green, oth
 accent). The leading `>` markers and the `[!kind]` tag are concealed on blockquote and callout
 lines through the same column map, so the text stays aligned and editable; moving into the
 block shows the markers again.
-**Remaining:** tables are still shown as source, and a display formula appears when the caret
-leaves the block rather than live while typing.
+**Landed (tables):** a pipe table outside the caret paragraph draws as a grid: the header row
+gets a tinted background, the `|---|` separator row collapses (it reserves no row) into the
+header divider, and a vertical line is drawn at every cell pipe using that row's source
+column mapped through the display map, with outer edges and a bottom border. The pipes and
+the separator row are concealed, so the cells read as text; moving the caret into the table
+shows the full markdown again. Tests cover separator detection, table block detection around
+the caret paragraph, and pipe concealment.
+**Remaining:** a display formula appears when the caret leaves its block rather than live
+while typing.
 **Done when:** a note with emphasis, an image and a table shows the caret's line as source
 and the rest as preview, and every click lands on the source column the user aimed at.
 

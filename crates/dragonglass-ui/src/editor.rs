@@ -338,6 +338,8 @@ pub struct Editor {
     editor_images: Vec<EditorImage>,
     /// Callout blocks drawn as boxes behind their source rows.
     layout_callouts: Rc<Vec<CalloutLayout>>,
+    /// Table blocks drawn as a grid.
+    layout_tables: Rc<Vec<TableLayout>>,
     /// The buffer revision `display_math` was parsed from.
     display_math_revision: u64,
     /// Typeset display formulas, keyed by TeX source. `None` records a failed formula.
@@ -633,10 +635,10 @@ impl LineMap {
 }
 
 /// Build the shaped display text and both directions of the column map.
-fn conceal_text(text: &str, conceal: bool) -> LineMap {
+fn conceal_text(text: &str, conceal: bool, table: bool) -> LineMap {
     let chars: Vec<char> = text.chars().collect();
     let hidden = if conceal {
-        hidden_markers(&chars)
+        hidden_markers(&chars, table)
     } else {
         vec![false; chars.len()]
     };
@@ -680,7 +682,7 @@ fn conceal_text(text: &str, conceal: bool) -> LineMap {
 }
 
 /// Which characters are markdown markers to hide when the line is not being edited.
-fn hidden_markers(chars: &[char]) -> Vec<bool> {
+fn hidden_markers(chars: &[char], table: bool) -> Vec<bool> {
     let mut hidden = vec![false; chars.len()];
     let len = chars.len();
     let mut i = 0usize;
@@ -704,6 +706,14 @@ fn hidden_markers(chars: &[char]) -> Vec<bool> {
                 hidden[close + 1] = true;
             }
             i = close + 2;
+        }
+    }
+
+    if table {
+        for (at, ch) in chars.iter().enumerate() {
+            if *ch == '|' {
+                hidden[at] = true;
+            }
         }
     }
 
@@ -809,6 +819,16 @@ fn find_token(chars: &[char], from: usize, token: &str) -> Option<usize> {
         return None;
     }
     (from..=chars.len() - token.len()).find(|&at| chars[at..at + token.len()] == token[..])
+}
+
+/// A table drawn as a grid over its rows. The separator row owns no rows of its own.
+#[derive(Debug, Clone)]
+struct TableLayout {
+    first_row: usize,
+    /// Exclusive.
+    last_row: usize,
+    /// Row where the header ends and the body begins.
+    divider_row: usize,
 }
 
 /// A callout block (`> [!note]` …) drawn as a tinted box over its rows.
@@ -922,6 +942,8 @@ struct LineLayout {
     language: String,
     /// Whether markers were hidden (the line was not the caret line).
     concealed: bool,
+    /// Whether the line belongs to a table, so its cell pipes are hidden.
+    table: bool,
     /// Wrapped spans of the line, in character columns.
     spans: Rc<Vec<(usize, usize)>>,
     /// The same spans in display columns, for building row metadata.
@@ -961,6 +983,7 @@ impl Editor {
             display_math: Rc::new(Vec::new()),
             editor_images: Vec::new(),
             layout_callouts: Rc::new(Vec::new()),
+            layout_tables: Rc::new(Vec::new()),
             display_math_revision: u64::MAX,
             math_scenes: HashMap::new(),
             doc_text: ((u64::MAX, u64::MAX), Rc::new(String::new())),
@@ -2154,6 +2177,11 @@ impl Editor {
         let caret_line = self.buffer.line_col().0;
         let raw_block = self.raw_block_for_line(caret_line);
         let block_changed = self.layout_raw_block != raw_block;
+        // Tables are drawn as a grid, so their pipes are structural while the caret is
+        // elsewhere.
+        let table_ranges = table_blocks(&self.buffer, raw_block);
+        let mut table_rows: Vec<(usize, usize)> = vec![(usize::MAX, 0); table_ranges.len()];
+        let mut table_dividers: Vec<usize> = vec![usize::MAX; table_ranges.len()];
         if !width_changed
             && self.cache_revision == revision
             && !folds_changed
@@ -2286,6 +2314,10 @@ impl Editor {
                         && cached.language == language
                         && cached.concealed
                             == (line_index < raw_block.0 || line_index > raw_block.1)
+                        && cached.table
+                            == table_ranges
+                                .iter()
+                                .any(|(start, end)| line_index >= *start && line_index <= *end)
                         && self.buffer.line_eq(line_index, &cached.text) =>
                 {
                     // Clone the layout, not the `&LineLayout`.
@@ -2298,11 +2330,15 @@ impl Editor {
                 Some(layout) => layout,
                 None => {
                     let text = self.buffer.line(line_index);
+                    let in_table = table_ranges
+                        .iter()
+                        .any(|(start, end)| line_index >= *start && line_index <= *end);
                     LineLayout::shape(
                         &text,
                         in_code,
                         &language,
                         line_index < raw_block.0 || line_index > raw_block.1,
+                        in_table,
                         &font,
                         font_size,
                         width,
@@ -2318,6 +2354,24 @@ impl Editor {
                 .position(|(start, _, _)| *start == line_index)
             {
                 callout_rows[position].0 = rows.len();
+            }
+            let table_position = table_ranges
+                .iter()
+                .position(|(start, end)| line_index >= *start && line_index <= *end);
+            if let Some(position) = table_position {
+                if table_ranges[position].0 == line_index {
+                    table_rows[position].0 = rows.len();
+                }
+                if is_table_separator(&layout.text) {
+                    table_rows[position].1 = rows.len();
+                    table_dividers[position] = rows.len();
+                    if line_index < self.line_cache.len() {
+                        self.line_cache[line_index] = Some(layout);
+                    } else {
+                        self.line_cache.push(Some(layout));
+                    }
+                    continue;
+                }
             }
             let line_is_raw = line_index >= raw_block.0 && line_index <= raw_block.1;
             if !in_code
@@ -2431,6 +2485,9 @@ impl Editor {
             {
                 callout_rows[position].1 = rows.len();
             }
+            if let Some(position) = table_position {
+                table_rows[position].1 = rows.len();
+            }
             if line_index < self.line_cache.len() {
                 self.line_cache[line_index] = Some(layout);
             } else {
@@ -2440,6 +2497,21 @@ impl Editor {
         self.line_cache.truncate(count);
 
         self.display_math = Rc::new(blocks);
+        self.layout_tables = Rc::new(
+            table_ranges
+                .iter()
+                .zip(table_rows)
+                .zip(table_dividers)
+                .filter(|((_, (first, last)), divider)| {
+                    *first != usize::MAX && *last > *first && *divider != usize::MAX
+                })
+                .map(|((_, (first, last)), divider)| TableLayout {
+                    first_row: first,
+                    last_row: last,
+                    divider_row: divider,
+                })
+                .collect(),
+        );
         self.layout_callouts = Rc::new(
             callout_ranges
                 .into_iter()
@@ -6033,6 +6105,7 @@ impl LineLayout {
         in_code: bool,
         language: &str,
         conceal: bool,
+        table: bool,
         font: &gpui::Font,
         font_size: Pixels,
         width: f32,
@@ -6044,6 +6117,7 @@ impl LineLayout {
         let map = Rc::new(conceal_text(
             text,
             conceal && !in_code && !syntax::is_fence(text),
+            table,
         ));
         let chars = map.display.clone();
         let concealed = conceal;
@@ -6137,6 +6211,7 @@ impl LineLayout {
             in_code,
             language: language.to_string(),
             concealed,
+            table,
             spans: Rc::new(spans),
             display_spans: Rc::new(display_spans),
             map,
@@ -7258,6 +7333,92 @@ impl Element for EditorText {
             }
         }
 
+        // Tables: header tint, outer edges, the divider under the header and a vertical
+        // line at every cell pipe. The source text paints on top.
+        {
+            let editor = self.editor.read(cx);
+            let theme = *cx.global::<Theme>();
+            let width = bounds.size.width;
+            for table in editor.layout_tables.iter() {
+                if table.last_row <= prepaint.visible.start
+                    || table.first_row >= prepaint.visible.end
+                {
+                    continue;
+                }
+                let first = table.first_row.max(prepaint.visible.start);
+                let last = table.last_row.min(prepaint.visible.end);
+                if last <= first {
+                    continue;
+                }
+                let top = bounds.top() + line_height * first as f32;
+                let height = line_height * (last - first) as f32;
+                let header_end = table.divider_row.clamp(first, last);
+                if header_end > first {
+                    window.paint_quad(fill(
+                        Bounds::new(
+                            point(bounds.left(), bounds.top() + line_height * first as f32),
+                            size(width, line_height * (header_end - first) as f32),
+                        ),
+                        theme.chip,
+                    ));
+                }
+                // Outer edges.
+                window.paint_quad(fill(
+                    Bounds::new(point(bounds.left(), top), size(px(1.0), height)),
+                    theme.border,
+                ));
+                window.paint_quad(fill(
+                    Bounds::new(
+                        point(bounds.left() + width - px(1.0), top),
+                        size(px(1.0), height),
+                    ),
+                    theme.border,
+                ));
+                // Header divider.
+                if table.divider_row >= first && table.divider_row <= last {
+                    let y = bounds.top() + line_height * table.divider_row as f32;
+                    window.paint_quad(fill(
+                        Bounds::new(point(bounds.left(), y), size(width, px(1.0))),
+                        theme.border,
+                    ));
+                }
+                // Cell separators, at the source column of each pipe.
+                for row_index in first..last {
+                    let (Some(meta), Some(row)) =
+                        (prepaint.metas.get(row_index), prepaint.rows.get(row_index))
+                    else {
+                        continue;
+                    };
+                    let line = editor.buffer.line(meta.line);
+                    if is_table_separator(&line) {
+                        continue;
+                    }
+                    let y = bounds.top() + line_height * row_index as f32;
+                    for (col, ch) in line.chars().enumerate() {
+                        if ch != '|' || col < meta.start || col >= meta.end {
+                            continue;
+                        }
+                        let byte = meta
+                            .map
+                            .byte_for_source(col)
+                            .saturating_sub(meta.display_start_byte);
+                        let x = bounds.left() + row.x_for_index(byte);
+                        window.paint_quad(fill(
+                            Bounds::new(point(x, y), size(px(1.0), line_height)),
+                            theme.border,
+                        ));
+                    }
+                }
+                if table.last_row < prepaint.visible.end {
+                    let y = bounds.top() + line_height * table.last_row as f32 - px(1.0);
+                    window.paint_quad(fill(
+                        Bounds::new(point(bounds.left(), y), size(width, px(1.0))),
+                        theme.border,
+                    ));
+                }
+            }
+        }
+
         for quad in prepaint.find_matches.drain(..) {
             window.paint_quad(quad);
         }
@@ -7447,6 +7608,52 @@ fn callout_kind(line: &str) -> Option<String> {
     let end = inner.find(']')?;
     let kind = inner[..end].trim().to_lowercase();
     (!kind.is_empty()).then_some(kind)
+}
+
+/// Whether a line is a table's `|---|:--:|` separator row.
+fn is_table_separator(line: &str) -> bool {
+    let trimmed = line.trim();
+    if !trimmed.contains('-') || !trimmed.contains('|') {
+        return false;
+    }
+    let cells: Vec<&str> = trimmed
+        .trim_matches('|')
+        .split('|')
+        .map(str::trim)
+        .collect();
+    !cells.is_empty()
+        && cells.iter().all(|cell| {
+            let cell = cell.trim_start_matches(':').trim_end_matches(':');
+            !cell.is_empty() && cell.chars().all(|ch| ch == '-')
+        })
+}
+
+/// Table blocks outside the caret paragraph: `(first line, last line)`, inclusive.
+fn table_blocks(buffer: &Buffer, raw_block: (usize, usize)) -> Vec<(usize, usize)> {
+    let count = buffer.line_count();
+    let mut blocks = Vec::new();
+    let mut line = 0usize;
+    while line + 1 < count {
+        let header = buffer.line(line);
+        if !header.contains('|') || !is_table_separator(&buffer.line(line + 1)) {
+            line += 1;
+            continue;
+        }
+        let start = line;
+        let mut end = line + 1;
+        while end + 1 < count {
+            let candidate = buffer.line(end + 1);
+            if candidate.trim().is_empty() || !candidate.contains('|') {
+                break;
+            }
+            end += 1;
+        }
+        if !(raw_block.0 <= start && start <= raw_block.1) {
+            blocks.push((start, end));
+        }
+        line = end + 1;
+    }
+    blocks
 }
 
 /// A standalone image embed: `![[target]]`, `![[target|300]]` or `![[target|alt text]]`.
@@ -7644,7 +7851,7 @@ mod tests {
     #[test]
     fn concealed_markers_map_between_source_and_display() {
         let text = "a **bold** b";
-        let map = conceal_text(text, true);
+        let map = conceal_text(text, true, false);
         assert_eq!(map.display.iter().collect::<String>(), "a bold b");
 
         // Every visible display character maps to the same source character, both ways.
@@ -7661,12 +7868,38 @@ mod tests {
         assert_eq!(map.source_for_display(2), 4);
 
         // Turning concealment off is the identity.
-        let plain = conceal_text(text, false);
+        let plain = conceal_text(text, false, false);
         assert_eq!(plain.display, source);
         for col in 0..source.len() {
             assert_eq!(plain.display_for_source(col), col);
             assert_eq!(plain.source_for_display(col), col);
         }
+    }
+
+    #[test]
+    fn table_separators_and_blocks_are_recognised() {
+        assert!(is_table_separator("| --- | --- |"));
+        assert!(is_table_separator("|---|:--:|"));
+        assert!(is_table_separator("| :--- | ---: |"));
+        assert!(!is_table_separator("| a | b |"));
+        assert!(!is_table_separator("---"));
+        assert!(!is_table_separator("| -- | xx |"));
+
+        let table = Buffer::from_text("| a | b |\n|---|---|\n| 1 | 2 |\n\ntext\n");
+        assert_eq!(table_blocks(&table, (usize::MAX, usize::MAX)), vec![(0, 2)]);
+        // The table containing the caret stays raw.
+        assert!(table_blocks(&table, (0, 0)).is_empty());
+        let prose = Buffer::from_text("a | b\nplain\n");
+        assert!(table_blocks(&prose, (usize::MAX, usize::MAX)).is_empty());
+    }
+
+    #[test]
+    fn table_pipes_are_concealed() {
+        let map = conceal_text("| a | b |", true, true);
+        assert_eq!(map.display.iter().collect::<String>(), " a  b ");
+        // Without the table flag the pipes stay.
+        let plain = conceal_text("| a | b |", true, false);
+        assert_eq!(plain.display.iter().collect::<String>(), "| a | b |");
     }
 
     #[test]
@@ -7734,7 +7967,7 @@ mod tests {
     #[test]
     fn concealment_keeps_utf8_byte_offsets_aligned() {
         let text = "é **b**";
-        let map = conceal_text(text, true);
+        let map = conceal_text(text, true, false);
         assert_eq!(map.display.iter().collect::<String>(), "é b");
         // `é` is two bytes; the display offsets and the caret byte must agree.
         assert_eq!(map.display_offsets, vec![0, 2, 3, 4]);
@@ -7745,18 +7978,18 @@ mod tests {
 
     #[test]
     fn concealing_leaves_code_and_unclosed_markers_alone() {
-        let map = conceal_text("`a**b**` and **c**", true);
+        let map = conceal_text("`a**b**` and **c**", true, false);
         assert_eq!(map.display.iter().collect::<String>(), "a**b** and c");
-        let map = conceal_text("2 * 3 * 4", true);
+        let map = conceal_text("2 * 3 * 4", true, false);
         assert_eq!(map.display.iter().collect::<String>(), "2 * 3 * 4");
-        let map = conceal_text("[[Note]] and ![[shot.png]]", true);
+        let map = conceal_text("[[Note]] and ![[shot.png]]", true, false);
         assert_eq!(map.display.iter().collect::<String>(), "Note and shot.png");
     }
 
     #[test]
     fn wrapped_rows_cover_every_source_column_once() {
         let text = "a **bold** b";
-        let map = conceal_text(text, true);
+        let map = conceal_text(text, true, false);
         let source_len = text.chars().count();
         // Two display rows split inside the hidden markers.
         let spans = row_source_spans(&[(0, 4), (4, 8)], &map, source_len);
