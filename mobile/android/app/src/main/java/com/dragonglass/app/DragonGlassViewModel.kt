@@ -28,6 +28,8 @@ import uniffi.dragonglass.PropertyInfo
 import uniffi.dragonglass.RelationInfo
 import uniffi.dragonglass.SearchHit
 import uniffi.dragonglass.StatsInfo
+import uniffi.dragonglass.SyncStateInfo
+import uniffi.dragonglass.syncState
 import uniffi.dragonglass.TagCount
 import uniffi.dragonglass.TemplateInfo
 import uniffi.dragonglass.TrashEntry
@@ -251,29 +253,43 @@ class DragonGlassViewModel(application: Application) : AndroidViewModel(applicat
         }
     }
 
+    /// The shared sync state machine, fed from this vault's git status.
+    val syncState: SyncStateInfo
+        get() {
+            val status = gitStatus
+            if (status?.isRepo != true) {
+                return SyncStateInfo.IDLE
+            }
+            return uniffi.dragonglass.syncState(
+                changed = status.changed.toUInt(),
+                untracked = status.untracked.toUInt(),
+                ahead = status.ahead.toUInt(),
+                behind = status.behind.toUInt(),
+                conflicts = status.conflicts.size.toUInt(),
+                busy = gitBusy,
+                failed = gitError != null,
+            )
+        }
+
     /// One-line sync state for the chrome.
     val syncLabel: String
         get() {
             val status = gitStatus
-            return when {
-                gitBusy -> "Syncing…"
-                gitError != null -> "Sync failed"
-                status?.conflicts?.isNotEmpty() == true -> "Conflicts"
-                status?.isRepo == true && (status.hasLocalWork || status.ahead > 0) -> "Unsynced"
-                status?.isRepo == true && status.behind > 0 -> "Behind"
-                status?.isRepo == true -> "Synced"
-                canSyncWithFolder -> "Folder sync"
-                else -> "Git sync"
+            if (status?.isRepo != true) {
+                return if (canSyncWithFolder) "Folder sync" else "Git sync"
+            }
+            return when (syncState) {
+                SyncStateInfo.IDLE -> if (status.behind > 0) "Behind" else "Synced"
+                SyncStateInfo.DIRTY -> "Unsynced"
+                SyncStateInfo.SYNCING -> "Syncing…"
+                SyncStateInfo.CONFLICT -> "Conflicts"
+                SyncStateInfo.ERROR -> "Sync failed"
             }
         }
 
     /// Whether the sync chip should stand out.
     val syncNeedsAttention: Boolean
-        get() = gitError != null ||
-            gitStatus?.conflicts?.isNotEmpty() == true ||
-            gitStatus?.hasLocalWork == true ||
-            (gitStatus?.behind ?: 0) > 0 ||
-            (gitStatus?.ahead ?: 0) > 0
+        get() = syncState != SyncStateInfo.IDLE
 
     /// Remember where the preview was scrolled when it is closed.
     fun rememberPreviewScroll(offset: Int) {

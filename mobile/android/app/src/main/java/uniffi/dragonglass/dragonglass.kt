@@ -691,6 +691,8 @@ internal object IntegrityCheckingUniffiLib {
     ): Int
     external fun uniffi_dragonglass_ffi_checksum_func_resolve_link_fragment(
     ): Int
+    external fun uniffi_dragonglass_ffi_checksum_func_sync_state(
+    ): Int
     external fun uniffi_dragonglass_ffi_checksum_method_mobilevault_bookmarks(
     ): Int
     external fun uniffi_dragonglass_ffi_checksum_method_mobilevault_create_folder(
@@ -871,6 +873,8 @@ internal object UniffiLib {
     ): RustBuffer.ByValue
     external fun uniffi_dragonglass_ffi_fn_func_resolve_link_fragment(`source`: RustBuffer.ByValue,`fragment`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
+    external fun uniffi_dragonglass_ffi_fn_func_sync_state(`changed`: Int,`untracked`: Int,`ahead`: Int,`behind`: Int,`conflicts`: Int,`busy`: Byte,`failed`: Byte,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
     external fun ffi_dragonglass_ffi_rustbuffer_alloc(`size`: Long,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
     external fun ffi_dragonglass_ffi_rustbuffer_from_bytes(`bytes`: ForeignBytes.ByValue,uniffi_out_err: UniffiRustCallStatus, 
@@ -1012,6 +1016,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if ((lib.uniffi_dragonglass_ffi_checksum_func_resolve_link_fragment() and 0xFFFF) != 43324) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if ((lib.uniffi_dragonglass_ffi_checksum_func_sync_state() and 0xFFFF) != 17630) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if ((lib.uniffi_dragonglass_ffi_checksum_method_mobilevault_bookmarks() and 0xFFFF) != 6789) {
@@ -3371,6 +3378,46 @@ public object FfiConverterTypeMobileError : FfiConverterRustBuffer<MobileExcepti
 
 
 
+/**
+ * The shared sync state, so Android and iOS render one state machine.
+ */
+
+enum class SyncStateInfo {
+    
+    IDLE,
+    DIRTY,
+    SYNCING,
+    CONFLICT,
+    ERROR;
+
+    
+
+
+    companion object
+}
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeSyncStateInfo: FfiConverterRustBuffer<SyncStateInfo> {
+    override fun read(buf: ByteBuffer) = try {
+        SyncStateInfo.values()[buf.getInt() - 1]
+    } catch (e: IndexOutOfBoundsException) {
+        throw RuntimeException("invalid enum value, something is very wrong!!", e)
+    }
+
+    override fun allocationSize(value: SyncStateInfo) = 4UL
+
+    override fun write(value: SyncStateInfo, buf: ByteBuffer) {
+        buf.putInt(value.ordinal + 1)
+    }
+}
+
+
+
+
+
 
 /**
  * @suppress
@@ -4066,6 +4113,23 @@ public object FfiConverterSequenceTypeTreeRow: FfiConverterRustBuffer<List<TreeR
         
         FfiConverterString.lower(`source`),
         FfiConverterString.lower(`fragment`),_status)
+}
+    )
+    }
+    
+ fun `syncState`(`changed`: kotlin.UInt, `untracked`: kotlin.UInt, `ahead`: kotlin.UInt, `behind`: kotlin.UInt, `conflicts`: kotlin.UInt, `busy`: kotlin.Boolean, `failed`: kotlin.Boolean): SyncStateInfo {
+            return FfiConverterTypeSyncStateInfo.lift(
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_dragonglass_ffi_fn_func_sync_state(
+    
+        
+        FfiConverterUInt.lower(`changed`),
+        FfiConverterUInt.lower(`untracked`),
+        FfiConverterUInt.lower(`ahead`),
+        FfiConverterUInt.lower(`behind`),
+        FfiConverterUInt.lower(`conflicts`),
+        FfiConverterBoolean.lower(`busy`),
+        FfiConverterBoolean.lower(`failed`),_status)
 }
     )
     }

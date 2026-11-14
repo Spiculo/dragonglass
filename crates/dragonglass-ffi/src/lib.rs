@@ -223,6 +223,42 @@ fn now_millis() -> u64 {
         .unwrap_or(0)
 }
 
+/// The shared sync state, so Android and iOS render one state machine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum SyncStateInfo {
+    Idle,
+    Dirty,
+    Syncing,
+    Conflict,
+    Error,
+}
+
+#[uniffi::export]
+pub fn sync_state(
+    changed: u32,
+    untracked: u32,
+    ahead: u32,
+    behind: u32,
+    conflicts: u32,
+    busy: bool,
+    failed: bool,
+) -> SyncStateInfo {
+    let snapshot = dragonglass_core::git::SyncSnapshot {
+        changed: changed as usize,
+        untracked: untracked as usize,
+        ahead: ahead as usize,
+        behind: behind as usize,
+        conflicts: conflicts as usize,
+    };
+    match dragonglass_core::git::SyncState::of(snapshot, busy, failed) {
+        dragonglass_core::git::SyncState::Idle => SyncStateInfo::Idle,
+        dragonglass_core::git::SyncState::Dirty => SyncStateInfo::Dirty,
+        dragonglass_core::git::SyncState::Syncing => SyncStateInfo::Syncing,
+        dragonglass_core::git::SyncState::Conflict => SyncStateInfo::Conflict,
+        dragonglass_core::git::SyncState::Error => SyncStateInfo::Error,
+    }
+}
+
 /// The 1-based source line a `#Heading` or `#^block` fragment points at, if present.
 #[uniffi::export]
 pub fn resolve_link_fragment(source: String, fragment: String) -> Option<u32> {

@@ -819,8 +819,12 @@ preserved), drafts round-trip, fragment resolution and clamped reader settings.
 **Landed (clients):** Android captures a fingerprint when it opens a note and every save now
 goes through `saveDocumentWithFingerprint`; a conflict throws and leaves the note open with
 its text, and the new baseline is stored after a successful write.
-**Remaining:** `sync_state`; Android reader settings use the FFI functions but have no
-settings screen yet.
+**Landed (`sync_state`):** `core::git::SyncState`/`SyncSnapshot` define the five states
+(idle, dirty, syncing, conflict, error) and their attention rule; the FFI exposes them as
+`syncState(...)`, and Android's chip label/tint now come from that state machine instead of
+its own when-chain.
+**Remaining:** Android reader settings use the FFI functions but have no settings screen yet;
+iOS is not started.
 
 **UX contract document:** write `docs/ux-contract.md` with the invariants in §2 and a table
 of state transitions (open, edit, save, close, read, follow, back). Desktop and Android
