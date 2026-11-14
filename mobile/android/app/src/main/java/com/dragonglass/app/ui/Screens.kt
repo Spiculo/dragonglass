@@ -770,14 +770,45 @@ private fun NoteRow(
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun EditorScreen(vm: DragonGlassViewModel, relative: String) {
-    // Back goes Preview → Edit, then Edit → list. Sheets and dialogs handle their own
-    // Back before this handler sees it.
+    // Back goes Preview → Edit, then asks about unsaved edits, then returns to the list.
+    // Sheets and dialogs handle their own Back before this handler sees it.
+    val noteTitle = relative.substringAfterLast('/').removeSuffix(".md")
+    var confirmClose by remember { mutableStateOf(false) }
     BackHandler {
         if (vm.preview) {
             vm.togglePreview()
+        } else if (vm.dirty) {
+            confirmClose = true
         } else {
             vm.closeNote()
         }
+    }
+
+    if (confirmClose) {
+        AlertDialog(
+            onDismissRequest = { confirmClose = false },
+            title = { Text("Save changes?") },
+            text = { Text("$noteTitle has unsaved edits.") },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        confirmClose = false
+                        vm.closeNote()
+                    },
+                ) { Text("Save") }
+            },
+            dismissButton = {
+                Row {
+                    TextButton(
+                        onClick = {
+                            confirmClose = false
+                            vm.discardAndClose()
+                        },
+                    ) { Text("Discard") }
+                    TextButton(onClick = { confirmClose = false }) { Text("Cancel") }
+                }
+            },
+        )
     }
 
     var menuOpen by remember { mutableStateOf(false) }
@@ -791,7 +822,12 @@ private fun EditorScreen(vm: DragonGlassViewModel, relative: String) {
     var tagStart by remember { mutableStateOf<Int?>(null) }
     var slashPickerOpen by remember { mutableStateOf(false) }
     var slashStart by remember { mutableStateOf<Int?>(null) }
-    var editorValue by remember(relative) { mutableStateOf(TextFieldValue(vm.source)) }
+    var editorValue by remember(relative) {
+        val stored = vm.selectionFor(relative)
+        val start = stored.first.coerceIn(0, vm.source.length)
+        val end = stored.last.coerceIn(start, vm.source.length)
+        mutableStateOf(TextFieldValue(vm.source, TextRange(start, end)))
+    }
     val focusRequester = remember { FocusRequester() }
     val focusManager = LocalFocusManager.current
     val title = relative.substringAfterLast('/').removeSuffix(".md")
@@ -1092,6 +1128,7 @@ private fun EditorScreen(vm: DragonGlassViewModel, relative: String) {
                         val previous = editorValue.text
                         editorValue = it
                         vm.onSourceChange(it.text)
+                        vm.rememberSelection(relative, it.selection.min until it.selection.max)
                         val caret = it.selection.end.coerceIn(0, it.text.length)
                         val line = it.text.take(caret).count { ch -> ch == '\n' }
                         val col = caret - (it.text.lastIndexOf('\n', caret - 1) + 1)

@@ -290,6 +290,15 @@ class DragonGlassViewModel(application: Application) : AndroidViewModel(applicat
     /// Content hash of the version each open note is based on, for conflict-safe saves.
     private val fingerprints = mutableMapOf<String, ULong>()
 
+    /// Editor selection per note, so reopening a note returns to the place in it.
+    private val selections = mutableMapOf<String, IntRange>()
+
+    fun selectionFor(relative: String): IntRange = selections[relative] ?: IntRange(0, 0)
+
+    fun rememberSelection(relative: String, range: IntRange) {
+        selections[relative] = range
+    }
+
     /// Caret position, for the debounced draft written when the app goes to the background.
     private var cursorLine = 0
     private var cursorCol = 0
@@ -916,6 +925,12 @@ class DragonGlassViewModel(application: Application) : AndroidViewModel(applicat
             previewHtml = ""
             refresh()
         }
+    }
+
+    /// Close the open note without saving its edits (after the back prompt).
+    fun discardAndClose() {
+        dirty = false
+        closeNote()
     }
 
     fun onSourceChange(value: String) {

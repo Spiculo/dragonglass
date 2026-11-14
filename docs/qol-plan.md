@@ -343,8 +343,10 @@ note opens. Preserve preview scroll across Edit ↔ Preview.
 preview WebView saves its scroll offset when Edit replaces it and restores it after the page
 finishes loading, and it only reloads when the rendered document actually changes (so a
 recomposition no longer resets the page).
-**Remaining (desktop is done via session v2):** on Android the editor's own selection and
-scroll still belong to `BasicTextField` and reset when the screen is rebuilt.
+**Landed (Android selection):** the editor remembers each note's selection range and restores
+it when the note reopens, so the caret returns to where it was.
+**Remaining:** the text field's own scroll offset still belongs to `BasicTextField` and has no
+public handle, so it is not restored on rebuild (desktop is complete via session v2).
 
 #### Q1.8 Mobile back precedence — A · S
 Define one hierarchy: Preview → Edit; search results → list; sheet/dialog → dismiss; dirty
@@ -354,10 +356,10 @@ exit. Use one `BackHandler` per level, not competing handlers.
 back-through-the-app test passes.
 
 **Landed:** Back goes Preview → Edit → list; sheets and dialogs dismiss themselves through
-Material; the editor's Back closes the note only after a successful save (a failed save
-keeps it open, Q0.7); the list clears the search query, then the bookmarks filter, before it
-leaves the screen. One `BackHandler` per level.
-**Remaining:** a dirty note closes by saving rather than offering a Save/Discard prompt.
+Material; the editor's Back on a dirty note opens a Save / Discard / Cancel prompt (Save
+closes only after a successful write, so a failed save keeps the note open, Q0.7); the list
+clears the search query, then the bookmarks filter, before it leaves the screen. One
+`BackHandler` per level.
 
 #### Q1.9 Outline follows the reader — D · S
 Highlight the current heading while scrolling, scroll the outline to it, and make outline
