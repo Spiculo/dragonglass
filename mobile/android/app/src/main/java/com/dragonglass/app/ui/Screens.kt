@@ -770,6 +770,10 @@ private fun EditorScreen(vm: DragonGlassViewModel, relative: String) {
     var showSync by remember { mutableStateOf(false) }
     var linkPickerOpen by remember { mutableStateOf(false) }
     var linkStart by remember { mutableStateOf<Int?>(null) }
+    var tagPickerOpen by remember { mutableStateOf(false) }
+    var tagStart by remember { mutableStateOf<Int?>(null) }
+    var slashPickerOpen by remember { mutableStateOf(false) }
+    var slashStart by remember { mutableStateOf<Int?>(null) }
     var editorValue by remember(relative) { mutableStateOf(TextFieldValue(vm.source)) }
     val focusRequester = remember { FocusRequester() }
     val focusManager = LocalFocusManager.current
@@ -802,6 +806,15 @@ private fun EditorScreen(vm: DragonGlassViewModel, relative: String) {
                 TextRange(value.selection.start + prefix.length, value.selection.end + prefix.length),
             ),
         )
+        focusRequester.requestFocus()
+    }
+
+    /// Replace the trigger the picker was opened from with `text`.
+    fun insertFrom(start: Int?, text: String) {
+        val from = start ?: editorValue.selection.min
+        val to = editorValue.selection.max.coerceAtLeast(from)
+        val newText = editorValue.text.substring(0, from) + text + editorValue.text.substring(to)
+        applyValue(TextFieldValue(newText, TextRange(from + text.length)))
         focusRequester.requestFocus()
     }
 
@@ -1023,6 +1036,20 @@ private fun EditorScreen(vm: DragonGlassViewModel, relative: String) {
                             linkStart = (it.selection.min - 2).coerceAtLeast(0)
                             linkPickerOpen = true
                         }
+                        // `#` after whitespace opens the tag picker; `/` at line start the
+                        // slash-command picker.
+                        if (!vm.preview && it.text.length == previous.length + 1) {
+                            val caret = it.selection.min
+                            val typed = it.text.getOrNull(caret - 1)
+                            val before = if (caret >= 2) it.text[caret - 2] else '\n'
+                            if (typed == '#' && before.isWhitespace()) {
+                                tagStart = caret - 1
+                                tagPickerOpen = true
+                            } else if (typed == '/' && (caret == 1 || before == '\n')) {
+                                slashStart = caret - 1
+                                slashPickerOpen = true
+                            }
+                        }
                     },
                     modifier = Modifier
                         .fillMaxSize()
@@ -1079,6 +1106,29 @@ private fun EditorScreen(vm: DragonGlassViewModel, relative: String) {
             onPick = { target ->
                 insertWikilink(target)
                 linkPickerOpen = false
+            },
+        )
+    }
+
+    if (tagPickerOpen) {
+        TagPickerSheet(
+            vm = vm,
+            onDismiss = { tagPickerOpen = false },
+            onPick = { tag ->
+                insertFrom(tagStart, "#$tag")
+                tagStart = null
+                tagPickerOpen = false
+            },
+        )
+    }
+
+    if (slashPickerOpen) {
+        SlashPickerSheet(
+            onDismiss = { slashPickerOpen = false },
+            onPick = { text ->
+                insertFrom(slashStart, text)
+                slashStart = null
+                slashPickerOpen = false
             },
         )
     }
@@ -1260,6 +1310,103 @@ private fun ReaderSettingsSheet(vm: DragonGlassViewModel, onDismiss: () -> Unit)
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 modifier = Modifier.padding(top = 8.dp),
             )
+        }
+    }
+}
+
+/// A tag picker for `#`.
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun TagPickerSheet(
+    vm: DragonGlassViewModel,
+    onDismiss: () -> Unit,
+    onPick: (String) -> Unit,
+) {
+    var query by remember { mutableStateOf("") }
+    val needle = query.trim().lowercase()
+    val results = vm.tags.filter {
+        needle.isEmpty() || it.tag.lowercase().contains(needle)
+    }.take(60)
+
+    ModalBottomSheet(onDismissRequest = onDismiss) {
+        Column(Modifier.fillMaxWidth().padding(horizontal = 16.dp)) {
+            Text("Insert tag", style = MaterialTheme.typography.titleLarge)
+            OutlinedTextField(
+                value = query,
+                onValueChange = { query = it },
+                placeholder = { Text("Search tags") },
+                singleLine = true,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(vertical = 8.dp),
+            )
+            LazyColumn(Modifier.heightIn(max = 360.dp)) {
+                items(results, key = { it.tag }) { tag ->
+                    ListItem(
+                        headlineContent = { Text("#${tag.tag}", maxLines = 1) },
+                        supportingContent = {
+                            Text("${tag.notes} notes", style = MaterialTheme.typography.labelSmall)
+                        },
+                        modifier = Modifier.clickable { onPick(tag.tag) },
+                    )
+                }
+                if (results.isEmpty()) {
+                    item { Muted("No tags in this vault.") }
+                }
+            }
+        }
+    }
+}
+
+/// Common markdown blocks, inserted from a `/` picker.
+private val SLASH_PRESETS = listOf(
+    "Heading 1" to "# ",
+    "Heading 2" to "## ",
+    "Heading 3" to "### ",
+    "Bullet list" to "- ",
+    "Numbered list" to "1. ",
+    "Task" to "- [ ] ",
+    "Quote" to "> ",
+    "Code block" to "```\n\n```",
+    "Math block" to "$$\n\n$$",
+    "Callout" to "> [!note] ",
+    "Table" to "| a | b |\n| --- | --- |\n|  |  |\n",
+)
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun SlashPickerSheet(onDismiss: () -> Unit, onPick: (String) -> Unit) {
+    var query by remember { mutableStateOf("") }
+    val needle = query.trim().lowercase()
+    val results = SLASH_PRESETS.filter {
+        needle.isEmpty() || it.first.lowercase().contains(needle)
+    }
+    ModalBottomSheet(onDismissRequest = onDismiss) {
+        Column(Modifier.fillMaxWidth().padding(horizontal = 16.dp)) {
+            Text("Insert block", style = MaterialTheme.typography.titleLarge)
+            OutlinedTextField(
+                value = query,
+                onValueChange = { query = it },
+                placeholder = { Text("Search blocks") },
+                singleLine = true,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(vertical = 8.dp),
+            )
+            LazyColumn(Modifier.heightIn(max = 360.dp)) {
+                items(results, key = { it.first }) { (label, insert) ->
+                    ListItem(
+                        headlineContent = { Text(label, maxLines = 1) },
+                        supportingContent = {
+                            Text(
+                                insert.replace("\n", "⏎"),
+                                style = MaterialTheme.typography.labelSmall,
+                            )
+                        },
+                        modifier = Modifier.clickable { onPick(insert) },
+                    )
+                }
+            }
         }
     }
 }

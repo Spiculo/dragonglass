@@ -734,9 +734,12 @@ syntax; `[[` opens a searchable note picker; the toolbar does not cover the care
 **Landed:** a keyboard accessory row above the editor (hidden in preview) with bold, italic,
 highlight, inline code, heading, bullet, task and wikilink buttons. Each acts on the current
 selection and writes through to the buffer; the wikilink button, and typing `[[`, open a
-searchable note picker that inserts `[[stem]]` at the caret.
-**Remaining:** tag (`#`) and slash-command pickers, and syntax highlighting/line numbers in
-the editor (line numbers are judged harmful on a phone).
+searchable note picker that inserts `[[stem]]` at the caret. Typing `#` after whitespace opens
+a searchable tag picker (inserts `#tag`) and typing `/` at the start of a line opens a
+slash-command picker for headings, lists, tasks, quotes, code, math, callouts and tables; each
+picker replaces the trigger character it was opened from.
+**Remaining:** syntax highlighting in the editor (line numbers are judged harmful on a
+phone).
 
 #### Q4.4 Sync is visible and recoverable — A · M
 Show a sync chip/state in the editor and list (synced/unsaved/syncing/error/last sync),
