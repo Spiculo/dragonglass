@@ -960,11 +960,20 @@ private fun EditorScreen(vm: DragonGlassViewModel, relative: String) {
         modifier = Modifier.imePadding(),
         topBar = {
             TopAppBar(
-                navigationIcon = {
-                    TextButton(onClick = vm::closeNote) { Text("Back") }
-                },
                 title = {
                     Text(title, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                },
+                navigationIcon = {
+                    // History arrows are separate from Done, which closes the note.
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        TextButton(onClick = vm::navBack, enabled = vm.canGoBack) {
+                            Text("\u2039", fontSize = 22.sp)
+                        }
+                        TextButton(onClick = vm::navForward, enabled = vm.canGoForward) {
+                            Text("\u203A", fontSize = 22.sp)
+                        }
+                        TextButton(onClick = vm::closeNote) { Text("Done") }
+                    }
                 },
                 actions = {
                     TextButton(onClick = vm::togglePreview) {

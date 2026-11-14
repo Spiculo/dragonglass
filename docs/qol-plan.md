@@ -294,8 +294,10 @@ walk a 100-entry history of `(note, mode, cursor line, reading block)` recorded 
 note open — links, quick switcher, search hits, daily notes, reopen — and on back/forward
 restore the mode, caret and reading position. Visiting a new place after going back drops
 the forward tail; a status line shows the position in the history.
-**Remaining:** mouse back/forward buttons, the outline-jump entries, and the mobile Back
-chrome.
+**Landed (mouse, outline, mobile):** the mouse back/forward buttons run the same history, an
+outline jump records its starting place before the page moves, and Android keeps a 50-entry
+note history with its own `‹`/`›` chrome (separate from Done, which closes the note),
+restoring the note, mode and preview scroll.
 
 #### Q1.4 Heading and block fragments — D · M
 Keep the `#fragment` in parsed inline links instead of stripping it (`inline.rs`), parse

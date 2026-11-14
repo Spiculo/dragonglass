@@ -111,9 +111,9 @@ use editor::Editor;
 use gpui::{
     actions, anchored, div, prelude::*, px, size, uniform_list, AnyElement, App, Application,
     Bounds, Context, Corner, CursorStyle, ElementId, Entity, FocusHandle, Focusable, KeyBinding,
-    KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, Render,
-    ScrollStrategy, Timer, UniformListScrollHandle, WeakEntity, Window, WindowBounds,
-    WindowOptions,
+    KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, NavigationDirection,
+    Pixels, Point, Render, ScrollStrategy, Timer, UniformListScrollHandle, WeakEntity, Window,
+    WindowBounds, WindowOptions,
 };
 use graph_view::GraphView;
 use reading::ReaderSettings;
@@ -1840,6 +1840,17 @@ impl DragonGlassApp {
             },
         );
         cx.notify();
+    }
+
+    /// Mouse back/forward buttons use the same history as the shortcuts.
+    fn nav_button(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        match event.button {
+            MouseButton::Navigate(NavigationDirection::Back) => self.nav_back(&NavBack, window, cx),
+            MouseButton::Navigate(NavigationDirection::Forward) => {
+                self.nav_forward(&NavForward, window, cx)
+            }
+            _ => {}
+        }
     }
 
     fn nav_back(&mut self, _: &NavBack, window: &mut Window, cx: &mut Context<Self>) {
@@ -7006,6 +7017,7 @@ impl Render for DragonGlassApp {
                             .on_mouse_down(MouseButton::Left, move |_ev, window, cx| {
                                 me.update(cx, |this, cx| {
                                     this.reveal_outline_heading(index);
+                                    this.remember_nav(cx);
                                     this.editor.update(cx, |editor, cx| {
                                         editor.jump_to_heading(
                                             line.saturating_sub(1),
@@ -7347,6 +7359,14 @@ impl Render for DragonGlassApp {
                 .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_drag_release_out))
                 .on_mouse_move(cx.listener(Self::clear_stuck_drag_move))
                 .on_mouse_down(MouseButton::Left, cx.listener(Self::clear_stuck_drag_down))
+                .on_mouse_down(
+                    MouseButton::Navigate(NavigationDirection::Back),
+                    cx.listener(Self::nav_button),
+                )
+                .on_mouse_down(
+                    MouseButton::Navigate(NavigationDirection::Forward),
+                    cx.listener(Self::nav_button),
+                )
                 .on_action(cx.listener(Self::open_switcher))
                 .on_action(cx.listener(Self::open_search))
                 .on_action(cx.listener(Self::open_git))
@@ -7749,6 +7769,14 @@ impl Render for DragonGlassApp {
             .on_mouse_up(MouseButton::Left, cx.listener(Self::finish_resize))
             .on_mouse_move(cx.listener(Self::clear_stuck_drag_move))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::clear_stuck_drag_down))
+            .on_mouse_down(
+                MouseButton::Navigate(NavigationDirection::Back),
+                cx.listener(Self::nav_button),
+            )
+            .on_mouse_down(
+                MouseButton::Navigate(NavigationDirection::Forward),
+                cx.listener(Self::nav_button),
+            )
             .on_action(cx.listener(Self::open_switcher))
             .on_action(cx.listener(Self::open_search))
             .on_action(cx.listener(Self::open_git))

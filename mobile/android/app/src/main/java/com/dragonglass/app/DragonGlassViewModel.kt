@@ -298,6 +298,45 @@ class DragonGlassViewModel(application: Application) : AndroidViewModel(applicat
     /// Content hash of the version each open note is based on, for conflict-safe saves.
     private val fingerprints = mutableMapOf<String, ULong>()
 
+    /// Back/forward spots through the notes, with their mode and scroll.
+    private data class NavSpot(val relative: String, val preview: Boolean, val scroll: Int)
+
+    private val navHistory = mutableListOf<NavSpot>()
+    private var navIndex = -1
+    /// A spot being restored, so opening it does not record itself again.
+    private var pendingNav: NavSpot? = null
+
+    val canGoBack: Boolean get() = navIndex > 0
+    val canGoForward: Boolean get() = navIndex + 1 < navHistory.size
+
+    private fun recordNav(spot: NavSpot) {
+        if (navHistory.getOrNull(navIndex) == spot) return
+        while (navHistory.size > navIndex + 1) {
+            navHistory.removeAt(navHistory.lastIndex)
+        }
+        navHistory.add(spot)
+        if (navHistory.size > 50) navHistory.removeAt(0)
+        navIndex = navHistory.lastIndex
+    }
+
+    fun navBack() {
+        if (!canGoBack) return
+        navIndex--
+        restoreNav()
+    }
+
+    fun navForward() {
+        if (!canGoForward) return
+        navIndex++
+        restoreNav()
+    }
+
+    private fun restoreNav() {
+        val spot = navHistory.getOrNull(navIndex) ?: return
+        pendingNav = spot
+        openNote(spot.relative, jumpToLine = null, keepPreview = spot.preview)
+    }
+
     /// Editor selection per note, so reopening a note returns to the place in it.
     private val selections = mutableMapOf<String, IntRange>()
 
@@ -968,9 +1007,18 @@ class DragonGlassViewModel(application: Application) : AndroidViewModel(applicat
                     // A link followed inside the preview keeps the preview open.
                     preview = keepPreview
                     previewHtml = opened.html
-                    previewScroll = 0
+                    val restore = pendingNav
+                    pendingNav = null
+                    if (restore != null && restore.relative == opened.relative) {
+                        previewScroll = restore.scroll
+                    } else {
+                        previewScroll = 0
+                    }
                     dirty = false
                     pendingLine = jumpToLine
+                    if (restore == null) {
+                        recordNav(NavSpot(opened.relative, preview, 0))
+                    }
                 }
                 .onFailure { error = it.message ?: "Could not open the note" }
             loading = false
