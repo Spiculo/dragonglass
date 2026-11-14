@@ -12,6 +12,7 @@ use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::Arc;
 
 use dragonglass_core::drafts;
 use dragonglass_core::find as find_engine;
@@ -24,11 +25,12 @@ use dragonglass_core::math::{self, MathOptions, MathScene, MathStyle};
 use dragonglass_core::{blocks, git, history, stats, syntax, templates, wrap, Buffer};
 use gpui::{
     actions, anchored, div, fill, point, prelude::*, px, relative, size, AnyElement, App, Bounds,
-    ClipboardEntry, ClipboardItem, Context, Corner, CursorStyle, ElementId, ElementInputHandler,
-    Entity, EntityInputHandler, ExternalPaths, FocusHandle, Focusable, GlobalElementId,
-    ImageFormat, InspectorElementId, KeyBinding, KeyDownEvent, LayoutId, MouseButton,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point, Render, ScrollHandle,
-    ShapedLine, SharedString, Style, TextRun, Timer, UTF16Selection, Window,
+    ClipboardEntry, ClipboardItem, Context, Corner, Corners, CursorStyle, ElementId,
+    ElementInputHandler, Entity, EntityInputHandler, ExternalPaths, FocusHandle, Focusable,
+    GlobalElementId, ImageFormat, InspectorElementId, KeyBinding, KeyDownEvent, LayoutId,
+    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point, Render,
+    RenderImage, ScrollHandle, ShapedLine, SharedString, Style, TextRun, Timer, UTF16Selection,
+    Window,
 };
 
 use crate::math_element::{paint_scene, MathElement};
@@ -332,6 +334,8 @@ pub struct Editor {
     reading_content: ReadingCache,
     /// Display-math blocks in the current document, with the rows they occupy.
     display_math: Rc<Vec<DisplayMathLayout>>,
+    /// Standalone image embeds currently drawn in place of their source line.
+    editor_images: Vec<EditorImage>,
     /// The buffer revision `display_math` was parsed from.
     display_math_revision: u64,
     /// Typeset display formulas, keyed by TeX source. `None` records a failed formula.
@@ -783,6 +787,17 @@ fn find_token(chars: &[char], from: usize, token: &str) -> Option<usize> {
     (from..=chars.len() - token.len()).find(|&at| chars[at..at + token.len()] == token[..])
 }
 
+/// A standalone `![[image]]` line drawn over the rows it owns.
+#[derive(Debug, Clone)]
+struct EditorImage {
+    line: usize,
+    first_row: usize,
+    row_count: usize,
+    data: Arc<RenderImage>,
+    width: f32,
+    height: f32,
+}
+
 /// A `$$…$$` block in the source, before its rows are known.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct DisplayMathSource {
@@ -911,6 +926,7 @@ impl Editor {
             doc_generation: 0,
             reading_content: ReadingCache::new(),
             display_math: Rc::new(Vec::new()),
+            editor_images: Vec::new(),
             display_math_revision: u64::MAX,
             math_scenes: HashMap::new(),
             doc_text: ((u64::MAX, u64::MAX), Rc::new(String::new())),
@@ -2198,6 +2214,7 @@ impl Editor {
         } else {
             0
         };
+        self.editor_images.clear();
         let mut rules: HashSet<usize> = HashSet::new();
         let mut in_code = false;
         let mut language = String::new();
@@ -2259,6 +2276,63 @@ impl Editor {
                     language = fence_language(&layout.text);
                 }
                 in_code = !in_code;
+            }
+
+            // A standalone image embed outside the edited paragraph is drawn as an image,
+            // with empty rows reserved for its height.
+            if !line_is_raw && !in_code {
+                if let Some((target, requested)) = image_embed(&layout.text) {
+                    if let Some(path) = self.resolve_embed(&target) {
+                        if let Some((data, image_width, image_height)) =
+                            crate::reading::inline_image(&path)
+                        {
+                            let (display_width, display_height, row_count) = editor_image_layout(
+                                image_width,
+                                image_height,
+                                width - 16.0,
+                                f32::from(self.line_height),
+                                requested,
+                            );
+                            let empty = Rc::new(window.text_system().shape_line(
+                                SharedString::from(""),
+                                font_size,
+                                &[],
+                                None,
+                            ));
+                            let first_row = rows.len();
+                            let source_len = layout.text.chars().count();
+                            let display_len = layout.map.display.len();
+                            let display_byte =
+                                layout.map.display_offsets.last().copied().unwrap_or(0);
+                            for _ in 0..row_count {
+                                rows.push(empty.clone());
+                                metas.push(RowMeta {
+                                    line: line_index,
+                                    start: source_len,
+                                    end: source_len,
+                                    display_start: display_len,
+                                    display_end: display_len,
+                                    display_start_byte: display_byte,
+                                    map: layout.map.clone(),
+                                });
+                            }
+                            self.editor_images.push(EditorImage {
+                                line: line_index,
+                                first_row,
+                                row_count,
+                                data,
+                                width: display_width,
+                                height: display_height,
+                            });
+                            if line_index < self.line_cache.len() {
+                                self.line_cache[line_index] = Some(layout);
+                            } else {
+                                self.line_cache.push(Some(layout));
+                            }
+                            continue;
+                        }
+                    }
+                }
             }
 
             if let Some(&block) = block_start.get(&line_index) {
@@ -2567,6 +2641,24 @@ impl Editor {
     }
 
     /// Set the folder pasted images are filed into (vault-relative).
+    /// Resolve an embed target to a file in the vault, its attachments folder or the index.
+    fn resolve_embed(&self, target: &str) -> Option<PathBuf> {
+        let root = self.vault_root.as_ref()?;
+        let direct = root.join(target);
+        if direct.is_file() {
+            return Some(direct);
+        }
+        let in_folder = root.join(&self.attachments_folder).join(target);
+        if in_folder.is_file() {
+            return Some(in_folder);
+        }
+        let index = dragonglass_core::assets::Attachments::index(root);
+        index
+            .resolve(target)
+            .map(|relative| root.join(relative))
+            .filter(|path| path.is_file())
+    }
+
     pub fn set_attachments_folder(&mut self, folder: &str) {
         if !folder.trim().is_empty() {
             self.attachments_folder = folder.trim().to_string();
@@ -7138,6 +7230,35 @@ impl Element for EditorText {
             }
         }
 
+        // Draw standalone image embeds over the rows reserved for them.
+        {
+            let editor = self.editor.read(cx);
+            let column_width = f32::from(bounds.size.width);
+            for image in editor.editor_images.iter() {
+                if prepaint.hidden_lines.contains(&image.line) {
+                    continue;
+                }
+                let last_row = image.first_row + image.row_count;
+                if last_row <= visible.start || image.first_row >= visible.end {
+                    continue;
+                }
+                let width = px(image.width).min(bounds.size.width - px(16.0));
+                let height = px(image.height);
+                let left = bounds.left() + px(((column_width - f32::from(width)) / 2.0).max(0.0));
+                let block_height = line_height * image.row_count as f32;
+                let top = bounds.top()
+                    + line_height * image.first_row as f32
+                    + px(((f32::from(block_height) - f32::from(height)) / 2.0).max(0.0));
+                let _ = window.paint_image(
+                    Bounds::new(point(left, top), size(width, height)),
+                    Corners::default(),
+                    image.data.clone(),
+                    0,
+                    false,
+                );
+            }
+        }
+
         if focus_handle.is_focused(window) {
             if let Some(cursor) = prepaint.cursor.take() {
                 window.paint_quad(cursor);
@@ -7206,6 +7327,57 @@ fn visible_row_range(
 
 /// Convert wrapped display spans into contiguous source row ranges. Hidden markers belong
 /// to the row they precede/follow, so every source column falls inside exactly one row.
+/// A standalone image embed: `![[target]]`, `![[target|300]]` or `![[target|alt text]]`.
+/// Returns the target and a pixel width when the size parses as a number.
+fn image_embed(text: &str) -> Option<(String, Option<f32>)> {
+    let inner = text.trim().strip_prefix("![[")?.strip_suffix("]]")?;
+    if inner.contains('\n') {
+        return None;
+    }
+    let (target, size) = match inner.split_once('|') {
+        Some((target, rest)) => (target.trim(), Some(rest.trim())),
+        None => (inner.trim(), None),
+    };
+    if target.is_empty() {
+        return None;
+    }
+    let width = size
+        .and_then(|size| size.parse::<f32>().ok())
+        .filter(|width| *width > 0.0);
+    Some((target.to_string(), width))
+}
+
+/// Display size for an image drawn in the editor, and how many rows it needs.
+///
+/// A bare embed gets a preview about five lines tall; `![[img|300]]` asks for a width.
+/// The result never exceeds the column and keeps the image's aspect ratio.
+fn editor_image_layout(
+    image_width: f32,
+    image_height: f32,
+    max_width: f32,
+    line_height: f32,
+    requested_width: Option<f32>,
+) -> (f32, f32, usize) {
+    let aspect = if image_height > 0.0 {
+        image_width / image_height
+    } else {
+        1.0
+    };
+    let aspect = aspect.clamp(0.02, 50.0);
+    let max_width = max_width.max(48.0);
+    let mut height = requested_width
+        .filter(|width| *width > 0.0)
+        .map(|width| width / aspect)
+        .unwrap_or(line_height * 5.0);
+    let mut width = height * aspect;
+    if width > max_width {
+        width = max_width;
+        height = width / aspect;
+    }
+    let row_count = ((height / line_height).ceil() as usize).clamp(1, 30);
+    (width, height, row_count)
+}
+
 /// A thematic break: three or more of `-`, `*` or `_`, with nothing else.
 fn thematic_break(line: &str) -> bool {
     let trimmed = line.trim();
@@ -7373,6 +7545,46 @@ mod tests {
             assert_eq!(plain.display_for_source(col), col);
             assert_eq!(plain.source_for_display(col), col);
         }
+    }
+
+    #[test]
+    fn standalone_image_embeds_parse_target_and_width() {
+        assert_eq!(
+            image_embed("![[shot.png]]"),
+            Some(("shot.png".to_string(), None))
+        );
+        assert_eq!(
+            image_embed("  ![[shot.png|300]]  "),
+            Some(("shot.png".to_string(), Some(300.0)))
+        );
+        // A non-numeric size is alt text, not a width.
+        assert_eq!(
+            image_embed("![[shot.png|a wide shot]]"),
+            Some(("shot.png".to_string(), None))
+        );
+        // Only a whole line is substituted.
+        assert_eq!(image_embed("see ![[shot.png]]"), None);
+        assert_eq!(image_embed("![[shot.png"), None);
+        assert_eq!(image_embed("![[|300]]"), None);
+    }
+
+    #[test]
+    fn image_previews_keep_aspect_and_fit_the_column() {
+        // A 2:1 image with no width: five lines tall, twice as wide.
+        assert_eq!(
+            editor_image_layout(200.0, 100.0, 600.0, 20.0, None),
+            (200.0, 100.0, 5)
+        );
+        // `|300` sets the width; the height follows the ratio.
+        assert_eq!(
+            editor_image_layout(200.0, 100.0, 600.0, 20.0, Some(300.0)),
+            (300.0, 150.0, 8)
+        );
+        // A narrow column caps the width and scales the height with it.
+        assert_eq!(
+            editor_image_layout(200.0, 100.0, 120.0, 20.0, None),
+            (120.0, 60.0, 3)
+        );
     }
 
     #[test]

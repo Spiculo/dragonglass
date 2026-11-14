@@ -584,8 +584,15 @@ splits inside hidden markers, code spans and unclosed markers.
 **Landed (rules):** a thematic break (`---`, `***`, `___` on a blank-line-delimited line,
 outside frontmatter and code fences) paints as a horizontal rule instead of source while it
 is outside the caret paragraph.
-**Remaining:** images, tables and callouts are still shown as source, and a display formula
-appears when the caret leaves the block rather than live while typing.
+**Landed (images):** a standalone `![[image]]` line outside the caret paragraph is decoded
+(shared, mtime-keyed image cache) and drawn in place: about five lines tall, or the width
+from `![[image|300]]`, keeping the aspect ratio and fitting the column. Its layout reserves
+exactly the rows the picture needs and pushes them as blank rows with the line's map, so
+scroll, click-to-edit (the caret lands on that line and the source returns), selection and
+IME mapping are unchanged. Moving into the paragraph re-shows the source, and moving out
+draws the image again.
+**Remaining:** tables and callouts are still shown as source, and a display formula appears
+when the caret leaves the block rather than live while typing.
 **Done when:** a note with emphasis, an image and a table shows the caret's line as source
 and the rest as preview, and every click lands on the source column the user aimed at.
 

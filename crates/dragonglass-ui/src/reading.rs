@@ -2870,7 +2870,7 @@ fn resolve_file(root: &Path, attachments: Option<&Attachments>, target: &str) ->
 }
 
 /// A decoded inline image: pixel data and intrinsic size.
-type DecodedImage = Option<(Arc<RenderImage>, f32, f32)>;
+pub(crate) type DecodedImage = Option<(Arc<RenderImage>, f32, f32)>;
 
 thread_local! {
     /// Decoded inline images, keyed by path and modification time.
@@ -2879,7 +2879,7 @@ thread_local! {
 }
 
 /// Decode an image for inline rendering. Returns `(data, width, height)` in image pixels.
-fn inline_image(path: &Path) -> DecodedImage {
+pub(crate) fn inline_image(path: &Path) -> DecodedImage {
     let modified = std::fs::metadata(path)
         .and_then(|meta| meta.modified())
         .ok()?;
