@@ -411,6 +411,20 @@ class DragonGlassViewModel(application: Application) : AndroidViewModel(applicat
         gitBranch = readGit("branch", "main").ifBlank { "main" }
     }
 
+    /// Unix millis of the last successful sync, shown in the sync sheet.
+    var lastSyncAt by mutableStateOf(readGit("lastSync", "").toLongOrNull())
+        private set
+
+    private fun writeGit(key: String, value: String) {
+        gitPreferences.edit().putString(gitKey(key), value).apply()
+    }
+
+    private fun recordSync() {
+        val now = System.currentTimeMillis()
+        lastSyncAt = now
+        writeGit("lastSync", now.toString())
+    }
+
     private fun readGit(key: String, fallback: String): String {
         gitPreferences.getString(gitKey(key), null)?.let { return it }
         if (activeVault.id == "default") {
@@ -850,6 +864,25 @@ class DragonGlassViewModel(application: Application) : AndroidViewModel(applicat
         }
     }
 
+    /// Close the open note and search the vault for a tag, so Details chips can filter.
+    fun filterByTag(tag: String) {
+        val note = selected
+        val text = source
+        val dirtyNow = dirty
+        viewModelScope.launch {
+            if (note != null && dirtyNow) {
+                runCatching { withContext(Dispatchers.IO) { ensureVault().saveNote(note, text) } }
+                    .onFailure { error = it.message ?: "Could not save the note" }
+            }
+            selected = null
+            source = ""
+            preview = false
+            previewScroll = 0
+            dirty = false
+            onQueryChange(tag)
+        }
+    }
+
     /// Move any note from the list to the trash, saving it first when it is the open one.
     fun trashNote(relative: String) {
         val text = source
@@ -1096,6 +1129,7 @@ class DragonGlassViewModel(application: Application) : AndroidViewModel(applicat
             result
                 .onSuccess { synced ->
                     gitStatus = synced.status
+                    recordSync()
                     gitMessage = buildString {
                         if (synced.committed) append("Committed local changes. ")
                         if (synced.pulled) append("Pulled remote changes. ")

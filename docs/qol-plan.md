@@ -724,8 +724,8 @@ retried from where it failed.
 state — Syncing…, Sync failed, Conflicts, Unsynced, Behind, Synced, Folder sync, Git sync —
 tinted when work is local, behind or failed. Tapping it opens the sync sheet, so the editor
 can sync directly; `syncGit` saves the open note first and refuses to run when that save
-fails (Q0.7).
-**Remaining:** Retry/Abort buttons on individual conflict rows, and a last-sync timestamp.
+fails (Q0.7). The sheet shows the last successful sync time (persisted per vault) and a
+conflict section with **Retry** and **Abort sync** buttons.
 
 #### Q4.5 New note and row actions — A · S
 Prompt for title and folder on create (no root "Untitled"), add long-press row actions
@@ -738,8 +738,10 @@ the title becomes the file name (sanitized, with ` 2`, ` 3` suffixes for duplica
 first heading. Long-pressing a row (list, tree or search results) opens a sheet with
 Bookmark/Remove bookmark, Rename or move (a path dialog) and Move to trash; the actions work
 on that row even when another note is open, saving the open note first when needed.
-**Remaining:** folder selection on create, and clickable property/tag/relation chips in
-Details (they need a tag/relation filter that returns to the list with a query).
+**Landed (tags):** tapping a tag chip in Details closes the note (saving it first) and
+returns to the list with that tag as the search query.
+**Remaining:** folder selection on create, and property/relation chips (relations need a
+resolver that accepts the engine's target strings).
 
 #### Q4.6 Import/export progress — A · S
 Report file/byte progress, allow cancel, and keep the UI responsive for large vaults.

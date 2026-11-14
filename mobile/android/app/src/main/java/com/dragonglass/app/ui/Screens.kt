@@ -1273,7 +1273,13 @@ private fun DetailsSheet(vm: DragonGlassViewModel, onDismiss: () -> Unit) {
                 vm.tags.forEach { tag ->
                     Text(
                         text = "#${tag.tag}  (${tag.notes})",
-                        modifier = Modifier.padding(vertical = 2.dp),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable {
+                                onDismiss()
+                                vm.filterByTag(tag.tag)
+                            }
+                            .padding(vertical = 4.dp),
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
                 }
@@ -1328,6 +1334,13 @@ private fun GitSyncSheet(vm: DragonGlassViewModel, onDismiss: () -> Unit) {
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 style = MaterialTheme.typography.bodySmall,
             )
+            vm.lastSyncAt?.let { millis ->
+                Text(
+                    text = "Last sync: ${trashTime(millis)}",
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    style = MaterialTheme.typography.labelSmall,
+                )
+            }
 
             OutlinedTextField(
                 value = remote,
@@ -1462,11 +1475,17 @@ private fun GitSyncSheet(vm: DragonGlassViewModel, onDismiss: () -> Unit) {
                         color = MaterialTheme.colorScheme.error,
                     )
                 }
-                OutlinedButton(
-                    onClick = vm::abortGitRebase,
-                    enabled = !vm.gitBusy,
+                Row(
                     modifier = Modifier.padding(top = 8.dp),
-                ) { Text("Abort sync") }
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    Button(onClick = vm::syncGit, enabled = !vm.gitBusy) {
+                        Text("Retry")
+                    }
+                    OutlinedButton(onClick = vm::abortGitRebase, enabled = !vm.gitBusy) {
+                        Text("Abort sync")
+                    }
+                }
             }
         }
     }
