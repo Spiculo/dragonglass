@@ -4649,9 +4649,15 @@ impl Render for Editor {
 
         // Text style for rich runs (highlights) in reading mode.
         let style = window.text_style();
+        let mut reader_font = style.font();
+        if let Some(settings) = cx.try_global::<crate::reading::ReaderSettings>() {
+            if let Some(family) = settings.font.family() {
+                reader_font.family = family.into();
+            }
+        }
         let run_template = TextRun {
             len: 0,
-            font: style.font(),
+            font: reader_font,
             color: style.color,
             background_color: None,
             underline: None,

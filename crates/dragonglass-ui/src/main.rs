@@ -116,8 +116,8 @@ use gpui::{
     WindowBounds, WindowOptions,
 };
 use graph_view::GraphView;
-use reading::ReaderSettings;
 use reading::ReadingCache;
+use reading::{ReaderFont, ReaderSettings};
 use theme::Theme;
 
 actions!(
@@ -4503,6 +4503,8 @@ impl DragonGlassApp {
         cx.set_global(ReaderSettings {
             body_size: self.config.reader_size as f32,
             measure: self.config.reader_width as f32,
+            line_height: self.config.reader_line_height as f32 / 100.0,
+            font: ReaderFont::from_name(&self.config.reader_font),
         });
         let editors: Vec<Entity<Editor>> = self.tabs.iter().map(|tab| tab.editor.clone()).collect();
         for editor in editors {
@@ -4546,6 +4548,41 @@ impl DragonGlassApp {
         };
         self.refresh_reader_settings(cx);
         self.set_status(kind, message);
+        cx.notify();
+    }
+
+    /// Cycle the reading line height through comfortable values.
+    fn cycle_reader_line_height(&mut self, cx: &mut Context<Self>) {
+        const STEPS: [u16; 6] = [130, 140, 150, 160, 175, 190];
+        let next = STEPS
+            .iter()
+            .position(|step| *step == self.config.reader_line_height)
+            .map(|index| STEPS[(index + 1) % STEPS.len()])
+            .unwrap_or(150);
+        self.config.reader_line_height = next;
+        let message = match config::save(&self.vault_root, &self.config) {
+            Ok(()) => format!("reading line height: {next}%"),
+            Err(error) => format!("reader setting changed (not saved: {error})"),
+        };
+        self.refresh_reader_settings(cx);
+        self.set_status(StatusKind::Info, message);
+        cx.notify();
+    }
+
+    /// Cycle the reading typeface: serif, sans, mono.
+    fn cycle_reader_font(&mut self, cx: &mut Context<Self>) {
+        let next = match self.config.reader_font.as_str() {
+            "serif" => "sans",
+            "sans" => "mono",
+            _ => "serif",
+        };
+        self.config.reader_font = next.to_string();
+        let message = match config::save(&self.vault_root, &self.config) {
+            Ok(()) => format!("reading typeface: {next}"),
+            Err(error) => format!("reader setting changed (not saved: {error})"),
+        };
+        self.refresh_reader_settings(cx);
+        self.set_status(StatusKind::Info, message);
         cx.notify();
     }
 
@@ -4697,6 +4734,8 @@ impl DragonGlassApp {
             "autosave" => self.toggle_autosave(cx),
             "reader-size" => self.cycle_reader_setting(false, cx),
             "reader-width" => self.cycle_reader_setting(true, cx),
+            "reader-line" => self.cycle_reader_line_height(cx),
+            "reader-font" => self.cycle_reader_font(cx),
             "font" => self.open_setting(SettingKey::FontSize, window, cx),
             "accent" => self.open_setting(SettingKey::Accent, window, cx),
             "attachments" => self.open_setting(SettingKey::AttachmentsFolder, window, cx),
@@ -4909,6 +4948,20 @@ impl DragonGlassApp {
                         "Reading width",
                         format!("{} px", self.config.reader_width),
                         "reader-width",
+                        theme,
+                    ))
+                    .child(row(
+                        "setting-reader-line",
+                        "Reading line height",
+                        format!("{:.0}%", self.config.reader_line_height as f32),
+                        "reader-line",
+                        theme,
+                    ))
+                    .child(row(
+                        "setting-reader-font",
+                        "Reading typeface",
+                        self.config.reader_font.clone(),
+                        "reader-font",
                         theme,
                     ))
                     .child(heading("Editor shortcuts", theme))
@@ -6650,9 +6703,15 @@ impl Render for DragonGlassApp {
             }
 
             let style = window.text_style();
+            let mut template_font = style.font();
+            if let Some(reader) = cx.try_global::<ReaderSettings>() {
+                if let Some(family) = reader.font.family() {
+                    template_font.family = family.into();
+                }
+            }
             let template = gpui::TextRun {
                 len: 0,
-                font: style.font(),
+                font: template_font,
                 color: style.color,
                 background_color: None,
                 underline: None,
@@ -8467,6 +8526,8 @@ fn open_vault_window(vault_path: PathBuf, uri_note: Option<String>, cx: &mut App
     cx.set_global(ReaderSettings {
         body_size: initial_config.reader_size as f32,
         measure: initial_config.reader_width as f32,
+        line_height: initial_config.reader_line_height as f32 / 100.0,
+        font: ReaderFont::from_name(&initial_config.reader_font),
     });
 
     let bounds = Bounds::centered(None, size(px(1000.0), px(640.0)), cx);

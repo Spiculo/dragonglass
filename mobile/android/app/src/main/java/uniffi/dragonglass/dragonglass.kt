@@ -853,7 +853,7 @@ internal object UniffiLib {
     ): Unit
     external fun uniffi_dragonglass_ffi_fn_method_mobilevault_search(`ptr`: Long,`query`: RustBuffer.ByValue,`limit`: Int,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
-    external fun uniffi_dragonglass_ffi_fn_method_mobilevault_set_reader_settings(`ptr`: Long,`bodySize`: Int,`measure`: Int,`font`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    external fun uniffi_dragonglass_ffi_fn_method_mobilevault_set_reader_settings(`ptr`: Long,`bodySize`: Int,`measure`: Int,`font`: RustBuffer.ByValue,`lineHeight`: Int,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
     external fun uniffi_dragonglass_ffi_fn_method_mobilevault_tags(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
@@ -1123,7 +1123,7 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if ((lib.uniffi_dragonglass_ffi_checksum_method_mobilevault_search() and 0xFFFF) != 61885) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if ((lib.uniffi_dragonglass_ffi_checksum_method_mobilevault_set_reader_settings() and 0xFFFF) != 5172) {
+    if ((lib.uniffi_dragonglass_ffi_checksum_method_mobilevault_set_reader_settings() and 0xFFFF) != 8904) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if ((lib.uniffi_dragonglass_ffi_checksum_method_mobilevault_tags() and 0xFFFF) != 23594) {
@@ -1709,7 +1709,7 @@ public interface MobileVaultInterface {
      */
     fun `search`(`query`: kotlin.String, `limit`: kotlin.Int): List<SearchHit>
     
-    fun `setReaderSettings`(`bodySize`: kotlin.UInt, `measure`: kotlin.UInt, `font`: kotlin.String)
+    fun `setReaderSettings`(`bodySize`: kotlin.UInt, `measure`: kotlin.UInt, `font`: kotlin.String, `lineHeight`: kotlin.UInt)
     
     /**
      * All tags in the vault, with the number of notes that use each one.
@@ -2340,7 +2340,7 @@ open class MobileVault: Disposable, AutoCloseable, MobileVaultInterface
     
 
     
-    @Throws(MobileException::class)override fun `setReaderSettings`(`bodySize`: kotlin.UInt, `measure`: kotlin.UInt, `font`: kotlin.String)
+    @Throws(MobileException::class)override fun `setReaderSettings`(`bodySize`: kotlin.UInt, `measure`: kotlin.UInt, `font`: kotlin.String, `lineHeight`: kotlin.UInt)
         = 
     callWithHandle {
     uniffiRustCallWithError(MobileException) { _status ->
@@ -2349,7 +2349,8 @@ open class MobileVault: Disposable, AutoCloseable, MobileVaultInterface
         
         FfiConverterUInt.lower(`bodySize`),
         FfiConverterUInt.lower(`measure`),
-        FfiConverterString.lower(`font`),_status)
+        FfiConverterString.lower(`font`),
+        FfiConverterUInt.lower(`lineHeight`),_status)
 }
     }
     
@@ -2968,6 +2969,11 @@ data class ReaderSettingsInfo (
      * `sans`, `serif` or `mono`.
      */
     var `font`: kotlin.String
+    , 
+    /**
+     * Line height as a percentage of the body size (120–220).
+     */
+    var `lineHeight`: kotlin.UInt
     
 ){
     
@@ -2987,19 +2993,22 @@ public object FfiConverterTypeReaderSettingsInfo: FfiConverterRustBuffer<ReaderS
             FfiConverterUInt.read(buf),
             FfiConverterUInt.read(buf),
             FfiConverterString.read(buf),
+            FfiConverterUInt.read(buf),
         )
     }
 
     override fun allocationSize(value: ReaderSettingsInfo) = (
             FfiConverterUInt.allocationSize(value.`bodySize`) +
             FfiConverterUInt.allocationSize(value.`measure`) +
-            FfiConverterString.allocationSize(value.`font`)
+            FfiConverterString.allocationSize(value.`font`) +
+            FfiConverterUInt.allocationSize(value.`lineHeight`)
     )
 
     override fun write(value: ReaderSettingsInfo, buf: ByteBuffer) {
             FfiConverterUInt.write(value.`bodySize`, buf)
             FfiConverterUInt.write(value.`measure`, buf)
             FfiConverterString.write(value.`font`, buf)
+            FfiConverterUInt.write(value.`lineHeight`, buf)
     }
 }
 

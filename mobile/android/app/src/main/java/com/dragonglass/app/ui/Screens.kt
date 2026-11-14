@@ -1127,6 +1127,7 @@ private fun EditorScreen(vm: DragonGlassViewModel, relative: String) {
                     bodySize = vm.readerSize,
                     measure = vm.readerMeasure,
                     fontFamily = vm.readerFont,
+                    lineHeight = vm.readerLineHeight,
                     darkTheme = vm.darkTheme,
                 )
             } else {
@@ -1469,6 +1470,19 @@ private fun ReaderSettingsSheet(vm: DragonGlassViewModel, onDismiss: () -> Unit)
                 TextButton(
                     onClick = { vm.setReaderTypography(vm.readerSize, vm.readerMeasure + 60) },
                 ) { Text("+") }
+            }
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text("Line height", Modifier.weight(1f))
+                TextButton(onClick = { vm.chooseReaderLineHeight(vm.readerLineHeight - 10) }) {
+                    Text("−")
+                }
+                Text("${vm.readerLineHeight}%")
+                TextButton(onClick = { vm.chooseReaderLineHeight(vm.readerLineHeight + 10) }) {
+                    Text("+")
+                }
             }
             Row(
                 modifier = Modifier
@@ -2656,15 +2670,16 @@ private fun MarkdownWebView(
     bodySize: Int = 16,
     measure: Int = 700,
     fontFamily: String = "serif",
+    lineHeight: Int = 150,
     /// Null follows the system; the app's theme setting overrides it.
     darkTheme: Boolean? = null,
 ) {
     val dark = darkTheme ?: isSystemInDarkTheme()
     // Comfortable defaults for a phone or tablet, plus the dark palette when needed.
-    val themed = remember(html, dark, bodySize, measure, fontFamily) {
+    val themed = remember(html, dark, bodySize, measure, fontFamily, lineHeight) {
         val base = html.replace(
             "</head>",
-            "<style>${previewCss(bodySize, measure, fontFamily)}</style></head>",
+            "<style>${previewCss(bodySize, measure, fontFamily, lineHeight)}</style></head>",
         )
         if (dark) {
             base.replace("</head>", "<style>$DARK_PREVIEW_CSS</style></head>")
@@ -2780,7 +2795,12 @@ private fun handlePreviewLink(
 }
 
 /// Reading defaults for the preview, following the shared reader settings.
-private fun previewCss(bodySize: Int, measure: Int, fontFamily: String): String {
+private fun previewCss(
+    bodySize: Int,
+    measure: Int,
+    fontFamily: String,
+    lineHeight: Int,
+): String {
     val body = when (fontFamily) {
         "sans" -> "-apple-system,'Segoe UI',Roboto,sans-serif"
         "mono" -> "ui-monospace,SFMono-Regular,Menlo,monospace"
@@ -2788,7 +2808,7 @@ private fun previewCss(bodySize: Int, measure: Int, fontFamily: String): String 
     }
     return """
 body{max-width:${measure}px;margin:0 auto;padding:16px;font-size:${bodySize}px;
-  line-height:1.65;-webkit-text-size-adjust:100%;font-family:$body}
+  line-height:${lineHeight / 100.0};-webkit-text-size-adjust:100%;font-family:$body}
 img{max-width:100%;height:auto}
 pre,code,kbd{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
 pre,table{max-width:100%;overflow-x:auto}

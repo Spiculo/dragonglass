@@ -29,6 +29,8 @@ pub struct Config {
     pub reader_width: u16,
     /// Reading body font: `sans`, `serif` or `mono`.
     pub reader_font: String,
+    /// Reading line height, as a percentage of the body size (120–220).
+    pub reader_line_height: u16,
 }
 
 impl Default for Config {
@@ -47,6 +49,7 @@ impl Default for Config {
             reader_size: 15,
             reader_width: 780,
             reader_font: "serif".to_string(),
+            reader_line_height: 150,
         }
     }
 }
@@ -69,6 +72,7 @@ impl Config {
         out.push_str(&format!("reader_size={}\n", self.reader_size));
         out.push_str(&format!("reader_width={}\n", self.reader_width));
         out.push_str(&format!("reader_font={}\n", self.reader_font));
+        out.push_str(&format!("reader_line_height={}\n", self.reader_line_height));
         out
     }
 
@@ -117,6 +121,11 @@ impl Config {
                 "reader_width" => {
                     if let Ok(width) = value.parse::<u16>() {
                         config.reader_width = width.clamp(480, 1200);
+                    }
+                }
+                "reader_line_height" => {
+                    if let Ok(height) = value.parse::<u16>() {
+                        config.reader_line_height = height.clamp(120, 220);
                     }
                 }
                 "reader_font" => {

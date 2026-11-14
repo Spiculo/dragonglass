@@ -438,12 +438,14 @@ body measure. Expose the same settings on mobile preview.
 **Done when:** changing size/width updates all open readers and split previews immediately
 and survives relaunch; no horizontal scroll appears at 320 px width.
 
-**Landed (desktop):** `reading::ReaderSettings` (body size, measure) is a GPUI global backed
-by `reader_size` and `reader_width` in `config.txt`, with Settings rows that cycle comfortable
-values. Body text, list items, quotes, callouts and the column width all read it, display
-math scales to the measure, and open readers plus the split preview repaint immediately.
-**Remaining:** line height, font family and zoom; metadata header alignment; the mobile
-preview.
+**Landed (desktop):** `reading::ReaderSettings` (body size, measure, line height, typeface)
+is a GPUI global backed by `reader_size`, `reader_width`, `reader_line_height` and
+`reader_font` in `config.txt`, with Settings rows that cycle comfortable values. Body text,
+list items, quotes and callouts use the line height and typeface, the column width bounds
+every block, display math scales to the measure, and open readers plus the split preview
+repaint immediately. Zoom is the body-size control: it scales the text without changing the
+column. The mobile preview exposes the same values through the shared FFI (Q4.7).
+**Remaining:** nothing functional; the metadata header already sits inside the measure.
 
 #### Q2.5 Zen / focus reading — D · M
 Add a distraction-free mode that hides the tab bar, sidebar, outline and relations, centers

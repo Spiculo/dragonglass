@@ -53,6 +53,38 @@ pub struct ReaderSettings {
     pub body_size: f32,
     /// Maximum width of the reading column, in pixels.
     pub measure: f32,
+    /// Line height as a multiple of the body size.
+    pub line_height: f32,
+    /// Reading typeface.
+    pub font: ReaderFont,
+}
+
+/// Reading typefaces. `Sans` keeps the application's UI font.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ReaderFont {
+    #[default]
+    Sans,
+    Serif,
+    Mono,
+}
+
+impl ReaderFont {
+    /// The family to apply, or `None` to keep the template's own family.
+    pub fn family(self) -> Option<&'static str> {
+        match self {
+            ReaderFont::Sans => None,
+            ReaderFont::Serif => Some("Georgia"),
+            ReaderFont::Mono => Some("Menlo"),
+        }
+    }
+
+    pub fn from_name(name: &str) -> Self {
+        match name.to_lowercase().as_str() {
+            "serif" => ReaderFont::Serif,
+            "mono" => ReaderFont::Mono,
+            _ => ReaderFont::Sans,
+        }
+    }
 }
 
 impl Default for ReaderSettings {
@@ -60,6 +92,8 @@ impl Default for ReaderSettings {
         Self {
             body_size: 15.0,
             measure: 780.0,
+            line_height: 1.5,
+            font: ReaderFont::Sans,
         }
     }
 }
@@ -229,6 +263,8 @@ struct RenderCtx<'a> {
     body_size: f32,
     /// Maximum width of the reading column.
     measure: f32,
+    /// Line height as a multiple of the body size.
+    line_height: f32,
 }
 
 /// One place a footnote is referenced, used by the footnote picker.
@@ -1345,6 +1381,7 @@ impl ReadingCache {
                             template: &template,
                             body_size: reader.body_size,
                             measure: reader.measure,
+                            line_height: reader.line_height,
                         };
 
                         let mut item = div()
@@ -1816,6 +1853,7 @@ impl<'a> RenderCtx<'a> {
             template,
             body_size: self.body_size,
             measure: self.measure,
+            line_height: self.line_height,
         }
     }
 }
@@ -1906,7 +1944,15 @@ fn rich_text(
     base: usize,
     ctx: &RenderCtx,
 ) -> AnyElement {
-    rich_text_styled(text, size, block, base, ctx, gpui::FontWeight::NORMAL, 1.5)
+    rich_text_styled(
+        text,
+        size,
+        block,
+        base,
+        ctx,
+        gpui::FontWeight::NORMAL,
+        ctx.line_height,
+    )
 }
 
 /// Inline text â€” emphasis, code, links, math, highlights â€” at a given size, weight and

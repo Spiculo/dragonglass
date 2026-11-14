@@ -203,6 +203,8 @@ pub struct ReaderSettingsInfo {
     pub measure: u32,
     /// `sans`, `serif` or `mono`.
     pub font: String,
+    /// Line height as a percentage of the body size (120–220).
+    pub line_height: u32,
 }
 
 fn fingerprint_info(info: DocumentFingerprint) -> FingerprintInfo {
@@ -538,6 +540,7 @@ impl MobileVault {
             body_size: config.reader_size as u32,
             measure: config.reader_width as u32,
             font: config.reader_font,
+            line_height: config.reader_line_height as u32,
         }
     }
 
@@ -546,10 +549,12 @@ impl MobileVault {
         body_size: u32,
         measure: u32,
         font: String,
+        line_height: u32,
     ) -> Result<(), MobileError> {
         let mut config = config::load(&self.root);
         config.reader_size = body_size.clamp(11, 24) as u16;
         config.reader_width = measure.clamp(480, 1200) as u16;
+        config.reader_line_height = line_height.clamp(120, 220) as u16;
         config.reader_font = match font.to_lowercase().as_str() {
             "sans" => "sans".to_string(),
             "mono" => "mono".to_string(),
@@ -1247,20 +1252,23 @@ mod tests {
         assert_eq!(default.body_size, 15);
         assert_eq!(default.measure, 780);
         assert_eq!(default.font, "serif");
+        assert_eq!(default.line_height, 150);
         vault
-            .set_reader_settings(18, 900, "mono".to_string())
+            .set_reader_settings(18, 900, "mono".to_string(), 180)
             .unwrap();
         let loaded = vault.reader_settings();
         assert_eq!(loaded.body_size, 18);
         assert_eq!(loaded.measure, 900);
         assert_eq!(loaded.font, "mono");
+        assert_eq!(loaded.line_height, 180);
         vault
-            .set_reader_settings(1, 9999, "nonsense".to_string())
+            .set_reader_settings(1, 9999, "nonsense".to_string(), 999)
             .unwrap();
         let clamped = vault.reader_settings();
         assert_eq!(clamped.body_size, 11);
         assert_eq!(clamped.measure, 1200);
         assert_eq!(clamped.font, "serif");
+        assert_eq!(clamped.line_height, 220);
     }
 
     fn temp_vault(name: &str) -> PathBuf {

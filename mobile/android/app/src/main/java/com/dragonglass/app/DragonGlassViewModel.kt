@@ -123,14 +123,23 @@ class DragonGlassViewModel(application: Application) : AndroidViewModel(applicat
         private set
     var readerFont by mutableStateOf("serif")
         private set
+    var readerLineHeight by mutableStateOf(150)
+        private set
 
-    fun setReaderTypography(size: Int, measure: Int, font: String = readerFont) {
+    fun setReaderTypography(
+        size: Int,
+        measure: Int,
+        font: String = readerFont,
+        lineHeight: Int = readerLineHeight,
+    ) {
         readerSize = size.coerceIn(11, 24)
         readerMeasure = measure.coerceIn(480, 1200)
         readerFont = if (font in setOf("sans", "serif", "mono")) font else "serif"
+        readerLineHeight = lineHeight.coerceIn(120, 220)
         val bodySize = readerSize
         val width = readerMeasure
         val face = readerFont
+        val leading = readerLineHeight
         viewModelScope.launch {
             runCatching {
                 withContext(Dispatchers.IO) {
@@ -138,6 +147,7 @@ class DragonGlassViewModel(application: Application) : AndroidViewModel(applicat
                         bodySize.toUInt(),
                         width.toUInt(),
                         face,
+                        leading.toUInt(),
                     )
                 }
             }
@@ -146,6 +156,10 @@ class DragonGlassViewModel(application: Application) : AndroidViewModel(applicat
 
     fun chooseReaderFont(font: String) {
         setReaderTypography(readerSize, readerMeasure, font)
+    }
+
+    fun chooseReaderLineHeight(lineHeight: Int) {
+        setReaderTypography(readerSize, readerMeasure, readerFont, lineHeight)
     }
 
     /// App theme: `system`, `light` or `dark`, stored on the device.
@@ -625,6 +639,7 @@ class DragonGlassViewModel(application: Application) : AndroidViewModel(applicat
                 readerSize = settings.bodySize.toInt()
                 readerMeasure = settings.measure.toInt()
                 readerFont = settings.font
+                readerLineHeight = settings.lineHeight.toInt()
             }
         }
     }
