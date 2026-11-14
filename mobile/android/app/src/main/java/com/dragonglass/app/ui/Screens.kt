@@ -1235,6 +1235,42 @@ private fun EditorScreen(vm: DragonGlassViewModel, relative: String) {
         )
     }
 
+    if (vm.conflictNote != null) {
+        ModalBottomSheet(onDismissRequest = {}) {
+            Column(
+                Modifier
+                    .fillMaxWidth()
+                    .navigationBarsPadding()
+                    .padding(horizontal = 16.dp)
+                    .padding(bottom = 24.dp),
+            ) {
+                Text("Changed on disk", style = MaterialTheme.typography.titleLarge)
+                Text(
+                    text = "This note was edited outside the app. Your text is still here; " +
+                        "choose what to do before it is lost.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(vertical = 8.dp),
+                )
+                Button(
+                    onClick = vm::reloadConflicted,
+                    modifier = Modifier.fillMaxWidth(),
+                ) { Text("Reload from disk") }
+                OutlinedButton(
+                    onClick = vm::keepMine,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(top = 8.dp),
+                ) { Text("Keep mine (overwrite)") }
+                OutlinedButton(
+                    onClick = vm::saveConflictCopy,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(top = 8.dp),
+                ) { Text("Save a copy") }
+            }
+        }
+    }
     if (showSync) {
         GitSyncSheet(vm, onDismiss = { showSync = false })
     }

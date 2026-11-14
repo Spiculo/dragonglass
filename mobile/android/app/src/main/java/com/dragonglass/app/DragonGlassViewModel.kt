@@ -287,6 +287,10 @@ class DragonGlassViewModel(application: Application) : AndroidViewModel(applicat
         findIndex = 0
     }
 
+    /// Set when a save found a newer version on disk; the note stays open with its text.
+    var conflictNote by mutableStateOf<String?>(null)
+        private set
+
     /// Content hash of the version each open note is based on, for conflict-safe saves.
     private val fingerprints = mutableMapOf<String, ULong>()
 
@@ -363,10 +367,77 @@ class DragonGlassViewModel(application: Application) : AndroidViewModel(applicat
                 report.fingerprint?.let { fingerprints[relative] = it.contentHash }
                 loaded.discardDraft(relative)
             }
-            "conflict" -> throw IllegalStateException(
-                "The note changed on disk. Reload it before saving over it.",
-            )
+            "conflict" -> {
+                conflictNote = relative
+                throw IllegalStateException(
+                    "The note changed on disk. Reload it before saving over it.",
+                )
+            }
             else -> throw IllegalStateException(report.message ?: "Could not save the note")
+        }
+    }
+
+    /// Reload the conflicting note from disk, dropping the local text.
+    fun reloadConflicted() {
+        val note = conflictNote ?: return
+        conflictNote = null
+        dirty = false
+        openNote(note)
+    }
+
+    /// Overwrite the disk version with the text in the editor.
+    fun keepMine() {
+        val note = selected ?: return
+        val text = source
+        viewModelScope.launch {
+            val result = runCatching {
+                withContext(Dispatchers.IO) {
+                    val loaded = ensureVault()
+                    val report = loaded.saveDocumentWithFingerprint(note, text, null)
+                    if (report.status != "saved") {
+                        throw IllegalStateException(report.message ?: "Could not save the note")
+                    }
+                    report.fingerprint?.let { fingerprints[note] = it.contentHash }
+                }
+            }
+            result
+                .onSuccess {
+                    conflictNote = null
+                    dirty = false
+                    message = "Saved over the version on disk"
+                    mirrorNote(note)
+                }
+                .onFailure { error = it.message ?: "Could not save the note" }
+        }
+    }
+
+    /// Write the editor text beside the note instead of over the disk version.
+    fun saveConflictCopy() {
+        val note = selected ?: return
+        val text = source
+        val stem = note.substringBeforeLast('.')
+        val extension = note.substringAfterLast('.', "md")
+        viewModelScope.launch {
+            val result = runCatching {
+                withContext(Dispatchers.IO) {
+                    val loaded = ensureVault()
+                    var candidate = "$stem (conflict).$extension"
+                    var index = 1
+                    while (File(vaultDirectory, candidate).exists()) {
+                        index++
+                        candidate = "$stem (conflict $index).$extension"
+                    }
+                    loaded.createNote(candidate, text)
+                    candidate
+                }
+            }
+            result
+                .onSuccess {
+                    conflictNote = null
+                    message = "Saved a copy as $it"
+                    refresh()
+                }
+                .onFailure { error = it.message ?: "Could not save a copy" }
         }
     }
 

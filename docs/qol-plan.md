@@ -166,8 +166,9 @@ quit and Save all stop on a conflict instead of dropping or overwriting the buff
 cover clean save, external edit, deleted file, mtime-only change and write errors.
 **Landed (Android):** the same contract now backs Android saves — a fingerprint is captured
 on open and every save path checks it, so an external edit blocks the write and keeps the
-note open instead of overwriting it.
-**Remaining:** a dedicated Android conflict sheet with Reload / Keep mine / Save as copy.
+note open instead of overwriting it. A conflict opens a sheet with **Reload from disk**,
+**Keep mine (overwrite)** and **Save a copy** (`name (conflict).md`); the note keeps its text
+until the user chooses.
 
 #### Q0.3 Drafts, autosave and crash recovery — D · A · S · L
 Persist a debounced draft under `.dragon-glass/drafts/` (path, base fingerprint, timestamp,
