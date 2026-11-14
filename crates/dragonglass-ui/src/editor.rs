@@ -7,6 +7,7 @@
 //! The editor also owns the in-note find/replace bar, optional Vim mode, and multi-cursor
 //! state. Selections and extra carets live here; the buffer only stores the primary caret.
 
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
@@ -366,6 +367,8 @@ pub struct Editor {
     autosave: bool,
     /// Window position of the open right-click menu, if any.
     context_menu: Option<Point<Pixels>>,
+    /// Screen position of the caret from the last paint, for the autocomplete popup.
+    caret_origin: Rc<RefCell<Option<Point<Pixels>>>>,
     /// Cached document statistics, recomputed per buffer revision.
     stats_cache: (u64, stats::Stats),
     /// Git added/removed lines for the file, refreshed when the saved buffer changes.
@@ -696,6 +699,7 @@ impl Editor {
             stats_armed: false,
             autosave: false,
             context_menu: None,
+            caret_origin: Rc::new(RefCell::new(None)),
             stats_cache: (u64::MAX, stats::Stats::default()),
             git_stat: None,
             git_stat_key: None,
@@ -5233,13 +5237,23 @@ impl Render for Editor {
                     .min_h(px(0.0))
                     .child(body)
                     .children(autocomplete_bar.map(|bar| {
-                        div()
-                            .absolute()
-                            .left_0()
-                            .right_0()
-                            .bottom_0()
-                            .child(bar)
-                            .into_any_element()
+                        // Anchor at the caret; the first frame has no caret position yet.
+                        match *self.caret_origin.borrow() {
+                            Some(origin) => anchored()
+                                .position(origin)
+                                .anchor(Corner::TopLeft)
+                                .offset(point(px(0.0), px(4.0)))
+                                .snap_to_window_with_margin(px(8.0))
+                                .child(bar)
+                                .into_any_element(),
+                            None => div()
+                                .absolute()
+                                .left_0()
+                                .right_0()
+                                .bottom_0()
+                                .child(bar)
+                                .into_any_element(),
+                        }
                     })),
             )
             .when_some(format_bar, |d, bar| d.child(bar))
@@ -6482,6 +6496,7 @@ impl Element for EditorText {
             editor.ensure_math_scenes(caret_line);
         });
 
+        let caret_slot = self.editor.read(cx).caret_origin.clone();
         let editor = self.editor.read(cx);
         let line_height = editor.line_height;
         let rows = editor.last_shaped.clone();
@@ -6618,6 +6633,9 @@ impl Element for EditorText {
                 color,
             )
         });
+        *caret_slot.borrow_mut() = cursor
+            .as_ref()
+            .map(|quad| point(quad.bounds.left(), quad.bounds.bottom()));
 
         let mut extra_cursor_quads = Vec::new();
         for state in &editor.extra_cursors {

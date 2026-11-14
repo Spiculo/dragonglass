@@ -661,11 +661,12 @@ substring matches.
 **Done when:** `[[`, `#` and `/` suggestions appear next to the caret, never resize the
 document, and are fully keyboard-operable.
 
-**Landed:** the suggestion list is now an overlay pinned to the bottom of the text area
-instead of a row that pushes the document up, so opening it never moves the caret. Prefix
-matches rank ahead of substring matches for notes and tags. Up/Down/Enter/Escape and Tab all
-work.
-**Remaining:** anchoring the popup to the caret itself rather than the viewport bottom.
+**Landed:** the suggestion list is an overlay, not a row that pushes the document up, so
+opening it never moves the caret. Every paint records the caret's screen corner, and the list
+is anchored just below it with GPUI's `anchored` element, snapped inside the window with an
+8 px margin; the first frame (before a caret position exists) falls back to the viewport
+bottom. Prefix matches rank ahead of substring matches for notes and tags.
+Up/Down/Enter/Escape and Tab all work.
 
 #### Q3.11 Format bar does not move the page — D · S
 Overlay the selection formatting bar near the selection (or reserve stable space) so
