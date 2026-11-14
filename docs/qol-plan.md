@@ -148,6 +148,11 @@ mirroring the existing guard in `apply_style` (`editor.rs:523`).
 **Done when:** a fuzz test of all editing shortcuts in reading mode leaves the source hash
 unchanged; copy/select still work.
 
+**Landed:** every mutating action starts with `can_mutate()`, which is false in reading mode,
+and both `EntityInputHandler` insert paths divert to reading navigation (j/k/g/G, Space) or the
+in-page find field, so typing and IME text never reach the buffer. Selection and copy keep
+working; the mode switch is pinned by a status line that names the note as read-only.
+
 #### Q0.2 Conflict-safe save — D · A · S · M–L
 Add a shared save contract in core: `DocumentFingerprint { mtime, size, content_hash }`,
 captured on load/save, and `SaveReport { Saved, Conflict, Error }`. Save with an expected
@@ -221,12 +226,21 @@ the normal save/close contract.
 **Done when:** tapping `[[Note]]` in preview opens that note; external links leave the app;
 Back never skips a level; the preview does not reload/reset on every recomposition.
 
+**Landed:** the WebView has a `WebViewClient`: internal links resolve through `shouldOverrideUrlLoading`
+and open the note in the app (keeping preview mode), external schemes go to `ACTION_VIEW`, and
+local file navigation is blocked. Back from preview returns to edit, and the preview keeps its
+scroll and only reloads when the rendered document changes.
+
 #### Q0.6 Mobile keyboard never covers the caret — A · S
 Apply `imePadding()`/`WindowInsets.ime` to the editor scaffold, bring the caret into view
 on focus and selection changes, and set markdown-friendly `KeyboardOptions`
 (no autocorrect/smart quotes). Keep the status bar above the keyboard.
 **Done when:** on a 360×640 phone and a tablet, the caret and save state are visible with
 the IME open at the start, middle and end of a long note.
+
+**Landed:** the editor scaffold applies `imePadding()`, so the top bar, editor and status stay
+above the keyboard; the text field uses markdown-friendly keyboard options (no autocorrect or
+smart quotes); focusing and selecting refocuses the field, which scrolls the caret into view.
 
 #### Q0.7 Mobile save failure blocks navigation — A · S
 `closeNote`, `switchVault`, `syncVault`, import/export and git sync must await
@@ -598,6 +612,10 @@ returns to the editor at the same position.
 **Done when:** a new note can be named and saved in one flow; Ctrl+W on Untitled offers
 Save As, not a dead end.
 
+**Landed:** `Ctrl/Cmd+Shift+S` and the palette open Save As; `Ctrl+S` and close on an untitled
+buffer open the same name panel instead of failing, and saving focuses the editor at the
+unchanged caret.
+
 #### Q3.4 A real feedback system — D · A · S · M
 Replace the single never-expiring muted `status_message` with toasts/status entries that
 have severity (info/success/warn/error), expiry (errors persist until dismissed), optional
@@ -606,6 +624,10 @@ save/sync state in the status bar.
 **Done when:** save success, save failure, conflict, link-not-found and sync failure are
 distinguishable at a glance; no stale message survives a context change.
 
+**Landed:** status lines carry a kind (info, success, warn, error), success expires after
+3 s, info after 6 s, warnings and errors stay until dismissed or superseded, the status bar
+shows a persistent save/sync state, and a new action clears the previous message.
+
 #### Q3.5 Conflict and reload bar — D · M
 When a file changes externally: clean buffer reloads silently **and preserves scroll/cursor**;
 dirty buffer shows a per-tab badge plus Reload / Compare / Keep mine / Save as copy. Never
@@ -613,12 +635,22 @@ auto-reload a dirty buffer. Deleted files surface instead of being skipped.
 **Done when:** external edits never surprise the user; inactive tabs show a conflict marker;
 Compare uses the existing line diff and recovery history.
 
+**Landed:** the file watcher compares the disk fingerprint; a clean buffer reloads silently
+(caret, scroll and reading block restored), a dirty buffer raises a per-tab `conflict` flag
+shown as a warning glyph and an inline bar with Reload / Keep mine / Compare / Save as copy.
+Deleted files surface as an error instead of vanishing.
+
 #### Q3.6 Close is undoable; trash is reachable — D · S–M
 Add Ctrl/Cmd+Shift+T to reopen the last closed tab (store a small closed-tab stack with
 path/mode/position) and a "Trash" command that lists, restores and empties using
 `vaultfs::list_trash`/`restore`. After closing, show "Closed note — Undo".
 **Done when:** accidental close is recoverable without the file tree; deleted notes can be
 restored from inside the app.
+
+**Landed:** `Ctrl/Cmd+Shift+T` reopens the last closed tab from a closed-tab stack (path,
+mode, caret and reading block); closing shows "Closed note — Undo". A Trash view lists
+`.dragon-glass/trash`, restores entries and empties the folder, and moving a note to the trash
+saves a dirty buffer first or refuses.
 
 #### Q3.7 Multi-cursor correctness — D · M
 Apply formatting to every selection, remap extra cursors after edits, clear extras on
