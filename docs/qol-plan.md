@@ -805,6 +805,15 @@ following into `dragonglass-core` (or a thin shared layer) and expose through th
 `sync_state`. Keep all of them local-only and synchronous where possible; do not add
 background work to the FFI.
 
+**Landed:** the FFI exposes `MobileVault.documentFingerprint`,
+`saveDocumentWithFingerprint` (returns `saved` / `conflict` with the disk hash / `error`),
+`saveDraft`/`loadDraft`/`discardDraft`, `readerSettings`/`setReaderSettings`, and a
+`resolveLinkFragment(source, fragment)` that resolves `#Heading` and `#^block` to a 1-based
+line. Kotlin bindings are regenerated. Tests cover conflict detection (the disk version is
+preserved), drafts round-trip, fragment resolution and clamped reader settings.
+**Remaining:** `sync_state`, and the clients using these functions instead of their own save
+paths (Android still saves through `saveNote`).
+
 **UX contract document:** write `docs/ux-contract.md` with the invariants in §2 and a table
 of state transitions (open, edit, save, close, read, follow, back). Desktop and Android
 should both point tests at it; iOS implements it rather than copying Android screens.

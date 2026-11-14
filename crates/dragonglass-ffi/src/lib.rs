@@ -12,11 +12,12 @@ use std::path::PathBuf;
 use std::sync::{Mutex, MutexGuard};
 
 use dragonglass_core::assets::Attachments;
+use dragonglass_core::fingerprint::{self, DocumentFingerprint, SaveReport};
 use dragonglass_core::graph::{self, EdgeKind, Graph};
 use dragonglass_core::relations::{self, NoteRelations};
 use dragonglass_core::{
-    bookmarks, find, frontmatter, html, markdown, query, search, stats, storage, templates, tree,
-    vaultfs, NodeKind, Note, NoteRef, TreeNode, Vault,
+    bookmarks, config, drafts, find, frontmatter, html, markdown, query, search, stats, storage,
+    templates, tree, vaultfs, NodeKind, Note, NoteRef, TreeNode, Vault,
 };
 
 #[derive(Debug, thiserror::Error, uniffi::Error)]
@@ -165,6 +166,84 @@ pub struct MobileVault {
     state: Mutex<State>,
 }
 
+/// The identity of one version of a note on disk.
+#[derive(Debug, Clone, Copy, uniffi::Record)]
+pub struct FingerprintInfo {
+    pub size: u64,
+    /// Modification time in Unix milliseconds (0 when unknown).
+    pub modified_ms: u64,
+    pub content_hash: u64,
+}
+
+/// The result of a conflict-safe save.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct SaveReportInfo {
+    /// `saved`, `conflict` or `error`.
+    pub status: String,
+    pub fingerprint: Option<FingerprintInfo>,
+    /// Content hash of the version on disk when the save conflicted.
+    pub disk_hash: Option<u64>,
+    pub message: Option<String>,
+}
+
+/// A recovery draft for one note.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct DraftInfo {
+    pub text: String,
+    pub line: u32,
+    pub col: u32,
+    pub written_at_ms: u64,
+    pub base_hash: Option<u64>,
+}
+
+/// Reading typography, shared with the desktop reader.
+#[derive(Debug, Clone, Copy, uniffi::Record)]
+pub struct ReaderSettingsInfo {
+    pub body_size: u32,
+    pub measure: u32,
+}
+
+fn fingerprint_info(info: DocumentFingerprint) -> FingerprintInfo {
+    let modified_ms = info
+        .modified
+        .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|elapsed| elapsed.as_millis() as u64)
+        .unwrap_or(0);
+    FingerprintInfo {
+        size: info.size,
+        modified_ms,
+        content_hash: info.content_hash,
+    }
+}
+
+fn now_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// The 1-based source line a `#Heading` or `#^block` fragment points at, if present.
+#[uniffi::export]
+pub fn resolve_link_fragment(source: String, fragment: String) -> Option<u32> {
+    let fragment = fragment.trim().trim_start_matches('#').trim();
+    if fragment.is_empty() {
+        return None;
+    }
+    if let Some(id) = fragment.strip_prefix('^') {
+        let marker = format!("^{id}");
+        return source
+            .lines()
+            .position(|line| line.trim_end().ends_with(&marker))
+            .map(|index| index as u32 + 1);
+    }
+    let wanted = fragment.to_lowercase();
+    markdown::headings(&source)
+        .into_iter()
+        .find(|heading| heading.text.trim().to_lowercase() == wanted)
+        .map(|heading| heading.line as u32)
+}
+
 #[uniffi::export]
 impl MobileVault {
     /// Open an existing directory of markdown notes. Mobile apps normally pass their
@@ -224,6 +303,122 @@ impl MobileVault {
         let mut rows = Vec::new();
         flatten_tree(&tree, 0, &mut rows);
         rows
+    }
+
+    /// Fingerprint a note on disk, for a later conflict-safe save.
+    pub fn document_fingerprint(&self, relative: String) -> Result<FingerprintInfo, MobileError> {
+        let path = self.readable_path(&relative)?;
+        Ok(fingerprint_info(DocumentFingerprint::of_path(&path)?))
+    }
+
+    /// Save a note only if its content still hashes to `expected_hash`.
+    ///
+    /// `expected_hash = None` means "no baseline" and writes. A conflict leaves the disk
+    /// version untouched and reports its hash so the app can offer Reload / Keep mine.
+    pub fn save_document_with_fingerprint(
+        &self,
+        relative: String,
+        text: String,
+        expected_hash: Option<u64>,
+    ) -> SaveReportInfo {
+        let path = match self.writable_path(&relative) {
+            Ok(path) => path,
+            Err(error) => {
+                return SaveReportInfo {
+                    status: "error".to_string(),
+                    fingerprint: None,
+                    disk_hash: None,
+                    message: Some(error.to_string()),
+                };
+            }
+        };
+        let expected = expected_hash.map(|content_hash| DocumentFingerprint {
+            size: 0,
+            modified: None,
+            content_hash,
+        });
+        match fingerprint::save_if_unchanged(&path, &text, expected.as_ref()) {
+            SaveReport::Saved { fingerprint } => {
+                let _ = self.refresh();
+                SaveReportInfo {
+                    status: "saved".to_string(),
+                    fingerprint: Some(fingerprint_info(fingerprint)),
+                    disk_hash: None,
+                    message: None,
+                }
+            }
+            SaveReport::Conflict { disk } => SaveReportInfo {
+                status: "conflict".to_string(),
+                fingerprint: None,
+                disk_hash: disk.map(|fingerprint| fingerprint.content_hash),
+                message: None,
+            },
+            SaveReport::Error { message } => SaveReportInfo {
+                status: "error".to_string(),
+                fingerprint: None,
+                disk_hash: None,
+                message: Some(message),
+            },
+        }
+    }
+
+    /// Write a recovery draft for a note (call from an idle/lifecycle hook).
+    pub fn save_draft(
+        &self,
+        relative: String,
+        text: String,
+        line: u32,
+        col: u32,
+    ) -> Result<(), MobileError> {
+        let base = self
+            .readable_path(&relative)
+            .ok()
+            .and_then(|path| DocumentFingerprint::of_path(&path).ok())
+            .map(|fingerprint| fingerprint.content_hash);
+        drafts::save(
+            &self.root,
+            &drafts::Draft {
+                note: relative,
+                line: line as usize,
+                col: col as usize,
+                at: now_millis(),
+                base,
+                text,
+            },
+        )?;
+        Ok(())
+    }
+
+    /// The draft for a note, if one is newer than what the app last saw.
+    pub fn load_draft(&self, relative: String) -> Option<DraftInfo> {
+        drafts::load(&self.root, &relative).map(|draft| DraftInfo {
+            text: draft.text,
+            line: draft.line as u32,
+            col: draft.col as u32,
+            written_at_ms: draft.at,
+            base_hash: draft.base,
+        })
+    }
+
+    pub fn discard_draft(&self, relative: String) {
+        drafts::discard(&self.root, &relative);
+    }
+
+    /// Reading typography from the vault config.
+    pub fn reader_settings(&self) -> ReaderSettingsInfo {
+        let config = config::load(&self.root);
+        ReaderSettingsInfo {
+            body_size: config.reader_size as u32,
+            measure: config.reader_width as u32,
+        }
+    }
+
+    pub fn set_reader_settings(&self, body_size: u32, measure: u32) -> Result<(), MobileError> {
+        let mut config = config::load(&self.root);
+        config.reader_size = body_size.clamp(11, 24) as u16;
+        config.reader_width = measure.clamp(480, 1200) as u16;
+        config::save(&self.root, &config)?;
+        Ok(())
     }
 
     pub fn note_source(&self, relative: String) -> Result<String, MobileError> {
@@ -794,6 +989,91 @@ mod tests {
             2
         );
         assert!(find_in_text("a".to_string(), "(".to_string(), true, false, false).is_empty());
+    }
+
+    #[test]
+    fn link_fragments_resolve_headings_and_blocks() {
+        let source = "# One\ntext\n## Sub\nbody ^note-1\n";
+        assert_eq!(
+            resolve_link_fragment(source.to_string(), "One".to_string()),
+            Some(1)
+        );
+        assert_eq!(
+            resolve_link_fragment(source.to_string(), "#sub".to_string()),
+            Some(3)
+        );
+        assert_eq!(
+            resolve_link_fragment(source.to_string(), "^note-1".to_string()),
+            Some(4)
+        );
+        assert_eq!(
+            resolve_link_fragment(source.to_string(), "Nope".to_string()),
+            None
+        );
+    }
+
+    #[test]
+    fn a_fingerprinted_save_detects_an_external_edit() {
+        let root = temp_vault("fingerprint");
+        fs::write(root.join("note.md"), "original").unwrap();
+        let vault = MobileVault::open(root.to_string_lossy().to_string()).unwrap();
+        let loaded = vault.document_fingerprint("note.md".to_string()).unwrap();
+
+        let saved = vault.save_document_with_fingerprint(
+            "note.md".to_string(),
+            "mine".to_string(),
+            Some(loaded.content_hash),
+        );
+        assert_eq!(saved.status, "saved");
+        assert!(saved.fingerprint.is_some());
+
+        let stale = loaded.content_hash;
+        fs::write(root.join("note.md"), "someone else").unwrap();
+        let conflicted = vault.save_document_with_fingerprint(
+            "note.md".to_string(),
+            "mine again".to_string(),
+            Some(stale),
+        );
+        assert_eq!(conflicted.status, "conflict");
+        assert!(conflicted.disk_hash.is_some());
+        assert_eq!(
+            fs::read_to_string(root.join("note.md")).unwrap(),
+            "someone else"
+        );
+    }
+
+    #[test]
+    fn drafts_roundtrip_through_the_vault() {
+        let root = temp_vault("drafts");
+        fs::write(root.join("note.md"), "body").unwrap();
+        let vault = MobileVault::open(root.to_string_lossy().to_string()).unwrap();
+        vault
+            .save_draft("note.md".to_string(), "typed text".to_string(), 3, 0)
+            .unwrap();
+        let draft = vault.load_draft("note.md".to_string()).expect("draft");
+        assert_eq!(draft.text, "typed text");
+        assert_eq!(draft.line, 3);
+        assert!(draft.base_hash.is_some());
+        assert!(vault.load_draft("other.md".to_string()).is_none());
+        vault.discard_draft("note.md".to_string());
+        assert!(vault.load_draft("note.md".to_string()).is_none());
+    }
+
+    #[test]
+    fn reader_settings_roundtrip_and_clamp() {
+        let root = temp_vault("reader");
+        let vault = MobileVault::open(root.to_string_lossy().to_string()).unwrap();
+        let default = vault.reader_settings();
+        assert_eq!(default.body_size, 15);
+        assert_eq!(default.measure, 780);
+        vault.set_reader_settings(18, 900).unwrap();
+        let loaded = vault.reader_settings();
+        assert_eq!(loaded.body_size, 18);
+        assert_eq!(loaded.measure, 900);
+        vault.set_reader_settings(1, 9999).unwrap();
+        let clamped = vault.reader_settings();
+        assert_eq!(clamped.body_size, 11);
+        assert_eq!(clamped.measure, 1200);
     }
 
     fn temp_vault(name: &str) -> PathBuf {
