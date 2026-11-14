@@ -336,6 +336,8 @@ pub struct Editor {
     display_math: Rc<Vec<DisplayMathLayout>>,
     /// Standalone image embeds currently drawn in place of their source line.
     editor_images: Vec<EditorImage>,
+    /// Callout blocks drawn as boxes behind their source rows.
+    layout_callouts: Rc<Vec<CalloutLayout>>,
     /// The buffer revision `display_math` was parsed from.
     display_math_revision: u64,
     /// Typeset display formulas, keyed by TeX source. `None` records a failed formula.
@@ -683,6 +685,28 @@ fn hidden_markers(chars: &[char]) -> Vec<bool> {
     let len = chars.len();
     let mut i = 0usize;
 
+    // Leading quote markers are structure, not prose: hide `> ` levels and, directly
+    // after them, a callout tag like `[!note]`.
+    while i < len && chars[i] == '>' {
+        hidden[i] = true;
+        i += 1;
+        while i < len && chars[i] == ' ' {
+            hidden[i] = true;
+            i += 1;
+        }
+    }
+    if starts_at(chars, i, "[!") {
+        if let Some(close) = (i + 2..len).find(|&at| chars[at] == ']') {
+            for slot in &mut hidden[i..=close] {
+                *slot = true;
+            }
+            if chars.get(close + 1) == Some(&' ') {
+                hidden[close + 1] = true;
+            }
+            i = close + 2;
+        }
+    }
+
     while i < len {
         // Inline code: hide both backticks; the content is literal.
         if chars[i] == '`' {
@@ -785,6 +809,15 @@ fn find_token(chars: &[char], from: usize, token: &str) -> Option<usize> {
         return None;
     }
     (from..=chars.len() - token.len()).find(|&at| chars[at..at + token.len()] == token[..])
+}
+
+/// A callout block (`> [!note]` …) drawn as a tinted box over its rows.
+#[derive(Debug, Clone)]
+struct CalloutLayout {
+    first_row: usize,
+    /// Exclusive.
+    last_row: usize,
+    kind: String,
 }
 
 /// A standalone `![[image]]` line drawn over the rows it owns.
@@ -927,6 +960,7 @@ impl Editor {
             reading_content: ReadingCache::new(),
             display_math: Rc::new(Vec::new()),
             editor_images: Vec::new(),
+            layout_callouts: Rc::new(Vec::new()),
             display_math_revision: u64::MAX,
             math_scenes: HashMap::new(),
             doc_text: ((u64::MAX, u64::MAX), Rc::new(String::new())),
@@ -2215,6 +2249,27 @@ impl Editor {
             0
         };
         self.editor_images.clear();
+        // Callout blocks, outside the paragraph being edited, get a tinted box.
+        let mut callout_ranges: Vec<(usize, usize, String)> = Vec::new();
+        let mut scan = 0usize;
+        while scan < count {
+            let line = self.buffer.line(scan);
+            if let Some(kind) = callout_kind(&line) {
+                let start = scan;
+                scan += 1;
+                while scan < count && self.buffer.line(scan).trim_start().starts_with('>') {
+                    scan += 1;
+                }
+                let end = scan.saturating_sub(1);
+                let raw = raw_block.0 <= start && start <= raw_block.1;
+                if !raw {
+                    callout_ranges.push((start, end, kind));
+                }
+            } else {
+                scan += 1;
+            }
+        }
+        let mut callout_rows: Vec<(usize, usize)> = vec![(usize::MAX, 0); callout_ranges.len()];
         let mut rules: HashSet<usize> = HashSet::new();
         let mut in_code = false;
         let mut language = String::new();
@@ -2258,6 +2313,12 @@ impl Editor {
                 }
             };
 
+            if let Some(position) = callout_ranges
+                .iter()
+                .position(|(start, _, _)| *start == line_index)
+            {
+                callout_rows[position].0 = rows.len();
+            }
             let line_is_raw = line_index >= raw_block.0 && line_index <= raw_block.1;
             if !in_code
                 && !syntax::is_fence(&layout.text)
@@ -2364,6 +2425,12 @@ impl Editor {
                 }
             }
 
+            if let Some(position) = callout_ranges
+                .iter()
+                .position(|(_, end, _)| *end == line_index)
+            {
+                callout_rows[position].1 = rows.len();
+            }
             if line_index < self.line_cache.len() {
                 self.line_cache[line_index] = Some(layout);
             } else {
@@ -2373,6 +2440,18 @@ impl Editor {
         self.line_cache.truncate(count);
 
         self.display_math = Rc::new(blocks);
+        self.layout_callouts = Rc::new(
+            callout_ranges
+                .into_iter()
+                .zip(callout_rows)
+                .filter(|(_, (first, last))| *first != usize::MAX && *last > *first)
+                .map(|((_, _, kind), (first, last))| CalloutLayout {
+                    first_row: first,
+                    last_row: last,
+                    kind,
+                })
+                .collect(),
+        );
         self.layout_rules = Rc::new(rules);
         self.last_rows = Rc::new(metas);
         self.last_shaped = Rc::new(rows);
@@ -7145,6 +7224,40 @@ impl Element for EditorText {
             window.paint_quad(quad);
         }
 
+        // Callout boxes sit behind their rows and in front of the current-line highlight.
+        {
+            let editor = self.editor.read(cx);
+            let theme = *cx.global::<Theme>();
+            let width = bounds.size.width;
+            for callout in editor.layout_callouts.iter() {
+                if callout.last_row <= prepaint.visible.start
+                    || callout.first_row >= prepaint.visible.end
+                {
+                    continue;
+                }
+                let first = callout.first_row.max(prepaint.visible.start);
+                let last = callout.last_row.min(prepaint.visible.end);
+                if last <= first {
+                    continue;
+                }
+                let top = bounds.top() + line_height * first as f32;
+                let height = line_height * (last - first) as f32;
+                let accent = match callout.kind.as_str() {
+                    "warning" | "caution" | "danger" | "error" => theme.warn,
+                    "tip" | "success" => theme.code_text,
+                    _ => theme.accent_text,
+                };
+                window.paint_quad(fill(
+                    Bounds::new(point(bounds.left(), top), size(width, height)),
+                    theme.chip,
+                ));
+                window.paint_quad(fill(
+                    Bounds::new(point(bounds.left(), top), size(px(3.0), height)),
+                    accent,
+                ));
+            }
+        }
+
         for quad in prepaint.find_matches.drain(..) {
             window.paint_quad(quad);
         }
@@ -7327,6 +7440,15 @@ fn visible_row_range(
 
 /// Convert wrapped display spans into contiguous source row ranges. Hidden markers belong
 /// to the row they precede/follow, so every source column falls inside exactly one row.
+/// The callout kind of a `> [!kind]` line (`note`, `warning`, …), if it is one.
+fn callout_kind(line: &str) -> Option<String> {
+    let rest = line.trim_start().strip_prefix('>')?.trim_start();
+    let inner = rest.strip_prefix("[!")?;
+    let end = inner.find(']')?;
+    let kind = inner[..end].trim().to_lowercase();
+    (!kind.is_empty()).then_some(kind)
+}
+
 /// A standalone image embed: `![[target]]`, `![[target|300]]` or `![[target|alt text]]`.
 /// Returns the target and a pixel width when the size parses as a number.
 fn image_embed(text: &str) -> Option<(String, Option<f32>)> {
@@ -7545,6 +7667,18 @@ mod tests {
             assert_eq!(plain.display_for_source(col), col);
             assert_eq!(plain.source_for_display(col), col);
         }
+    }
+
+    #[test]
+    fn callout_kinds_are_recognised() {
+        assert_eq!(callout_kind("> [!note]"), Some("note".to_string()));
+        assert_eq!(
+            callout_kind("> [!Warning] Be careful"),
+            Some("warning".to_string())
+        );
+        assert_eq!(callout_kind("> plain quote"), None);
+        assert_eq!(callout_kind("plain"), None);
+        assert_eq!(callout_kind("> [!]"), None);
     }
 
     #[test]

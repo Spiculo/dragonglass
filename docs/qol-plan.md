@@ -591,8 +591,13 @@ exactly the rows the picture needs and pushes them as blank rows with the line's
 scroll, click-to-edit (the caret lands on that line and the source returns), selection and
 IME mapping are unchanged. Moving into the paragraph re-shows the source, and moving out
 draws the image again.
-**Remaining:** tables and callouts are still shown as source, and a display formula appears
-when the caret leaves the block rather than live while typing.
+**Landed (callouts):** a `> [!kind]` block outside the caret paragraph paints a tinted box
+with a left accent coloured by kind (warning/error amber, tip/success green, otherwise
+accent). The leading `>` markers and the `[!kind]` tag are concealed on blockquote and callout
+lines through the same column map, so the text stays aligned and editable; moving into the
+block shows the markers again.
+**Remaining:** tables are still shown as source, and a display formula appears when the caret
+leaves the block rather than live while typing.
 **Done when:** a note with emphasis, an image and a table shows the caret's line as source
 and the rest as preview, and every click lands on the source column the user aimed at.
 
