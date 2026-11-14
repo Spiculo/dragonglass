@@ -292,6 +292,8 @@ enum SettingKey {
     DailyFolder,
     WeeklyFolder,
     MonthlyFolder,
+    GitName,
+    GitEmail,
 }
 
 impl SettingKey {
@@ -304,8 +306,21 @@ impl SettingKey {
             SettingKey::DailyFolder => "Daily notes folder",
             SettingKey::WeeklyFolder => "Weekly notes folder",
             SettingKey::MonthlyFolder => "Monthly notes folder",
+            SettingKey::GitName => "Git commit name",
+            SettingKey::GitEmail => "Git commit email",
         }
     }
+}
+
+/// Result of the fetch/pull that runs when a vault window opens.
+#[derive(Debug, PartialEq, Eq)]
+enum AutoPull {
+    NoRemote,
+    UpToDate,
+    Updated,
+    LocalChanges,
+    Diverged,
+    Failed(String),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1427,6 +1442,69 @@ impl DragonGlassApp {
         } else {
             None
         };
+    }
+
+    /// Fetch and fast-forward from origin once the window opens.
+    ///
+    /// The network work runs off the UI thread. Uncommitted notes are never touched: the
+    /// pull is skipped when the working tree is dirty or when local and remote diverged.
+    fn auto_pull_on_open(&mut self, cx: &mut Context<Self>) {
+        let root = self.vault_root.clone();
+        if !git::is_repo(&root) {
+            return;
+        }
+
+        cx.spawn(async move |this, cx| {
+            let outcome = smol::unblock(move || auto_pull(&root)).await;
+            let _ = this.update(cx, |app, cx| match outcome {
+                AutoPull::Updated => {
+                    app.reload_after_pull(cx);
+                    app.status_message = Some("pulled changes from origin".to_string());
+                }
+                AutoPull::LocalChanges => {
+                    app.refresh_git();
+                    app.status_message =
+                        Some("auto-pull skipped: local changes are not committed".to_string());
+                }
+                AutoPull::Diverged => {
+                    app.refresh_git();
+                    app.status_message =
+                        Some("auto-pull skipped: local and remote have diverged".to_string());
+                }
+                AutoPull::UpToDate => app.refresh_git(),
+                AutoPull::NoRemote => {}
+                AutoPull::Failed(error) => {
+                    eprintln!("[dragon-glass] auto-pull failed: {error}");
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Reload the file tree and any clean open editors after a successful pull.
+    fn reload_after_pull(&mut self, cx: &mut Context<Self>) {
+        self.refresh_vault(cx);
+
+        for index in 0..self.tabs.len() {
+            let editor = self.tabs[index].editor.clone();
+            if editor.read(cx).is_dirty() {
+                continue;
+            }
+            let Some(relative) = self.tabs[index].relative.clone() else {
+                continue;
+            };
+            if !self.vault_root.join(&relative).exists() {
+                continue;
+            }
+            editor.update(cx, |editor, cx| {
+                let _ = editor.reload();
+                cx.notify();
+            });
+        }
+
+        self.cache_epoch = self.cache_epoch.wrapping_add(1);
+        self.refresh_properties(cx);
+        cx.notify();
     }
 
     /// Re-scan the vault after files are created or removed.
@@ -3396,6 +3474,8 @@ impl DragonGlassApp {
             SettingKey::DailyFolder => self.config.daily_folder.clone(),
             SettingKey::WeeklyFolder => self.config.weekly_folder.clone(),
             SettingKey::MonthlyFolder => self.config.monthly_folder.clone(),
+            SettingKey::GitName => self.config.git_name.clone().unwrap_or_default(),
+            SettingKey::GitEmail => self.config.git_email.clone().unwrap_or_default(),
         };
         self.pending_setting = Some(key);
         self.open_panel(SwitcherMode::SettingInput, window, cx);
@@ -3465,6 +3545,27 @@ impl DragonGlassApp {
                     self.config.monthly_folder = value.trim().to_string();
                 }
             }
+            SettingKey::GitName => {
+                let name = value.trim();
+                self.config.git_name = if name.is_empty() {
+                    None
+                } else {
+                    Some(name.to_string())
+                };
+            }
+            SettingKey::GitEmail => {
+                let email = value.trim();
+                if email.is_empty() {
+                    self.config.git_email = None;
+                } else if email.contains('@') {
+                    self.config.git_email = Some(email.to_string());
+                } else {
+                    self.status_message =
+                        Some("commit email must look like name@example.com".to_string());
+                    cx.notify();
+                    return;
+                }
+            }
         }
 
         self.status_message = Some(match config::save(&self.vault_root, &self.config) {
@@ -3497,6 +3598,8 @@ impl DragonGlassApp {
             "daily" => self.open_setting(SettingKey::DailyFolder, window, cx),
             "weekly" => self.open_setting(SettingKey::WeeklyFolder, window, cx),
             "monthly" => self.open_setting(SettingKey::MonthlyFolder, window, cx),
+            "git-name" => self.open_setting(SettingKey::GitName, window, cx),
+            "git-email" => self.open_setting(SettingKey::GitEmail, window, cx),
             "save-all" => {
                 self.status_message = Some(match self.save_all(cx) {
                     Ok(saved) => format!("saved {saved} note(s)"),
@@ -3587,6 +3690,16 @@ impl DragonGlassApp {
             .accent
             .clone()
             .unwrap_or_else(|| "theme default".to_string());
+        let git_name = self
+            .config
+            .git_name
+            .clone()
+            .unwrap_or_else(|| "from git config".to_string());
+        let git_email = self
+            .config
+            .git_email
+            .clone()
+            .unwrap_or_else(|| "from git config".to_string());
         let user_themes = if self.user_themes.is_empty() {
             "none installed".to_string()
         } else {
@@ -3742,6 +3855,28 @@ impl DragonGlassApp {
                         "monthly",
                         theme,
                     ))
+                    .child(heading("Git", theme))
+                    .child(row(
+                        "setting-git",
+                        "Repository",
+                        git_label(&self.git_status),
+                        "none",
+                        theme,
+                    ))
+                    .child(row(
+                        "setting-git-name",
+                        "Commit name",
+                        git_name,
+                        "git-name",
+                        theme,
+                    ))
+                    .child(row(
+                        "setting-git-email",
+                        "Commit email",
+                        git_email,
+                        "git-email",
+                        theme,
+                    ))
                     .child(heading("Data", theme))
                     .child(row(
                         "setting-save-all",
@@ -3764,13 +3899,6 @@ impl DragonGlassApp {
                         "Open another vault",
                         self.vault_path.clone(),
                         "vault",
-                        theme,
-                    ))
-                    .child(row(
-                        "setting-git",
-                        "Git",
-                        git_label(&self.git_status),
-                        "none",
                         theme,
                     ))
                     .child(row(
@@ -3913,11 +4041,24 @@ impl DragonGlassApp {
         if message.is_empty() {
             return;
         }
-        self.status_message = Some(match git::commit_all(&self.vault_root, message) {
-            Ok(true) => format!("committed: {message}"),
-            Ok(false) => "nothing to commit".to_string(),
-            Err(e) => format!("git commit failed: {e}"),
-        });
+        let author = git::Author::new(
+            self.config.git_name.as_deref(),
+            self.config.git_email.as_deref(),
+        );
+        self.status_message = Some(
+            match git::commit_all(&self.vault_root, message, author.as_ref()) {
+                Ok(true) => format!("committed: {message}"),
+                Ok(false) => "nothing to commit".to_string(),
+                Err(error) => {
+                    let text = error.to_string();
+                    if text.contains("who you are") {
+                        "git commit failed: set your name and email in Settings".to_string()
+                    } else {
+                        format!("git commit failed: {text}")
+                    }
+                }
+            },
+        );
         self.refresh_git();
     }
 
@@ -5125,6 +5266,38 @@ fn save_theme(root: &Path, theme: Theme, name: Option<&str>) -> std::io::Result<
         None => theme.name().to_string(),
     };
     storage::write_atomic(&dir.join("theme.txt"), &format!("{value}\n"))
+}
+
+/// Fetch, then fast-forward only when the working tree is clean and the branches have not
+/// diverged. Runs on a blocking thread; it never prompts for input.
+fn auto_pull(root: &Path) -> AutoPull {
+    match git::fetch(root) {
+        Ok(git::Outcome::NoRemote) => return AutoPull::NoRemote,
+        Ok(_) => {}
+        Err(error) => return AutoPull::Failed(error.to_string()),
+    }
+
+    let status = match git::status(root) {
+        Ok(status) => status,
+        Err(error) => return AutoPull::Failed(error.to_string()),
+    };
+    if !status.is_clean() {
+        return AutoPull::LocalChanges;
+    }
+    if status.behind == 0 {
+        return AutoPull::UpToDate;
+    }
+    if status.ahead > 0 {
+        return AutoPull::Diverged;
+    }
+
+    match git::pull(root) {
+        Ok(git::Outcome::Updated) => AutoPull::Updated,
+        Ok(git::Outcome::UpToDate) => AutoPull::UpToDate,
+        Ok(git::Outcome::NoRemote) => AutoPull::NoRemote,
+        Ok(git::Outcome::Conflicts(_)) => AutoPull::Diverged,
+        Err(error) => AutoPull::Failed(error.to_string()),
+    }
 }
 
 fn describe_outcome(outcome: git::Outcome) -> String {
@@ -6826,6 +6999,8 @@ fn open_vault_window(vault_path: PathBuf, uri_note: Option<String>, cx: &mut App
     });
 
     app_view.update(cx, |this, cx| this.watch_vault(cx));
+    // Fetch and fast-forward in the background; local edits and diverged branches are left alone.
+    app_view.update(cx, |this, cx| this.auto_pull_on_open(cx));
     // Pin the note we opened, so the next launch reopens the same one.
     app_view.update(cx, |this, cx| this.remember_session(cx));
 
@@ -6859,6 +7034,69 @@ mod tests {
             text: format!("h{line}"),
             line,
         }
+    }
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "dragon-glass-ui-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn auto_pull_without_a_remote_does_nothing() {
+        let root = temp_dir("auto-pull-noremote");
+        git::init(&root).unwrap();
+        assert_eq!(auto_pull(&root), AutoPull::NoRemote);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn auto_pull_skips_uncommitted_changes() {
+        let remote = temp_dir("auto-pull-remote");
+        assert!(std::process::Command::new("git")
+            .args(["init", "--bare"])
+            .arg(&remote)
+            .status()
+            .unwrap()
+            .success());
+
+        let root = temp_dir("auto-pull-dirty");
+        git::init(&root).unwrap();
+        std::fs::write(root.join("note.md"), "# note\n").unwrap();
+        git::commit_all(
+            &root,
+            "first",
+            Some(&git::Author {
+                name: Some("Test".to_string()),
+                email: Some("test@example.com".to_string()),
+            }),
+        )
+        .unwrap();
+
+        let url = remote.to_string_lossy().to_string();
+        assert!(std::process::Command::new("git")
+            .args(["remote", "add", "origin", &url])
+            .current_dir(&root)
+            .status()
+            .unwrap()
+            .success());
+        assert!(std::process::Command::new("git")
+            .args(["push", "-u", "origin", "main"])
+            .current_dir(&root)
+            .status()
+            .unwrap()
+            .success());
+
+        std::fs::write(root.join("draft.md"), "draft\n").unwrap();
+        assert_eq!(auto_pull(&root), AutoPull::LocalChanges);
+
+        std::fs::remove_dir_all(&root).unwrap();
+        std::fs::remove_dir_all(&remote).unwrap();
     }
 
     #[test]

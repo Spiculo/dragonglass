@@ -8,7 +8,7 @@ This is the first vertical slice, not full parity yet:
 - Open the app-private vault and list notes, either flat or as a folder tree
 - Fuzzy title search plus full-text search with line-level hits that jump into the editor
 - Bookmarks, stored in the vault's `.dragon-glass` folder, with a bookmarks-only filter
-- One-commit git sync with a GitHub HTTPS token
+- One-commit git sync with a GitHub HTTPS token and your own commit name/email
 - Edit markdown source and save atomically
 - Render markdown/HTML (headings, lists, tables, math, code) in a WebView
 - Outline, properties, stats, relations and tags from the shared engine
@@ -81,14 +81,18 @@ binary; both read and write the same repository format.
 1. Create a **fine-grained personal access token** on GitHub with
    **Contents: Read and write** for the vault repository.
 2. Tap **Sync** in the note list.
-3. Enter `https://github.com/<owner>/<repo>.git`, the branch, and the token.
+3. Enter `https://github.com/<owner>/<repo>.git`, the branch, your name and email, and the
+   token. Commits use that name and email; there is no Dragon Glass bot identity.
 4. Use **Link existing** to clone the GitHub repo into the vault (the old local vault is
    kept as a timestamped backup), or **Create new** to initialize a new repository and push
    the current notes. **Create new** expects an empty remote.
 5. After that, **Sync** does `commit all changes as one commit → pull --rebase → push`.
+   Opening the app or switching vaults also fetches from origin and fast-forwards when the
+   working tree is clean. Local changes or diverged branches skip the automatic pull.
 
 The token is encrypted with Android Keystore and never written into the vault or
-`.git/config`. Local `file://` remotes are supported for testing and do not require a token.
+`.git/config`. The commit name and email are stored in the app's preferences, not in the
+vault. Local `file://` remotes are supported for testing and do not require a token.
 
 ### Troubleshooting
 

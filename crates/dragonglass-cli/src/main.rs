@@ -15,8 +15,8 @@ use std::process::ExitCode;
 
 use anyhow::{anyhow, bail, Context, Result};
 use dragonglass_core::{
-    api, assets, git, graph, history, html, import, mcp, pdf, query, resolve, shared, storage,
-    store, update, uri, Note, NoteRef, Vault,
+    api, assets, config, git, graph, history, html, import, mcp, pdf, query, resolve, shared,
+    storage, store, update, uri, Note, NoteRef, Vault,
 };
 use dragonglass_plugins as plugins;
 
@@ -184,7 +184,9 @@ fn git_commit(args: Vec<String>) -> Result<()> {
         _ => (vault_arg(Some(args[0].clone())), args[1..].join(" ")),
     };
 
-    if git::commit_all(&root, &message)? {
+    let settings = config::load(&root);
+    let author = git::Author::new(settings.git_name.as_deref(), settings.git_email.as_deref());
+    if git::commit_all(&root, &message, author.as_ref())? {
         println!("committed: {message}");
     } else {
         println!("nothing to commit");
