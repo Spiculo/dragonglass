@@ -397,8 +397,9 @@ motions do nothing (they can no longer move the hidden caret), and `j`/`k`/`g`/`
 through the input handler with all other typing swallowed. Ctrl+F opens in-page find (Q2.2).
 Enter follows the link under the reading selection. Shift+arrows still extend the reading
 selection (Q2.3).
-**Remaining:** a keyboard focus ring that steps through links with Tab (links are followed by
-Enter over a selection or by clicking).
+Tab and Shift+Tab step through the links in document order, selecting each one so the
+existing highlight marks the focus; Enter follows it, so reading and following links needs no
+mouse.
 
 #### Q2.2 In-page find — D · M
 Build a reading find bar over block display text: case/regex/whole-word reuse from

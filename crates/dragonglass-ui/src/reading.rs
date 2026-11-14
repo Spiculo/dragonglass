@@ -1125,6 +1125,78 @@ impl ReadingCache {
         self.list_state.scroll_to_reveal_item(target);
     }
 
+    /// Select the next (or previous) link so Tab/Shift+Tab can walk them; Enter then
+    /// follows the selected link. Returns whether a link was found.
+    pub fn focus_next_link(&mut self, backwards: bool) -> bool {
+        let mut links: Vec<(ReadPoint, ReadPoint)> = Vec::new();
+        for (index, block) in self.blocks.iter().enumerate() {
+            let texts: Vec<&str> = match block {
+                Block::Heading { text, .. } | Block::Paragraph(text) | Block::Quote(text) => {
+                    vec![text]
+                }
+                Block::ListItem { text, .. } => vec![text],
+                Block::Callout { title, text, .. } => vec![title, text],
+                _ => continue,
+            };
+            let mut offset = 0usize;
+            for (at, text) in texts.iter().enumerate() {
+                if at > 0 {
+                    offset += 1;
+                }
+                for span in inline::parse(text) {
+                    if span.href.is_some() && !span.text.is_empty() {
+                        let start = ReadPoint {
+                            block: index,
+                            offset,
+                        };
+                        let end = ReadPoint {
+                            block: index,
+                            offset: offset + span.text.len(),
+                        };
+                        links.push((start, end));
+                    }
+                    offset += span.text.len();
+                }
+            }
+        }
+        if links.is_empty() {
+            return false;
+        }
+
+        let current = self.selection.borrow().head;
+        let next = match current {
+            Some(head) => match links
+                .iter()
+                .position(|(start, end)| head >= *start && head < *end)
+            {
+                Some(index) if backwards => (index + links.len() - 1) % links.len(),
+                Some(index) => (index + 1) % links.len(),
+                None => {
+                    let first = links.iter().position(|(start, _)| *start >= head);
+                    match (backwards, first) {
+                        (true, _) => 0,
+                        (false, Some(index)) => index,
+                        (false, None) => 0,
+                    }
+                }
+            },
+            None if backwards => links.len() - 1,
+            None => 0,
+        };
+
+        let (start, end) = links[next];
+        let mut selection = self.selection.borrow_mut();
+        selection.anchor = Some(ReadPoint {
+            block: end.block,
+            offset: end.offset.saturating_sub(1),
+        });
+        selection.head = Some(start);
+        selection.down = None;
+        selection.dragging = false;
+        selection.moved = true;
+        true
+    }
+
     /// The current reading selection head, if any.
     pub fn selection_head(&self) -> Option<ReadPoint> {
         self.selection.borrow().head

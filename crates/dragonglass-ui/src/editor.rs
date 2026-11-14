@@ -3686,6 +3686,12 @@ impl Editor {
 
     /// Tab: accept an autocomplete suggestion, otherwise indent the selection or caret.
     fn indent(&mut self, _: &Indent, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.reading {
+            // Tab steps through links in reading mode; Enter follows the selected one.
+            self.reading_content.focus_next_link(false);
+            cx.notify();
+            return;
+        }
         if !self.can_mutate() || self.find.open {
             return;
         }
@@ -3699,6 +3705,11 @@ impl Editor {
 
     /// Shift+Tab: remove one indent step from the selected lines or the caret's line.
     fn outdent(&mut self, _: &Outdent, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.reading {
+            self.reading_content.focus_next_link(true);
+            cx.notify();
+            return;
+        }
         if !self.can_mutate() || self.find.open {
             return;
         }
