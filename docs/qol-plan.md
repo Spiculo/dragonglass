@@ -207,7 +207,11 @@ button: Save and quit / Quit without saving / Cancel, and a failed save keeps th
 with the error and the conflict bar instead of quitting. The macOS
 `applicationWillTerminate` observer remains only for system-initiated termination (logout,
 shutdown), where no window exists to ask. Window close and Cmd+Q share one code path.
-**Remaining:** Android lifecycle (Q0.7 covers the save-before-navigate half).
+**Landed (Android):** the activity keeps the view model and calls `flushDraft` in `onStop`, so
+backgrounding writes a recovery draft; `closeNote`, vault switches and navigation await the
+save first and leave `selected`/`source` in place when it fails (Q0.7's Retry / Discard /
+Cancel dialog covers the decision). No exit path clears a dirty buffer before the write
+succeeds.
 
 #### Q0.5 Mobile preview is a real navigation surface — A · M
 Attach a `WebViewClient`: resolve internal `.html` links to `vm.openNote`, send external
