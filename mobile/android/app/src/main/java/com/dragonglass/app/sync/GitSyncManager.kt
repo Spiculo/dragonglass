@@ -1,6 +1,7 @@
 package com.dragonglass.app.sync
 
 import org.eclipse.jgit.api.Git
+import org.eclipse.jgit.api.MergeCommand
 import org.eclipse.jgit.api.RebaseCommand
 import org.eclipse.jgit.lib.BranchTrackingStatus
 import org.eclipse.jgit.lib.PersonIdent
@@ -35,6 +36,9 @@ data class GitSyncResult(
     val conflicts: List<String>,
 )
 
+/** Outcome of the fetch + fast-forward that runs when the app opens. */
+enum class PullOutcome { NoRemote, UpToDate, Updated, LocalChanges, Diverged }
+
 class GitSyncException(
     message: String,
     val conflicts: List<String> = emptyList(),
@@ -44,16 +48,17 @@ class GitSyncException(
  * One-commit git sync for a vault.
  *
  * `sync()` batches every pending note change into one commit, pulls with rebase (so the
- * local change stays a single commit), then pushes. Credentials are supplied per network
- * command and are never written into the repository.
+ * local change stays a single commit), then pushes. On app open, [fetchAndPullFastForward]
+ * only brings remote changes when the working tree is clean. Credentials are supplied per
+ * network command and are never written into the repository.
  */
 class GitSyncManager(
     private val vaultDir: File,
     private val remoteUrl: String,
     private val branch: String,
     private val token: String?,
-    private val authorName: String = "Dragon Glass",
-    private val authorEmail: String = "dragon-glass@localhost",
+    private val authorName: String? = null,
+    private val authorEmail: String? = null,
 ) {
     fun isRepo(): Boolean = File(vaultDir, ".git").exists()
 
@@ -197,6 +202,48 @@ class GitSyncManager(
     }
 
     /**
+     * Fetch, then fast-forward to the remote branch when local history is clean.
+     *
+     * This is the safe launch-time pull: it never commits, rebases or merges over local
+     * work. Dirty trees and diverged branches are reported instead of changed.
+     */
+    fun fetchAndPullFastForward(): PullOutcome {
+        if (!isRepo()) {
+            throw GitSyncException("Initialize or link a repository first")
+        }
+        return Git.open(vaultDir).use { git ->
+            configureRemote(git)
+            git.fetch()
+                .setRemote("origin")
+                .setCredentialsProvider(credentials())
+                .call()
+
+            if (git.status().call().hasUncommittedChanges()) {
+                return PullOutcome.LocalChanges
+            }
+
+            val remoteRef = git.repository.resolve("refs/remotes/origin/$branch")
+                ?: return PullOutcome.NoRemote
+            val tracking = BranchTrackingStatus.of(git.repository, branch)
+                ?: return PullOutcome.UpToDate
+            if (tracking.behindCount == 0) {
+                return PullOutcome.UpToDate
+            }
+            if (tracking.aheadCount > 0) {
+                return PullOutcome.Diverged
+            }
+
+            val before = git.repository.resolve("HEAD")?.name
+            git.merge()
+                .include(remoteRef)
+                .setFastForward(MergeCommand.FastForwardMode.FF_ONLY)
+                .call()
+            val after = git.repository.resolve("HEAD")?.name
+            if (before == after) PullOutcome.UpToDate else PullOutcome.Updated
+        }
+    }
+
+    /**
      * Abort an in-progress rebase, restoring the working tree to the local commit.
      */
     fun abortRebase() {
@@ -243,13 +290,34 @@ class GitSyncManager(
         if (!git.status().call().hasUncommittedChanges()) {
             return false
         }
-        val author = PersonIdent(authorName, authorEmail)
+        val author = commitAuthor(git)
         git.commit()
             .setMessage(message)
             .setAuthor(author)
             .setCommitter(author)
             .call()
         return true
+    }
+
+    /**
+     * The user's identity for commits. The Git settings win; otherwise fall back to the
+     * repository's `user.name` / `user.email` (for example a repo cloned with them set).
+     * There is no app-wide bot identity.
+     */
+    private fun commitAuthor(git: Git): PersonIdent {
+        val config = git.repository.config
+        val name = authorName?.trim().orEmpty().ifEmpty {
+            config.getString("user", null, "name")?.trim().orEmpty()
+        }
+        val email = authorEmail?.trim().orEmpty().ifEmpty {
+            config.getString("user", null, "email")?.trim().orEmpty()
+        }
+        if (name.isEmpty() || email.isEmpty()) {
+            throw GitSyncException(
+                "Add your name and email for commits in Git settings",
+            )
+        }
+        return PersonIdent(name, email)
     }
 
     private fun pullRebase(git: Git): Boolean {

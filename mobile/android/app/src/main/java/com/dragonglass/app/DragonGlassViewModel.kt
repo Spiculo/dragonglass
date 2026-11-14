@@ -13,6 +13,7 @@ import com.dragonglass.app.storage.VaultStore
 import com.dragonglass.app.sync.GitStatus
 import com.dragonglass.app.sync.GitSyncException
 import com.dragonglass.app.sync.GitSyncManager
+import com.dragonglass.app.sync.PullOutcome
 import com.dragonglass.app.sync.SecureTokenStore
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -566,6 +567,10 @@ class DragonGlassViewModel(application: Application) : AndroidViewModel(applicat
         private set
     var gitBranch by mutableStateOf("main")
         private set
+    var gitAuthorName by mutableStateOf("")
+        private set
+    var gitAuthorEmail by mutableStateOf("")
+        private set
     var gitStatus by mutableStateOf<GitStatus?>(null)
         private set
     var gitHasToken by mutableStateOf(false)
@@ -604,6 +609,7 @@ class DragonGlassViewModel(application: Application) : AndroidViewModel(applicat
         refresh()
         refreshGitStatus()
         pullFromFolder()
+        autoPullGitOnOpen()
     }
 
     private fun ensureVault(): MobileVault {
@@ -772,6 +778,8 @@ class DragonGlassViewModel(application: Application) : AndroidViewModel(applicat
     private fun loadGitSettings() {
         gitRemote = readGit("remote", "")
         gitBranch = readGit("branch", "main").ifBlank { "main" }
+        gitAuthorName = readGit("author_name", "")
+        gitAuthorEmail = readGit("author_email", "")
     }
 
     /// Unix millis of the last successful sync, shown in the sync sheet.
@@ -916,6 +924,7 @@ class DragonGlassViewModel(application: Application) : AndroidViewModel(applicat
         refresh()
         refreshGitStatus()
         pullFromFolder()
+        autoPullGitOnOpen()
     }
 
     fun toggleBookmarksOnly() {
@@ -1554,14 +1563,68 @@ class DragonGlassViewModel(application: Application) : AndroidViewModel(applicat
         }
     }
 
-    fun saveGitSettings(remote: String, branch: String, token: String?) {
+    /**
+     * Fetch and fast-forward from origin when the app opens.
+     *
+     * Stays silent when offline or not configured. Local edits and diverged branches are
+     * never touched; the message tells the user why the pull was skipped.
+     */
+    private fun autoPullGitOnOpen() {
+        val remote = gitRemote
+        val branch = gitBranch
+        if (remote.isBlank()) return
+        val token = tokenStore.load()
+        if (token == null && !remote.startsWith("file:")) return
+
+        viewModelScope.launch {
+            val outcome = runCatching {
+                withContext(Dispatchers.IO) {
+                    val manager = GitSyncManager(vaultDirectory, remote, branch, token)
+                    if (!manager.isRepo()) null else manager.fetchAndPullFastForward()
+                }
+            }
+            outcome
+                .onSuccess { result ->
+                    when (result) {
+                        PullOutcome.Updated -> {
+                            val note = selected
+                            message = "Pulled changes from origin."
+                            refreshGitStatus()
+                            if (note != null && !dirty) openNote(note) else refresh()
+                        }
+                        PullOutcome.LocalChanges ->
+                            message = "Auto-pull skipped: commit or discard local changes first."
+                        PullOutcome.Diverged ->
+                            message = "Auto-pull skipped: local and remote have diverged."
+                        PullOutcome.NoRemote, PullOutcome.UpToDate, null -> refreshGitStatus()
+                    }
+                }
+                .onFailure {
+                    // Opening the app must work offline; a failed fetch stays quiet.
+                }
+        }
+    }
+
+    fun saveGitSettings(
+        remote: String,
+        branch: String,
+        token: String?,
+        authorName: String,
+        authorEmail: String,
+    ) {
         val cleanRemote = remote.trim()
         val cleanBranch = branch.trim().ifBlank { "main" }
+        val cleanName = authorName.trim()
+        val cleanEmail = authorEmail.trim()
         gitRemote = cleanRemote
         gitBranch = cleanBranch
+        gitAuthorName = cleanName
+        gitAuthorEmail = cleanEmail
         gitPreferences.edit()
             .putString(gitKey("remote"), cleanRemote)
             .putString(gitKey("branch"), cleanBranch)
+            .putString(gitKey("author_name"), cleanName)
+            .putString(gitKey("author_email"), cleanEmail)
             .apply()
         if (!token.isNullOrBlank()) {
             tokenStore.save(token.trim())
@@ -1575,12 +1638,18 @@ class DragonGlassViewModel(application: Application) : AndroidViewModel(applicat
         val remote = gitRemote
         val branch = gitBranch
         val token = tokenStore.load()
+        val authorName = gitAuthorName.trim()
+        val authorEmail = gitAuthorEmail.trim()
         if (remote.isBlank()) {
             gitError = "Set the GitHub remote URL first"
             return
         }
         if (token == null && !remote.startsWith("file:")) {
             gitError = "Add a GitHub token first"
+            return
+        }
+        if (authorName.isEmpty() || authorEmail.isEmpty()) {
+            gitError = "Add your name and email for commits"
             return
         }
         viewModelScope.launch {
@@ -1598,7 +1667,14 @@ class DragonGlassViewModel(application: Application) : AndroidViewModel(applicat
             }
             val result = runCatching {
                 withContext(Dispatchers.IO) {
-                    GitSyncManager(vaultDirectory, remote, branch, token).sync()
+                    GitSyncManager(
+                        vaultDirectory,
+                        remote,
+                        branch,
+                        token,
+                        authorName,
+                        authorEmail,
+                    ).sync()
                 }
             }
             result
@@ -1629,12 +1705,18 @@ class DragonGlassViewModel(application: Application) : AndroidViewModel(applicat
         val remote = gitRemote
         val branch = gitBranch
         val token = tokenStore.load()
+        val authorName = gitAuthorName.trim()
+        val authorEmail = gitAuthorEmail.trim()
         if (remote.isBlank()) {
             gitError = "Set the GitHub remote URL first"
             return
         }
         if (token == null && !remote.startsWith("file:")) {
             gitError = "Add a GitHub token first"
+            return
+        }
+        if (authorName.isEmpty() || authorEmail.isEmpty()) {
+            gitError = "Add your name and email for commits"
             return
         }
         viewModelScope.launch {
@@ -1644,7 +1726,14 @@ class DragonGlassViewModel(application: Application) : AndroidViewModel(applicat
             gitConflicts = emptyList()
             val result = runCatching {
                 withContext(Dispatchers.IO) {
-                    GitSyncManager(vaultDirectory, remote, branch, token).initRemote()
+                    GitSyncManager(
+                        vaultDirectory,
+                        remote,
+                        branch,
+                        token,
+                        authorName,
+                        authorEmail,
+                    ).initRemote()
                 }
             }
             result

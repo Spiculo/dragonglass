@@ -77,7 +77,9 @@ A lot already works. This is a working application, not a mockup — but it is e
   (`autosave=on`)
 
 **Around the editor**
-- Git sync by driving your own `git` binary (your credentials, SSH config and hooks)
+- Git sync by driving your own `git` binary (your credentials, SSH config, hooks and commit
+  identity; set a name/email in Settings to override it), with a fetch + fast-forward when a
+  vault opens if the working tree is clean
 - HTML and PDF export
 - Read-only local HTTP API and an MCP server over stdio for AI tooling
 - Importers for Evernote (`.enex`) and Roam exports
@@ -229,6 +231,14 @@ normal/visual/insert modes, counts, the common motions and `d/y/c` operators, `/
 with `n`/`N` (a miss or a bad pattern reports in the status line), `Ctrl+R` for redo, `:w`,
 and `:s/…/…/` / `:%s/…/…/g`. `:wq`, `:x` and `:q` save if needed and close the tab; closing
 goes through the normal save path, so it cannot drop unsaved text.
+
+Git commits use the identity from your own `git config`. To override it for one vault, set
+**Settings → Git → Commit name / Commit email** (stored as `git_name=` and `git_email=` in
+`.dragon-glass/config.txt`). Leave them unset to keep using your normal git identity.
+
+Opening a vault fetches from origin and fast-forwards the local branch. Auto-pull is skipped
+when the working tree has uncommitted changes or when local and remote have diverged, so it
+never pulls over your edits.
 
 ## CLI
 

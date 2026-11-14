@@ -41,6 +41,10 @@ pub struct Config {
     pub scroll_sync: bool,
     /// Ask before opening a web, mail or phone link.
     pub confirm_external_links: bool,
+    /// Optional git commit name. Empty means "use the user's git config".
+    pub git_name: Option<String>,
+    /// Optional git commit email. Empty means "use the user's git config".
+    pub git_email: Option<String>,
 }
 
 impl Default for Config {
@@ -65,6 +69,8 @@ impl Default for Config {
             show_relations: false,
             scroll_sync: false,
             confirm_external_links: false,
+            git_name: None,
+            git_email: None,
         }
     }
 }
@@ -96,6 +102,12 @@ impl Config {
             "confirm_external_links={}\n",
             self.confirm_external_links
         ));
+        if let Some(name) = &self.git_name {
+            out.push_str(&format!("git_name={name}\n"));
+        }
+        if let Some(email) = &self.git_email {
+            out.push_str(&format!("git_email={email}\n"));
+        }
         out
     }
 
@@ -178,6 +190,8 @@ impl Config {
                         _ => "serif".to_string(),
                     };
                 }
+                "git_name" => config.git_name = Some(value),
+                "git_email" => config.git_email = Some(value),
                 _ => {}
             }
         }
@@ -214,6 +228,23 @@ mod tests {
         assert_eq!(config.accent, None);
         assert!(!config.vim_mode);
         assert_eq!(config.font_size, 14);
+        assert_eq!(config.git_name, None);
+        assert_eq!(config.git_email, None);
+    }
+
+    #[test]
+    fn git_identity_roundtrips() {
+        let config = Config {
+            git_name: Some("Ada Lovelace".to_string()),
+            git_email: Some("ada@example.com".to_string()),
+            ..Config::default()
+        };
+        let parsed = Config::from_text(&config.to_text());
+        assert_eq!(parsed, config);
+        assert_eq!(
+            Config::from_text("git_name=Ada\ngit_email=ada@example.com\n").git_email,
+            Some("ada@example.com".to_string())
+        );
     }
 
     #[test]
