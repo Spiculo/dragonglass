@@ -190,6 +190,12 @@ class DragonGlassViewModel(application: Application) : AndroidViewModel(applicat
         private set
     var findReplacement by mutableStateOf("")
         private set
+    var findRegex by mutableStateOf(false)
+        private set
+    var findCase by mutableStateOf(false)
+        private set
+    var findWholeWord by mutableStateOf(false)
+        private set
 
     val findLabel: String
         get() = if (findRanges.isEmpty()) "0/0" else "${findIndex + 1}/${findRanges.size}"
@@ -245,6 +251,21 @@ class DragonGlassViewModel(application: Application) : AndroidViewModel(applicat
         refreshFind()
     }
 
+    fun toggleFindRegex() {
+        findRegex = !findRegex
+        refreshFind()
+    }
+
+    fun toggleFindCase() {
+        findCase = !findCase
+        refreshFind()
+    }
+
+    fun toggleFindWholeWord() {
+        findWholeWord = !findWholeWord
+        refreshFind()
+    }
+
     fun findNext(backwards: Boolean = false) {
         if (findRanges.isEmpty()) return
         findIndex = if (backwards) {
@@ -259,7 +280,7 @@ class DragonGlassViewModel(application: Application) : AndroidViewModel(applicat
             emptyList()
         } else {
             runCatching {
-                findInText(source, findPattern, false, false, false)
+                findInText(source, findPattern, findRegex, findCase, findWholeWord)
                     .map { it.start.toInt() until it.end.toInt() }
             }.getOrDefault(emptyList())
         }

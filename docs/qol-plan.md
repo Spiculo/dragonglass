@@ -726,8 +726,8 @@ Matches refresh as the note changes.
 **Landed (replace):** the find bar has a replacement field with Replace (current match) and
 All (every match in one pass, built from the non-overlapping ranges). The editor text syncs
 to the buffer after a replace.
-**Remaining:** regex/case/whole-word toggles in the mobile bar (the FFI already accepts those
-options).
+**Landed (options):** the find bar has `.*`, `Aa` and `Word` toggles for regex, case and
+whole-word matching; changing one recomputes the matches through the engine's finder.
 
 #### Q4.3 Mobile editing toolbar and autocomplete — A · L
 Add a keyboard accessory row: bold, italic, highlight, link, heading, list, task, code;

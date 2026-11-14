@@ -1047,6 +1047,18 @@ private fun EditorScreen(vm: DragonGlassViewModel, relative: String) {
                         .padding(horizontal = 8.dp),
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
+                    FindToggle(".*", vm.findRegex, vm::toggleFindRegex)
+                    Spacer(Modifier.width(6.dp))
+                    FindToggle("Aa", vm.findCase, vm::toggleFindCase)
+                    Spacer(Modifier.width(6.dp))
+                    FindToggle("Word", vm.findWholeWord, vm::toggleFindWholeWord)
+                }
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 8.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
                     OutlinedTextField(
                         value = vm.findReplacement,
                         onValueChange = vm::onReplaceChange,
@@ -2503,6 +2515,16 @@ private fun TrashSheet(vm: DragonGlassViewModel, onDismiss: () -> Unit) {
                 TextButton(onClick = { confirmEmpty = false }) { Text("Cancel") }
             },
         )
+    }
+}
+
+/// One on/off find option.
+@Composable
+private fun FindToggle(label: String, on: Boolean, flip: () -> Unit) {
+    if (on) {
+        Button(onClick = flip) { Text(label) }
+    } else {
+        OutlinedButton(onClick = flip) { Text(label) }
     }
 }
 
