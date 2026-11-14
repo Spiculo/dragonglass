@@ -12,6 +12,7 @@ import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.isSystemInDarkTheme
@@ -756,10 +757,52 @@ private fun EditorScreen(vm: DragonGlassViewModel, relative: String) {
     var showDetails by remember { mutableStateOf(false) }
     var showRename by remember { mutableStateOf(false) }
     var showSync by remember { mutableStateOf(false) }
+    var linkPickerOpen by remember { mutableStateOf(false) }
+    var linkStart by remember { mutableStateOf<Int?>(null) }
     var editorValue by remember(relative) { mutableStateOf(TextFieldValue(vm.source)) }
     val focusRequester = remember { FocusRequester() }
     val focusManager = LocalFocusManager.current
     val title = relative.substringAfterLast('/').removeSuffix(".md")
+
+    // Toolbar edits act on the current selection and write through to the buffer.
+    fun applyValue(value: TextFieldValue) {
+        editorValue = value
+        vm.onSourceChange(value.text)
+    }
+
+    fun wrapSelection(open: String, close: String = open) {
+        val value = editorValue
+        val start = value.selection.min
+        val end = value.selection.max
+        val selected = value.text.substring(start, end)
+        val newText = value.text.substring(0, start) + open + selected + close + value.text.substring(end)
+        val caret = if (selected.isEmpty()) start + open.length else start + open.length + selected.length + close.length
+        applyValue(TextFieldValue(newText, TextRange(caret)))
+        focusRequester.requestFocus()
+    }
+
+    fun prefixLine(prefix: String) {
+        val value = editorValue
+        val lineStart = value.text.substring(0, value.selection.min).lastIndexOf('\n') + 1
+        val newText = value.text.substring(0, lineStart) + prefix + value.text.substring(lineStart)
+        applyValue(
+            TextFieldValue(
+                newText,
+                TextRange(value.selection.start + prefix.length, value.selection.end + prefix.length),
+            ),
+        )
+        focusRequester.requestFocus()
+    }
+
+    fun insertWikilink(target: String) {
+        val start = linkStart ?: editorValue.selection.min
+        val end = editorValue.selection.max
+        val insertion = "[[$target]]"
+        val newText = editorValue.text.substring(0, start) + insertion + editorValue.text.substring(end)
+        applyValue(TextFieldValue(newText, TextRange(start + insertion.length)))
+        linkStart = null
+        focusRequester.requestFocus()
+    }
 
     LaunchedEffect(relative) { focusRequester.requestFocus() }
 
@@ -905,8 +948,14 @@ private fun EditorScreen(vm: DragonGlassViewModel, relative: String) {
                 BasicTextField(
                     value = editorValue,
                     onValueChange = {
+                        val previous = editorValue.text
                         editorValue = it
                         vm.onSourceChange(it.text)
+                        // Typing `[[` opens the note picker for a wikilink.
+                        if (it.text.endsWith("[[") && !previous.endsWith("[[") && !vm.preview) {
+                            linkStart = (it.selection.min - 2).coerceAtLeast(0)
+                            linkPickerOpen = true
+                        }
                     },
                     modifier = Modifier
                         .fillMaxSize()
@@ -930,7 +979,41 @@ private fun EditorScreen(vm: DragonGlassViewModel, relative: String) {
                 )
             }
             }
+            if (!vm.preview) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .horizontalScroll(rememberScrollState())
+                        .padding(horizontal = 8.dp, vertical = 2.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    TextButton(onClick = { wrapSelection("**") }) { Text("B", fontWeight = FontWeight.Bold) }
+                    TextButton(onClick = { wrapSelection("*") }) { Text("I", fontStyle = androidx.compose.ui.text.font.FontStyle.Italic) }
+                    TextButton(onClick = { wrapSelection("==") }) { Text("==") }
+                    TextButton(onClick = { wrapSelection("`") }) { Text("`") }
+                    TextButton(onClick = { prefixLine("# ") }) { Text("H1") }
+                    TextButton(onClick = { prefixLine("- ") }) { Text("-") }
+                    TextButton(onClick = { prefixLine("- [ ] ") }) { Text("☐") }
+                    TextButton(
+                        onClick = {
+                            linkStart = editorValue.selection.min
+                            linkPickerOpen = true
+                        },
+                    ) { Text("[[ ]]") }
+                }
+            }
         }
+    }
+
+    if (linkPickerOpen) {
+        LinkPickerSheet(
+            vm = vm,
+            onDismiss = { linkPickerOpen = false },
+            onPick = { target ->
+                insertWikilink(target)
+                linkPickerOpen = false
+            },
+        )
     }
 
     if (showSync) {
@@ -1059,6 +1142,59 @@ private fun OutlineRow(heading: HeadingInfo, onClick: () -> Unit) {
             .clickable(onClick = onClick)
             .padding(start = ((heading.level - 1).coerceAtLeast(0) * 12).dp),
     )
+}
+
+/// Search the vault's notes and insert one as a wikilink.
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun LinkPickerSheet(
+    vm: DragonGlassViewModel,
+    onDismiss: () -> Unit,
+    onPick: (String) -> Unit,
+) {
+    var query by remember { mutableStateOf("") }
+    val needle = query.trim().lowercase()
+    val results = remember(needle, vm.notes) {
+        vm.notes
+            .filter {
+                needle.isEmpty() ||
+                    it.title.lowercase().contains(needle) ||
+                    it.relative.lowercase().contains(needle)
+            }
+            .take(60)
+    }
+
+    ModalBottomSheet(onDismissRequest = onDismiss) {
+        Column(Modifier.fillMaxWidth().padding(horizontal = 16.dp)) {
+            Text("Insert link", style = MaterialTheme.typography.titleLarge)
+            OutlinedTextField(
+                value = query,
+                onValueChange = { query = it },
+                placeholder = { Text("Search notes") },
+                singleLine = true,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(vertical = 8.dp),
+            )
+            LazyColumn(Modifier.heightIn(max = 360.dp)) {
+                items(results, key = { it.relative }) { note ->
+                    ListItem(
+                        headlineContent = { Text(note.title, maxLines = 1) },
+                        supportingContent = {
+                            Text(note.relative, style = MaterialTheme.typography.labelSmall)
+                        },
+                        modifier = Modifier.clickable {
+                            val stem = note.relative.substringAfterLast('/').removeSuffix(".md")
+                            onPick(stem)
+                        },
+                    )
+                }
+                if (results.isEmpty()) {
+                    item { Muted("No notes match.") }
+                }
+            }
+        }
+    }
 }
 
 @OptIn(ExperimentalMaterial3Api::class)

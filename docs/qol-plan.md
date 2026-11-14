@@ -706,6 +706,13 @@ screens.
 **Done when:** common markdown can be authored on a phone without typing punctuation
 syntax; `[[` opens a searchable note picker; the toolbar does not cover the caret.
 
+**Landed:** a keyboard accessory row above the editor (hidden in preview) with bold, italic,
+highlight, inline code, heading, bullet, task and wikilink buttons. Each acts on the current
+selection and writes through to the buffer; the wikilink button, and typing `[[`, open a
+searchable note picker that inserts `[[stem]]` at the caret.
+**Remaining:** tag (`#`) and slash-command pickers, and syntax highlighting/line numbers in
+the editor (line numbers are judged harmful on a phone).
+
 #### Q4.4 Sync is visible and recoverable — A · M
 Show a sync chip/state in the editor and list (synced/unsaved/syncing/error/last sync),
 allow sync from the editor after saving, make conflict rows actionable with Retry/Abort,
