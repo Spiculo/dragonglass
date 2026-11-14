@@ -155,6 +155,11 @@ pub fn folder_of(relative: &str) -> &str {
     }
 }
 
+/// Radius of a node in canvas units. A note with more links gets a bigger circle.
+pub fn node_radius(links: usize) -> f32 {
+    (5.0 + (links as f32).sqrt() * 2.0).min(16.0)
+}
+
 /// The subgraph within `depth` hops of `root`, capped at `max_nodes`.
 pub fn local(graph: &Graph, root: usize, depth: usize, max_nodes: usize) -> Graph {
     if graph.nodes.is_empty() || root >= graph.nodes.len() {
@@ -216,51 +221,152 @@ pub fn local(graph: &Graph, root: usize, depth: usize, max_nodes: usize) -> Grap
     Graph { nodes, edges }
 }
 
-/// Deterministic Fruchterman-Reingold layout inside `width` x `height`.
-pub fn layout(graph: &Graph, width: f32, height: f32, iterations: usize) -> Vec<(f32, f32)> {
-    let n = graph.nodes.len();
-    if n == 0 {
-        return Vec::new();
+/// Tuning for the force-directed graph layout.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LayoutParams {
+    /// Width of the virtual canvas.
+    pub width: f32,
+    /// Height of the virtual canvas.
+    pub height: f32,
+    /// Empty space kept between a node edge and the canvas edge.
+    pub padding: f32,
+    /// Number of simulation steps used by [`layout`] and [`GraphLayout::settle`].
+    pub iterations: usize,
+    /// Strength of the pairwise repulsion.
+    pub repel: f32,
+    /// Strength of the spring along an edge.
+    pub link_force: f32,
+    /// Target length of an edge. Zero asks the layout to derive it from the graph size.
+    pub link_distance: f32,
+    /// Pull toward the canvas centre. This keeps disconnected parts together.
+    pub center_force: f32,
+    /// Extra space between two node circles.
+    pub collision_gap: f32,
+}
+
+impl Default for LayoutParams {
+    fn default() -> Self {
+        Self {
+            width: 1000.0,
+            height: 600.0,
+            padding: 8.0,
+            iterations: 120,
+            repel: 1.0,
+            link_force: 0.06,
+            link_distance: 0.0,
+            center_force: 0.015,
+            collision_gap: 6.0,
+        }
+    }
+}
+
+impl LayoutParams {
+    pub fn new(width: f32, height: f32, iterations: usize) -> Self {
+        Self {
+            width,
+            height,
+            iterations,
+            ..Self::default()
+        }
     }
 
-    let center = (width / 2.0, height / 2.0);
-    let radius = (width.min(height) / 2.0) * 0.7;
-
-    let mut pos: Vec<(f32, f32)> = (0..n)
-        .map(|i| {
-            let angle = std::f32::consts::TAU * (i as f32) / (n as f32);
-            // A small deterministic jitter stops symmetric nodes from stacking.
-            let jitter = 1.0 + ((i * 2654435761usize % 1000) as f32 / 1000.0 - 0.5) * 0.1;
-            (
-                center.0 + radius * angle.cos() * jitter,
-                center.1 + radius * angle.sin() * jitter,
-            )
-        })
-        .collect();
-
-    if n == 1 {
-        return pos;
+    /// The natural distance between two linked nodes.
+    pub fn k(&self, n: usize) -> f32 {
+        let area = (self.width.max(1.0) * self.height.max(1.0)) as f32;
+        (area / n.max(1) as f32).sqrt().clamp(60.0, 160.0)
     }
 
-    let area = width * height;
-    let k = (area / n as f32).sqrt();
-    let mut temperature = radius * 0.5;
-    let cooling = if iterations > 0 {
-        temperature / (iterations as f32 + 1.0)
-    } else {
-        0.0
-    };
+    fn resolved_link_distance(&self, n: usize) -> f32 {
+        if self.link_distance > 0.0 {
+            self.link_distance
+        } else {
+            self.k(n) * 0.8
+        }
+    }
+}
 
-    for _ in 0..iterations {
+/// A deterministic, incremental force-directed layout.
+///
+/// The UI can call [`step`](Self::step) once per frame to animate the graph. Headless
+/// callers use [`layout`] instead, which settles the same simulation synchronously.
+#[derive(Debug, Clone)]
+pub struct GraphLayout {
+    positions: Vec<(f32, f32)>,
+    pinned: Vec<bool>,
+    alpha: f32,
+    decay: f32,
+    params: LayoutParams,
+    steps: usize,
+}
+
+impl GraphLayout {
+    /// Start a layout from a deterministic ring. Call [`step`](Self::step) to animate it.
+    pub fn new(graph: &Graph, params: LayoutParams) -> Self {
+        let n = graph.nodes.len();
+        let positions = initial_positions(graph, &params);
+        let decay = 0.02f32.powf(1.0 / params.iterations.max(1) as f32);
+        Self {
+            positions,
+            pinned: vec![false; n],
+            alpha: 1.0,
+            decay,
+            params,
+            steps: 0,
+        }
+    }
+
+    pub fn positions(&self) -> &[(f32, f32)] {
+        &self.positions
+    }
+
+    pub fn params(&self) -> LayoutParams {
+        self.params
+    }
+
+    /// True while the simulation still wants frames.
+    pub fn is_active(&self) -> bool {
+        self.alpha > 0.02
+    }
+
+    /// Raise the temperature again. Dragging a node or rebuilding the graph uses this.
+    pub fn reheat(&mut self, alpha: f32) {
+        self.alpha = self.alpha.max(alpha.clamp(0.0, 1.0));
+    }
+
+    /// Pin a node so forces cannot move it. The UI pins a node after the user drags it.
+    pub fn pin(&mut self, node: usize, pinned: bool) {
+        if let Some(slot) = self.pinned.get_mut(node) {
+            *slot = pinned;
+        }
+    }
+
+    /// Move a node directly. Used by the pointer drag.
+    pub fn set_position(&mut self, node: usize, position: (f32, f32)) {
+        if let Some(slot) = self.positions.get_mut(node) {
+            *slot = position;
+        }
+    }
+
+    /// Advance the simulation by one frame. Returns true while another frame is useful.
+    pub fn step(&mut self, graph: &Graph, _dt: f32) -> bool {
+        let n = self.positions.len().min(graph.nodes.len());
+        if n == 0 || !self.is_active() {
+            return false;
+        }
+
+        let k = self.params.k(n);
+        let link_distance = self.params.resolved_link_distance(n);
+        let center = (self.params.width / 2.0, self.params.height / 2.0);
         let mut disp = vec![(0.0f32, 0.0f32); n];
 
-        // Repulsion between every pair.
+        // Repulsion between every pair. The factor keeps the force in the same
+        // range as the springs, so a single alpha controls the whole step.
         for i in 0..n {
             for j in (i + 1)..n {
-                let dx = pos[i].0 - pos[j].0;
-                let dy = pos[i].1 - pos[j].1;
-                let distance = (dx * dx + dy * dy).sqrt().max(0.01);
-                let force = k * k / distance;
+                let dx = self.positions[i].0 - self.positions[j].0;
+                let dy = self.positions[i].1 - self.positions[j].1;
+                let distance = (dx * dx + dy * dy).sqrt().max(0.5);
+                let force = self.params.repel * k * k / distance * 0.025;
                 let (ux, uy) = (dx / distance, dy / distance);
                 disp[i].0 += ux * force;
                 disp[i].1 += uy * force;
@@ -269,12 +375,16 @@ pub fn layout(graph: &Graph, width: f32, height: f32, iterations: usize) -> Vec<
             }
         }
 
-        // Attraction along edges.
+        // Springs along edges. They pull toward `link_distance` and push apart
+        // when an edge is too short, which keeps clusters from collapsing.
         for edge in &graph.edges {
-            let dx = pos[edge.from].0 - pos[edge.to].0;
-            let dy = pos[edge.from].1 - pos[edge.to].1;
-            let distance = (dx * dx + dy * dy).sqrt().max(0.01);
-            let force = distance * distance / k;
+            if edge.from >= n || edge.to >= n {
+                continue;
+            }
+            let dx = self.positions[edge.from].0 - self.positions[edge.to].0;
+            let dy = self.positions[edge.from].1 - self.positions[edge.to].1;
+            let distance = (dx * dx + dy * dy).sqrt().max(0.5);
+            let force = (distance - link_distance) * self.params.link_force;
             let (ux, uy) = (dx / distance, dy / distance);
             disp[edge.from].0 -= ux * force;
             disp[edge.from].1 -= uy * force;
@@ -282,20 +392,167 @@ pub fn layout(graph: &Graph, width: f32, height: f32, iterations: usize) -> Vec<
             disp[edge.to].1 += uy * force;
         }
 
-        for i in 0..n {
-            let (dx, dy) = disp[i];
-            let length = (dx * dx + dy * dy).sqrt().max(0.01);
-            let step = length.min(temperature);
-            pos[i].0 += dx / length * step;
-            pos[i].1 += dy / length * step;
-            pos[i].0 = pos[i].0.clamp(0.0, width);
-            pos[i].1 = pos[i].1.clamp(0.0, height);
+        // A weak centre pull and soft walls keep disconnected notes on screen.
+        for (i, (x, y)) in self.positions.iter().enumerate() {
+            let radius = node_radius(graph.nodes[i].links) + self.params.padding;
+            disp[i].0 += (center.0 - x) * self.params.center_force;
+            disp[i].1 += (center.1 - y) * self.params.center_force;
+            if *x < radius {
+                disp[i].0 += (radius - x) * 0.2;
+            }
+            if *x > self.params.width - radius {
+                disp[i].0 -= (x - (self.params.width - radius)) * 0.2;
+            }
+            if *y < radius {
+                disp[i].1 += (radius - y) * 0.2;
+            }
+            if *y > self.params.height - radius {
+                disp[i].1 -= (y - (self.params.height - radius)) * 0.2;
+            }
         }
 
-        temperature = (temperature - cooling).max(0.0);
+        // The step shrinks with alpha, so the graph slows down instead of
+        // oscillating forever.
+        let max_step = (14.0 * self.alpha).max(0.4);
+        for i in 0..n {
+            if self.pinned[i] {
+                continue;
+            }
+            let (dx, dy) = disp[i];
+            let length = (dx * dx + dy * dy).sqrt();
+            if length > 0.001 {
+                let step = length.min(max_step);
+                self.positions[i].0 += dx / length * step;
+                self.positions[i].1 += dy / length * step;
+            }
+        }
+
+        self.resolve_collisions(graph, 2);
+        self.clamp_to_bounds(graph);
+        self.alpha *= self.decay;
+        self.steps += 1;
+        self.is_active()
     }
 
-    pos
+    /// Run the simulation to rest. Used by the headless [`layout`] entry point.
+    pub fn settle(&mut self, graph: &Graph) {
+        for _ in 0..self.params.iterations.max(1) {
+            if !self.step(graph, 1.0 / 60.0) {
+                break;
+            }
+        }
+        // Forces can leave a tiny residual overlap at an edge. A few direct
+        // separation passes make the final positions usable for hit-testing.
+        for _ in 0..6 {
+            self.resolve_collisions(graph, 2);
+            self.clamp_to_bounds(graph);
+        }
+        self.alpha = 0.0;
+    }
+
+    fn resolve_collisions(&mut self, graph: &Graph, passes: usize) {
+        let n = self.positions.len().min(graph.nodes.len());
+        const EPSILON: f32 = 0.001;
+
+        for _ in 0..passes {
+            for i in 0..n {
+                for j in (i + 1)..n {
+                    let min_distance = node_radius(graph.nodes[i].links)
+                        + node_radius(graph.nodes[j].links)
+                        + self.params.collision_gap;
+                    let dx = self.positions[i].0 - self.positions[j].0;
+                    let dy = self.positions[i].1 - self.positions[j].1;
+                    let distance = (dx * dx + dy * dy).sqrt();
+                    if distance >= min_distance {
+                        continue;
+                    }
+
+                    let (ux, uy) = if distance > EPSILON {
+                        (dx / distance, dy / distance)
+                    } else {
+                        // Two nodes exactly on top of each other: pick a stable
+                        // direction from their indices.
+                        let angle = std::f32::consts::TAU * ((i * 37 + j * 17) % n.max(1)) as f32
+                            / n.max(1) as f32;
+                        (angle.cos(), angle.sin())
+                    };
+                    let overlap = min_distance - distance;
+                    let (wi, wj) = match (self.pinned[i], self.pinned[j]) {
+                        (false, false) => (0.5, 0.5),
+                        (true, false) => (0.0, 1.0),
+                        (false, true) => (1.0, 0.0),
+                        (true, true) => (0.0, 0.0),
+                    };
+                    self.positions[i].0 += ux * overlap * wi;
+                    self.positions[i].1 += uy * overlap * wi;
+                    self.positions[j].0 -= ux * overlap * wj;
+                    self.positions[j].1 -= uy * overlap * wj;
+                }
+            }
+            self.clamp_to_bounds(graph);
+        }
+    }
+
+    fn clamp_to_bounds(&mut self, graph: &Graph) {
+        let n = self.positions.len().min(graph.nodes.len());
+        for i in 0..n {
+            let radius = node_radius(graph.nodes[i].links) + self.params.padding;
+            let (x, y) = self.positions[i];
+            self.positions[i].0 = clamp_axis(x, radius, self.params.width);
+            self.positions[i].1 = clamp_axis(y, radius, self.params.height);
+        }
+    }
+}
+
+fn clamp_axis(value: f32, margin: f32, length: f32) -> f32 {
+    let low = margin;
+    let high = length - margin;
+    if low <= high {
+        value.clamp(low, high)
+    } else {
+        length / 2.0
+    }
+}
+
+fn initial_positions(graph: &Graph, params: &LayoutParams) -> Vec<(f32, f32)> {
+    let n = graph.nodes.len();
+    if n == 0 {
+        return Vec::new();
+    }
+
+    let center = (params.width / 2.0, params.height / 2.0);
+    if n == 1 {
+        return vec![center];
+    }
+
+    let max_radius = graph
+        .nodes
+        .iter()
+        .map(|node| node_radius(node.links))
+        .fold(0.0f32, f32::max);
+    let ring =
+        ((params.width.min(params.height) / 2.0) - max_radius - params.padding).max(10.0) * 0.75;
+
+    (0..n)
+        .map(|i| {
+            let angle = std::f32::consts::TAU * (i as f32) / (n as f32);
+            // A small deterministic jitter stops symmetric nodes from stacking.
+            let jitter = 1.0 + ((i * 2654435761usize % 1000) as f32 / 1000.0 - 0.5) * 0.1;
+            (
+                center.0 + ring * angle.cos() * jitter,
+                center.1 + ring * angle.sin() * jitter,
+            )
+        })
+        .collect()
+}
+
+/// Deterministic force-directed layout inside `width` x `height`.
+///
+/// Use [`GraphLayout`] directly when the caller wants to animate the simulation.
+pub fn layout(graph: &Graph, width: f32, height: f32, iterations: usize) -> Vec<(f32, f32)> {
+    let mut layout = GraphLayout::new(graph, LayoutParams::new(width, height, iterations));
+    layout.settle(graph);
+    layout.positions
 }
 
 #[cfg(test)]
@@ -436,5 +693,96 @@ mod tests {
         }
 
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn dense_graph(n: usize) -> Graph {
+        let nodes = (0..n)
+            .map(|id| Node {
+                id,
+                relative: format!("note-{id}.md"),
+                links: id % 9,
+            })
+            .collect();
+        let mut edges = Vec::new();
+        for i in 0..n {
+            edges.push(Edge {
+                from: i,
+                to: (i + 1) % n,
+                kind: EdgeKind::Link,
+            });
+            if i % 3 == 0 {
+                edges.push(Edge {
+                    from: i,
+                    to: (i + 7) % n,
+                    kind: EdgeKind::Embed,
+                });
+            }
+        }
+        Graph { nodes, edges }
+    }
+
+    #[test]
+    fn layout_does_not_overlap_node_circles() {
+        let graph = dense_graph(80);
+        let params = LayoutParams::new(1000.0, 600.0, 240);
+        let mut layout = GraphLayout::new(&graph, params);
+        layout.settle(&graph);
+
+        let positions = layout.positions();
+        assert_eq!(positions.len(), graph.nodes.len());
+        for i in 0..positions.len() {
+            for j in (i + 1)..positions.len() {
+                let dx = positions[i].0 - positions[j].0;
+                let dy = positions[i].1 - positions[j].1;
+                let distance = (dx * dx + dy * dy).sqrt();
+                let min = node_radius(graph.nodes[i].links)
+                    + node_radius(graph.nodes[j].links)
+                    + params.collision_gap;
+                assert!(
+                    distance + 0.01 >= min,
+                    "nodes {i} and {j} overlap: distance {distance}, minimum {min}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn layout_keeps_every_circle_inside_the_canvas() {
+        let graph = dense_graph(80);
+        let params = LayoutParams::new(1000.0, 600.0, 240);
+        let mut layout = GraphLayout::new(&graph, params);
+        layout.settle(&graph);
+
+        for (id, (x, y)) in layout.positions().iter().enumerate() {
+            let radius = node_radius(graph.nodes[id].links) + params.padding;
+            assert!((*x >= radius - 0.01 && *x <= params.width - radius + 0.01));
+            assert!((*y >= radius - 0.01 && *y <= params.height - radius + 0.01));
+        }
+    }
+
+    #[test]
+    fn layout_stops_after_settling() {
+        let graph = dense_graph(20);
+        let mut layout = GraphLayout::new(&graph, LayoutParams::new(800.0, 500.0, 60));
+        let mut steps = 0;
+        while layout.step(&graph, 1.0 / 60.0) {
+            steps += 1;
+            assert!(steps < 500, "layout did not settle");
+        }
+        assert!(!layout.is_active());
+        assert!(!layout.step(&graph, 1.0 / 60.0));
+    }
+
+    #[test]
+    fn a_pinned_node_stays_where_the_pointer_left_it() {
+        let graph = dense_graph(20);
+        let mut layout = GraphLayout::new(&graph, LayoutParams::new(800.0, 500.0, 120));
+        layout.pin(0, true);
+        layout.set_position(0, (400.0, 250.0));
+        layout.reheat(1.0);
+        for _ in 0..12 {
+            layout.step(&graph, 1.0 / 60.0);
+        }
+        assert_eq!(layout.positions()[0], (400.0, 250.0));
     }
 }
