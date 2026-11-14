@@ -13,11 +13,12 @@
 //! tab=notes/a.md|1|12|3|0.0|4
 //! ```
 //!
-//! A `tab` line is `note|reading|line|col|scroll|reading_block`. The note is vault-relative
-//! and empty for an untitled tab; `reading` is `0` or `1`; the rest are 0-based cursor
-//! columns, the editor's vertical scroll offset in pixels and the reading view's top block.
-//! Unknown keys and malformed fields are ignored, and version 1 files (`note=…`,
-//! `reading=…`) still load as a single tab.
+//! A `tab` line is `note|reading|line|col|scroll|reading_block|anchor|folds`. The note is
+//! vault-relative and empty for an untitled tab; `reading` is `0` or `1`; the rest are
+//! 0-based cursor columns, the editor's vertical scroll offset in pixels, the reading view's
+//! top block, the selection anchor as a character index (empty when there is no selection)
+//! and a comma-separated list of folded heading indices. Unknown keys and malformed fields
+//! are ignored, and version 1 files (`note=…`, `reading=…`) still load as a single tab.
 
 use std::path::{Path, PathBuf};
 
@@ -39,6 +40,10 @@ pub struct TabSession {
     pub scroll: f32,
     /// The reading view's top block index.
     pub reading_block: usize,
+    /// Selection anchor as a character index; the caret end is `line`/`col`.
+    pub anchor: Option<usize>,
+    /// Heading indices whose sections are folded in the editor.
+    pub folded: Vec<usize>,
 }
 
 /// The tabs that were open, and which one was active.
@@ -55,14 +60,19 @@ impl Session {
         out.push_str("version=2\n");
         out.push_str(&format!("active={}\n", self.active.min(self.tabs.len())));
         for tab in self.tabs.iter().take(MAX_TABS) {
+            let folds: Vec<String> = tab.folded.iter().map(|index| index.to_string()).collect();
             out.push_str(&format!(
-                "tab={}|{}|{}|{}|{:.1}|{}\n",
+                "tab={}|{}|{}|{}|{:.1}|{}|{}|{}\n",
                 tab.note,
                 u8::from(tab.reading),
                 tab.line,
                 tab.col,
                 tab.scroll.max(0.0),
-                tab.reading_block
+                tab.reading_block,
+                tab.anchor
+                    .map(|anchor| anchor.to_string())
+                    .unwrap_or_default(),
+                folds.join(",")
             ));
         }
         out
@@ -159,6 +169,13 @@ fn parse_tab(value: &str) -> Option<TabSession> {
         .next()
         .and_then(|field| field.trim().parse().ok())
         .unwrap_or(0);
+    tab.anchor = fields.next().and_then(|field| field.trim().parse().ok());
+    if let Some(folds) = fields.next() {
+        tab.folded = folds
+            .split(',')
+            .filter_map(|index| index.trim().parse().ok())
+            .collect();
+    }
     // A tab with no note and every other field at its default is an untitled buffer, which
     // is valid; anything else is at least a note path.
     Some(tab)
@@ -197,6 +214,8 @@ mod tests {
                     col: 3,
                     scroll: 240.0,
                     reading_block: 4,
+                    anchor: Some(9),
+                    folded: vec![0, 3],
                 },
                 TabSession {
                     note: "notes/b.md".to_string(),
@@ -205,10 +224,21 @@ mod tests {
                     col: 0,
                     scroll: 0.0,
                     reading_block: 0,
+                    anchor: None,
+                    folded: Vec::new(),
                 },
             ],
         };
         assert_eq!(Session::from_text(&session.to_text()), session);
+    }
+
+    #[test]
+    fn a_tab_without_the_new_fields_still_loads() {
+        // The format before selection and folds were stored.
+        let session = Session::from_text("version=2\nactive=0\ntab=notes/a.md|1|12|3|0.0|4\n");
+        assert_eq!(session.tabs[0].anchor, None);
+        assert!(session.tabs[0].folded.is_empty());
+        assert_eq!(session.tabs[0].line, 12);
     }
 
     #[test]
@@ -282,6 +312,8 @@ mod tests {
                 col: 0,
                 scroll: 12.0,
                 reading_block: 2,
+                anchor: None,
+                folded: vec![1],
             }],
         };
         save(&dir, &session).unwrap();

@@ -255,7 +255,10 @@ load. Each tab round-trips its mode, caret line and column, editor scroll offset
 top block; startup reopens every saved tab whose file still exists, prunes missing files and
 restores the active tab. Tests cover round-trip, untitled tabs, v1 migration, malformed
 lines, caps and the restore filter.
-**Remaining:** selection ranges and fold state are not stored yet.
+**Landed (selection and folds):** a tab now also stores its selection anchor (character
+index, empty for no selection) and the folded heading indices. The parser treats both as
+optional trailing fields, so older session files still load. Restoring applies folds before
+the caret and selection so the geometry is stable.
 
 #### Q1.2 Map edit position to read position (and back) — D · M
 Add source line spans to the block parser (`markdown::parse_blocks` returns blocks plus
@@ -340,8 +343,8 @@ note opens. Preserve preview scroll across Edit ↔ Preview.
 preview WebView saves its scroll offset when Edit replaces it and restores it after the page
 finishes loading, and it only reloads when the rendered document actually changes (so a
 recomposition no longer resets the page).
-**Remaining:** the editor's own selection/scroll is still owned by `BasicTextField` and
-resets when the screen is rebuilt.
+**Remaining (desktop is done via session v2):** on Android the editor's own selection and
+scroll still belong to `BasicTextField` and reset when the screen is rebuilt.
 
 #### Q1.8 Mobile back precedence — A · S
 Define one hierarchy: Preview → Edit; search results → list; sheet/dialog → dismiss; dirty

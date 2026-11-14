@@ -1294,6 +1294,34 @@ impl Editor {
         self.scroll_handle.set_offset(point(x, px(offset.max(0.0))));
     }
 
+    /// The selection anchor (a character index) when a non-empty selection exists.
+    pub fn selection_anchor(&self) -> Option<usize> {
+        let cursor = self.buffer.cursor();
+        self.anchor.filter(|anchor| *anchor != cursor)
+    }
+
+    /// Restore a selection anchor; the cursor end is set separately.
+    pub fn set_selection_anchor(&mut self, anchor: Option<usize>) {
+        let cursor = self.buffer.cursor();
+        let limit = self.buffer.len_chars();
+        self.anchor = anchor
+            .filter(|anchor| *anchor != cursor)
+            .map(|anchor| anchor.min(limit));
+    }
+
+    /// Heading indices whose sections are folded.
+    pub fn folded_headings(&self) -> Vec<usize> {
+        let mut folds: Vec<usize> = self.folded.iter().copied().collect();
+        folds.sort_unstable();
+        folds
+    }
+
+    /// Restore folded headings from a session.
+    pub fn set_folded_headings(&mut self, folds: &[usize]) {
+        self.folded = folds.iter().copied().collect();
+        self.fold_revision = self.fold_revision.wrapping_add(1);
+    }
+
     /// The reading view's top block.
     pub fn reading_block(&self) -> usize {
         self.reading_content.top_block()

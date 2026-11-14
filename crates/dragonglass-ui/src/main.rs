@@ -1406,6 +1406,8 @@ impl DragonGlassApp {
                     col,
                     scroll: editor.scroll_offset(),
                     reading_block: editor.reading_block(),
+                    anchor: editor.selection_anchor(),
+                    folded: editor.folded_headings(),
                 }
             })
             .collect();
@@ -8241,7 +8243,9 @@ fn open_vault_window(vault_path: PathBuf, uri_note: Option<String>, cx: &mut App
                     editor.set_reading_mode(true);
                 }
                 if let Some(saved) = saved {
+                    editor.set_folded_headings(&saved.folded);
                     editor.set_cursor_position(saved.line, saved.col);
+                    editor.set_selection_anchor(saved.anchor);
                     editor.set_scroll_offset(saved.scroll);
                     editor.scroll_reading_to(saved.reading_block);
                 }
