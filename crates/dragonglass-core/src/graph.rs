@@ -251,10 +251,10 @@ impl Default for LayoutParams {
             height: 600.0,
             padding: 8.0,
             iterations: 120,
-            repel: 1.0,
-            link_force: 0.06,
+            repel: 0.025,
+            link_force: 0.05,
             link_distance: 0.0,
-            center_force: 0.015,
+            center_force: 0.02,
             collision_gap: 6.0,
         }
     }
@@ -272,7 +272,7 @@ impl LayoutParams {
 
     /// The natural distance between two linked nodes.
     pub fn k(&self, n: usize) -> f32 {
-        let area = (self.width.max(1.0) * self.height.max(1.0)) as f32;
+        let area = self.width.max(1.0) * self.height.max(1.0);
         (area / n.max(1) as f32).sqrt().clamp(60.0, 160.0)
     }
 
@@ -308,7 +308,8 @@ impl GraphLayout {
         Self {
             positions,
             pinned: vec![false; n],
-            alpha: 1.0,
+            // One node has nothing to settle; do not schedule frames for it.
+            alpha: if n <= 1 { 0.0 } else { 1.0 },
             decay,
             params,
             steps: 0,
@@ -328,9 +329,12 @@ impl GraphLayout {
         self.alpha > 0.02
     }
 
-    /// Raise the temperature again. Dragging a node or rebuilding the graph uses this.
+    /// Set the temperature. Dragging a node or rebuilding the graph uses this.
+    ///
+    /// A rebuild with known positions can ask for a gentle nudge (`0.3`); a new
+    /// graph asks for a full simulation (`1.0`).
     pub fn reheat(&mut self, alpha: f32) {
-        self.alpha = self.alpha.max(alpha.clamp(0.0, 1.0));
+        self.alpha = alpha.clamp(0.0, 1.0);
     }
 
     /// Pin a node so forces cannot move it. The UI pins a node after the user drags it.
@@ -366,6 +370,8 @@ impl GraphLayout {
                 let dx = self.positions[i].0 - self.positions[j].0;
                 let dy = self.positions[i].1 - self.positions[j].1;
                 let distance = (dx * dx + dy * dy).sqrt().max(0.5);
+                // `repel` is a strength multiplier on a small base. Keeping the
+                // base here makes the value easy to tune without changing units.
                 let force = self.params.repel * k * k / distance * 0.025;
                 let (ux, uy) = (dx / distance, dy / distance);
                 disp[i].0 += ux * force;
@@ -414,11 +420,11 @@ impl GraphLayout {
         // The step shrinks with alpha, so the graph slows down instead of
         // oscillating forever.
         let max_step = (14.0 * self.alpha).max(0.4);
-        for i in 0..n {
+        for (i, (dx, dy)) in disp.iter().enumerate().take(n) {
             if self.pinned[i] {
                 continue;
             }
-            let (dx, dy) = disp[i];
+            let (dx, dy) = (*dx, *dy);
             let length = (dx * dx + dy * dy).sqrt();
             if length > 0.001 {
                 let step = length.min(max_step);
@@ -784,5 +790,30 @@ mod tests {
             layout.step(&graph, 1.0 / 60.0);
         }
         assert_eq!(layout.positions()[0], (400.0, 250.0));
+    }
+
+    #[test]
+    fn collision_pushes_other_nodes_away_from_a_dragged_node() {
+        let graph = dense_graph(10);
+        let params = LayoutParams::new(800.0, 500.0, 120);
+        let mut layout = GraphLayout::new(&graph, params);
+        layout.settle(&graph);
+        let target = layout.positions()[1];
+        layout.pin(0, true);
+        layout.set_position(0, target);
+        layout.reheat(1.0);
+        for _ in 0..12 {
+            layout.step(&graph, 1.0 / 60.0);
+        }
+
+        let distance = {
+            let a = layout.positions()[0];
+            let b = layout.positions()[1];
+            ((a.0 - b.0).powi(2) + (a.1 - b.1).powi(2)).sqrt()
+        };
+        let minimum = node_radius(graph.nodes[0].links)
+            + node_radius(graph.nodes[1].links)
+            + params.collision_gap;
+        assert!(distance + 0.01 >= minimum);
     }
 }
