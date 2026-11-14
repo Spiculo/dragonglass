@@ -296,6 +296,10 @@ pub struct Editor {
     /// Vault root, used to resolve embeds and attachments.
     vault_root: Option<PathBuf>,
     reading: bool,
+    /// Whether live-preview substitutions are drawn in the source editor.
+    dynamic: bool,
+    /// Window position of the open mode menu, if any.
+    mode_menu: Option<Point<Pixels>>,
     /// Selection anchor. `None` means no selection; the cursor is the active end.
     anchor: Option<usize>,
     selecting: bool,
@@ -398,6 +402,8 @@ pub struct Editor {
     heading_source: Option<Rc<String>>,
     /// The paragraph the current layout kept raw.
     layout_raw_block: (usize, usize),
+    /// Whether the current layout includes live-preview substitutions.
+    layout_dynamic: bool,
     /// Lines that are thematic breaks and are drawn as a rule instead of source.
     layout_rules: Rc<HashSet<usize>>,
     /// Bumped when `folded` changes so `lay_out` reflows.
@@ -567,6 +573,37 @@ fn list_continuation(line: &str, col: usize) -> Option<String> {
     None
 }
 
+/// How the note is shown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ViewMode {
+    /// Raw markdown source.
+    Full,
+    /// Source with markers concealed and blocks previewed in place.
+    Dynamic,
+    /// The rendered reader.
+    Viewer,
+}
+
+impl ViewMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            ViewMode::Full => "Full editor",
+            ViewMode::Dynamic => "Dynamic",
+            ViewMode::Viewer => "Viewer",
+        }
+    }
+
+    fn from_parts(reading: bool, dynamic: bool) -> Self {
+        if reading {
+            ViewMode::Viewer
+        } else if dynamic {
+            ViewMode::Dynamic
+        } else {
+            ViewMode::Full
+        }
+    }
+}
+
 /// A wrapped visual row: `[start, end)` character columns of logical line `line`, plus the
 /// matching range in the shaped display text.
 #[derive(Debug, Clone)]
@@ -578,6 +615,16 @@ struct RowMeta {
     display_end: usize,
     display_start_byte: usize,
     map: Rc<LineMap>,
+}
+
+/// Inline styling carried by concealed text (bold, italic, strike, code, highlight).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct InlineStyle {
+    bold: bool,
+    italic: bool,
+    strike: bool,
+    code: bool,
+    highlight: bool,
 }
 
 /// Maps a source line to the text that is actually shaped for it.
@@ -597,6 +644,8 @@ struct LineMap {
     source_byte: Vec<usize>,
     /// Source column of every display column (len + 1 entries).
     display_source: Vec<usize>,
+    /// Inline styling per display character.
+    styles: Vec<InlineStyle>,
 }
 
 impl LineMap {
@@ -639,18 +688,23 @@ impl LineMap {
 /// Build the shaped display text and both directions of the column map.
 fn conceal_text(text: &str, conceal: bool, table: bool) -> LineMap {
     let chars: Vec<char> = text.chars().collect();
-    let hidden = if conceal {
+    let (hidden, source_styles) = if conceal {
         hidden_markers(&chars, table)
     } else {
-        vec![false; chars.len()]
+        (
+            vec![false; chars.len()],
+            vec![InlineStyle::default(); chars.len()],
+        )
     };
 
     let mut display = Vec::with_capacity(chars.len());
     let mut display_source = Vec::with_capacity(chars.len());
+    let mut styles = Vec::with_capacity(chars.len());
     for (index, ch) in chars.iter().enumerate() {
         if !hidden[index] {
             display.push(*ch);
             display_source.push(index);
+            styles.push(source_styles[index]);
         }
     }
     display_source.push(chars.len());
@@ -680,12 +734,14 @@ fn conceal_text(text: &str, conceal: bool, table: bool) -> LineMap {
         source_display,
         source_byte,
         display_source,
+        styles,
     }
 }
 
 /// Which characters are markdown markers to hide when the line is not being edited.
-fn hidden_markers(chars: &[char], table: bool) -> Vec<bool> {
+fn hidden_markers(chars: &[char], table: bool) -> (Vec<bool>, Vec<InlineStyle>) {
     let mut hidden = vec![false; chars.len()];
+    let mut styles = vec![InlineStyle::default(); chars.len()];
     let len = chars.len();
     let mut i = 0usize;
 
@@ -726,6 +782,9 @@ fn hidden_markers(chars: &[char], table: bool) -> Vec<bool> {
                 if close > i + 1 {
                     hidden[i] = true;
                     hidden[close] = true;
+                    for slot in &mut styles[i + 1..close] {
+                        slot.code = true;
+                    }
                     i = close + 1;
                     continue;
                 }
@@ -798,6 +857,15 @@ fn hidden_markers(chars: &[char], table: bool) -> Vec<bool> {
             for slot in &mut hidden[close..close + width] {
                 *slot = true;
             }
+            for slot in &mut styles[i + width..close] {
+                match token {
+                    "**" | "__" => slot.bold = true,
+                    "*" | "_" => slot.italic = true,
+                    "~~" => slot.strike = true,
+                    "==" => slot.highlight = true,
+                    _ => {}
+                }
+            }
             i += width;
             matched = true;
             break;
@@ -807,7 +875,7 @@ fn hidden_markers(chars: &[char], table: bool) -> Vec<bool> {
         }
     }
 
-    hidden
+    (hidden, styles)
 }
 
 fn starts_at(chars: &[char], at: usize, token: &str) -> bool {
@@ -972,6 +1040,8 @@ impl Editor {
             path: None,
             vault_root: None,
             reading: false,
+            dynamic: true,
+            mode_menu: None,
             anchor: None,
             selecting: false,
             focus_handle: cx.focus_handle(),
@@ -1024,6 +1094,7 @@ impl Editor {
             heading_cache: (u64::MAX, u64::MAX, Rc::new(Vec::new())),
             heading_source: None,
             layout_raw_block: (usize::MAX, usize::MAX),
+            layout_dynamic: true,
             layout_rules: Rc::new(HashSet::new()),
             fold_revision: 0,
             layout_fold_revision: u64::MAX,
@@ -1541,6 +1612,45 @@ impl Editor {
     }
 
     /// Toggle between edit and reading mode (used by the command palette).
+    pub fn view_mode(&self) -> ViewMode {
+        ViewMode::from_parts(self.reading, self.dynamic)
+    }
+
+    /// Switch between the three views. Full turns previews off; Dynamic turns them on;
+    /// Viewer enters reading mode.
+    pub fn set_view_mode(&mut self, mode: ViewMode) {
+        match mode {
+            ViewMode::Full => {
+                if self.reading {
+                    self.set_reading_mode(false);
+                }
+                self.set_dynamic_mode(false);
+            }
+            ViewMode::Dynamic => {
+                if self.reading {
+                    self.set_reading_mode(false);
+                }
+                self.set_dynamic_mode(true);
+            }
+            ViewMode::Viewer => self.set_reading_mode(true),
+        }
+    }
+
+    pub fn is_dynamic(&self) -> bool {
+        self.dynamic
+    }
+
+    /// Enable or disable in-editor previews. Turning them off re-shapes the document so
+    /// markers and substituted blocks return to source.
+    pub fn set_dynamic_mode(&mut self, dynamic: bool) {
+        if self.dynamic == dynamic {
+            return;
+        }
+        self.dynamic = dynamic;
+        self.cache_revision = u64::MAX;
+        self.line_cache.clear();
+    }
+
     pub fn toggle_reading_mode(&mut self) {
         self.set_reading_mode(!self.reading);
     }
@@ -2212,20 +2322,27 @@ impl Editor {
         let caret_line = self.buffer.line_col().0;
         let raw_block = self.raw_block_for_line(caret_line);
         let block_changed = self.layout_raw_block != raw_block;
+        let dynamic_changed = self.layout_dynamic != self.dynamic;
         // Tables are drawn as a grid, so their pipes are structural while the caret is
         // elsewhere.
-        let table_ranges = table_blocks(&self.buffer, raw_block);
+        let table_ranges = if self.dynamic {
+            table_blocks(&self.buffer, raw_block)
+        } else {
+            Vec::new()
+        };
         let mut table_rows: Vec<(usize, usize)> = vec![(usize::MAX, 0); table_ranges.len()];
         let mut table_dividers: Vec<usize> = vec![usize::MAX; table_ranges.len()];
         if !width_changed
             && self.cache_revision == revision
             && !folds_changed
             && !block_changed
+            && !dynamic_changed
             && !self.last_shaped.is_empty()
         {
             return;
         }
         self.layout_raw_block = raw_block;
+        self.layout_dynamic = self.dynamic;
         if width_changed {
             // Every row's wrapping depends on the width.
             self.line_cache.clear();
@@ -2271,7 +2388,9 @@ impl Editor {
         // `$$…$$` blocks are drawn as typeset formulas whenever the caret is outside them.
         // Blocks are re-parsed only when the text changes; their row spans are rebuilt on
         // every full layout because folds and wrapping move rows.
-        let sources: Vec<DisplayMathSource> = if self.display_math_revision == revision {
+        let sources: Vec<DisplayMathSource> = if !self.dynamic {
+            Vec::new()
+        } else if self.display_math_revision == revision {
             self.display_math
                 .iter()
                 .map(|block| DisplayMathSource {
@@ -2331,7 +2450,7 @@ impl Editor {
         // Callout blocks, outside the paragraph being edited, get a tinted box.
         let mut callout_ranges: Vec<(usize, usize, String)> = Vec::new();
         let mut scan = 0usize;
-        while scan < count {
+        while self.dynamic && scan < count {
             let line = self.buffer.line(scan);
             if let Some(kind) = callout_kind(&line) {
                 let start = scan;
@@ -2370,7 +2489,8 @@ impl Editor {
                     if cached.in_code == in_code
                         && cached.language == language
                         && cached.concealed
-                            == (line_index < raw_block.0 || line_index > raw_block.1)
+                            == (self.dynamic
+                                && (line_index < raw_block.0 || line_index > raw_block.1))
                         && cached.table
                             == table_ranges
                                 .iter()
@@ -2394,7 +2514,7 @@ impl Editor {
                         &text,
                         in_code,
                         &language,
-                        line_index < raw_block.0 || line_index > raw_block.1,
+                        self.dynamic && (line_index < raw_block.0 || line_index > raw_block.1),
                         in_table,
                         &font,
                         font_size,
@@ -2431,7 +2551,8 @@ impl Editor {
                 }
             }
             let line_is_raw = line_index >= raw_block.0 && line_index <= raw_block.1;
-            if !in_code
+            if self.dynamic
+                && !in_code
                 && !syntax::is_fence(&layout.text)
                 && line_index > frontmatter_end
                 && !line_is_raw
@@ -2452,7 +2573,7 @@ impl Editor {
 
             // A standalone image embed outside the edited paragraph is drawn as an image,
             // with empty rows reserved for its height.
-            if !line_is_raw && !in_code {
+            if self.dynamic && !line_is_raw && !in_code {
                 if let Some((target, requested)) = image_embed(&layout.text) {
                     if let Some(path) = self.resolve_embed(&target) {
                         if let Some((data, image_width, image_height)) =
@@ -4487,6 +4608,9 @@ impl Editor {
     /// Escape closes the find bar, leaves Vim insert/visual mode, or drops extra carets.
     /// Returns whether the editor consumed the key.
     pub fn handle_escape(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.mode_menu.take().is_some() {
+            return true;
+        }
         if self.context_menu.take().is_some() {
             return true;
         }
@@ -5680,6 +5804,58 @@ impl Render for Editor {
                 .into_any_element()
         });
 
+        let mode_menu = self.mode_menu.map(|position| {
+            let current = self.view_mode();
+            let entity = cx.entity();
+            let rows: Vec<AnyElement> = [ViewMode::Full, ViewMode::Dynamic, ViewMode::Viewer]
+                .into_iter()
+                .map(|mode| {
+                    let entity = entity.clone();
+                    div()
+                        .id(ElementId::Name(format!("mode-{mode:?}").into()))
+                        .px_3()
+                        .py_1()
+                        .text_sm()
+                        .cursor_pointer()
+                        .when(mode == current, |d| {
+                            d.bg(theme.chip).text_color(theme.accent_text)
+                        })
+                        .when(mode != current, |d| d.text_color(theme.text))
+                        .hover(move |style| style.bg(theme.hover))
+                        .child(mode.label())
+                        .on_mouse_down(MouseButton::Left, move |_event, _window, cx| {
+                            entity.update(cx, |this, cx| {
+                                this.set_view_mode(mode);
+                                this.mode_menu = None;
+                                cx.notify();
+                            });
+                        })
+                        .into_any_element()
+                })
+                .collect();
+            anchored()
+                .position(position)
+                .anchor(Corner::TopLeft)
+                .snap_to_window_with_margin(px(8.0))
+                .child(
+                    div()
+                        .id("mode-menu")
+                        .flex()
+                        .flex_col()
+                        .w(px(160.0))
+                        .py_1()
+                        .rounded_md()
+                        .bg(theme.panel)
+                        .border_1()
+                        .border_color(theme.border)
+                        .on_mouse_down(MouseButton::Left, |_event, _window, cx| {
+                            cx.stop_propagation();
+                        })
+                        .children(rows),
+                )
+                .into_any_element()
+        });
+
         let (line, column) = self.buffer.line_col();
         let line_count = self.buffer.line_count();
         let words = self.stats_cache.1.words;
@@ -5870,26 +6046,22 @@ impl Render for Editor {
                         )
                         .child(
                             div()
-                                .id("mode-toggle")
+                                .id("mode-select")
                                 .px_2()
                                 .py_1()
                                 .rounded_md()
                                 .cursor_pointer()
                                 .bg(theme.chip)
-                                .text_color(if reading {
-                                    theme.accent_text
-                                } else {
-                                    theme.muted
-                                })
+                                .text_color(theme.accent_text)
                                 .hover(move |style| style.bg(theme.hover))
                                 .on_mouse_down(
                                     MouseButton::Left,
-                                    cx.listener(|this, _ev, _window, cx| {
-                                        this.toggle_reading_mode();
+                                    cx.listener(|this, event: &MouseDownEvent, _window, cx| {
+                                        this.mode_menu = Some(event.position);
                                         cx.notify();
                                     }),
                                 )
-                                .child(if reading { "READ" } else { "EDIT" }),
+                                .child(format!("{} \u{25BE}", self.view_mode().label())),
                         ),
                 ),
             )
@@ -5945,6 +6117,25 @@ impl Render for Editor {
             })
             .child(status)
             .children(context_menu)
+            .when(self.mode_menu.is_some(), |d| {
+                d.child(
+                    div()
+                        .id("mode-backdrop")
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .right_0()
+                        .bottom_0()
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _event, _window, cx| {
+                                this.mode_menu = None;
+                                cx.notify();
+                            }),
+                        ),
+                )
+            })
+            .children(mode_menu)
     }
 }
 
@@ -6299,6 +6490,7 @@ impl LineLayout {
                 }
                 None => runs_for(
                     &tokens[start..end],
+                    &map.styles[start..end],
                     &offsets[start..=end],
                     font,
                     color,
@@ -6372,6 +6564,7 @@ fn runs_for_code(
 /// `offsets` spans the row's characters plus one, so byte lengths are plain differences.
 fn runs_for(
     kinds: &[syntax::TokenKind],
+    styles: &[InlineStyle],
     offsets: &[usize],
     font: &gpui::Font,
     base_color: gpui::Hsla,
@@ -6382,19 +6575,29 @@ fn runs_for(
 
     while index < kinds.len() {
         let kind = kinds[index];
+        let style = styles.get(index).copied().unwrap_or_default();
         let mut end = index + 1;
-        while end < kinds.len() && kinds[end] == kind {
+        while end < kinds.len()
+            && kinds[end] == kind
+            && styles.get(end).copied().unwrap_or_default() == style
+        {
             end += 1;
         }
 
         let len = offsets[end] - offsets[index];
-        let run_font = if kind == syntax::TokenKind::Heading {
-            gpui::Font {
-                weight: gpui::FontWeight::BOLD,
-                ..font.clone()
-            }
+        let mut run_font = font.clone();
+        if kind == syntax::TokenKind::Heading || style.bold {
+            run_font.weight = gpui::FontWeight::BOLD;
+        }
+        if style.italic {
+            run_font.style = gpui::FontStyle::Italic;
+        }
+        let background = if style.highlight {
+            Some(theme.star)
+        } else if style.code {
+            Some(theme.code_bg)
         } else {
-            font.clone()
+            None
         };
 
         if len > 0 {
@@ -6402,9 +6605,12 @@ fn runs_for(
                 len,
                 font: run_font,
                 color: token_color(kind, base_color, theme),
-                background_color: None,
+                background_color: background,
                 underline: None,
-                strikethrough: None,
+                strikethrough: style.strike.then_some(gpui::StrikethroughStyle {
+                    thickness: px(1.0),
+                    color: None,
+                }),
             });
         }
 
@@ -7981,6 +8187,35 @@ fn caret_after_block_edit(
 mod tests {
     use super::*;
     use gpui::{point, size};
+
+    #[test]
+    fn concealed_markers_carry_inline_styles() {
+        let map = conceal_text("a **b** `c` ~~d~~ ==e==", true, false);
+        let display: String = map.display.iter().collect();
+        let style = |needle: &str| map.styles[display.find(needle).unwrap()];
+        assert!(style("b").bold);
+        assert!(style("c").code);
+        assert!(style("d").strike);
+        assert!(style("e").highlight);
+        assert!(!style("b").italic);
+        // Without concealment everything is plain source.
+        let plain = conceal_text("**b**", false, false);
+        assert!(plain
+            .styles
+            .iter()
+            .all(|style| *style == InlineStyle::default()));
+    }
+
+    #[test]
+    fn view_modes_map_from_reading_and_dynamic() {
+        assert_eq!(ViewMode::from_parts(false, false), ViewMode::Full);
+        assert_eq!(ViewMode::from_parts(false, true), ViewMode::Dynamic);
+        assert_eq!(ViewMode::from_parts(true, true), ViewMode::Viewer);
+        assert_eq!(ViewMode::from_parts(true, false), ViewMode::Viewer);
+        assert_eq!(ViewMode::Full.label(), "Full editor");
+        assert_eq!(ViewMode::Dynamic.label(), "Dynamic");
+        assert_eq!(ViewMode::Viewer.label(), "Viewer");
+    }
 
     #[test]
     fn concealed_markers_map_between_source_and_display() {
