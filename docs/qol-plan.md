@@ -808,8 +808,11 @@ the WebView only reloads when the rendered document changes, so mode switches ke
 text size and column width steppers, stored in the vault config through the shared FFI
 (`readerSettings` / `setReaderSettings`) and applied to the preview stylesheet; the values
 match the desktop reader's `reader_size`/`reader_width`.
-**Remaining:** an explicit theme choice on Android (it follows the system), and reader font
-family.
+**Landed (font and theme):** the Reader settings sheet also picks the typeface (sans, serif
+or mono) — stored as `reader_font` in the vault config and applied to the preview stylesheet,
+with code kept monospace — and the app theme (system, light or dark), stored on the device and
+applied to both the Compose colours and the preview's dark overrides. The typeface is shared
+with the desktop through the config; the desktop reading view does not consume it yet.
 
 #### P2 — polish (schedule after P0/P1)
 - Mobile: graph layout off the main thread, pan/zoom, share/deep-link entry, vault

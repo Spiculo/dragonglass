@@ -64,6 +64,8 @@ class DragonGlassViewModel(application: Application) : AndroidViewModel(applicat
     private val gitPreferences =
         application.getSharedPreferences("dragon_glass_git", Context.MODE_PRIVATE)
     private val tokenStore = SecureTokenStore(application)
+    private val uiPreferences =
+        application.getSharedPreferences("dragon_glass_ui", Context.MODE_PRIVATE)
     private var vault: MobileVault? = null
 
     var vaults by mutableStateOf(vaultStore.vaults())
@@ -119,20 +121,48 @@ class DragonGlassViewModel(application: Application) : AndroidViewModel(applicat
         private set
     var readerMeasure by mutableStateOf(780)
         private set
+    var readerFont by mutableStateOf("serif")
+        private set
 
-    fun setReaderTypography(size: Int, measure: Int) {
+    fun setReaderTypography(size: Int, measure: Int, font: String = readerFont) {
         readerSize = size.coerceIn(11, 24)
         readerMeasure = measure.coerceIn(480, 1200)
+        readerFont = if (font in setOf("sans", "serif", "mono")) font else "serif"
+        val bodySize = readerSize
+        val width = readerMeasure
+        val face = readerFont
         viewModelScope.launch {
             runCatching {
                 withContext(Dispatchers.IO) {
                     ensureVault().setReaderSettings(
-                        readerSize.toUInt(),
-                        readerMeasure.toUInt(),
+                        bodySize.toUInt(),
+                        width.toUInt(),
+                        face,
                     )
                 }
             }
         }
+    }
+
+    fun chooseReaderFont(font: String) {
+        setReaderTypography(readerSize, readerMeasure, font)
+    }
+
+    /// App theme: `system`, `light` or `dark`, stored on the device.
+    var themeMode by mutableStateOf(uiPreferences.getString("theme", "system") ?: "system")
+        private set
+
+    val darkTheme: Boolean?
+        get() = when (themeMode) {
+            "light" -> false
+            "dark" -> true
+            else -> null
+        }
+
+    fun chooseTheme(mode: String) {
+        if (mode !in setOf("system", "light", "dark")) return
+        themeMode = mode
+        uiPreferences.edit().putString("theme", mode).apply()
     }
 
     /// Files copied by a running import/export, and whether it can still be cancelled.
@@ -448,6 +478,7 @@ class DragonGlassViewModel(application: Application) : AndroidViewModel(applicat
             runCatching { it.readerSettings() }.onSuccess { settings ->
                 readerSize = settings.bodySize.toInt()
                 readerMeasure = settings.measure.toInt()
+                readerFont = settings.font
             }
         }
     }

@@ -15,7 +15,7 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
         setContent {
-            DragonGlassTheme {
+            DragonGlassTheme(darkTheme = viewModel.darkTheme) {
                 DragonGlassApp(viewModel)
             }
         }

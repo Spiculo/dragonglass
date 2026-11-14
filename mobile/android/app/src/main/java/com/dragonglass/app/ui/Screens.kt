@@ -1069,6 +1069,8 @@ private fun EditorScreen(vm: DragonGlassViewModel, relative: String) {
                     onScroll = { vm.rememberPreviewScroll(it) },
                     bodySize = vm.readerSize,
                     measure = vm.readerMeasure,
+                    fontFamily = vm.readerFont,
+                    darkTheme = vm.darkTheme,
                 )
             } else {
                 BasicTextField(
@@ -1354,9 +1356,53 @@ private fun ReaderSettingsSheet(vm: DragonGlassViewModel, onDismiss: () -> Unit)
                     onClick = { vm.setReaderTypography(vm.readerSize, vm.readerMeasure + 60) },
                 ) { Text("+") }
             }
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(top = 8.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text("Typeface", Modifier.weight(1f))
+                listOf("sans" to "Sans", "serif" to "Serif", "mono" to "Mono").forEach {
+                    (key, label) ->
+                    if (vm.readerFont == key) {
+                        Button(
+                            onClick = { vm.chooseReaderFont(key) },
+                            modifier = Modifier.padding(start = 4.dp),
+                        ) { Text(label) }
+                    } else {
+                        OutlinedButton(
+                            onClick = { vm.chooseReaderFont(key) },
+                            modifier = Modifier.padding(start = 4.dp),
+                        ) { Text(label) }
+                    }
+                }
+            }
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(top = 8.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text("Theme", Modifier.weight(1f))
+                listOf("system" to "System", "light" to "Light", "dark" to "Dark").forEach {
+                    (key, label) ->
+                    if (vm.themeMode == key) {
+                        Button(
+                            onClick = { vm.chooseTheme(key) },
+                            modifier = Modifier.padding(start = 4.dp),
+                        ) { Text(label) }
+                    } else {
+                        OutlinedButton(
+                            onClick = { vm.chooseTheme(key) },
+                            modifier = Modifier.padding(start = 4.dp),
+                        ) { Text(label) }
+                    }
+                }
+            }
             Text(
-                text = "The width is the reading column; on a phone the page width wins. " +
-                    "These values are stored in the vault and shared with the desktop app.",
+                text = "The width and typeface are stored in the vault and shared with the " +
+                    "desktop app. The theme is kept on this device.",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 modifier = Modifier.padding(top = 8.dp),
@@ -2478,11 +2524,17 @@ private fun MarkdownWebView(
     onScroll: (Int) -> Unit = {},
     bodySize: Int = 16,
     measure: Int = 700,
+    fontFamily: String = "serif",
+    /// Null follows the system; the app's theme setting overrides it.
+    darkTheme: Boolean? = null,
 ) {
-    val dark = isSystemInDarkTheme()
+    val dark = darkTheme ?: isSystemInDarkTheme()
     // Comfortable defaults for a phone or tablet, plus the dark palette when needed.
-    val themed = remember(html, dark, bodySize, measure) {
-        val base = html.replace("</head>", "<style>${previewCss(bodySize, measure)}</style></head>")
+    val themed = remember(html, dark, bodySize, measure, fontFamily) {
+        val base = html.replace(
+            "</head>",
+            "<style>${previewCss(bodySize, measure, fontFamily)}</style></head>",
+        )
         if (dark) {
             base.replace("</head>", "<style>$DARK_PREVIEW_CSS</style></head>")
         } else {
@@ -2597,12 +2649,20 @@ private fun handlePreviewLink(
 }
 
 /// Reading defaults for the preview, following the shared reader settings.
-private fun previewCss(bodySize: Int, measure: Int): String = """
+private fun previewCss(bodySize: Int, measure: Int, fontFamily: String): String {
+    val body = when (fontFamily) {
+        "sans" -> "-apple-system,'Segoe UI',Roboto,sans-serif"
+        "mono" -> "ui-monospace,SFMono-Regular,Menlo,monospace"
+        else -> "Georgia,'Times New Roman',serif"
+    }
+    return """
 body{max-width:${measure}px;margin:0 auto;padding:16px;font-size:${bodySize}px;
-  line-height:1.65;-webkit-text-size-adjust:100%}
+  line-height:1.65;-webkit-text-size-adjust:100%;font-family:$body}
 img{max-width:100%;height:auto}
+pre,code,kbd{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
 pre,table{max-width:100%;overflow-x:auto}
 """
+}
 
 /// The engine's export CSS targets light pages, so dark mode overrides the few colors that
 /// would otherwise be dark-on-dark. Math is drawn as black SVG, hence the invert.

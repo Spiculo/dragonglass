@@ -27,6 +27,8 @@ pub struct Config {
     pub reader_size: u16,
     /// Reading view column width in pixels.
     pub reader_width: u16,
+    /// Reading body font: `sans`, `serif` or `mono`.
+    pub reader_font: String,
 }
 
 impl Default for Config {
@@ -44,6 +46,7 @@ impl Default for Config {
             font_size: 14,
             reader_size: 15,
             reader_width: 780,
+            reader_font: "serif".to_string(),
         }
     }
 }
@@ -65,6 +68,7 @@ impl Config {
         out.push_str(&format!("font_size={}\n", self.font_size));
         out.push_str(&format!("reader_size={}\n", self.reader_size));
         out.push_str(&format!("reader_width={}\n", self.reader_width));
+        out.push_str(&format!("reader_font={}\n", self.reader_font));
         out
     }
 
@@ -114,6 +118,13 @@ impl Config {
                     if let Ok(width) = value.parse::<u16>() {
                         config.reader_width = width.clamp(480, 1200);
                     }
+                }
+                "reader_font" => {
+                    let font = value.to_lowercase();
+                    config.reader_font = match font.as_str() {
+                        "sans" | "mono" => font,
+                        _ => "serif".to_string(),
+                    };
                 }
                 _ => {}
             }

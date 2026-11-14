@@ -197,10 +197,12 @@ pub struct DraftInfo {
 }
 
 /// Reading typography, shared with the desktop reader.
-#[derive(Debug, Clone, Copy, uniffi::Record)]
+#[derive(Debug, Clone, uniffi::Record)]
 pub struct ReaderSettingsInfo {
     pub body_size: u32,
     pub measure: u32,
+    /// `sans`, `serif` or `mono`.
+    pub font: String,
 }
 
 fn fingerprint_info(info: DocumentFingerprint) -> FingerprintInfo {
@@ -535,13 +537,24 @@ impl MobileVault {
         ReaderSettingsInfo {
             body_size: config.reader_size as u32,
             measure: config.reader_width as u32,
+            font: config.reader_font,
         }
     }
 
-    pub fn set_reader_settings(&self, body_size: u32, measure: u32) -> Result<(), MobileError> {
+    pub fn set_reader_settings(
+        &self,
+        body_size: u32,
+        measure: u32,
+        font: String,
+    ) -> Result<(), MobileError> {
         let mut config = config::load(&self.root);
         config.reader_size = body_size.clamp(11, 24) as u16;
         config.reader_width = measure.clamp(480, 1200) as u16;
+        config.reader_font = match font.to_lowercase().as_str() {
+            "sans" => "sans".to_string(),
+            "mono" => "mono".to_string(),
+            _ => "serif".to_string(),
+        };
         config::save(&self.root, &config)?;
         Ok(())
     }
@@ -1233,14 +1246,21 @@ mod tests {
         let default = vault.reader_settings();
         assert_eq!(default.body_size, 15);
         assert_eq!(default.measure, 780);
-        vault.set_reader_settings(18, 900).unwrap();
+        assert_eq!(default.font, "serif");
+        vault
+            .set_reader_settings(18, 900, "mono".to_string())
+            .unwrap();
         let loaded = vault.reader_settings();
         assert_eq!(loaded.body_size, 18);
         assert_eq!(loaded.measure, 900);
-        vault.set_reader_settings(1, 9999).unwrap();
+        assert_eq!(loaded.font, "mono");
+        vault
+            .set_reader_settings(1, 9999, "nonsense".to_string())
+            .unwrap();
         let clamped = vault.reader_settings();
         assert_eq!(clamped.body_size, 11);
         assert_eq!(clamped.measure, 1200);
+        assert_eq!(clamped.font, "serif");
     }
 
     fn temp_vault(name: &str) -> PathBuf {
