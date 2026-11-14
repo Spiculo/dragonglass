@@ -378,6 +378,24 @@ private fun NotesScreen(
                 }
             }
 
+            val progress = vm.transferProgress
+            if (progress != null) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 16.dp, vertical = 6.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    LinearProgressIndicator(modifier = Modifier.weight(1f))
+                    Text(
+                        text = "${vm.transferLabel} $progress",
+                        modifier = Modifier.padding(horizontal = 8.dp),
+                        style = MaterialTheme.typography.labelSmall,
+                    )
+                    TextButton(onClick = vm::cancelTransfer) { Text("Cancel") }
+                }
+            }
+
             when {
                 vm.query.isNotBlank() -> SearchResults(vm, searchListState, openRowActions)
                 vm.notes.isEmpty() && !vm.loading -> EmptyVault()

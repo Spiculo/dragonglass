@@ -26,6 +26,9 @@ data class StoredVault(
  * The app-private copy remains the source of truth, which keeps the shared engine unchanged.
  */
 class VaultStore(private val context: Context) {
+    /// Thrown when the user cancels a long import or export.
+    class TransferCancelled : Exception("Transfer cancelled")
+
     private val preferences =
         context.getSharedPreferences("dragon_glass_vaults", Context.MODE_PRIVATE)
     private val vaultsDirectory = File(context.filesDir, "vaults")
@@ -64,7 +67,11 @@ class VaultStore(private val context: Context) {
     }
 
     /** Copy a SAF tree into a fresh app-private vault and make it the active one. */
-    fun importTree(treeUri: Uri): StoredVault {
+    fun importTree(
+        treeUri: Uri,
+        onProgress: (Int) -> Unit = {},
+        isCancelled: () -> Boolean = { false },
+    ): StoredVault {
         takePermission(treeUri, write = false)
 
         val source = DocumentFile.fromTreeUri(context, treeUri)
@@ -76,7 +83,13 @@ class VaultStore(private val context: Context) {
             throw IllegalStateException("Could not create local storage for $name")
         }
 
-        val copied = copyInto(source, root)
+        val copied = try {
+            copyInto(source, root, onProgress, isCancelled)
+        } catch (error: Throwable) {
+            // A cancelled or failed import leaves no half-vault behind.
+            root.deleteRecursively()
+            throw error
+        }
         if (copied == 0) {
             root.deleteRecursively()
             throw IllegalStateException("That folder has no markdown or attachment files to import")
@@ -90,12 +103,17 @@ class VaultStore(private val context: Context) {
     }
 
     /** Write the active vault into a SAF tree, merging by name. Returns the file count. */
-    fun exportTree(vault: StoredVault, treeUri: Uri): Int {
+    fun exportTree(
+        vault: StoredVault,
+        treeUri: Uri,
+        onProgress: (Int) -> Unit = {},
+        isCancelled: () -> Boolean = { false },
+    ): Int {
         takePermission(treeUri, write = true)
 
         val target = DocumentFile.fromTreeUri(context, treeUri)
             ?: throw IllegalStateException("The selected folder is not writable")
-        val written = copyOut(vault.root, target)
+        val written = copyOut(vault.root, target, onProgress, isCancelled)
         if (written == 0) {
             throw IllegalStateException("There are no notes to export yet")
         }
@@ -111,16 +129,22 @@ class VaultStore(private val context: Context) {
         return written
     }
 
-    private fun copyInto(source: DocumentFile, target: File): Int {
+    private fun copyInto(
+        source: DocumentFile,
+        target: File,
+        onProgress: (Int) -> Unit,
+        isCancelled: () -> Boolean,
+    ): Int {
         var copied = 0
         for (child in source.listFiles()) {
+            if (isCancelled()) throw TransferCancelled()
             val name = child.name ?: continue
             // Dot folders are Obsidian/git metadata; the app has its own.
             if (name.startsWith(".")) continue
             if (child.isDirectory) {
                 val directory = File(target, name)
                 directory.mkdirs()
-                copied += copyInto(child, directory)
+                copied += copyInto(child, directory, onProgress, isCancelled)
             } else if (child.isFile) {
                 val output = File(target, name)
                 val input = context.contentResolver.openInputStream(child.uri) ?: continue
@@ -128,20 +152,27 @@ class VaultStore(private val context: Context) {
                     output.outputStream().use { file -> stream.copyTo(file) }
                 }
                 copied++
+                onProgress(copied)
             }
         }
         return copied
     }
 
-    private fun copyOut(source: File, target: DocumentFile): Int {
+    private fun copyOut(
+        source: File,
+        target: DocumentFile,
+        onProgress: (Int) -> Unit,
+        isCancelled: () -> Boolean,
+    ): Int {
         var written = 0
         for (file in source.listFiles().orEmpty()) {
+            if (isCancelled()) throw TransferCancelled()
             if (file.name.startsWith(".")) continue
             if (file.isDirectory) {
                 val directory = target.findFile(file.name)?.takeIf { it.isDirectory }
                     ?: target.createDirectory(file.name)
                     ?: continue
-                written += copyOut(file, directory)
+                written += copyOut(file, directory, onProgress, isCancelled)
             } else {
                 val existing = target.findFile(file.name)?.takeIf { it.isFile }
                 val document = existing
@@ -153,6 +184,7 @@ class VaultStore(private val context: Context) {
                     output.use { stream -> input.copyTo(stream) }
                 }
                 written++
+                onProgress(written)
             }
         }
         return written
@@ -185,7 +217,7 @@ class VaultStore(private val context: Context) {
     /** Mirror the whole local vault into the folder and prune files deleted locally. */
     fun pushAll(vault: StoredVault): Int {
         val tree = treeFor(vault) ?: return 0
-        val written = copyOut(vault.root, tree)
+        val written = copyOut(vault.root, tree, {}, { false })
         pruneRemote(tree, vault.root)
         return written
     }
@@ -194,7 +226,7 @@ class VaultStore(private val context: Context) {
     fun sync(vault: StoredVault): Pair<Int, Int> {
         val tree = treeFor(vault) ?: return 0 to 0
         val pulled = pullDirectory(tree, vault.root, "")
-        val written = copyOut(vault.root, tree)
+        val written = copyOut(vault.root, tree, {}, { false })
         pruneRemote(tree, vault.root)
         return pulled to written
     }

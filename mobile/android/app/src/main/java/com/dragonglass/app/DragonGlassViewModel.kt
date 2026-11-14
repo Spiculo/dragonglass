@@ -109,6 +109,18 @@ class DragonGlassViewModel(application: Application) : AndroidViewModel(applicat
     var previewScroll by mutableStateOf(0)
         private set
 
+    /// Files copied by a running import/export, and whether it can still be cancelled.
+    var transferProgress by mutableStateOf<Int?>(null)
+        private set
+    var transferLabel by mutableStateOf("")
+        private set
+    @Volatile
+    private var transferCancelled = false
+
+    fun cancelTransfer() {
+        transferCancelled = true
+    }
+
     /// In-note find: pattern, matches (UTF-16 ranges) and the current one.
     var findOpen by mutableStateOf(false)
         private set
@@ -311,16 +323,32 @@ class DragonGlassViewModel(application: Application) : AndroidViewModel(applicat
     fun importVault(treeUri: Uri) {
         viewModelScope.launch {
             loading = true
+            transferCancelled = false
+            transferLabel = "Importing"
+            transferProgress = 0
             val result = runCatching {
                 saveDirtyNote()
-                withContext(Dispatchers.IO) { vaultStore.importTree(treeUri) }
+                withContext(Dispatchers.IO) {
+                    vaultStore.importTree(
+                        treeUri,
+                        onProgress = { transferProgress = it },
+                        isCancelled = { transferCancelled },
+                    )
+                }
             }
             result
                 .onSuccess { stored ->
                     applyActiveVault(stored)
                     message = "Imported ${stored.name}"
                 }
-                .onFailure { error = it.message ?: "Could not import that folder" }
+                .onFailure { failure ->
+                    if (failure is VaultStore.TransferCancelled) {
+                        message = "Import cancelled"
+                    } else {
+                        error = failure.message ?: "Could not import that folder"
+                    }
+                }
+            transferProgress = null
             loading = false
         }
     }
@@ -330,13 +358,30 @@ class DragonGlassViewModel(application: Application) : AndroidViewModel(applicat
         val active = activeVault
         viewModelScope.launch {
             loading = true
+            transferCancelled = false
+            transferLabel = "Exporting"
+            transferProgress = 0
             val result = runCatching {
                 saveDirtyNote()
-                withContext(Dispatchers.IO) { vaultStore.exportTree(active, treeUri) }
+                withContext(Dispatchers.IO) {
+                    vaultStore.exportTree(
+                        active,
+                        treeUri,
+                        onProgress = { transferProgress = it },
+                        isCancelled = { transferCancelled },
+                    )
+                }
             }
             result
                 .onSuccess { message = "Exported $it ${if (it == 1) "file" else "files"}" }
-                .onFailure { error = it.message ?: "Could not export the vault" }
+                .onFailure { failure ->
+                    if (failure is VaultStore.TransferCancelled) {
+                        message = "Export cancelled"
+                    } else {
+                        error = failure.message ?: "Could not export the vault"
+                    }
+                }
+            transferProgress = null
             loading = false
         }
     }
