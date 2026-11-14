@@ -922,6 +922,11 @@ with the desktop through the config; the desktop reading view does not consume i
   IME regression pass.
 - Performance: background index/alias build, lazy tab loading, cache invalidation audit.
 
+**Landed from this list:** the desktop tab overflow menu, tag chips as navigation, code-copy
+feedback, and `tel:`/`file://` link handling; explicit `./` and `../` wikilinks now resolve
+from the current note's folder. Android keeps its list/preview scroll, loads restored tabs
+lazily and has the shared reader settings. The rest of the list is still open.
+
 ---
 
 ## 5. Shared architecture: fix it once, not per client

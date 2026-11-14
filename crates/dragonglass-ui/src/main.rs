@@ -72,6 +72,30 @@ const HOTKEYS: &[(&str, &str, &str)] = &[
     ("PrevTab", "ctrl-shift-tab", "Previous tab"),
 ];
 
+/// Resolve `./` and `../` in an explicit relative link against the folder of the note that
+/// contains it. Other targets are returned unchanged and keep the global resolver rules.
+fn relative_link_target(target: &str, base_dir: Option<&str>) -> String {
+    let target = target.replace('\\', "/");
+    if !(target.starts_with("./") || target.starts_with("../")) {
+        return target;
+    }
+    let mut parts: Vec<&str> = base_dir
+        .unwrap_or("")
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .collect();
+    for part in target.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            other => parts.push(other),
+        }
+    }
+    parts.join("/")
+}
+
 /// Bind a saved override by action name.
 fn bind_named(cx: &mut App, key: &str, action: &str) {
     // Accept both `ctrl+shift+g` and `ctrl-shift-g`; GPUI only understands `-`.
@@ -749,6 +773,8 @@ impl DragonGlassApp {
         if target.starts_with("http://")
             || target.starts_with("https://")
             || target.starts_with("mailto:")
+            || target.starts_with("tel:")
+            || target.starts_with("file://")
         {
             cx.open_url(target);
             return;
@@ -766,6 +792,13 @@ impl DragonGlassApp {
             return;
         }
 
+        // `[[../Sibling]]` and `[[./Child]]` resolve from the current note's folder.
+        let base = self
+            .active
+            .as_deref()
+            .and_then(|active| active.rsplit_once('/').map(|(dir, _)| dir));
+        let note = relative_link_target(note, base);
+        let note = note.as_str();
         match self.note_index.resolve_relative(note) {
             Some(relative) => {
                 let relative = relative.to_string();
@@ -8832,6 +8865,23 @@ fn open_vault_window(vault_path: PathBuf, uri_note: Option<String>, cx: &mut App
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn relative_links_resolve_from_the_note_folder() {
+        assert_eq!(
+            relative_link_target("../Sibling", Some("notes/deep")),
+            "notes/Sibling"
+        );
+        assert_eq!(
+            relative_link_target("./Child", Some("notes")),
+            "notes/Child"
+        );
+        assert_eq!(relative_link_target("../../Top", Some("a/b")), "Top");
+        // Escaping the vault clamps at the root rather than producing `..`.
+        assert_eq!(relative_link_target("../../../Top", Some("a")), "Top");
+        // Non-relative targets keep their global resolution.
+        assert_eq!(relative_link_target("Sibling", Some("notes")), "Sibling");
+    }
 
     fn tab(note: &str) -> session::TabSession {
         session::TabSession {
