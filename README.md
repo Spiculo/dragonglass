@@ -63,7 +63,8 @@ A lot already works. This is a working application, not a mockup — but it is e
 **Vault and knowledge**
 - File tree with new note/folder, rename, move and delete to a recoverable trash
   (right-click a row), plus the quick switcher and full-text search
-- Wikilinks, backlinks, tags, outline, document relations and a graph view
+- Wikilinks, backlinks, tags, outline, document relations and a live, collision-aware
+  graph view with node drag, hover focus and zoom-faded labels
 - Daily/weekly/monthly notes, templates, properties, bookmarks
 - Embeds and attachments (images, PDF, audio), transclusion, shared blocks; images honor
   `![[img|300]]` width and alt text, click opens a lightbox, and other attachments open in

@@ -942,8 +942,11 @@ index is usable immediately and the full index (slugs and aliases) replaces it w
 background pass finishes, with a generation check dropping stale builds. The desktop graph
 view pans by dragging, zooms at the pointer with the wheel or trackpad (0.35×–4×, with a reset
 control) and fits the canvas uniformly instead of stretching it to the window's aspect ratio.
-Android keeps its list/preview scroll, loads restored tabs lazily and has the shared reader
-settings. The rest of the list is still open.
+Nodes now settle with a live force simulation, reserve their radius during collision, can be
+dragged (the dragged node stays pinned until the graph is rebuilt), and highlight their links
+on hover. Labels fade with zoom, avoid other labels and node circles, and the whole drawing is
+clipped to the graph pane. Android keeps its list/preview scroll, loads restored tabs lazily
+and has the shared reader settings. The rest of the list is still open.
 
 ---
 

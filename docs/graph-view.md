@@ -1,6 +1,7 @@
 # Graph view: dynamic nodes, no overlap, and pane clipping
 
-Status: plan on branch `fix/graph-node-layout`, cut from `main`.
+Status: landed on branch `fix/graph-node-layout`. The force-slider UI is the only
+deferred item.
 Scope: the desktop GPUI graph view. Android has no graph view yet.
 
 ## 1. Problems in the current implementation
@@ -386,3 +387,39 @@ cargo clippy --all-targets --all-features
 - `PLAN.md`: graph view section, forces/collision and dynamic layout.
 - `docs/qol-plan.md`: the graph bullet in the P2 list, plus a "Landed" note.
 - `README.md`: the feature line that mentions the graph view.
+
+## 8. Landed
+
+The branch contains the plan, four code commits and this document on
+`fix/graph-node-layout`:
+
+1. `Clip the graph view to its pane` adds `overflow_hidden` on the graph root
+   and canvas, and wraps the custom element's paint in `ContentMask`.
+2. `Add radius-aware collision layout for the graph` moves `node_radius` into
+   `dragonglass-core`, adds `LayoutParams` and `GraphLayout`, runs collision
+   and soft-boundary passes, and adds the no-overlap, bounds, settle and pin
+   tests.
+3. `Tune graph forces and keep dragged nodes apart` sets the default centre,
+   repel and link strengths, makes `reheat` set the temperature, and adds the
+   pinned-node collision test.
+4. `Add live graph layout, drag and hover focus` drives the simulation from
+   `GraphView::schedule_frame` with `cx.on_next_frame`. It stops when the
+   layout settles or when `show_graph` turns false. A dragged node is pinned
+   until the next rebuild. Labels use the screen-space `place_labels` pass,
+   fade in above zoom 0.7, stay visible for hovered nodes and neighbours, and
+   are cached by name plus quantized alpha. Rebuilds seed positions from a path
+   cache, opening the graph resets zoom and pan, and pan is clamped.
+5. This document updates the status, behaviour and test notes.
+
+Verification on the branch:
+
+```sh
+cargo test -p dragonglass-core -p dragonglass-ui   # 390 core + 104 UI tests
+cargo fmt --all -- --check
+cargo clippy -p dragonglass-core -p dragonglass-ui --all-targets --all-features
+```
+
+The only clippy warnings are the pre-existing `flow.rs` ones (`large_enum_variant`
+and `too_many_arguments`), which are outside this change. The force-slider UI
+remains open as a follow-up; `LayoutParams` already exposes the values
+(`center_force`, `repel`, `link_force`, `link_distance`).
