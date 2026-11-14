@@ -465,9 +465,15 @@ previewed", and an unresolved inline asset link opens the file with the OS too. 
 preview uses the new FFI `render_html_from_vault(source, root)`, which builds the vault
 attachment index so `![[shot.png]]` resolves to its subfolder path; the Kotlin bindings were
 regenerated and `:app:compileDebugKotlin` passes.
-**Remaining:** images inside running text are still rendered as their link label (the flow
-layout needs image pieces); remote image URLs are deliberately not fetched because the app
-is offline by default; PDF/audio/video use the OS viewer rather than an embedded player.
+**Landed (inline images):** images inside running text render as pictures. `![[img.png]]` and
+`![alt](src)` are flagged as images by the inline parser, resolved through the same vault
+attachment index, decoded once (cached by path and mtime) and placed as atomic pieces in the
+measured flow, so they sit on the text baseline, wrap like words and scale down rather than
+overflow the column; clicking one opens the lightbox. Selection and copy still use the
+label text, so offsets are unchanged.
+**Remaining (by design/choice):** remote image URLs are not fetched (the app is offline by
+default), but they stay clickable and open in the browser; PDF/audio/video use the OS viewer
+rather than an embedded player.
 
 #### Q2.7 Code, tables and callouts — D · S–M
 Add a copy button to code fences, horizontal scroll plus sticky headers for wide tables,

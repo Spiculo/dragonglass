@@ -26,6 +26,8 @@ pub struct Style {
     pub wiki: bool,
     /// A `[^id]` footnote reference.
     pub footnote: bool,
+    /// An embedded image (`![[img.png]]` or `![alt](img.png)`), not a link to a note.
+    pub image: bool,
 }
 
 /// One run of inline text with a single style.
@@ -215,7 +217,23 @@ fn parse_into(chars: &[char], base: Style, href: Option<&str>, out: &mut Vec<Inl
             }
         }
 
-        // `[[wikilink]]` / `![[embed]]`.
+        // `![[embed]]` inside running text: a wikilink flagged as an image.
+        if ch == '!' && chars.get(i + 1) == Some(&'[') && chars.get(i + 2) == Some(&'[') {
+            if let Some(close) = find(chars, i + 3, &[']', ']'][..]) {
+                let inner: String = chars[i + 3..close].iter().collect();
+                flush(&mut buffer, base, href, out);
+                let mut style = base;
+                style.link = true;
+                style.wiki = true;
+                style.image = true;
+                let (target, label) = split_wikilink(&inner);
+                push_span(out, label, style, Some(&target));
+                i = close + 2;
+                continue;
+            }
+        }
+
+        // `[[wikilink]]`.
         if ch == '[' && chars.get(i + 1) == Some(&'[') {
             if let Some(close) = find(chars, i + 2, &[']', ']'][..]) {
                 let inner: String = chars[i + 2..close].iter().collect();
@@ -243,6 +261,7 @@ fn parse_into(chars: &[char], base: Style, href: Option<&str>, out: &mut Vec<Inl
                     flush(&mut buffer, base, href.as_deref(), out);
                     let mut style = base;
                     style.link = true;
+                    style.image = ch == '!';
                     if label.trim().is_empty() {
                         push_span(out, destination.trim().to_string(), style, href.as_deref());
                     } else {

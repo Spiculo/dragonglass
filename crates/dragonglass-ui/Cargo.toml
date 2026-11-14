@@ -17,7 +17,15 @@ dragonglass-plugins.workspace = true
 anyhow.workspace = true
 chrono = "0.4"
 gpui = "0.2.2"
+image = { version = "0.25.1", default-features = false, features = [
+    "bmp",
+    "gif",
+    "jpeg",
+    "png",
+    "webp",
+] }
 notify = "8.2"
+smallvec = "1"
 smol = "2"
 
 # macOS: compile the Metal shaders at startup instead of at build time. The build-time

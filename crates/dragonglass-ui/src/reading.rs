@@ -10,6 +10,7 @@ use std::hash::{Hash, Hasher};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::SystemTime;
 
 use dragonglass_core::assets::Attachments;
@@ -26,7 +27,8 @@ use gpui::{
     ClipboardItem, Corner, CursorStyle, DispatchPhase, Element, ElementId, Entity, FontStyle,
     GlobalElementId, Hitbox, HitboxBehavior, InspectorElementId, IntoElement, LayoutId,
     ListAlignment, ListState, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad,
-    Pixels, Point, StrikethroughStyle, StyledText, TextLayout, TextRun, UnderlineStyle, Window,
+    Pixels, Point, RenderImage, StrikethroughStyle, StyledText, TextLayout, TextRun,
+    UnderlineStyle, Window,
 };
 
 use crate::flow::{FlowContent, FlowKind, FlowPiece, FlowText};
@@ -1888,7 +1890,7 @@ fn rich_text_styled(
     // the faster single-run path below.
     if spans
         .iter()
-        .any(|span| span.style.math && span.math.is_some())
+        .any(|span| (span.style.math && span.math.is_some()) || span.style.image)
     {
         let len = spans
             .iter()
@@ -1907,6 +1909,7 @@ fn rich_text_styled(
             len,
             ctx.selection.clone(),
             ctx.opener.cloned(),
+            ctx.on_image.cloned(),
             ctx.theme,
         )
         .into_any_element();
@@ -2064,6 +2067,37 @@ fn flow_content(
                 });
                 offset += display.len();
                 continue;
+            }
+        }
+
+        // An inline image: decode it once and place it as an atomic piece. The display text
+        // stays the label, so selection and copy are unchanged.
+        if span.style.image {
+            if let (Some(root), Some(href)) = (ctx.vault_root, span.href.as_deref()) {
+                if !href.starts_with("http://") && !href.starts_with("https://") {
+                    if let Some(path) = resolve_file(root, ctx.attachments, href) {
+                        if let Some((data, image_width, image_height)) = inline_image(&path) {
+                            let height = (size * 2.4).max(12.0);
+                            let width = if image_height > 0.0 {
+                                height * (image_width / image_height)
+                            } else {
+                                height
+                            };
+                            pieces.push(FlowPiece {
+                                kind: FlowKind::Image {
+                                    data,
+                                    width: px(width),
+                                    height: px(height),
+                                    href: span.href.clone(),
+                                },
+                                offset,
+                                len: span.text.len(),
+                            });
+                            offset += span.text.len();
+                            continue;
+                        }
+                    }
+                }
             }
         }
 
@@ -2636,6 +2670,43 @@ fn resolve_file(root: &Path, attachments: Option<&Attachments>, target: &str) ->
     let resolved = attachments?.resolve(target)?;
     let path = root.join(resolved);
     path.is_file().then_some(path)
+}
+
+/// A decoded inline image: pixel data and intrinsic size.
+type DecodedImage = Option<(Arc<RenderImage>, f32, f32)>;
+
+thread_local! {
+    /// Decoded inline images, keyed by path and modification time.
+    static INLINE_IMAGES: RefCell<HashMap<(PathBuf, SystemTime), DecodedImage>> =
+        RefCell::new(HashMap::new());
+}
+
+/// Decode an image for inline rendering. Returns `(data, width, height)` in image pixels.
+fn inline_image(path: &Path) -> DecodedImage {
+    let modified = std::fs::metadata(path)
+        .and_then(|meta| meta.modified())
+        .ok()?;
+    let key = (path.to_path_buf(), modified);
+    INLINE_IMAGES.with(|cache| {
+        if let Some(hit) = cache.borrow().get(&key) {
+            return hit.clone();
+        }
+        let loaded = std::fs::read(path)
+            .ok()
+            .and_then(|bytes| image::load_from_memory(&bytes).ok())
+            .map(|decoded| {
+                let width = decoded.width() as f32;
+                let height = decoded.height() as f32;
+                let frame = image::Frame::new(decoded.into_rgba8());
+                let data = Arc::new(RenderImage::new(smallvec::SmallVec::from_buf_and_len(
+                    [frame],
+                    1,
+                )));
+                (data, width, height)
+            });
+        cache.borrow_mut().insert(key, loaded.clone());
+        loaded
+    })
 }
 
 fn is_image(target: &str) -> bool {

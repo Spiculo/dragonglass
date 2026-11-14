@@ -7,18 +7,19 @@
 
 use std::cell::RefCell;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use gpui::{
-    fill, point, px, App, Bounds, CursorStyle, DispatchPhase, Element, ElementId, Font,
+    fill, point, px, App, Bounds, Corners, CursorStyle, DispatchPhase, Element, ElementId, Font,
     GlobalElementId, Hitbox, HitboxBehavior, Hsla, InspectorElementId, IntoElement, LayoutId,
-    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, ShapedLine, SharedString,
-    StrikethroughStyle, Style, TextRun, UnderlineStyle, Window,
+    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, RenderImage, ShapedLine,
+    SharedString, StrikethroughStyle, Style, TextRun, UnderlineStyle, Window,
 };
 
 use dragonglass_core::math::MathScene;
 
 use crate::math_element;
-use crate::reading::{LinkOpener, ReadPoint, ReadSelection};
+use crate::reading::{ImageOpener, LinkOpener, ReadPoint, ReadSelection};
 use crate::theme::Theme;
 
 /// One inline piece, in display-text order.
@@ -44,6 +45,13 @@ pub(crate) enum FlowKind {
         scene: Rc<MathScene>,
         color: Hsla,
     },
+    /// An inline image, painted at its intrinsic aspect ratio.
+    Image {
+        data: Arc<RenderImage>,
+        width: Pixels,
+        height: Pixels,
+        href: Option<String>,
+    },
 }
 
 pub(crate) struct FlowContent {
@@ -63,6 +71,7 @@ pub(crate) struct FlowText {
     len: usize,
     selection: Rc<RefCell<ReadSelection>>,
     opener: Option<LinkOpener>,
+    on_image: Option<ImageOpener>,
     theme: Theme,
 }
 
@@ -75,6 +84,7 @@ impl FlowText {
         len: usize,
         selection: Rc<RefCell<ReadSelection>>,
         opener: Option<LinkOpener>,
+        on_image: Option<ImageOpener>,
         theme: Theme,
     ) -> Self {
         Self {
@@ -85,6 +95,7 @@ impl FlowText {
             len,
             selection,
             opener,
+            on_image,
             theme,
         }
     }
@@ -125,6 +136,16 @@ enum PlacedPiece {
         display_offset: usize,
         len: usize,
         color: Hsla,
+    },
+    Image {
+        data: Arc<RenderImage>,
+        x: Pixels,
+        ascent: Pixels,
+        width: Pixels,
+        height: Pixels,
+        display_offset: usize,
+        len: usize,
+        href: Option<String>,
     },
 }
 
@@ -239,6 +260,45 @@ impl FlowLayout {
                     });
                     x += math_width;
                 }
+                FlowKind::Image {
+                    data,
+                    width: requested_width,
+                    height: requested_height,
+                    href,
+                } => {
+                    let mut image_width = *requested_width;
+                    let mut image_height = *requested_height;
+                    if x > px(0.0) && x + image_width > width {
+                        flush(
+                            &mut current,
+                            &mut ascent,
+                            &mut descent,
+                            &mut top,
+                            &mut lines,
+                        );
+                        x = px(0.0);
+                    }
+                    // Never overflow the column: scale the picture down, keeping its ratio.
+                    if image_width > width && image_width > px(0.0) {
+                        let scale = width / image_width;
+                        image_width = width;
+                        image_height *= scale;
+                    }
+                    let image_ascent = image_height * 0.8;
+                    ascent = ascent.max(image_ascent);
+                    descent = descent.max(image_height - image_ascent);
+                    current.push(PlacedPiece::Image {
+                        data: data.clone(),
+                        x,
+                        ascent: image_ascent,
+                        width: image_width,
+                        height: image_height,
+                        display_offset: piece.offset,
+                        len: piece.len,
+                        href: href.clone(),
+                    });
+                    x += image_width;
+                }
             }
         }
 
@@ -280,6 +340,7 @@ impl FlowLayout {
             let width = match piece {
                 PlacedPiece::Text { shaped, .. } => shaped.width,
                 PlacedPiece::Math { scene, .. } => px(scene.width() as f32 * font_size),
+                PlacedPiece::Image { width, .. } => *width,
             };
             if position.x <= piece_x(piece) + width {
                 chosen = Some(piece);
@@ -315,6 +376,19 @@ impl FlowLayout {
                     display_offset + piece_len
                 }
             }
+            Some(PlacedPiece::Image {
+                x,
+                width,
+                display_offset,
+                len: piece_len,
+                ..
+            }) => {
+                if position.x < *x + *width / 2.0 {
+                    *display_offset
+                } else {
+                    display_offset + piece_len
+                }
+            }
             None => line
                 .pieces
                 .last()
@@ -331,21 +405,25 @@ impl FlowLayout {
 
 fn piece_x(piece: &PlacedPiece) -> Pixels {
     match piece {
-        PlacedPiece::Text { x, .. } | PlacedPiece::Math { x, .. } => *x,
+        PlacedPiece::Text { x, .. }
+        | PlacedPiece::Math { x, .. }
+        | PlacedPiece::Image { x, .. } => *x,
     }
 }
 
 fn piece_display_offset(piece: &PlacedPiece) -> usize {
     match piece {
-        PlacedPiece::Text { display_offset, .. } | PlacedPiece::Math { display_offset, .. } => {
-            *display_offset
-        }
+        PlacedPiece::Text { display_offset, .. }
+        | PlacedPiece::Math { display_offset, .. }
+        | PlacedPiece::Image { display_offset, .. } => *display_offset,
     }
 }
 
 fn piece_display_len(piece: &PlacedPiece) -> usize {
     match piece {
-        PlacedPiece::Text { len, .. } | PlacedPiece::Math { len, .. } => *len,
+        PlacedPiece::Text { len, .. }
+        | PlacedPiece::Math { len, .. }
+        | PlacedPiece::Image { len, .. } => *len,
     }
 }
 
@@ -491,6 +569,7 @@ impl Element for FlowText {
 
             let selection = self.selection.clone();
             let opener = self.opener.clone();
+            let on_image = self.on_image.clone();
             let up_layout = layout.clone();
             window.on_mouse_event(
                 move |event: &MouseUpEvent, phase, window: &mut Window, cx: &mut App| {
@@ -514,11 +593,14 @@ impl Element for FlowText {
 
                     if clicked {
                         if let Some(head) = head {
-                            if let Some(opener) = &opener {
-                                if let Some(target) =
-                                    up_layout.link_at(head.offset.saturating_sub(base))
-                                {
+                            let local = head.offset.saturating_sub(base);
+                            if let Some(target) = up_layout.link_at(local) {
+                                if let Some(opener) = &opener {
                                     opener(&target, window, cx);
+                                }
+                            } else if let Some(target) = up_layout.image_link_at(local, len) {
+                                if let Some(on_image) = &on_image {
+                                    on_image(&target, window, cx);
                                 }
                             }
                         }
@@ -585,6 +667,26 @@ impl Element for FlowText {
                             math_origin,
                         );
                     }
+                    PlacedPiece::Image {
+                        data,
+                        x,
+                        ascent,
+                        width,
+                        height,
+                        ..
+                    } => {
+                        let image_bounds = Bounds {
+                            origin: point(origin.x + *x, baseline - *ascent),
+                            size: gpui::size(*width, *height),
+                        };
+                        let _ = window.paint_image(
+                            image_bounds,
+                            Corners::default(),
+                            data.clone(),
+                            0,
+                            false,
+                        );
+                    }
                 }
             }
         }
@@ -594,7 +696,12 @@ impl Element for FlowText {
             layout.piece_at(base, len, window.mouse_position() - origin, font_size)
         {
             if bounds.contains(&window.mouse_position()) {
-                if let PlacedPiece::Text { href: Some(_), .. } = link_hit {
+                let clickable = matches!(
+                    link_hit,
+                    PlacedPiece::Text { href: Some(_), .. }
+                        | PlacedPiece::Image { href: Some(_), .. }
+                );
+                if clickable {
                     window.set_cursor_style(CursorStyle::PointingHand, hitbox);
                 }
             }
@@ -603,6 +710,29 @@ impl Element for FlowText {
 }
 
 impl FlowLayout {
+    /// The href of an image piece whose display range contains `offset`.
+    fn image_link_at(&self, offset: usize, len: usize) -> Option<String> {
+        if offset > len {
+            return None;
+        }
+        for line in &self.lines {
+            for piece in &line.pieces {
+                if let PlacedPiece::Image {
+                    display_offset,
+                    len: piece_len,
+                    href: Some(href),
+                    ..
+                } = piece
+                {
+                    if offset >= *display_offset && offset <= display_offset + piece_len {
+                        return Some(href.clone());
+                    }
+                }
+            }
+        }
+        None
+    }
+
     /// The TeX source and bounds (local to the paragraph) of a math box under `position`.
     fn math_hit_at(
         &self,
@@ -667,6 +797,7 @@ impl FlowLayout {
             let width = match piece {
                 PlacedPiece::Text { shaped, .. } => shaped.width,
                 PlacedPiece::Math { scene, .. } => px(scene.width() as f32 * font_size),
+                PlacedPiece::Image { width, .. } => *width,
             };
             if position.x <= piece_x(piece) + width {
                 return Some(piece);
@@ -736,6 +867,7 @@ fn flow_selection_quads(
                 PlacedPiece::Math { x, scene, .. } => {
                     (*x, *x + px(scene.width() as f32 * font_size))
                 }
+                PlacedPiece::Image { x, width, .. } => (*x, *x + *width),
             };
             if x1 > x0 {
                 quads.push(fill(
