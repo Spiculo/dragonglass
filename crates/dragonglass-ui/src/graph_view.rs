@@ -3,10 +3,11 @@
 
 use dragonglass_core::graph::{self, Graph};
 use gpui::{
-    div, fill, point, prelude::*, px, relative, size, App, Bounds, Context, Element, ElementId,
-    Entity, FocusHandle, Focusable, GlobalElementId, InspectorElementId, LayoutId, MouseButton,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, PathBuilder, Pixels, Point, Render,
-    ScrollDelta, ScrollWheelEvent, ShapedLine, SharedString, Style, TextRun, WeakEntity, Window,
+    div, fill, point, prelude::*, px, relative, size, App, Bounds, ContentMask, Context, Element,
+    ElementId, Entity, FocusHandle, Focusable, GlobalElementId, InspectorElementId, LayoutId,
+    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, PathBuilder, Pixels,
+    Point, Render, ScrollDelta, ScrollWheelEvent, ShapedLine, SharedString, Style, TextRun,
+    WeakEntity, Window,
 };
 
 use crate::theme::Theme;
@@ -249,6 +250,7 @@ impl Render for GraphView {
             .flex()
             .flex_col()
             .size_full()
+            .overflow_hidden()
             .bg(theme.bg)
             .child(
                 div()
@@ -286,6 +288,7 @@ impl Render for GraphView {
                 div()
                     .flex_1()
                     .min_h(px(0.0))
+                    .overflow_hidden()
                     .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
                     .on_mouse_move(cx.listener(Self::on_mouse_move))
                     .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
@@ -406,6 +409,9 @@ impl Element for GraphCanvas {
         window: &mut Window,
         cx: &mut App,
     ) {
+        // This is a custom element, so it must clip itself. Without this mask,
+        // pan and zoom can paint nodes and labels over the sidebar and panels.
+        window.with_content_mask(Some(ContentMask { bounds }), |window| {
         let theme = *cx.global::<Theme>();
         let (nw, nh) = (f32::from(bounds.size.width), f32::from(bounds.size.height));
 
@@ -530,6 +536,7 @@ impl Element for GraphCanvas {
 
         self.view.update(cx, |view, _cx| {
             view.last_bounds = Some(bounds);
+        });
         });
     }
 }
