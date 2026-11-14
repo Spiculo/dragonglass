@@ -929,8 +929,11 @@ web, mail and phone links open only after an inline Open/Cancel bar (local files
 the app do not ask). A resting pointer over a reading-view link shows a tooltip with its
 target (note, heading/block fragment, footnote, tag or URL), for both plain and measured
 (flow) paragraphs. Reading-view folds are part of session v2, so folded sections reopen
-folded. Android keeps its list/preview scroll, loads restored tabs lazily and has the shared
-reader settings. The rest of the list is still open.
+folded. The vault's frontmatter/alias index is built off the startup path: a path/stem-only
+index is usable immediately and the full index (slugs and aliases) replaces it when a
+background pass finishes, with a generation check dropping stale builds. Android keeps its
+list/preview scroll, loads restored tabs lazily and has the shared reader settings. The rest
+of the list is still open.
 
 ---
 

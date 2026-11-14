@@ -765,6 +765,8 @@ struct DragonGlassApp {
     last_preview_progress: f32,
     /// A link waiting for the user to confirm opening it.
     pending_url: Option<String>,
+    /// Which background alias-index build is current, so a stale one is dropped.
+    index_generation: u64,
     /// Scroll position of the outline panel, so the active heading stays visible.
     outline_scroll: UniformListScrollHandle,
     /// The heading the outline last scrolled to.
@@ -859,6 +861,27 @@ impl DragonGlassApp {
                 self.create_linked_note(note, window, cx);
             }
         }
+    }
+
+    /// Build the frontmatter/alias index without blocking the UI, then swap it in if it is
+    /// still the newest request. The path-only index is the deterministic fallback until
+    /// then.
+    fn rebuild_index_in_background(&mut self, refs: Vec<NoteRef>, cx: &mut Context<Self>) {
+        self.index_generation = self.index_generation.wrapping_add(1);
+        let generation = self.index_generation;
+        let executor = cx.background_executor().clone();
+        cx.spawn(async move |this, cx| {
+            let index = executor
+                .spawn(async move { resolve::NoteIndex::new(&refs) })
+                .await;
+            let _ = this.update(cx, |app, cx| {
+                if app.index_generation == generation {
+                    app.note_index = index;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
     }
 
     /// Move to a `#heading` or `#^block` fragment in the active note.
@@ -2142,7 +2165,11 @@ impl DragonGlassApp {
     fn refresh_vault(&mut self, cx: &mut Context<Self>) {
         if let Ok(vault) = Vault::open(&self.vault_root) {
             self.note_refs = vault.notes();
-            self.note_index = resolve::NoteIndex::new(&self.note_refs);
+            // Paths and stems are enough to navigate immediately; aliases arrive when the
+            // background pass finishes.
+            self.note_index = resolve::NoteIndex::from_paths(
+                self.note_refs.iter().map(|note| note.relative.clone()),
+            );
             self.tree = tree::build_with_dirs(&self.note_refs, &vault.folders());
             self.notes = self.note_refs.len();
             self.full_graph = graph::build(&self.note_refs);
@@ -2156,6 +2183,8 @@ impl DragonGlassApp {
                 .map(|note| (note.path_no_ext().to_string(), note.stem().to_string()))
                 .collect(),
         );
+        let refs = self.note_refs.clone();
+        self.rebuild_index_in_background(refs, cx);
         self.tag_suggestions = Rc::new(tags::vault_tags(&self.note_refs));
         let notes = (*self.note_suggestions).clone();
         let tag_list = (*self.tag_suggestions).clone();
@@ -4339,6 +4368,7 @@ impl DragonGlassApp {
                 last_editor_progress: -1.0,
                 last_preview_progress: -1.0,
                 pending_url: None,
+                index_generation: 0,
                 outline_scroll: UniformListScrollHandle::new(),
                 outline_current: None,
                 conflict: false,
@@ -8805,7 +8835,8 @@ fn open_vault_window(vault_path: PathBuf, uri_note: Option<String>, cx: &mut App
     let initial_text = editor.read(cx).text();
     let initial_headings = Rc::new(markdown::headings(&initial_text));
     let initial_stats = stats::compute(&initial_text);
-    let note_index = resolve::NoteIndex::new(&note_refs);
+    let note_index =
+        resolve::NoteIndex::from_paths(note_refs.iter().map(|note| note.relative.clone()));
     cx.set_global(initial_theme);
     cx.set_global(FocusMode::default());
     cx.set_global(ReaderSettings {
@@ -8825,6 +8856,7 @@ fn open_vault_window(vault_path: PathBuf, uri_note: Option<String>, cx: &mut App
         ..Default::default()
     };
 
+    let refs_for_index = note_refs.clone();
     let app_view = cx.new(|cx| {
         let app = DragonGlassApp {
             editor: editor.clone(),
@@ -8887,6 +8919,7 @@ fn open_vault_window(vault_path: PathBuf, uri_note: Option<String>, cx: &mut App
             last_editor_progress: -1.0,
             last_preview_progress: -1.0,
             pending_url: None,
+            index_generation: 0,
             outline_scroll: UniformListScrollHandle::new(),
             outline_current: None,
             conflict: false,
@@ -8938,6 +8971,9 @@ fn open_vault_window(vault_path: PathBuf, uri_note: Option<String>, cx: &mut App
         app.check_recovery(cx);
     });
 
+    app_view.update(cx, |app, cx| {
+        app.rebuild_index_in_background(refs_for_index, cx);
+    });
     app_view.update(cx, |this, cx| this.watch_vault(cx));
     // Pin the note we opened, so the next launch reopens the same one.
     app_view.update(cx, |this, cx| this.remember_session(cx));
