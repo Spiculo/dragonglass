@@ -405,8 +405,8 @@ stronger colour, cycles with Enter / Shift+Enter / F3 / Shift+F3, and toggles re
 whole word with the same `Ctrl+Alt+R/C/W` keys as the editor. Escape closes it and scrolls
 back to the block where it opened; the buffer is never touched. Tests cover counting,
 wrapping, backspace, option toggles, invalid regex and document immutability.
-**Remaining:** paragraphs that contain inline math use the flow layout, which does not paint
-the highlight quads yet (they are still counted and scrolled to).
+**Landed (flow paragraphs):** paragraphs that use the measured flow layout (inline math or
+images) now paint the same find quads, so a match is visible there too.
 
 #### Q2.3 Selection and copy polish — D · M
 Add double-click word, triple-click paragraph/line, Shift-click extension, keyboard

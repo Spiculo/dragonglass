@@ -1901,7 +1901,7 @@ fn rich_text_styled(
                     .unwrap_or(span.text.len())
             })
             .sum();
-        let content = flow_content(&spans, size, weight, line_height, ctx);
+        let content = flow_content(&spans, block, size, weight, line_height, ctx);
         return FlowText::new(
             content,
             block,
@@ -2022,6 +2022,7 @@ fn rich_text_styled(
 /// split at spaces so the flow layout can break lines between words.
 fn flow_content(
     spans: &[inline::Inline],
+    block: Option<usize>,
     size: f32,
     weight: gpui::FontWeight,
     line_height: f32,
@@ -2159,6 +2160,10 @@ fn flow_content(
         font_size: size,
         line_height,
         link_color: theme.accent_text,
+        find: ctx
+            .find
+            .map(|_| ctx.find_matches(block))
+            .unwrap_or_default(),
     })
 }
 

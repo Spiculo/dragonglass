@@ -60,6 +60,8 @@ pub(crate) struct FlowContent {
     /// Line-height multiplier, matching the surrounding prose.
     pub line_height: f32,
     pub link_color: Hsla,
+    /// In-page find matches in this paragraph: `(byte range, is_current)`.
+    pub find: Vec<(std::ops::Range<usize>, bool)>,
 }
 
 /// A paragraph with math in it.
@@ -625,9 +627,29 @@ impl Element for FlowText {
             }
         }
 
+        // Find matches sit behind the text and in front of the selection.
+        for (range, current) in &self.content.find {
+            let color = if *current {
+                theme.star.opacity(0.55)
+            } else {
+                theme.accent.opacity(0.22)
+            };
+            for quad in flow_range_quads(
+                layout,
+                base,
+                origin,
+                range.start,
+                range.end,
+                color,
+                self.content.font_size,
+            ) {
+                window.paint_quad(quad);
+            }
+        }
+
         if let Some((start, end)) = self.selection.borrow().ordered() {
             for quad in flow_selection_quads(
-                &layout,
+                layout,
                 block,
                 base,
                 origin,
@@ -834,6 +856,66 @@ fn flow_selection_quads(
         return Vec::new();
     }
 
+    let mut quads = Vec::new();
+    for line in &layout.lines {
+        let top = origin.y + line.top;
+        let height = (line.ascent + line.descent).max(px(font_size * 1.5));
+        for piece in &line.pieces {
+            let p_start = base + piece_display_offset(piece);
+            let p_end = p_start + piece_display_len(piece);
+            let a = from.max(p_start);
+            let b = to.min(p_end);
+            if a >= b {
+                continue;
+            }
+            let (x0, x1) = match piece {
+                PlacedPiece::Text {
+                    shaped,
+                    x,
+                    display_offset,
+                    len,
+                    ..
+                } => {
+                    let local0 = a - (base + display_offset);
+                    let local1 = (b - (base + display_offset)).min(*len);
+                    let x0 = *x + shaped.x_for_index(local0.min(*len));
+                    let x1 = if local1 >= shaped.len() {
+                        *x + shaped.width
+                    } else {
+                        *x + shaped.x_for_index(local1)
+                    };
+                    (x0, x1)
+                }
+                PlacedPiece::Math { x, scene, .. } => {
+                    (*x, *x + px(scene.width() as f32 * font_size))
+                }
+                PlacedPiece::Image { x, width, .. } => (*x, *x + *width),
+            };
+            if x1 > x0 {
+                quads.push(fill(
+                    Bounds {
+                        origin: point(origin.x + x0, top),
+                        size: gpui::size(x1 - x0, height),
+                    },
+                    color,
+                ));
+            }
+        }
+    }
+    quads
+}
+
+/// Highlight quads for a display-text range in one paragraph, without the cross-block
+/// selection clamping.
+fn flow_range_quads(
+    layout: &FlowLayout,
+    base: usize,
+    origin: gpui::Point<Pixels>,
+    from: usize,
+    to: usize,
+    color: Hsla,
+    font_size: f32,
+) -> Vec<gpui::PaintQuad> {
     let mut quads = Vec::new();
     for line in &layout.lines {
         let top = origin.y + line.top;
