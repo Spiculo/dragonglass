@@ -642,8 +642,11 @@ full-vault walk on mode entry.
 throttled to ~7 passes a second with a trailing one-shot timer (no timer when the buffer is
 clean), instead of counting the whole note on every keystroke. The attachment index is still
 built once per vault/mode entry.
-**Remaining:** `document_headings` still re-parses the document on every revision because
-fold markers and layout depend on it; incremental heading updates are open.
+**Landed (headings):** a revision now re-parses headings only when the edit can change them.
+A same-length edit with no newline, `#`, backtick, `~` or `=` in the changed bytes, on a line
+that is not a heading, a fence or a setext heading's text, reuses the cached heading list; any
+structural edit (newline, marker, heading line, frontmatter) re-parses. A unit test covers the
+prose case and each structural case that must invalidate the cache.
 
 #### Q3.9 Focused split is the command target — D · S
 Track the focused pane/tab; Ctrl+W, Save, Find and format commands apply to the focused

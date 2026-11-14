@@ -384,6 +384,8 @@ pub struct Editor {
     folded: HashSet<usize>,
     /// Headings for the current document revision, used to compute fold ranges.
     heading_cache: (u64, u64, Rc<Vec<markdown::Heading>>),
+    /// The text the heading cache was built from, for the cheap "still valid" check.
+    heading_source: Option<Rc<String>>,
     /// Bumped when `folded` changes so `lay_out` reflows.
     fold_revision: u64,
     /// The fold revision the current layout was built for.
@@ -708,6 +710,7 @@ impl Editor {
             vim: Vim::new(),
             folded: HashSet::new(),
             heading_cache: (u64::MAX, u64::MAX, Rc::new(Vec::new())),
+            heading_source: None,
             fold_revision: 0,
             layout_fold_revision: u64::MAX,
             fold_markers: Rc::new(Vec::new()),
@@ -1676,7 +1679,19 @@ impl Editor {
         let key = (self.doc_generation, self.buffer.revision());
         if self.heading_cache.0 != key.0 || self.heading_cache.1 != key.1 {
             let text = self.document_text();
-            self.heading_cache = (key.0, key.1, Rc::new(markdown::headings(&text)));
+            let same_generation = self.heading_cache.0 == key.0;
+            let reusable = same_generation
+                && self
+                    .heading_source
+                    .as_deref()
+                    .is_some_and(|old| headings_unchanged(old, &text));
+            let headings = if reusable {
+                self.heading_cache.2.clone()
+            } else {
+                Rc::new(markdown::headings(&text))
+            };
+            self.heading_source = Some(text);
+            self.heading_cache = (key.0, key.1, headings);
         }
         self.heading_cache.2.clone()
     }
@@ -6847,6 +6862,83 @@ fn visible_row_range(
     start.min(row_count)..end.min(row_count)
 }
 
+/// Whether an edit cannot change the document's headings: same length, no newline and no
+/// heading/fence character in the changed bytes, and the edited line is not a heading, a
+/// fence or the text line of a setext heading.
+fn headings_unchanged(old: &str, new: &str) -> bool {
+    if old.len() != new.len() {
+        return false;
+    }
+    let bytes = old.as_bytes();
+    let mut start = 0;
+    while start < bytes.len() && bytes[start] == new.as_bytes()[start] {
+        start += 1;
+    }
+    if start == bytes.len() {
+        return true;
+    }
+    let mut end = 0;
+    while end < bytes.len() - start
+        && bytes[bytes.len() - 1 - end] == new.as_bytes()[bytes.len() - 1 - end]
+    {
+        end += 1;
+    }
+    let (Some(old_changed), Some(new_changed)) = (
+        old.get(start..old.len() - end),
+        new.get(start..new.len() - end),
+    ) else {
+        return false;
+    };
+    let risky = |text: &str| {
+        text.contains('\n')
+            || text.contains('#')
+            || text.contains('`')
+            || text.contains('~')
+            || text.contains('=')
+    };
+    if risky(old_changed) || risky(new_changed) {
+        return false;
+    }
+
+    let line_start = old[..start].rfind('\n').map(|at| at + 1).unwrap_or(0);
+    let line_end = old[start..]
+        .find('\n')
+        .map(|at| start + at)
+        .unwrap_or(old.len());
+    let line_is_structural = |line: &str| {
+        let trimmed = line.trim_start();
+        trimmed.starts_with('#') || trimmed.starts_with("```") || trimmed.starts_with("~~~")
+    };
+    if line_is_structural(&old[line_start..line_end])
+        || line_is_structural(&new[line_start..line_end])
+    {
+        return false;
+    }
+
+    // A setext underline turns the line above it into a heading.
+    fn next_line(text: &str, line_end: usize) -> &str {
+        text[line_end..].split('\n').nth(1).unwrap_or("")
+    }
+    let is_setext = |line: &str| {
+        let trimmed = line.trim();
+        (!trimmed.is_empty() && trimmed.chars().all(|ch| ch == '='))
+            || (trimmed.len() > 1 && trimmed.chars().all(|ch| ch == '-'))
+    };
+    if is_setext(next_line(old, line_end)) || is_setext(next_line(new, line_end)) {
+        return false;
+    }
+
+    // The frontmatter block is not prose.
+    if let Some(body) = old.strip_prefix("---") {
+        if let Some(close) = body.find("\n---") {
+            if start < 3 + close + 4 {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 /// The caret after a block edit. `follow` keeps the same line and column inside the moved or
 /// duplicated block; otherwise (a deletion) the caret goes to the start of the following
 /// block. Pure text math so it can be tested without an editor.
@@ -6876,6 +6968,19 @@ fn caret_after_block_edit(
 mod tests {
     use super::*;
     use gpui::{point, size};
+
+    #[test]
+    fn prose_edits_keep_the_heading_cache_valid() {
+        let old = "# One\n\nsome prose here\n";
+        assert!(headings_unchanged(old, "# One\n\nsome proze here\n"));
+        // A newline shifts every following heading line.
+        assert!(!headings_unchanged(old, "# One\n\nsome\nprose here\n"));
+        // Editing the heading itself must re-parse.
+        assert!(!headings_unchanged(old, "# Two\n\nsome prose here\n"));
+        // A fence marker changes block state.
+        assert!(!headings_unchanged(old, "# One\n\n``` prose here\n"));
+        assert!(!headings_unchanged(old, "# One\n\n== prose here\n"));
+    }
 
     #[test]
     fn a_moved_block_keeps_the_caret_on_the_same_line() {
