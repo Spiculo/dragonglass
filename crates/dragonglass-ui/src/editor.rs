@@ -22,12 +22,12 @@ use dragonglass_core::markdown;
 use dragonglass_core::math::{self, MathOptions, MathScene, MathStyle};
 use dragonglass_core::{blocks, git, history, stats, syntax, templates, wrap, Buffer};
 use gpui::{
-    actions, div, fill, point, prelude::*, px, relative, size, AnyElement, App, Bounds,
-    ClipboardEntry, ClipboardItem, Context, CursorStyle, ElementId, ElementInputHandler, Entity,
-    EntityInputHandler, ExternalPaths, FocusHandle, Focusable, GlobalElementId, ImageFormat,
-    InspectorElementId, KeyBinding, KeyDownEvent, LayoutId, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point, Render, ScrollHandle, ShapedLine,
-    SharedString, Style, TextRun, Timer, UTF16Selection, Window,
+    actions, anchored, div, fill, point, prelude::*, px, relative, size, AnyElement, App, Bounds,
+    ClipboardEntry, ClipboardItem, Context, Corner, CursorStyle, ElementId, ElementInputHandler,
+    Entity, EntityInputHandler, ExternalPaths, FocusHandle, Focusable, GlobalElementId,
+    ImageFormat, InspectorElementId, KeyBinding, KeyDownEvent, LayoutId, MouseButton,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point, Render, ScrollHandle,
+    ShapedLine, SharedString, Style, TextRun, Timer, UTF16Selection, Window,
 };
 
 use crate::math_element::{paint_scene, MathElement};
@@ -360,6 +360,8 @@ pub struct Editor {
     stats_armed: bool,
     /// Whether the note may be saved automatically after idle, when the disk still matches.
     autosave: bool,
+    /// Window position of the open right-click menu, if any.
+    context_menu: Option<Point<Pixels>>,
     /// Cached document statistics, recomputed per buffer revision.
     stats_cache: (u64, stats::Stats),
     /// Git added/removed lines for the file, refreshed when the saved buffer changes.
@@ -689,6 +691,7 @@ impl Editor {
             stats_at: None,
             stats_armed: false,
             autosave: false,
+            context_menu: None,
             stats_cache: (u64::MAX, stats::Stats::default()),
             git_stat: None,
             git_stat_key: None,
@@ -3776,6 +3779,9 @@ impl Editor {
     /// Escape closes the find bar, leaves Vim insert/visual mode, or drops extra carets.
     /// Returns whether the editor consumed the key.
     pub fn handle_escape(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.context_menu.take().is_some() {
+            return true;
+        }
         if self.reading && self.reading_content.close_lightbox() {
             return true;
         }
@@ -4503,6 +4509,7 @@ impl Editor {
         cx: &mut Context<Self>,
     ) {
         self.dismiss_autocomplete();
+        self.context_menu = None;
         window.focus(&self.focus_handle);
         if self.fold_from_gutter(event.position, cx) {
             return;
@@ -4536,6 +4543,19 @@ impl Editor {
         }
         self.buffer.set_cursor(index);
         self.selecting = true;
+        cx.notify();
+    }
+
+    /// Right-click opens cut/copy/paste and formatting at the pointer, without moving the
+    /// caret or dropping the selection.
+    fn on_context_menu(
+        &mut self,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        window.focus(&self.focus_handle);
+        self.context_menu = Some(event.position);
         cx.notify();
     }
 
@@ -4651,6 +4671,7 @@ impl Render for Editor {
                 .overflow_y_scroll()
                 .track_scroll(&self.scroll_handle)
                 .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
+                .on_mouse_down(MouseButton::Right, cx.listener(Self::on_context_menu))
                 .on_mouse_move(cx.listener(Self::on_mouse_move))
                 .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
                 .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
@@ -4843,6 +4864,95 @@ impl Render for Editor {
                     .into_any_element(),
             )
         };
+
+        let context_menu = self.context_menu.map(|position| {
+            let row = |id: &'static str, label: &'static str| {
+                div()
+                    .id(id)
+                    .px_3()
+                    .py_1()
+                    .text_sm()
+                    .text_color(theme.text)
+                    .cursor_pointer()
+                    .hover(move |style| style.bg(theme.hover))
+                    .child(label)
+            };
+            anchored()
+                .position(position)
+                .anchor(Corner::TopLeft)
+                .snap_to_window_with_margin(px(8.0))
+                .child(
+                    div()
+                        .id("editor-context-menu")
+                        .flex()
+                        .flex_col()
+                        .w(px(180.0))
+                        .py_1()
+                        .rounded_md()
+                        .bg(theme.panel)
+                        .border_1()
+                        .border_color(theme.border)
+                        .text_color(theme.text)
+                        .on_mouse_down(MouseButton::Left, |_event, _window, cx| {
+                            cx.stop_propagation();
+                        })
+                        .child(row("ctx-cut", "Cut").on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _event, window, cx| {
+                                this.context_menu = None;
+                                this.cut(&Cut, window, cx);
+                            }),
+                        ))
+                        .child(row("ctx-copy", "Copy").on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _event, window, cx| {
+                                this.context_menu = None;
+                                this.copy(&Copy, window, cx);
+                            }),
+                        ))
+                        .child(row("ctx-paste", "Paste").on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _event, window, cx| {
+                                this.context_menu = None;
+                                this.paste(&Paste, window, cx);
+                            }),
+                        ))
+                        .child(div().h(px(1.0)).my_1().bg(theme.border))
+                        .child(row("ctx-bold", "Bold").on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _event, _window, cx| {
+                                this.context_menu = None;
+                                this.apply_style(text_format::Style::Bold);
+                                cx.notify();
+                            }),
+                        ))
+                        .child(row("ctx-italic", "Italic").on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _event, _window, cx| {
+                                this.context_menu = None;
+                                this.apply_style(text_format::Style::Italic);
+                                cx.notify();
+                            }),
+                        ))
+                        .child(row("ctx-highlight", "Highlight").on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _event, _window, cx| {
+                                this.context_menu = None;
+                                this.apply_style(text_format::Style::Highlight);
+                                cx.notify();
+                            }),
+                        ))
+                        .child(row("ctx-link", "Wikilink…").on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _event, _window, cx| {
+                                this.context_menu = None;
+                                this.start_wikilink();
+                                cx.notify();
+                            }),
+                        )),
+                )
+                .into_any_element()
+        });
 
         let (line, column) = self.buffer.line_col();
         let line_count = self.buffer.line_count();
@@ -5077,7 +5187,26 @@ impl Render for Editor {
                     })),
             )
             .when_some(format_bar, |d, bar| d.child(bar))
+            .when(self.context_menu.is_some(), |d| {
+                d.child(
+                    div()
+                        .id("editor-context-backdrop")
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .right_0()
+                        .bottom_0()
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _event, _window, cx| {
+                                this.context_menu = None;
+                                cx.notify();
+                            }),
+                        ),
+                )
+            })
             .child(status)
+            .children(context_menu)
     }
 }
 

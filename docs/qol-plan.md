@@ -663,6 +663,14 @@ move/duplicate/delete: preserve cursor and scroll.
 **Done when:** no common action is a silent no-op; the window title is a reliable dirty
 indicator; block operations do not jump the viewport.
 
+**Landed:** Vim has redo and `:wq`/`:x`/`:q` close; failed searches report. The window title
+shows the note and a dirty dot. Tabs close on middle-click. Copy/link actions report their
+outcome. A right-click opens a context menu at the pointer with Cut, Copy, Paste, Bold,
+Italic, Highlight and Wikilink; it never moves the caret or drops the selection, and closes
+on Escape or an outside click.
+**Remaining:** a tab overflow menu, and block move/duplicate/delete keeping the exact caret
+and scroll.
+
 #### Q3.13 Dirty state reflects content — D · S
 Compare against the saved text/revision rather than flipping a bool. Type-then-delete and
 undo-after-save return to clean. Use this same signal for close prompts and tab dots.
