@@ -946,8 +946,13 @@ Nodes now settle with a live force simulation, reserve their radius during colli
 dragged (the dragged node stays pinned until the graph is rebuilt), and highlight their links
 on hover. Labels fade with zoom, avoid other labels and node circles, and the whole drawing is
 clipped to the graph pane. A `forces` panel in the graph header adjusts the centre, repel,
-link and distance strengths for the current session. Android keeps its list/preview scroll, loads restored tabs lazily
-and has the shared reader settings. The rest of the list is still open.
+link and distance strengths for the current session. Node size follows body length and unique
+links; edge width follows repeated references. Frontmatter wikilinks are no longer counted as
+body links, and the Relation graph reads the recognised YAML relation keys. The command
+palette now filters as you type, accepts clicks, auto-scrolls the selected row, and treats
+Cmd/Ctrl+Shift+P as a command-palette alias (Properties moved to Cmd/Ctrl+Alt+P).
+Android keeps its list/preview scroll, loads restored tabs lazily and has the shared reader
+settings. The rest of the list is still open.
 
 ---
 

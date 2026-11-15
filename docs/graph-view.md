@@ -78,6 +78,25 @@ The same graph on this branch produces:
 
 The regression tests below keep the second set of numbers true.
 
+### 1.7 Scope and metadata
+
+The graph is not limited to open tabs:
+
+- **Graph view** opens the active note and its neighbours up to the depth
+  setting (1 by default). With no active note it shows the whole vault.
+- **Relation graph** shows the whole vault enriched with recognised YAML
+  frontmatter keys: `up`/`parent`, `down`/`child`, `prev`, `next`, `related`,
+  `series` and `supersedes`. Shared tags appear in the relations pane, not as
+  graph edges.
+- The normal graph reads **body wikilinks and embeds only**. Frontmatter
+  wikilinks are properties, not body links; the relation graph reads them
+  through the semantic keys above. This also stops a YAML `up: "[[note]]"`
+  from appearing as a duplicate plain link.
+
+Node size uses unique outgoing links plus the body word count. Edge width uses
+the number of references from one note to the other, so repeated links or
+embeds draw a thicker line.
+
 ## 2. How Obsidian handles it
 
 The Obsidian Help page for Graph view describes the user-facing contract:
@@ -436,11 +455,20 @@ The branch contains the plan, the code commits below and the docs on
    and the `Ctrl+Shift+G` shortcut had no action handler. Both are fixed: pan
    now clamps against the node bounds, and `OpenGraph` is wired on both root
    views.
+7. Node size now combines body word count and unique outgoing links, and edge
+   width combines repeated references. `Note::links` reads the body only, so a
+   YAML `up: "[[note]]"` is a relation, not a duplicate body link. The graph
+   header names the mode (`links`/`relations`) and scope (`local · depth N` or
+   `global`).
+8. The command palette now filters commands as you type, accepts row clicks,
+   scrolls the selected row into view with the arrow keys, and treats
+   `Cmd/Ctrl+Shift+P` as a command-palette alias. Properties moved to
+   `Cmd/Ctrl+Alt+P`.
 
 Verification on the branch:
 
 ```sh
-cargo test -p dragonglass-core -p dragonglass-ui   # 391 core + 108 UI tests
+cargo test -p dragonglass-core -p dragonglass-ui   # 393 core + 109 UI tests
 cargo fmt --all -- --check
 cargo clippy -p dragonglass-core -p dragonglass-ui --all-targets --all-features
 ```
@@ -467,7 +495,18 @@ xdotool for input. Screenshots were captured with ImageMagick. The results:
 - **Forces:** the `forces` panel opened and the centre stepper moved the value
   from `0.020` to `0.050`; the graph compacted.
 - **Shortcut:** `Ctrl+Shift+G` now opens the graph after the action wiring.
+- **Node and edge weight:** a 407-word note drew a visibly larger circle than a
+  short stub, and five repeated references drew a thicker edge.
+- **Command palette:** typing `graph` filtered the list to Graph view, Relation
+  graph, Graph: filter and Graph: cycle depth; clicking Graph view opened the
+  graph; 20 arrow presses scrolled the selected row into view;
+  `Ctrl+Shift+P` opened the command palette; Properties now shows
+  `Ctrl+Alt+P`.
+- **Relation graph:** a note with `up: "[[parent]]"` produced one dashed
+  relation edge and the header read `1 relations · global`; the normal graph
+  did not count the YAML wikilink as a body link.
 
 The screenshots live in `target/graph-checks/` during the run and are not
 committed. This closes the manual acceptance pass for pane clipping, drag,
-hover, force controls and the shortcut.
+hover, force controls, node/edge sizing, relation metadata and the command
+palette.

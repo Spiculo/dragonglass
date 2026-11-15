@@ -55,8 +55,8 @@ A lot already works. This is a working application, not a mockup — but it is e
   highlight, inline code and comments; `Ctrl+K` turns a selection into
   `[[target|selection]]`
 - Wikilink, tag and slash-command autocomplete while typing
-- Command palette, a settings page (`Ctrl+,`), configurable hotkeys, light/dark themes and
-  snippets
+- Command palette with live filtering, clickable rows and keyboard auto-scroll, a settings
+  page (`Ctrl+,`), configurable hotkeys, light/dark themes and snippets
 - Reading typography: text size and column width are settings, applied to every open reader
   and the split preview immediately and stored per vault
 
@@ -64,7 +64,8 @@ A lot already works. This is a working application, not a mockup — but it is e
 - File tree with new note/folder, rename, move and delete to a recoverable trash
   (right-click a row), plus the quick switcher and full-text search
 - Wikilinks, backlinks, tags, outline, document relations and a live, collision-aware
-  graph view with node drag, hover focus, force controls and zoom-faded labels
+  graph view with node drag, hover focus, force controls, note-size nodes, reference-width
+  edges and zoom-faded labels
 - Daily/weekly/monthly notes, templates, properties, bookmarks
 - Embeds and attachments (images, PDF, audio), transclusion, shared blocks; images honor
   `![[img|300]]` width and alt text, click opens a lightbox, and other attachments open in
