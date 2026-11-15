@@ -1,7 +1,7 @@
 # Graph view: dynamic nodes, no overlap, and pane clipping
 
-Status: landed on branch `fix/graph-node-layout`. The force-slider UI is the only
-deferred item.
+Status: landed on branch `fix/graph-node-layout`. All phases are implemented;
+force controls are session-local for now.
 Scope: the desktop GPUI graph view. Android has no graph view yet.
 
 ## 1. Problems in the current implementation
