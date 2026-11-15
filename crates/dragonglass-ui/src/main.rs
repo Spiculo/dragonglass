@@ -3025,6 +3025,10 @@ impl DragonGlassApp {
         cx.notify();
     }
 
+    fn open_graph_action(&mut self, _: &OpenGraph, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_graph(window, cx);
+    }
+
     fn open_graph(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(view) = self.graph_view.clone() else {
             return;
@@ -7874,6 +7878,7 @@ impl Render for DragonGlassApp {
                 .on_action(cx.listener(Self::open_search))
                 .on_action(cx.listener(Self::open_git))
                 .on_action(cx.listener(Self::open_relations))
+                .on_action(cx.listener(Self::open_graph_action))
                 .on_action(cx.listener(Self::open_daily))
                 .on_action(cx.listener(Self::open_weekly))
                 .on_action(cx.listener(Self::open_monthly))
@@ -8337,6 +8342,7 @@ impl Render for DragonGlassApp {
             .on_action(cx.listener(Self::open_search))
             .on_action(cx.listener(Self::open_git))
             .on_action(cx.listener(Self::open_relations))
+            .on_action(cx.listener(Self::open_graph_action))
             .on_action(cx.listener(Self::open_daily))
             .on_action(cx.listener(Self::open_weekly))
             .on_action(cx.listener(Self::open_monthly))

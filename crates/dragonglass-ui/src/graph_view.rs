@@ -34,6 +34,8 @@ const LABEL_ALPHA_STEPS: u8 = 8;
 const NODE_HIT_PADDING: f32 = 3.0;
 /// Keep at least this much of the graph on screen when the user pans.
 const PAN_MARGIN: f32 = 48.0;
+/// Extra space around the node circles when measuring the graph bounds.
+const GRAPH_PADDING: f32 = 8.0;
 
 pub struct GraphView {
     graph: Graph,
@@ -413,30 +415,18 @@ impl GraphView {
     }
 
     fn clamp_pan(&mut self) {
-        let Some(bounds) = self.last_bounds else {
+        let Some(view_bounds) = self.last_bounds else {
             return;
         };
-        let size = (f32::from(bounds.size.width), f32::from(bounds.size.height));
-        let scale = fit_scale(size) * self.zoom;
-        let half_width = CANVAS.0 * scale / 2.0;
-        let half_height = CANVAS.1 * scale / 2.0;
-        let margin_x = PAN_MARGIN.min(size.0 / 3.0);
-        let margin_y = PAN_MARGIN.min(size.1 / 3.0);
-
-        let center_x = size.0 / 2.0 + self.pan.0;
-        let center_y = size.1 / 2.0 + self.pan.1;
-        self.pan.0 = clamp_center(
-            center_x,
-            margin_x - half_width,
-            size.0 - margin_x + half_width,
-            size.0 / 2.0,
-        ) - size.0 / 2.0;
-        self.pan.1 = clamp_center(
-            center_y,
-            margin_y - half_height,
-            size.1 - margin_y + half_height,
-            size.1 / 2.0,
-        ) - size.1 / 2.0;
+        let Some(graph_bounds) = graph_bounds(&self.graph, self.layout.positions(), GRAPH_PADDING)
+        else {
+            return;
+        };
+        let size = (
+            f32::from(view_bounds.size.width),
+            f32::from(view_bounds.size.height),
+        );
+        self.pan = clamp_pan_to_bounds(self.pan, size, self.zoom, graph_bounds);
     }
 
     fn zoom_at(&mut self, local: Point<Pixels>, delta_lines: f32, cx: &mut Context<Self>) {
@@ -628,12 +618,60 @@ impl GraphView {
     }
 }
 
-fn clamp_center(value: f32, low: f32, high: f32, fallback: f32) -> f32 {
-    if low <= high {
-        value.clamp(low, high)
-    } else {
-        fallback
+/// Bounds of the drawn graph in canvas units, including node radius and padding.
+fn graph_bounds(
+    graph: &Graph,
+    positions: &[(f32, f32)],
+    padding: f32,
+) -> Option<(f32, f32, f32, f32)> {
+    let mut min_x = f32::MAX;
+    let mut min_y = f32::MAX;
+    let mut max_x = f32::MIN;
+    let mut max_y = f32::MIN;
+
+    for (id, node) in graph.nodes.iter().enumerate() {
+        let Some((x, y)) = positions.get(id) else {
+            continue;
+        };
+        let radius = graph::node_radius(node.links) + padding;
+        min_x = min_x.min(x - radius);
+        min_y = min_y.min(y - radius);
+        max_x = max_x.max(x + radius);
+        max_y = max_y.max(y + radius);
     }
+
+    (min_x != f32::MAX).then_some((min_x, min_y, max_x, max_y))
+}
+
+/// Keep at least `PAN_MARGIN` of the graph visible after a pan or zoom.
+fn clamp_pan_to_bounds(
+    pan: (f32, f32),
+    size: (f32, f32),
+    zoom: f32,
+    graph: (f32, f32, f32, f32),
+) -> (f32, f32) {
+    let scale = fit_scale(size) * zoom;
+    let (min_x, min_y, max_x, max_y) = graph;
+    let margin_x = PAN_MARGIN.min(size.0 / 3.0);
+    let margin_y = PAN_MARGIN.min(size.1 / 3.0);
+
+    let left = size.0 / 2.0 + pan.0 + (min_x - CANVAS.0 / 2.0) * scale;
+    let right = size.0 / 2.0 + pan.0 + (max_x - CANVAS.0 / 2.0) * scale;
+    let top = size.1 / 2.0 + pan.1 + (min_y - CANVAS.1 / 2.0) * scale;
+    let bottom = size.1 / 2.0 + pan.1 + (max_y - CANVAS.1 / 2.0) * scale;
+
+    let mut pan = pan;
+    if right < margin_x {
+        pan.0 += margin_x - right;
+    } else if left > size.0 - margin_x {
+        pan.0 -= left - (size.0 - margin_x);
+    }
+    if bottom < margin_y {
+        pan.1 += margin_y - bottom;
+    } else if top > size.1 - margin_y {
+        pan.1 -= top - (size.1 - margin_y);
+    }
+    pan
 }
 
 impl Focusable for GraphView {
@@ -700,19 +738,31 @@ impl Render for GraphView {
                 div()
                     .flex()
                     .flex_row()
-                    .justify_between()
+                    .items_center()
+                    .gap_3()
                     .px_3()
                     .py_1()
                     .bg(theme.panel_alt)
                     .text_xs()
                     .text_color(theme.muted)
-                    .child(format!(
-                        "graph: {count} notes / {edges} links · depth {}",
-                        self.depth
-                    ))
-                    .child("drag nodes or canvas · scroll to zoom · click a node to open · Esc to close")
                     .child(
                         div()
+                            .flex_shrink_0()
+                            .child(format!(
+                                "graph: {count} notes / {edges} links · depth {}",
+                                self.depth
+                            )),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .truncate()
+                            .child("drag nodes or canvas · scroll to zoom · click a node to open · Esc to close"),
+                    )
+                    .child(
+                        div()
+                            .flex_shrink_0()
                             .flex()
                             .flex_row()
                             .items_center()
@@ -1454,9 +1504,48 @@ mod tests {
     }
 
     #[test]
-    fn pan_clamping_keeps_a_fallback_for_tiny_windows() {
-        assert_eq!(clamp_center(50.0, 100.0, 10.0, 30.0), 30.0);
-        assert_eq!(clamp_center(50.0, 10.0, 100.0, 30.0), 50.0);
+    fn graph_bounds_include_the_node_radius_and_padding() {
+        let graph = Graph {
+            nodes: vec![
+                dragonglass_core::graph::Node {
+                    id: 0,
+                    relative: "a.md".to_string(),
+                    links: 0,
+                },
+                dragonglass_core::graph::Node {
+                    id: 1,
+                    relative: "b.md".to_string(),
+                    links: 4,
+                },
+            ],
+            edges: Vec::new(),
+        };
+        let bounds = graph_bounds(&graph, &[(100.0, 100.0), (200.0, 150.0)], 8.0).unwrap();
+        assert!(bounds.0 <= 100.0 - 13.0);
+        assert!(bounds.1 <= 100.0 - 13.0);
+        assert!(bounds.2 >= 200.0 + 13.0);
+        assert!(bounds.3 >= 150.0 + 13.0);
+    }
+
+    #[test]
+    fn pan_clamp_keeps_a_graph_with_a_large_pan_visible() {
+        let size = (900.0, 600.0);
+        let graph = (400.0, 250.0, 600.0, 350.0);
+        let (x, y) = clamp_pan_to_bounds((2000.0, 2000.0), size, 1.0, graph);
+        let left = size.0 / 2.0 + x + (graph.0 - CANVAS.0 / 2.0) * fit_scale(size);
+        let top = size.1 / 2.0 + y + (graph.1 - CANVAS.1 / 2.0) * fit_scale(size);
+        assert!(left <= size.0 - PAN_MARGIN.min(size.0 / 3.0));
+        assert!(top <= size.1 - PAN_MARGIN.min(size.1 / 3.0));
+    }
+
+    #[test]
+    fn pan_clamp_leaves_a_centred_graph_alone() {
+        let size = (900.0, 600.0);
+        let graph = (400.0, 250.0, 600.0, 350.0);
+        assert_eq!(
+            clamp_pan_to_bounds((0.0, 0.0), size, 1.0, graph),
+            (0.0, 0.0)
+        );
     }
 
     #[test]
