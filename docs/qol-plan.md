@@ -584,7 +584,9 @@ leaving a gap; rows keep their geometry so clicks, scroll, selection and find ar
 **Landed (marker hiding):** each line is shaped from a display string that omits inline
 markers (`**`, `__`, `*`, `_`, `~~`, `==`, backticks and `[[…]]`/`![[…]]` brackets), with a
 per-line map in both directions: source column → display column and byte offset, display
-column → source column. Wrapping measures the display text, while row metadata keeps
+column → source column. The concealed text keeps its inline styling — bold, italic,
+strikethrough, highlight, inline code background and code colour — so `**bold**` looks bold
+instead of merely losing its asterisks. Wrapping measures the display text, while row metadata keeps
 contiguous *source* ranges and each row's display start, so clicks, selection quads, the
 caret, vertical movement and IME bounds all convert through the map instead of assuming
 equal columns. The paragraph (blank-line-delimited) holding the caret stays raw, so markers
@@ -613,6 +615,10 @@ concealed, so the cells read as text; per-pipe vertical rules were removed becau
 source columns made them noisy. Moving the caret into the table shows the full markdown
 again. Tests cover separator detection, table block detection around the caret paragraph, and
 pipe concealment.
+**Landed (view selector):** the editor header has a three-way select — **Full editor**
+(raw markdown), **Dynamic** (live-preview substitutions) and **Viewer** (the reader). It
+replaces the old EDIT/READ toggle and persists per tab in session v2; Full turns every
+substitution and marker concealment off.
 **Landed (live formula):** the block holding the caret now typesets its `$$…$$` formula in
 the same layout pass and paints it under the source on three reserved rows, scaled to fit
 the column and the reserved height, so the result is visible while typing. Errors and

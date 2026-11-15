@@ -28,7 +28,7 @@ use crate::{storage, Result};
 pub const MAX_TABS: usize = 32;
 
 /// One remembered tab.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct TabSession {
     /// Vault-relative path. Empty means an untitled tab.
     pub note: String,
@@ -46,6 +46,25 @@ pub struct TabSession {
     pub folded: Vec<usize>,
     /// Heading block indices folded in the reading view.
     pub reading_folded: Vec<usize>,
+    /// Whether the source editor was in dynamic (live-preview) mode.
+    pub dynamic: bool,
+}
+
+impl Default for TabSession {
+    fn default() -> Self {
+        Self {
+            note: String::new(),
+            reading: false,
+            line: 0,
+            col: 0,
+            scroll: 0.0,
+            reading_block: 0,
+            anchor: None,
+            folded: Vec::new(),
+            reading_folded: Vec::new(),
+            dynamic: true,
+        }
+    }
 }
 
 /// The tabs that were open, and which one was active.
@@ -69,7 +88,7 @@ impl Session {
                 .map(|index| index.to_string())
                 .collect();
             out.push_str(&format!(
-                "tab={}|{}|{}|{}|{:.1}|{}|{}|{}|{}\n",
+                "tab={}|{}|{}|{}|{:.1}|{}|{}|{}|{}|{}\n",
                 tab.note,
                 u8::from(tab.reading),
                 tab.line,
@@ -80,7 +99,8 @@ impl Session {
                     .map(|anchor| anchor.to_string())
                     .unwrap_or_default(),
                 folds.join(","),
-                reading_folds.join(",")
+                reading_folds.join(","),
+                u8::from(tab.dynamic)
             ));
         }
         out
@@ -190,6 +210,9 @@ fn parse_tab(value: &str) -> Option<TabSession> {
             .filter_map(|index| index.trim().parse().ok())
             .collect();
     }
+    if let Some(dynamic) = fields.next() {
+        tab.dynamic = !matches!(dynamic.trim(), "0" | "false" | "no");
+    }
     // A tab with no note and every other field at its default is an untitled buffer, which
     // is valid; anything else is at least a note path.
     Some(tab)
@@ -231,6 +254,7 @@ mod tests {
                     anchor: Some(9),
                     folded: vec![0, 3],
                     reading_folded: vec![2],
+                    dynamic: false,
                 },
                 TabSession {
                     note: "notes/b.md".to_string(),
@@ -242,6 +266,7 @@ mod tests {
                     anchor: None,
                     folded: Vec::new(),
                     reading_folded: Vec::new(),
+                    dynamic: true,
                 },
             ],
         };
@@ -255,6 +280,7 @@ mod tests {
         assert_eq!(session.tabs[0].anchor, None);
         assert!(session.tabs[0].folded.is_empty());
         assert!(session.tabs[0].reading_folded.is_empty());
+        assert!(session.tabs[0].dynamic);
         assert_eq!(session.tabs[0].line, 12);
     }
 
@@ -332,6 +358,7 @@ mod tests {
                 anchor: None,
                 folded: vec![1],
                 reading_folded: vec![2, 4],
+                dynamic: true,
             }],
         };
         save(&dir, &session).unwrap();

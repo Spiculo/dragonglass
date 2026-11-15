@@ -1513,6 +1513,7 @@ impl DragonGlassApp {
                     anchor: editor.selection_anchor(),
                     folded: editor.folded_headings(),
                     reading_folded: editor.reading_folds(),
+                    dynamic: editor.is_dynamic(),
                 }
             })
             .collect();
@@ -8963,6 +8964,9 @@ fn open_vault_window(vault_path: PathBuf, uri_note: Option<String>, cx: &mut App
             editor.set_font_size(px(initial_config.font_size as f32));
             if active {
                 let loaded = editor.load(&vault_root.join(relative)).is_ok();
+                if let Some(saved) = saved {
+                    editor.set_dynamic_mode(saved.dynamic);
+                }
                 if forced_reading || saved.is_some_and(|tab| tab.reading) {
                     editor.set_reading_mode(true);
                 }
