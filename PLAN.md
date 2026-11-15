@@ -111,7 +111,9 @@ the vault** at `.dragon-glass/` and is a **rebuildable cache** (auto-added to th
 - Backlinks pane + unlinked mentions
 - Outgoing links
 - Nested tags + tag pane
-- Graph view (global + local), filters/forces/grouping
+- Graph view (global + local) with filters/depth/folder grouping, a live force layout,
+  radius-aware collision, node drag, hover focus and force controls; node size follows
+  note length and links, edge width follows repeated references
 - Transclusion `![[note]]`
 
 **Search**
@@ -283,9 +285,11 @@ Remaining: word wrap, horizontal scroll, richer live preview.
 bookmarks, command palette, hotkey editor, theming (light/dark, user themes, snippets),
 embeds and attachments (images/PDF/audio, `![[note]]` transclusion, and dragging or pasting
 an image — or a path to one — to file it in the attachments folder), file-recovery snapshots,
-graph view with filters/depth/folder grouping and dashed relation edges, external-change
-handling and the update prompt are in. Attachment embeds resolve by file name anywhere in the
-vault, the way Obsidian does.
+graph view with filters/depth/folder grouping, dashed relation edges, a live force layout,
+radius-aware collision, node drag, hover focus, force controls, note-size nodes,
+reference-width edges and zoom-faded labels, external-change handling and the update
+prompt are in. Attachment embeds resolve by file name
+anywhere in the vault, the way Obsidian does.
 
 ## 11. What is deliberately not done
 
@@ -491,6 +495,9 @@ command palette and a few shortcuts:
   reverse edges; also produces a link graph enriched with frontmatter relations. The graph
   view paints those relation edges dashed and tinted, and review flags relation keys that
   point at notes that do not exist.
+- `graph` — the link graph and its incremental force layout. The layout reserves each
+  node's radius, runs collision passes, keeps every circle inside the canvas and can be
+  stepped frame by frame for the live view (or settled at once for headless callers).
 - `assets` — a light index of the vault's files, so `![[shot.png]]` resolves by name anywhere
   in the vault for the reading view, the detached preview and HTML export.
 - `resolve` — one link resolver shared by the graph, relations, review, reading view and

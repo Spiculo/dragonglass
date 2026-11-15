@@ -12,6 +12,8 @@ pub struct Node {
     pub relative: String,
     /// Resolved outgoing links.
     pub links: usize,
+    /// Body word count, used to make larger notes larger in the graph.
+    pub words: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -29,6 +31,8 @@ pub struct Edge {
     pub from: usize,
     pub to: usize,
     pub kind: EdgeKind,
+    /// Number of references from `from` to `to` (repeated links or embeds).
+    pub weight: usize,
 }
 
 impl Edge {
@@ -76,16 +80,18 @@ pub fn build(notes: &[NoteRef]) -> Graph {
             id,
             relative: note.relative.clone(),
             links: 0,
+            words: 0,
         })
         .collect();
 
-    let mut edges = Vec::new();
-    let mut seen = HashSet::new();
+    let mut edges: Vec<Edge> = Vec::new();
+    let mut edge_index: HashMap<(usize, usize), usize> = HashMap::new();
 
     for (from, note_ref) in notes.iter().enumerate() {
         let Ok(note) = Note::load(&note_ref.path) else {
             continue;
         };
+        nodes[from].words = crate::stats::compute(&note.source).words;
         for link in note.links() {
             if link.target.is_empty() {
                 continue;
@@ -93,18 +99,22 @@ pub fn build(notes: &[NoteRef]) -> Graph {
             let Some(to) = index.resolve(&link.target) else {
                 continue;
             };
-            if seen.insert((from, to)) {
-                edges.push(Edge {
-                    from,
-                    to,
-                    kind: if link.embed {
-                        EdgeKind::Embed
-                    } else {
-                        EdgeKind::Link
-                    },
-                });
-                nodes[from].links += 1;
+            if let Some(index) = edge_index.get(&(from, to)).copied() {
+                edges[index].weight += 1;
+                continue;
             }
+            edge_index.insert((from, to), edges.len());
+            edges.push(Edge {
+                from,
+                to,
+                kind: if link.embed {
+                    EdgeKind::Embed
+                } else {
+                    EdgeKind::Link
+                },
+                weight: 1,
+            });
+            nodes[from].links += 1;
         }
     }
 
@@ -128,6 +138,7 @@ pub fn filter(graph: &Graph, query: &str) -> Graph {
                 id: nodes.len(),
                 relative: node.relative.clone(),
                 links: node.links,
+                words: node.words,
             });
         }
     }
@@ -140,6 +151,7 @@ pub fn filter(graph: &Graph, query: &str) -> Graph {
                 from: *remap.get(&edge.from)?,
                 to: *remap.get(&edge.to)?,
                 kind: edge.kind,
+                weight: edge.weight,
             })
         })
         .collect();
@@ -153,6 +165,16 @@ pub fn folder_of(relative: &str) -> &str {
         Some((folder, _)) => folder,
         None => "",
     }
+}
+
+/// Radius of a node in canvas units.
+///
+/// The base size is 5. Outgoing links add up to about 9 and body length adds up
+/// to about 6, so a large, heavily linked note is visibly larger than a stub.
+pub fn node_radius(links: usize, words: usize) -> f32 {
+    let link_size = (links as f32).sqrt() * 2.0;
+    let word_size = ((words as f32).sqrt() / 5.0).min(14.0);
+    (5.0 + link_size + word_size).min(28.0)
 }
 
 /// The subgraph within `depth` hops of `root`, capped at `max_nodes`.
@@ -196,6 +218,7 @@ pub fn local(graph: &Graph, root: usize, depth: usize, max_nodes: usize) -> Grap
             id: new_id,
             relative: graph.nodes[*old_id].relative.clone(),
             links: graph.nodes[*old_id].links,
+            words: graph.nodes[*old_id].words,
         })
         .collect();
 
@@ -209,6 +232,7 @@ pub fn local(graph: &Graph, root: usize, depth: usize, max_nodes: usize) -> Grap
                 from,
                 to,
                 kind: edge.kind,
+                weight: edge.weight,
             })
         })
         .collect();
@@ -216,51 +240,158 @@ pub fn local(graph: &Graph, root: usize, depth: usize, max_nodes: usize) -> Grap
     Graph { nodes, edges }
 }
 
-/// Deterministic Fruchterman-Reingold layout inside `width` x `height`.
-pub fn layout(graph: &Graph, width: f32, height: f32, iterations: usize) -> Vec<(f32, f32)> {
-    let n = graph.nodes.len();
-    if n == 0 {
-        return Vec::new();
+/// Tuning for the force-directed graph layout.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LayoutParams {
+    /// Width of the virtual canvas.
+    pub width: f32,
+    /// Height of the virtual canvas.
+    pub height: f32,
+    /// Empty space kept between a node edge and the canvas edge.
+    pub padding: f32,
+    /// Number of simulation steps used by [`layout`] and [`GraphLayout::settle`].
+    pub iterations: usize,
+    /// Strength of the pairwise repulsion.
+    pub repel: f32,
+    /// Strength of the spring along an edge.
+    pub link_force: f32,
+    /// Target length of an edge. Zero asks the layout to derive it from the graph size.
+    pub link_distance: f32,
+    /// Pull toward the canvas centre. This keeps disconnected parts together.
+    pub center_force: f32,
+    /// Extra space between two node circles.
+    pub collision_gap: f32,
+}
+
+impl Default for LayoutParams {
+    fn default() -> Self {
+        Self {
+            width: 1000.0,
+            height: 600.0,
+            padding: 8.0,
+            iterations: 120,
+            repel: 0.025,
+            link_force: 0.05,
+            link_distance: 0.0,
+            center_force: 0.02,
+            collision_gap: 6.0,
+        }
+    }
+}
+
+impl LayoutParams {
+    pub fn new(width: f32, height: f32, iterations: usize) -> Self {
+        Self {
+            width,
+            height,
+            iterations,
+            ..Self::default()
+        }
     }
 
-    let center = (width / 2.0, height / 2.0);
-    let radius = (width.min(height) / 2.0) * 0.7;
-
-    let mut pos: Vec<(f32, f32)> = (0..n)
-        .map(|i| {
-            let angle = std::f32::consts::TAU * (i as f32) / (n as f32);
-            // A small deterministic jitter stops symmetric nodes from stacking.
-            let jitter = 1.0 + ((i * 2654435761usize % 1000) as f32 / 1000.0 - 0.5) * 0.1;
-            (
-                center.0 + radius * angle.cos() * jitter,
-                center.1 + radius * angle.sin() * jitter,
-            )
-        })
-        .collect();
-
-    if n == 1 {
-        return pos;
+    /// The natural distance between two linked nodes.
+    pub fn k(&self, n: usize) -> f32 {
+        let area = self.width.max(1.0) * self.height.max(1.0);
+        (area / n.max(1) as f32).sqrt().clamp(60.0, 160.0)
     }
 
-    let area = width * height;
-    let k = (area / n as f32).sqrt();
-    let mut temperature = radius * 0.5;
-    let cooling = if iterations > 0 {
-        temperature / (iterations as f32 + 1.0)
-    } else {
-        0.0
-    };
+    fn resolved_link_distance(&self, n: usize) -> f32 {
+        if self.link_distance > 0.0 {
+            self.link_distance
+        } else {
+            self.k(n) * 0.8
+        }
+    }
+}
 
-    for _ in 0..iterations {
+/// A deterministic, incremental force-directed layout.
+///
+/// The UI can call [`step`](Self::step) once per frame to animate the graph. Headless
+/// callers use [`layout`] instead, which settles the same simulation synchronously.
+#[derive(Debug, Clone)]
+pub struct GraphLayout {
+    positions: Vec<(f32, f32)>,
+    pinned: Vec<bool>,
+    alpha: f32,
+    decay: f32,
+    params: LayoutParams,
+    steps: usize,
+}
+
+impl GraphLayout {
+    /// Start a layout from a deterministic ring. Call [`step`](Self::step) to animate it.
+    pub fn new(graph: &Graph, params: LayoutParams) -> Self {
+        let n = graph.nodes.len();
+        let positions = initial_positions(graph, &params);
+        let decay = 0.02f32.powf(1.0 / params.iterations.max(1) as f32);
+        Self {
+            positions,
+            pinned: vec![false; n],
+            // One node has nothing to settle; do not schedule frames for it.
+            alpha: if n <= 1 { 0.0 } else { 1.0 },
+            decay,
+            params,
+            steps: 0,
+        }
+    }
+
+    pub fn positions(&self) -> &[(f32, f32)] {
+        &self.positions
+    }
+
+    pub fn params(&self) -> LayoutParams {
+        self.params
+    }
+
+    /// True while the simulation still wants frames.
+    pub fn is_active(&self) -> bool {
+        self.alpha > 0.02
+    }
+
+    /// Set the temperature. Dragging a node or rebuilding the graph uses this.
+    ///
+    /// A rebuild with known positions can ask for a gentle nudge (`0.3`); a new
+    /// graph asks for a full simulation (`1.0`).
+    pub fn reheat(&mut self, alpha: f32) {
+        self.alpha = alpha.clamp(0.0, 1.0);
+    }
+
+    /// Pin a node so forces cannot move it. The UI pins a node after the user drags it.
+    pub fn pin(&mut self, node: usize, pinned: bool) {
+        if let Some(slot) = self.pinned.get_mut(node) {
+            *slot = pinned;
+        }
+    }
+
+    /// Move a node directly. Used by the pointer drag.
+    pub fn set_position(&mut self, node: usize, position: (f32, f32)) {
+        if let Some(slot) = self.positions.get_mut(node) {
+            *slot = position;
+        }
+    }
+
+    /// Advance the simulation by one frame. Returns true while another frame is useful.
+    pub fn step(&mut self, graph: &Graph, _dt: f32) -> bool {
+        let n = self.positions.len().min(graph.nodes.len());
+        if n == 0 || !self.is_active() {
+            return false;
+        }
+
+        let k = self.params.k(n);
+        let link_distance = self.params.resolved_link_distance(n);
+        let center = (self.params.width / 2.0, self.params.height / 2.0);
         let mut disp = vec![(0.0f32, 0.0f32); n];
 
-        // Repulsion between every pair.
+        // Repulsion between every pair. The factor keeps the force in the same
+        // range as the springs, so a single alpha controls the whole step.
         for i in 0..n {
             for j in (i + 1)..n {
-                let dx = pos[i].0 - pos[j].0;
-                let dy = pos[i].1 - pos[j].1;
-                let distance = (dx * dx + dy * dy).sqrt().max(0.01);
-                let force = k * k / distance;
+                let dx = self.positions[i].0 - self.positions[j].0;
+                let dy = self.positions[i].1 - self.positions[j].1;
+                let distance = (dx * dx + dy * dy).sqrt().max(0.5);
+                // `repel` is a strength multiplier on a small base. Keeping the
+                // base here makes the value easy to tune without changing units.
+                let force = self.params.repel * k * k / distance * 0.025;
                 let (ux, uy) = (dx / distance, dy / distance);
                 disp[i].0 += ux * force;
                 disp[i].1 += uy * force;
@@ -269,12 +400,16 @@ pub fn layout(graph: &Graph, width: f32, height: f32, iterations: usize) -> Vec<
             }
         }
 
-        // Attraction along edges.
+        // Springs along edges. They pull toward `link_distance` and push apart
+        // when an edge is too short, which keeps clusters from collapsing.
         for edge in &graph.edges {
-            let dx = pos[edge.from].0 - pos[edge.to].0;
-            let dy = pos[edge.from].1 - pos[edge.to].1;
-            let distance = (dx * dx + dy * dy).sqrt().max(0.01);
-            let force = distance * distance / k;
+            if edge.from >= n || edge.to >= n {
+                continue;
+            }
+            let dx = self.positions[edge.from].0 - self.positions[edge.to].0;
+            let dy = self.positions[edge.from].1 - self.positions[edge.to].1;
+            let distance = (dx * dx + dy * dy).sqrt().max(0.5);
+            let force = (distance - link_distance) * self.params.link_force;
             let (ux, uy) = (dx / distance, dy / distance);
             disp[edge.from].0 -= ux * force;
             disp[edge.from].1 -= uy * force;
@@ -282,20 +417,169 @@ pub fn layout(graph: &Graph, width: f32, height: f32, iterations: usize) -> Vec<
             disp[edge.to].1 += uy * force;
         }
 
-        for i in 0..n {
-            let (dx, dy) = disp[i];
-            let length = (dx * dx + dy * dy).sqrt().max(0.01);
-            let step = length.min(temperature);
-            pos[i].0 += dx / length * step;
-            pos[i].1 += dy / length * step;
-            pos[i].0 = pos[i].0.clamp(0.0, width);
-            pos[i].1 = pos[i].1.clamp(0.0, height);
+        // A weak centre pull and soft walls keep disconnected notes on screen.
+        for (i, (x, y)) in self.positions.iter().enumerate() {
+            let radius =
+                node_radius(graph.nodes[i].links, graph.nodes[i].words) + self.params.padding;
+            disp[i].0 += (center.0 - x) * self.params.center_force;
+            disp[i].1 += (center.1 - y) * self.params.center_force;
+            if *x < radius {
+                disp[i].0 += (radius - x) * 0.2;
+            }
+            if *x > self.params.width - radius {
+                disp[i].0 -= (x - (self.params.width - radius)) * 0.2;
+            }
+            if *y < radius {
+                disp[i].1 += (radius - y) * 0.2;
+            }
+            if *y > self.params.height - radius {
+                disp[i].1 -= (y - (self.params.height - radius)) * 0.2;
+            }
         }
 
-        temperature = (temperature - cooling).max(0.0);
+        // The step shrinks with alpha, so the graph slows down instead of
+        // oscillating forever.
+        let max_step = (14.0 * self.alpha).max(0.4);
+        for (i, (dx, dy)) in disp.iter().enumerate().take(n) {
+            if self.pinned[i] {
+                continue;
+            }
+            let (dx, dy) = (*dx, *dy);
+            let length = (dx * dx + dy * dy).sqrt();
+            if length > 0.001 {
+                let step = length.min(max_step);
+                self.positions[i].0 += dx / length * step;
+                self.positions[i].1 += dy / length * step;
+            }
+        }
+
+        self.resolve_collisions(graph, 2);
+        self.clamp_to_bounds(graph);
+        self.alpha *= self.decay;
+        self.steps += 1;
+        self.is_active()
     }
 
-    pos
+    /// Run the simulation to rest. Used by the headless [`layout`] entry point.
+    pub fn settle(&mut self, graph: &Graph) {
+        for _ in 0..self.params.iterations.max(1) {
+            if !self.step(graph, 1.0 / 60.0) {
+                break;
+            }
+        }
+        // Forces can leave a tiny residual overlap at an edge. A few direct
+        // separation passes make the final positions usable for hit-testing.
+        for _ in 0..32 {
+            self.resolve_collisions(graph, 2);
+            self.clamp_to_bounds(graph);
+        }
+        self.alpha = 0.0;
+    }
+
+    fn resolve_collisions(&mut self, graph: &Graph, passes: usize) {
+        let n = self.positions.len().min(graph.nodes.len());
+        const EPSILON: f32 = 0.001;
+
+        for _ in 0..passes {
+            for i in 0..n {
+                for j in (i + 1)..n {
+                    let min_distance = node_radius(graph.nodes[i].links, graph.nodes[i].words)
+                        + node_radius(graph.nodes[j].links, graph.nodes[j].words)
+                        + self.params.collision_gap;
+                    let dx = self.positions[i].0 - self.positions[j].0;
+                    let dy = self.positions[i].1 - self.positions[j].1;
+                    let distance = (dx * dx + dy * dy).sqrt();
+                    if distance >= min_distance {
+                        continue;
+                    }
+
+                    let (ux, uy) = if distance > EPSILON {
+                        (dx / distance, dy / distance)
+                    } else {
+                        // Two nodes exactly on top of each other: pick a stable
+                        // direction from their indices.
+                        let angle = std::f32::consts::TAU * ((i * 37 + j * 17) % n.max(1)) as f32
+                            / n.max(1) as f32;
+                        (angle.cos(), angle.sin())
+                    };
+                    let overlap = min_distance - distance;
+                    let (wi, wj) = match (self.pinned[i], self.pinned[j]) {
+                        (false, false) => (0.5, 0.5),
+                        (true, false) => (0.0, 1.0),
+                        (false, true) => (1.0, 0.0),
+                        (true, true) => (0.0, 0.0),
+                    };
+                    self.positions[i].0 += ux * overlap * wi;
+                    self.positions[i].1 += uy * overlap * wi;
+                    self.positions[j].0 -= ux * overlap * wj;
+                    self.positions[j].1 -= uy * overlap * wj;
+                }
+            }
+            self.clamp_to_bounds(graph);
+        }
+    }
+
+    fn clamp_to_bounds(&mut self, graph: &Graph) {
+        let n = self.positions.len().min(graph.nodes.len());
+        for i in 0..n {
+            let radius =
+                node_radius(graph.nodes[i].links, graph.nodes[i].words) + self.params.padding;
+            let (x, y) = self.positions[i];
+            self.positions[i].0 = clamp_axis(x, radius, self.params.width);
+            self.positions[i].1 = clamp_axis(y, radius, self.params.height);
+        }
+    }
+}
+
+fn clamp_axis(value: f32, margin: f32, length: f32) -> f32 {
+    let low = margin;
+    let high = length - margin;
+    if low <= high {
+        value.clamp(low, high)
+    } else {
+        length / 2.0
+    }
+}
+
+fn initial_positions(graph: &Graph, params: &LayoutParams) -> Vec<(f32, f32)> {
+    let n = graph.nodes.len();
+    if n == 0 {
+        return Vec::new();
+    }
+
+    let center = (params.width / 2.0, params.height / 2.0);
+    if n == 1 {
+        return vec![center];
+    }
+
+    let max_radius = graph
+        .nodes
+        .iter()
+        .map(|node| node_radius(node.links, node.words))
+        .fold(0.0f32, f32::max);
+    let ring =
+        ((params.width.min(params.height) / 2.0) - max_radius - params.padding).max(10.0) * 0.75;
+
+    (0..n)
+        .map(|i| {
+            let angle = std::f32::consts::TAU * (i as f32) / (n as f32);
+            // A small deterministic jitter stops symmetric nodes from stacking.
+            let jitter = 1.0 + ((i * 2654435761usize % 1000) as f32 / 1000.0 - 0.5) * 0.1;
+            (
+                center.0 + ring * angle.cos() * jitter,
+                center.1 + ring * angle.sin() * jitter,
+            )
+        })
+        .collect()
+}
+
+/// Deterministic force-directed layout inside `width` x `height`.
+///
+/// Use [`GraphLayout`] directly when the caller wants to animate the simulation.
+pub fn layout(graph: &Graph, width: f32, height: f32, iterations: usize) -> Vec<(f32, f32)> {
+    let mut layout = GraphLayout::new(graph, LayoutParams::new(width, height, iterations));
+    layout.settle(graph);
+    layout.positions
 }
 
 #[cfg(test)]
@@ -436,5 +720,184 @@ mod tests {
         }
 
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn dense_graph(n: usize) -> Graph {
+        let nodes = (0..n)
+            .map(|id| Node {
+                id,
+                relative: format!("note-{id}.md"),
+                links: id % 9,
+                words: id * 17,
+            })
+            .collect();
+        let mut edges = Vec::new();
+        for i in 0..n {
+            edges.push(Edge {
+                from: i,
+                to: (i + 1) % n,
+                kind: EdgeKind::Link,
+                weight: 1,
+            });
+            if i % 3 == 0 {
+                edges.push(Edge {
+                    from: i,
+                    to: (i + 7) % n,
+                    kind: EdgeKind::Embed,
+                    weight: 1,
+                });
+            }
+        }
+        Graph { nodes, edges }
+    }
+
+    #[test]
+    fn layout_does_not_overlap_node_circles() {
+        let graph = dense_graph(80);
+        let params = LayoutParams::new(1000.0, 600.0, 240);
+        let mut layout = GraphLayout::new(&graph, params);
+        layout.settle(&graph);
+
+        let positions = layout.positions();
+        assert_eq!(positions.len(), graph.nodes.len());
+        for i in 0..positions.len() {
+            for j in (i + 1)..positions.len() {
+                let dx = positions[i].0 - positions[j].0;
+                let dy = positions[i].1 - positions[j].1;
+                let distance = (dx * dx + dy * dy).sqrt();
+                let min = node_radius(graph.nodes[i].links, graph.nodes[i].words)
+                    + node_radius(graph.nodes[j].links, graph.nodes[j].words)
+                    + params.collision_gap;
+                assert!(
+                    distance + 0.01 >= min,
+                    "nodes {i} and {j} overlap: distance {distance}, minimum {min}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn layout_keeps_every_circle_inside_the_canvas() {
+        let graph = dense_graph(80);
+        let params = LayoutParams::new(1000.0, 600.0, 240);
+        let mut layout = GraphLayout::new(&graph, params);
+        layout.settle(&graph);
+
+        for (id, (x, y)) in layout.positions().iter().enumerate() {
+            let radius = node_radius(graph.nodes[id].links, graph.nodes[id].words) + params.padding;
+            assert!((*x >= radius - 0.01 && *x <= params.width - radius + 0.01));
+            assert!((*y >= radius - 0.01 && *y <= params.height - radius + 0.01));
+        }
+    }
+
+    #[test]
+    fn layout_stops_after_settling() {
+        let graph = dense_graph(20);
+        let mut layout = GraphLayout::new(&graph, LayoutParams::new(800.0, 500.0, 60));
+        let mut steps = 0;
+        while layout.step(&graph, 1.0 / 60.0) {
+            steps += 1;
+            assert!(steps < 500, "layout did not settle");
+        }
+        assert!(!layout.is_active());
+        assert!(!layout.step(&graph, 1.0 / 60.0));
+    }
+
+    #[test]
+    fn a_pinned_node_stays_where_the_pointer_left_it() {
+        let graph = dense_graph(20);
+        let mut layout = GraphLayout::new(&graph, LayoutParams::new(800.0, 500.0, 120));
+        layout.pin(0, true);
+        layout.set_position(0, (400.0, 250.0));
+        layout.reheat(1.0);
+        for _ in 0..12 {
+            layout.step(&graph, 1.0 / 60.0);
+        }
+        assert_eq!(layout.positions()[0], (400.0, 250.0));
+    }
+
+    #[test]
+    fn collision_pushes_other_nodes_away_from_a_dragged_node() {
+        let graph = dense_graph(10);
+        let params = LayoutParams::new(800.0, 500.0, 120);
+        let mut layout = GraphLayout::new(&graph, params);
+        layout.settle(&graph);
+        let target = layout.positions()[1];
+        layout.pin(0, true);
+        layout.set_position(0, target);
+        layout.reheat(1.0);
+        for _ in 0..12 {
+            layout.step(&graph, 1.0 / 60.0);
+        }
+
+        let distance = {
+            let a = layout.positions()[0];
+            let b = layout.positions()[1];
+            ((a.0 - b.0).powi(2) + (a.1 - b.1).powi(2)).sqrt()
+        };
+        let minimum = node_radius(graph.nodes[0].links, graph.nodes[0].words)
+            + node_radius(graph.nodes[1].links, graph.nodes[1].words)
+            + params.collision_gap;
+        assert!(distance + 0.01 >= minimum);
+    }
+
+    #[test]
+    fn repeated_references_thicken_one_edge_and_count_one_link() {
+        let dir = vault("weights");
+        let notes = vec![
+            note(&dir, "a.md", "[[b]] and [[b]] and ![[b]]\n"),
+            note(&dir, "b.md", "b\n"),
+        ];
+        let graph = build(&notes);
+        assert_eq!(graph.nodes[0].links, 1);
+        assert_eq!(graph.edges.len(), 1);
+        assert_eq!(graph.edges[0].weight, 3);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn node_radius_uses_words_and_links() {
+        let small = node_radius(0, 10);
+        let long = node_radius(0, 5_000);
+        let linked = node_radius(40, 10);
+        assert!(long > small);
+        assert!(linked > small);
+        assert!(node_radius(1_000_000, 1_000_000) <= 28.0);
+    }
+
+    #[test]
+    fn stronger_centre_force_compacts_the_graph() {
+        let graph = dense_graph(40);
+        let base = LayoutParams::new(1000.0, 600.0, 120);
+        let mut weak = GraphLayout::new(
+            &graph,
+            LayoutParams {
+                center_force: 0.0,
+                ..base
+            },
+        );
+        let mut strong = GraphLayout::new(
+            &graph,
+            LayoutParams {
+                center_force: 0.08,
+                ..base
+            },
+        );
+        for _ in 0..30 {
+            weak.step(&graph, 1.0 / 60.0);
+            strong.step(&graph, 1.0 / 60.0);
+        }
+
+        let mean_radius = |layout: &GraphLayout| {
+            let (cx, cy) = (base.width / 2.0, base.height / 2.0);
+            layout
+                .positions()
+                .iter()
+                .map(|(x, y)| ((x - cx).powi(2) + (y - cy).powi(2)).sqrt())
+                .sum::<f32>()
+                / layout.positions().len() as f32
+        };
+        assert!(mean_radius(&strong) < mean_radius(&weak));
     }
 }

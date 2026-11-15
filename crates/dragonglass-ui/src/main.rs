@@ -46,7 +46,7 @@ const HOTKEYS: &[(&str, &str, &str)] = &[
     ("OpenDaily", "secondary+shift+d", "Daily note"),
     ("OpenWeekly", "secondary+shift+w", "Weekly note"),
     ("OpenMonthly", "secondary+shift+m", "Monthly note"),
-    ("OpenProperties", "secondary+shift+p", "Properties"),
+    ("OpenProperties", "secondary+alt+p", "Properties"),
     ("ToggleBookmark", "secondary+shift+b", "Toggle bookmark"),
     ("OpenGit", "secondary+g", "Git"),
     ("ToggleTheme", "secondary+shift+l", "Toggle theme"),
@@ -153,9 +153,9 @@ use editor::Editor;
 use gpui::{
     actions, anchored, div, prelude::*, px, size, uniform_list, AnyElement, App, Application,
     Bounds, Context, Corner, CursorStyle, ElementId, Entity, FocusHandle, Focusable, KeyBinding,
-    KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, NavigationDirection,
-    Pixels, Point, Render, ScrollStrategy, Timer, UniformListScrollHandle, WeakEntity, Window,
-    WindowBounds, WindowOptions,
+    KeyDownEvent, Keystroke, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
+    NavigationDirection, Pixels, Point, Render, ScrollHandle, ScrollStrategy, Timer,
+    UniformListScrollHandle, WeakEntity, Window, WindowBounds, WindowOptions,
 };
 use graph_view::GraphView;
 use reading::ReadingCache;
@@ -423,6 +423,8 @@ struct Switcher {
     query: String,
     results: Vec<SwitcherItem>,
     selected: usize,
+    /// Keeps the selected row in view as the arrow keys move down the list.
+    scroll: ScrollHandle,
     /// When editing an existing property, its key; `None` when adding one.
     property_key: Option<String>,
     /// Action being rebound, while capturing a keystroke.
@@ -1461,6 +1463,7 @@ impl DragonGlassApp {
             query: self.active.clone().unwrap_or_default(),
             results: Vec::new(),
             selected: 0,
+            scroll: ScrollHandle::new(),
             property_key: None,
             capture_action: None,
         });
@@ -2405,6 +2408,21 @@ impl DragonGlassApp {
         cx.notify();
     }
 
+    /// Filter the command list by a case-insensitive substring of its label.
+    fn filter_command_items(items: Vec<SwitcherItem>, query: &str) -> Vec<SwitcherItem> {
+        let needle = query.trim().to_lowercase();
+        if needle.is_empty() {
+            return items;
+        }
+        items
+            .into_iter()
+            .filter(|item| {
+                item.label.to_lowercase().contains(&needle)
+                    || item.detail.to_lowercase().contains(&needle)
+            })
+            .collect()
+    }
+
     fn compute_results(&self, mode: SwitcherMode, query: &str) -> Vec<SwitcherItem> {
         match mode {
             SwitcherMode::QuickSwitch => search::fuzzy_notes(&self.note_refs, query, 20)
@@ -2705,119 +2723,122 @@ impl DragonGlassApp {
                     item: Item::Issue(issue.line),
                 })
                 .collect(),
-            SwitcherMode::CommandsMenu => vec![
-                command_item("Quick switcher", "secondary+o", CommandId::QuickSwitch),
-                command_item("Search", "secondary+shift+f", CommandId::Search),
-                command_item("Daily note", "secondary+shift+d", CommandId::Daily),
-                command_item("Weekly note", "secondary+shift+w", CommandId::Weekly),
-                command_item("Monthly note", "secondary+shift+m", CommandId::Monthly),
-                command_item("Properties", "secondary+shift+p", CommandId::Properties),
-                command_item("Toggle bookmark", "secondary+shift+b", CommandId::Bookmark),
-                command_item("Git", "secondary+g", CommandId::Git),
-                command_item(
-                    "Toggle reading mode",
-                    "secondary+e",
-                    CommandId::ToggleReading,
-                ),
-                command_item(
-                    "Find and replace",
-                    "secondary-alt+f",
-                    CommandId::FindReplace,
-                ),
-                command_item("Toggle Vim mode", "secondary-alt+v", CommandId::ToggleVim),
-                command_item(
-                    "Fold/unfold heading",
-                    "secondary-shift+[",
-                    CommandId::ToggleFold,
-                ),
-                command_item("Save", "secondary+s", CommandId::Save),
-                command_item("Toggle theme", "secondary+shift+l", CommandId::ToggleTheme),
-                command_item("Settings", "secondary-,", CommandId::Settings),
-                command_item("New note", "", CommandId::NewNote),
-                command_item("New folder", "", CommandId::NewFolder),
-                command_item("Rename current note", "", CommandId::RenameNote),
-                command_item("Delete current note", "", CommandId::DeleteNote),
-                command_item("Save note as", "", CommandId::SaveAs),
-                command_item("Toggle zen mode", "secondary-alt+z", CommandId::Zen),
-                command_item("File recovery", "", CommandId::History),
-                command_item("Check for updates", "", CommandId::CheckUpdates),
-                command_item("Graph view", "secondary+shift+g", CommandId::OpenGraph),
-                command_item(
-                    "Document relations",
-                    "secondary+shift+r",
-                    CommandId::Relations,
-                ),
-                command_item("Relation graph", "", CommandId::RelationGraph),
-                command_item("A/B versions", "", CommandId::Versions),
-                command_item("Save as version A", "", CommandId::SaveVersionA),
-                command_item("Save as version B", "", CommandId::SaveVersionB),
-                command_item("Insert template", "", CommandId::InsertTemplate),
-                command_item("New note from template", "", CommandId::NewFromTemplate),
-                command_item("Insert shared block", "", CommandId::InsertShared),
-                command_item("Edit shared block", "", CommandId::EditShared),
-                command_item(
-                    "Extract selection as shared block",
-                    "",
-                    CommandId::ExtractShared,
-                ),
-                command_item("Reload note from disk", "", CommandId::ReloadNote),
-                command_item("Review document", "", CommandId::ReviewDocument),
-                command_item("Move block up", "ctrl-shift+up", CommandId::MoveBlockUp),
-                command_item(
-                    "Move block down",
-                    "ctrl-shift+down",
-                    CommandId::MoveBlockDown,
-                ),
-                command_item("Duplicate block", "", CommandId::DuplicateBlock),
-                command_item("Delete block", "", CommandId::DeleteBlock),
-                command_item("Add related note", "", CommandId::AddRelation),
-                command_item("Run a query", "", CommandId::RunQuery),
-                command_item("Save workspace", "", CommandId::SaveWorkspace),
-                command_item("Keyboard shortcuts", "", CommandId::Hotkeys),
-                command_item("Graph: filter", "", CommandId::GraphFilter),
-                command_item("Graph: cycle depth", "", CommandId::GraphDepth),
-                command_item("Toggle snippets", "", CommandId::ToggleSnippets),
-                command_item(
-                    "Read and write side by side",
-                    "secondary-alt+1",
-                    CommandId::TogglePreview,
-                ),
-                command_item("Pop preview out to a window", "", CommandId::DetachPreview),
-                command_item("Load workspace", "", CommandId::LoadWorkspace),
-                command_item("Open vault", "", CommandId::OpenVault),
-                command_item("New window", "secondary+n", CommandId::NewWindow),
-                command_item(
-                    "Move tab to new window",
-                    "secondary-alt+n",
-                    CommandId::DetachTab,
-                ),
-                command_item(
-                    "Two editors side by side",
-                    "secondary-alt+2",
-                    CommandId::ToggleSplitEditor,
-                ),
-                command_item("Close tab", "secondary+w", CommandId::CloseTab),
-                command_item("Next tab", "ctrl-tab", CommandId::NextTab),
-                command_item("Previous tab", "ctrl-shift-tab", CommandId::PrevTab),
-            ]
-            .into_iter()
-            .chain(
-                self.user_themes
-                    .iter()
-                    .enumerate()
-                    .map(|(index, (name, _))| {
-                        command_item(&format!("Theme: {name}"), "", CommandId::UserTheme(index))
-                    }),
-            )
-            .chain(
-                self.plugin_commands
-                    .iter()
-                    .enumerate()
-                    .map(|(index, (_, _, title))| {
-                        command_item(title, "plugin", CommandId::Plugin(index))
-                    }),
-            )
-            .collect(),
+            SwitcherMode::CommandsMenu => Self::filter_command_items(
+                vec![
+                    command_item("Quick switcher", "secondary+o", CommandId::QuickSwitch),
+                    command_item("Search", "secondary+shift+f", CommandId::Search),
+                    command_item("Daily note", "secondary+shift+d", CommandId::Daily),
+                    command_item("Weekly note", "secondary+shift+w", CommandId::Weekly),
+                    command_item("Monthly note", "secondary+shift+m", CommandId::Monthly),
+                    command_item("Properties", "secondary+alt+p", CommandId::Properties),
+                    command_item("Toggle bookmark", "secondary+shift+b", CommandId::Bookmark),
+                    command_item("Git", "secondary+g", CommandId::Git),
+                    command_item(
+                        "Toggle reading mode",
+                        "secondary+e",
+                        CommandId::ToggleReading,
+                    ),
+                    command_item(
+                        "Find and replace",
+                        "secondary-alt+f",
+                        CommandId::FindReplace,
+                    ),
+                    command_item("Toggle Vim mode", "secondary-alt+v", CommandId::ToggleVim),
+                    command_item(
+                        "Fold/unfold heading",
+                        "secondary-shift+[",
+                        CommandId::ToggleFold,
+                    ),
+                    command_item("Save", "secondary+s", CommandId::Save),
+                    command_item("Toggle theme", "secondary+shift+l", CommandId::ToggleTheme),
+                    command_item("Settings", "secondary-,", CommandId::Settings),
+                    command_item("New note", "", CommandId::NewNote),
+                    command_item("New folder", "", CommandId::NewFolder),
+                    command_item("Rename current note", "", CommandId::RenameNote),
+                    command_item("Delete current note", "", CommandId::DeleteNote),
+                    command_item("Save note as", "", CommandId::SaveAs),
+                    command_item("Toggle zen mode", "secondary-alt+z", CommandId::Zen),
+                    command_item("File recovery", "", CommandId::History),
+                    command_item("Check for updates", "", CommandId::CheckUpdates),
+                    command_item("Graph view", "secondary+shift+g", CommandId::OpenGraph),
+                    command_item(
+                        "Document relations",
+                        "secondary+shift+r",
+                        CommandId::Relations,
+                    ),
+                    command_item("Relation graph", "", CommandId::RelationGraph),
+                    command_item("A/B versions", "", CommandId::Versions),
+                    command_item("Save as version A", "", CommandId::SaveVersionA),
+                    command_item("Save as version B", "", CommandId::SaveVersionB),
+                    command_item("Insert template", "", CommandId::InsertTemplate),
+                    command_item("New note from template", "", CommandId::NewFromTemplate),
+                    command_item("Insert shared block", "", CommandId::InsertShared),
+                    command_item("Edit shared block", "", CommandId::EditShared),
+                    command_item(
+                        "Extract selection as shared block",
+                        "",
+                        CommandId::ExtractShared,
+                    ),
+                    command_item("Reload note from disk", "", CommandId::ReloadNote),
+                    command_item("Review document", "", CommandId::ReviewDocument),
+                    command_item("Move block up", "ctrl-shift+up", CommandId::MoveBlockUp),
+                    command_item(
+                        "Move block down",
+                        "ctrl-shift+down",
+                        CommandId::MoveBlockDown,
+                    ),
+                    command_item("Duplicate block", "", CommandId::DuplicateBlock),
+                    command_item("Delete block", "", CommandId::DeleteBlock),
+                    command_item("Add related note", "", CommandId::AddRelation),
+                    command_item("Run a query", "", CommandId::RunQuery),
+                    command_item("Save workspace", "", CommandId::SaveWorkspace),
+                    command_item("Keyboard shortcuts", "", CommandId::Hotkeys),
+                    command_item("Graph: filter", "", CommandId::GraphFilter),
+                    command_item("Graph: cycle depth", "", CommandId::GraphDepth),
+                    command_item("Toggle snippets", "", CommandId::ToggleSnippets),
+                    command_item(
+                        "Read and write side by side",
+                        "secondary-alt+1",
+                        CommandId::TogglePreview,
+                    ),
+                    command_item("Pop preview out to a window", "", CommandId::DetachPreview),
+                    command_item("Load workspace", "", CommandId::LoadWorkspace),
+                    command_item("Open vault", "", CommandId::OpenVault),
+                    command_item("New window", "secondary+n", CommandId::NewWindow),
+                    command_item(
+                        "Move tab to new window",
+                        "secondary-alt+n",
+                        CommandId::DetachTab,
+                    ),
+                    command_item(
+                        "Two editors side by side",
+                        "secondary-alt+2",
+                        CommandId::ToggleSplitEditor,
+                    ),
+                    command_item("Close tab", "secondary+w", CommandId::CloseTab),
+                    command_item("Next tab", "ctrl-tab", CommandId::NextTab),
+                    command_item("Previous tab", "ctrl-shift-tab", CommandId::PrevTab),
+                ]
+                .into_iter()
+                .chain(
+                    self.user_themes
+                        .iter()
+                        .enumerate()
+                        .map(|(index, (name, _))| {
+                            command_item(&format!("Theme: {name}"), "", CommandId::UserTheme(index))
+                        }),
+                )
+                .chain(
+                    self.plugin_commands
+                        .iter()
+                        .enumerate()
+                        .map(|(index, (_, _, title))| {
+                            command_item(title, "plugin", CommandId::Plugin(index))
+                        }),
+                )
+                .collect(),
+                query,
+            ),
         }
     }
 
@@ -2827,6 +2848,7 @@ impl DragonGlassApp {
             query: String::new(),
             results: self.compute_results(mode, ""),
             selected: 0,
+            scroll: ScrollHandle::new(),
             property_key: None,
             capture_action: None,
         });
@@ -2880,6 +2902,7 @@ impl DragonGlassApp {
             query: query.to_string(),
             results: self.compute_results(SwitcherMode::Search, query),
             selected: 0,
+            scroll: ScrollHandle::new(),
             property_key: None,
             capture_action: None,
         });
@@ -3026,6 +3049,10 @@ impl DragonGlassApp {
         cx.notify();
     }
 
+    fn open_graph_action(&mut self, _: &OpenGraph, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_graph(window, cx);
+    }
+
     fn open_graph(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(view) = self.graph_view.clone() else {
             return;
@@ -3036,9 +3063,9 @@ impl DragonGlassApp {
         view.update(cx, |graph_view, cx| {
             match &active {
                 Some(relative) => graph_view.show_local(&full, relative),
-                None => graph_view.set_graph(full.clone()),
+                None => graph_view.show_global(&full),
             }
-            cx.notify();
+            graph_view.reset_view(cx);
         });
 
         self.show_graph = true;
@@ -3065,8 +3092,8 @@ impl DragonGlassApp {
         };
         let enriched = relations::graph(&self.note_refs);
         view.update(cx, |view, cx| {
-            view.set_graph(enriched.clone());
-            cx.notify();
+            view.show_global(&enriched);
+            view.reset_view(cx);
         });
         self.show_graph = true;
         self.show_query = false;
@@ -6605,11 +6632,13 @@ impl DragonGlassApp {
             }
             "up" => {
                 panel.selected = panel.selected.saturating_sub(1);
+                panel.scroll.scroll_to_item(panel.selected + 1);
             }
             "down" => {
                 if panel.selected + 1 < panel.results.len() {
                     panel.selected += 1;
                 }
+                panel.scroll.scroll_to_item(panel.selected + 1);
             }
             "backspace" => {
                 panel.query.pop();
@@ -6628,6 +6657,7 @@ impl DragonGlassApp {
         if query_changed {
             panel.results = self.compute_results(panel.mode, &panel.query);
             panel.selected = 0;
+            panel.scroll.scroll_to_item(1);
         }
 
         self.switcher = Some(panel);
@@ -7786,6 +7816,17 @@ impl Render for DragonGlassApp {
                 SwitcherMode::SettingInput => "setting:",
             };
             let rows = panel.results.iter().enumerate().map(|(i, item)| {
+                let select = cx.listener(move |this, _event, window, cx| {
+                    cx.stop_propagation();
+                    if let Some(panel) = this.switcher.as_mut() {
+                        panel.selected = i;
+                    }
+                    let enter = KeyDownEvent {
+                        keystroke: Keystroke::parse("enter").expect("enter is a valid key"),
+                        is_held: false,
+                    };
+                    this.on_switcher_key(&enter, window, cx);
+                });
                 let mut row = div()
                     .flex()
                     .flex_row()
@@ -7794,6 +7835,8 @@ impl Render for DragonGlassApp {
                     .h(px(28.0))
                     .px_3()
                     .text_sm()
+                    .cursor_pointer()
+                    .on_mouse_down(MouseButton::Left, select)
                     .child(item.label.clone())
                     .child(div().text_color(theme.muted).child(item.detail.clone()));
                 if i == panel.selected {
@@ -7808,6 +7851,7 @@ impl Render for DragonGlassApp {
                 .id("switcher")
                 .key_context("Switcher")
                 .track_focus(&self.switcher_focus)
+                .track_scroll(&panel.scroll)
                 .on_key_down(cx.listener(Self::on_switcher_key))
                 .flex()
                 .flex_col()
@@ -7875,6 +7919,7 @@ impl Render for DragonGlassApp {
                 .on_action(cx.listener(Self::open_search))
                 .on_action(cx.listener(Self::open_git))
                 .on_action(cx.listener(Self::open_relations))
+                .on_action(cx.listener(Self::open_graph_action))
                 .on_action(cx.listener(Self::open_daily))
                 .on_action(cx.listener(Self::open_weekly))
                 .on_action(cx.listener(Self::open_monthly))
@@ -8338,6 +8383,7 @@ impl Render for DragonGlassApp {
             .on_action(cx.listener(Self::open_search))
             .on_action(cx.listener(Self::open_git))
             .on_action(cx.listener(Self::open_relations))
+            .on_action(cx.listener(Self::open_graph_action))
             .on_action(cx.listener(Self::open_daily))
             .on_action(cx.listener(Self::open_weekly))
             .on_action(cx.listener(Self::open_monthly))
@@ -8722,6 +8768,8 @@ fn main() {
             KeyBinding::new("ctrl-pageup", PrevTab, None),
             KeyBinding::new("secondary-q", Quit, None),
             KeyBinding::new("secondary-alt-v", ToggleVim, None),
+            // Standard command-palette alias. Properties moved to Cmd/Ctrl+Alt+P.
+            KeyBinding::new("secondary-shift-p", OpenCommands, None),
         ]);
         // Command-H is Hide on macOS and Ctrl-H is find/replace elsewhere.
         #[cfg(target_os = "macos")]
@@ -9210,6 +9258,30 @@ mod tests {
         assert!(needs_link_confirmation("tel:+123"));
         // Opening a local attachment does not need a prompt.
         assert!(!needs_link_confirmation("file:///tmp/note.pdf"));
+    }
+
+    #[test]
+    fn command_palette_filters_commands_case_insensitively() {
+        let filtered = DragonGlassApp::filter_command_items(
+            vec![
+                command_item("Graph view", "", CommandId::OpenGraph),
+                command_item("Daily note", "", CommandId::Daily),
+            ],
+            "GRAPH",
+        );
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].label, "Graph view");
+        assert_eq!(
+            DragonGlassApp::filter_command_items(
+                vec![
+                    command_item("Graph view", "", CommandId::OpenGraph),
+                    command_item("Daily note", "", CommandId::Daily),
+                ],
+                "",
+            )
+            .len(),
+            2
+        );
     }
 
     #[test]
