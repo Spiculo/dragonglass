@@ -9,11 +9,11 @@ use std::collections::{HashMap, HashSet};
 
 use dragonglass_core::graph::{self, Graph, GraphLayout, LayoutParams};
 use gpui::{
-    div, fill, outline, point, prelude::*, px, relative, size, App, Bounds, ContentMask, Context,
-    Corners, Element, ElementId, Entity, FocusHandle, Focusable, GlobalElementId, Hsla,
-    InspectorElementId, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
-    PathBuilder, Pixels, Point, Render, ScrollDelta, ScrollWheelEvent, ShapedLine, SharedString,
-    Style, TextRun, WeakEntity, Window,
+    div, fill, outline, point, prelude::*, px, relative, size, AnyElement, App, Bounds,
+    ContentMask, Context, Corners, Element, ElementId, Entity, FocusHandle, Focusable,
+    GlobalElementId, Hsla, InspectorElementId, LayoutId, MouseButton, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, PathBuilder, Pixels, Point, Render, ScrollDelta,
+    ScrollWheelEvent, ShapedLine, SharedString, Style, TextRun, WeakEntity, Window,
 };
 
 use crate::theme::Theme;
@@ -38,6 +38,7 @@ const PAN_MARGIN: f32 = 48.0;
 pub struct GraphView {
     graph: Graph,
     layout: GraphLayout,
+    params: LayoutParams,
     /// The whole vault graph, before the local window and filter are applied.
     full: Graph,
     focus: Option<String>,
@@ -61,6 +62,80 @@ pub struct GraphView {
     /// Shaped labels, keyed by name and quantized alpha.
     label_cache: HashMap<(String, u8), ShapedLine>,
     label_color: Option<Hsla>,
+    show_forces: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ForceField {
+    Center,
+    Repel,
+    Link,
+    Distance,
+}
+
+impl ForceField {
+    const ALL: [ForceField; 4] = [
+        ForceField::Center,
+        ForceField::Repel,
+        ForceField::Link,
+        ForceField::Distance,
+    ];
+
+    fn key(self) -> &'static str {
+        match self {
+            ForceField::Center => "center",
+            ForceField::Repel => "repel",
+            ForceField::Link => "link",
+            ForceField::Distance => "distance",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            ForceField::Center => "centre",
+            ForceField::Repel => "repel",
+            ForceField::Link => "link",
+            ForceField::Distance => "distance",
+        }
+    }
+
+    fn value(self, params: &LayoutParams) -> f32 {
+        match self {
+            ForceField::Center => params.center_force,
+            ForceField::Repel => params.repel,
+            ForceField::Link => params.link_force,
+            ForceField::Distance => params.link_distance,
+        }
+    }
+
+    fn set(self, params: &mut LayoutParams, value: f32) {
+        let (min, max, _) = self.range();
+        let value = value.clamp(min, max);
+        match self {
+            ForceField::Center => params.center_force = value,
+            ForceField::Repel => params.repel = value,
+            ForceField::Link => params.link_force = value,
+            ForceField::Distance => params.link_distance = value,
+        }
+    }
+
+    fn range(self) -> (f32, f32, f32) {
+        match self {
+            ForceField::Center => (0.0, 0.10, 0.005),
+            ForceField::Repel => (0.0, 0.10, 0.005),
+            ForceField::Link => (0.0, 0.20, 0.01),
+            ForceField::Distance => (0.0, 200.0, 10.0),
+        }
+    }
+
+    fn display(self, params: &LayoutParams) -> String {
+        let value = self.value(params);
+        match self {
+            ForceField::Distance if value <= 0.0 => "auto".to_string(),
+            ForceField::Distance => format!("{value:.0}"),
+            _ => format!("{value:.3}"),
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -81,10 +156,12 @@ struct NodeDrag {
 impl GraphView {
     pub fn new(app: WeakEntity<crate::DragonGlassApp>, cx: &mut Context<Self>) -> Self {
         let empty = Graph::default();
-        let layout = GraphLayout::new(&empty, LayoutParams::new(CANVAS.0, CANVAS.1, LAYOUT_STEPS));
+        let params = LayoutParams::new(CANVAS.0, CANVAS.1, LAYOUT_STEPS);
+        let layout = GraphLayout::new(&empty, params);
         Self {
             graph: empty,
             layout,
+            params,
             full: Graph::default(),
             focus: None,
             filter: String::new(),
@@ -101,6 +178,7 @@ impl GraphView {
             positions: HashMap::new(),
             label_cache: HashMap::new(),
             label_color: None,
+            show_forces: false,
         }
     }
 
@@ -108,11 +186,11 @@ impl GraphView {
     pub fn set_graph(&mut self, graph: Graph) {
         let previous = self.snapshot_positions();
         self.graph = graph;
+        self.params.width = CANVAS.0;
+        self.params.height = CANVAS.1;
+        self.params.iterations = LAYOUT_STEPS;
 
-        let mut layout = GraphLayout::new(
-            &self.graph,
-            LayoutParams::new(CANVAS.0, CANVAS.1, LAYOUT_STEPS),
-        );
+        let mut layout = GraphLayout::new(&self.graph, self.params);
         let mut seeded = 0;
         for (id, node) in self.graph.nodes.iter().enumerate() {
             if let Some(position) = previous.get(&node.relative) {
@@ -166,6 +244,92 @@ impl GraphView {
 
     pub fn depth(&self) -> usize {
         self.depth
+    }
+
+    fn adjust_force(&mut self, field: ForceField, direction: f32, cx: &mut Context<Self>) {
+        let (min, max, step) = field.range();
+        let current = field.value(&self.params);
+        let next = if field == ForceField::Distance && current <= 0.0 {
+            if direction > 0.0 {
+                80.0
+            } else {
+                0.0
+            }
+        } else {
+            current + direction * step
+        };
+        field.set(&mut self.params, next.clamp(min, max));
+        self.apply_forces(cx);
+    }
+
+    fn reset_forces(&mut self, cx: &mut Context<Self>) {
+        self.params = LayoutParams::new(CANVAS.0, CANVAS.1, LAYOUT_STEPS);
+        self.apply_forces(cx);
+    }
+
+    /// Rebuild the simulation with the current force settings, keeping node positions.
+    fn apply_forces(&mut self, cx: &mut Context<Self>) {
+        let current = self.snapshot_positions();
+        self.params.width = CANVAS.0;
+        self.params.height = CANVAS.1;
+        self.params.iterations = LAYOUT_STEPS;
+
+        let mut layout = GraphLayout::new(&self.graph, self.params);
+        for (id, node) in self.graph.nodes.iter().enumerate() {
+            if let Some(position) = current.get(&node.relative) {
+                layout.set_position(id, *position);
+            }
+        }
+        self.layout = layout;
+        self.label_cache.clear();
+        if self.graph.nodes.len() > 1 {
+            self.layout.reheat(0.8);
+        }
+        cx.notify();
+    }
+
+    fn force_control(&self, field: ForceField, theme: Theme, cx: &mut Context<Self>) -> AnyElement {
+        let value = field.display(&self.params);
+        let button = |label: &'static str, id: String, direction: f32| {
+            div()
+                .id(ElementId::Name(id.into()))
+                .w(px(18.0))
+                .h(px(18.0))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded_sm()
+                .cursor_pointer()
+                .bg(theme.chip)
+                .text_color(theme.text)
+                .hover(move |style| style.bg(theme.hover))
+                .child(label)
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _event, _window, cx| {
+                        cx.stop_propagation();
+                        this.adjust_force(field, direction, cx);
+                    }),
+                )
+                .into_any_element()
+        };
+
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_1()
+            .child(field.label())
+            .child(button("−", format!("force-{}-minus", field.key()), -1.0))
+            .child(
+                div()
+                    .min_w(px(42.0))
+                    .text_center()
+                    .text_color(theme.text)
+                    .child(value),
+            )
+            .child(button("+", format!("force-{}-plus", field.key()), 1.0))
+            .into_any_element()
     }
 
     fn rebuild(&mut self) {
@@ -486,6 +650,44 @@ impl Render for GraphView {
 
         self.schedule_frame(window, cx);
 
+        let force_controls: Vec<_> = ForceField::ALL
+            .into_iter()
+            .map(|field| self.force_control(field, theme, cx))
+            .collect();
+        let force_panel = self.show_forces.then(|| {
+            div()
+                .flex()
+                .flex_row()
+                .flex_wrap()
+                .items_center()
+                .gap_3()
+                .px_3()
+                .py_1()
+                .bg(theme.input_bg)
+                .border_b_1()
+                .border_color(theme.border)
+                .text_xs()
+                .text_color(theme.muted)
+                .children(force_controls)
+                .child(
+                    div()
+                        .id("forces-reset")
+                        .px_2()
+                        .rounded_sm()
+                        .cursor_pointer()
+                        .hover(move |style| style.bg(theme.hover))
+                        .child("reset forces")
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _event, _window, cx| {
+                                cx.stop_propagation();
+                                this.reset_forces(cx);
+                            }),
+                        ),
+                )
+                .into_any_element()
+        });
+
         div()
             .key_context("Graph")
             .track_focus(&self.focus_handle)
@@ -511,21 +713,46 @@ impl Render for GraphView {
                     .child("drag nodes or canvas · scroll to zoom · click a node to open · Esc to close")
                     .child(
                         div()
-                            .id("graph-reset")
-                            .px_2()
-                            .rounded_sm()
-                            .cursor_pointer()
-                            .hover(move |style| style.bg(theme.hover))
-                            .child("reset view")
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(|this, _event, _window, cx| {
-                                    cx.stop_propagation();
-                                    this.reset_view(cx);
-                                }),
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .id("graph-forces")
+                                    .px_2()
+                                    .rounded_sm()
+                                    .cursor_pointer()
+                                    .hover(move |style| style.bg(theme.hover))
+                                    .child(if self.show_forces { "forces ✓" } else { "forces" })
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(|this, _event, _window, cx| {
+                                            cx.stop_propagation();
+                                            this.show_forces = !this.show_forces;
+                                            cx.notify();
+                                        }),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .id("graph-reset")
+                                    .px_2()
+                                    .rounded_sm()
+                                    .cursor_pointer()
+                                    .hover(move |style| style.bg(theme.hover))
+                                    .child("reset view")
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(|this, _event, _window, cx| {
+                                            cx.stop_propagation();
+                                            this.reset_view(cx);
+                                        }),
+                                    ),
                             ),
                     ),
             )
+            .children(force_panel)
             .child(
                 div()
                     .id("graph-canvas")
@@ -1230,5 +1457,29 @@ mod tests {
     fn pan_clamping_keeps_a_fallback_for_tiny_windows() {
         assert_eq!(clamp_center(50.0, 100.0, 10.0, 30.0), 30.0);
         assert_eq!(clamp_center(50.0, 10.0, 100.0, 30.0), 50.0);
+    }
+
+    #[test]
+    fn force_fields_clamp_to_their_ranges() {
+        let mut params = LayoutParams::new(1000.0, 600.0, 120);
+        ForceField::Center.set(&mut params, 1.0);
+        assert_eq!(params.center_force, 0.10);
+        ForceField::Repel.set(&mut params, -1.0);
+        assert_eq!(params.repel, 0.0);
+        ForceField::Link.set(&mut params, 0.055);
+        assert_eq!(params.link_force, 0.055);
+        ForceField::Distance.set(&mut params, 500.0);
+        assert_eq!(params.link_distance, 200.0);
+    }
+
+    #[test]
+    fn link_distance_displays_auto_until_it_is_set() {
+        let params = LayoutParams::new(1000.0, 600.0, 120);
+        assert_eq!(ForceField::Distance.display(&params), "auto");
+        let params = LayoutParams {
+            link_distance: 80.0,
+            ..params
+        };
+        assert_eq!(ForceField::Distance.display(&params), "80");
     }
 }

@@ -816,4 +816,39 @@ mod tests {
             + params.collision_gap;
         assert!(distance + 0.01 >= minimum);
     }
+
+    #[test]
+    fn stronger_centre_force_compacts_the_graph() {
+        let graph = dense_graph(40);
+        let base = LayoutParams::new(1000.0, 600.0, 120);
+        let mut weak = GraphLayout::new(
+            &graph,
+            LayoutParams {
+                center_force: 0.0,
+                ..base
+            },
+        );
+        let mut strong = GraphLayout::new(
+            &graph,
+            LayoutParams {
+                center_force: 0.08,
+                ..base
+            },
+        );
+        for _ in 0..30 {
+            weak.step(&graph, 1.0 / 60.0);
+            strong.step(&graph, 1.0 / 60.0);
+        }
+
+        let mean_radius = |layout: &GraphLayout| {
+            let (cx, cy) = (base.width / 2.0, base.height / 2.0);
+            layout
+                .positions()
+                .iter()
+                .map(|(x, y)| ((x - cx).powi(2) + (y - cy).powi(2)).sqrt())
+                .sum::<f32>()
+                / layout.positions().len() as f32
+        };
+        assert!(mean_radius(&strong) < mean_radius(&weak));
+    }
 }
