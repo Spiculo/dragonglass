@@ -60,6 +60,24 @@ Any filter or depth change calls `rebuild`, which calls `set_graph` and computes
 a new layout from scratch. Nodes jump to unrelated positions. `open_graph` also
 keeps the previous zoom and pan, so the graph can reopen off-screen.
 
+### 1.6 Phase 0 baseline
+
+The old layout was measured on `main` (`f551ba9`) in a detached worktree. The
+synthetic graph had 80 notes, a cycle plus chords, and 80 edges. It ran through
+`graph::layout(1000, 600, 120)` with the old radius formula:
+
+- **20 overlapping node pairs**
+- **80 of 80 node centres clamped to an edge**
+- **minimum centre distance 0.00**
+
+The same graph on this branch produces:
+
+- **0 overlapping pairs**
+- **0 nodes against an edge**
+- **minimum centre distance 18.83**
+
+The regression tests below keep the second set of numbers true.
+
 ## 2. How Obsidian handles it
 
 The Obsidian Help page for Graph view describes the user-facing contract:
@@ -318,9 +336,10 @@ Files: `graph_view.rs`, `main.rs`, docs.
 
 - Seed positions from the path cache on rebuild.
 - Reset zoom/pan on open; clamp pan.
-- Add a force settings popover only if it is still wanted after the dynamic
-  layout lands (center, repel, link distance). This is the Obsidian Forces
-  section, but it is not required for the bug fix.
+- Add the force controls in the graph header. The `forces` button opens
+  compact steppers for centre, repel, link force and link distance. Distance
+  reads `auto` until it is set. Values are session-local; persistence is a
+  separate config change.
 - Update `PLAN.md`, `docs/qol-plan.md` and the README feature list.
 
 ## 5. Test matrix
@@ -365,9 +384,8 @@ cargo clippy --all-targets --all-features
 
 ## 6. Decisions and recommendations
 
-1. **Scope.** Do Phases 1–4 in this branch. Phase 5 force sliders can wait.
-   Recommendation: ship the clipping fix first as its own commit, so it can be
-   cherry-picked if the simulation work takes longer.
+1. **Scope.** All five phases are implemented. The clipping fix stays its own
+   commit so it can be cherry-picked if the simulation work needs to be split.
 2. **Dragged node behavior.** Pin the dragged node until the next rebuild.
    Recommendation: pin; it matches "I put it there" expectations and avoids a
    snap-back.
@@ -376,8 +394,8 @@ cargo clippy --all-targets --all-features
    the view.
 4. **Labels.** Use zoom fade plus collision-aware placement. Recommendation:
    yes; always-on labels are the main source of visual overlap.
-5. **Force settings UI.** Defer. Recommendation: expose the parameters in core
-   now, add sliders only if users ask.
+5. **Force settings UI.** Landed as compact steppers in the graph header.
+   Values are session-local; persisting them belongs in the config layer.
 6. **Mobile.** Out of scope. The Android client has no graph view yet; the core
    layout will be reusable when it does.
 
@@ -390,7 +408,7 @@ cargo clippy --all-targets --all-features
 
 ## 8. Landed
 
-The branch contains the plan, four code commits and this document on
+The branch contains the plan, five code commits and this document on
 `fix/graph-node-layout`:
 
 1. `Clip the graph view to its pane` adds `overflow_hidden` on the graph root
@@ -409,17 +427,25 @@ The branch contains the plan, four code commits and this document on
    fade in above zoom 0.7, stay visible for hovered nodes and neighbours, and
    are cached by name plus quantized alpha. Rebuilds seed positions from a path
    cache, opening the graph resets zoom and pan, and pan is clamped.
-5. This document updates the status, behaviour and test notes.
+5. `Add graph force controls` adds the `forces` button and compact steppers for
+   centre, repel, link force and link distance. Every change rebuilds the
+   simulation from the current positions and reheats it. `LayoutParams` keeps
+   the values, and `distance` reads `auto` until it is set.
+6. This document updates the status, behaviour, baseline and test notes.
 
 Verification on the branch:
 
 ```sh
-cargo test -p dragonglass-core -p dragonglass-ui   # 390 core + 104 UI tests
+cargo test -p dragonglass-core -p dragonglass-ui   # 391 core + 106 UI tests
 cargo fmt --all -- --check
 cargo clippy -p dragonglass-core -p dragonglass-ui --all-targets --all-features
 ```
 
 The only clippy warnings are the pre-existing `flow.rs` ones (`large_enum_variant`
-and `too_many_arguments`), which are outside this change. The force-slider UI
-remains open as a follow-up; `LayoutParams` already exposes the values
-(`center_force`, `repel`, `link_force`, `link_distance`).
+and `too_many_arguments`), which are outside this change.
+
+**Remaining manual pass:** the GPUI app needs a display, so the desktop
+acceptance checks for pane clipping, node drag and hover were not run in the
+agent box. The code paths are covered by the clipping mask, the drag/pin tests
+and the hover paint state, but a human should still pan, zoom, drag and hover
+once on a desktop build.

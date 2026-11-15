@@ -112,7 +112,7 @@ the vault** at `.dragon-glass/` and is a **rebuildable cache** (auto-added to th
 - Outgoing links
 - Nested tags + tag pane
 - Graph view (global + local) with filters/depth/folder grouping, a live force layout,
-  radius-aware collision, node drag and hover focus; force sliders still open
+  radius-aware collision, node drag, hover focus and force controls
 - Transclusion `![[note]]`
 
 **Search**
@@ -285,9 +285,9 @@ bookmarks, command palette, hotkey editor, theming (light/dark, user themes, sni
 embeds and attachments (images/PDF/audio, `![[note]]` transclusion, and dragging or pasting
 an image — or a path to one — to file it in the attachments folder), file-recovery snapshots,
 graph view with filters/depth/folder grouping, dashed relation edges, a live force layout,
-radius-aware collision, node drag and zoom-faded labels, external-change handling and the
-update prompt are in. Attachment embeds resolve by file name anywhere in the vault, the way
-Obsidian does.
+radius-aware collision, node drag, hover focus, force controls and zoom-faded labels,
+external-change handling and the update prompt are in. Attachment embeds resolve by file name
+anywhere in the vault, the way Obsidian does.
 
 ## 11. What is deliberately not done
 

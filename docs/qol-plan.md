@@ -945,7 +945,8 @@ control) and fits the canvas uniformly instead of stretching it to the window's 
 Nodes now settle with a live force simulation, reserve their radius during collision, can be
 dragged (the dragged node stays pinned until the graph is rebuilt), and highlight their links
 on hover. Labels fade with zoom, avoid other labels and node circles, and the whole drawing is
-clipped to the graph pane. Android keeps its list/preview scroll, loads restored tabs lazily
+clipped to the graph pane. A `forces` panel in the graph header adjusts the centre, repel,
+link and distance strengths for the current session. Android keeps its list/preview scroll, loads restored tabs lazily
 and has the shared reader settings. The rest of the list is still open.
 
 ---
