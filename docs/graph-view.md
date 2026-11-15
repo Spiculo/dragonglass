@@ -408,7 +408,7 @@ cargo clippy --all-targets --all-features
 
 ## 8. Landed
 
-The branch contains the plan, five code commits and this document on
+The branch contains the plan, the code commits below and the docs on
 `fix/graph-node-layout`:
 
 1. `Clip the graph view to its pane` adds `overflow_hidden` on the graph root
@@ -431,12 +431,16 @@ The branch contains the plan, five code commits and this document on
    centre, repel, link force and link distance. Every change rebuilds the
    simulation from the current positions and reheats it. `LayoutParams` keeps
    the values, and `distance` reads `auto` until it is set.
-6. This document updates the status, behaviour, baseline and test notes.
+6. The follow-up desktop pass found two more issues: pan clamped against the
+   whole virtual canvas, so zoom/pan could leave only empty canvas on screen,
+   and the `Ctrl+Shift+G` shortcut had no action handler. Both are fixed: pan
+   now clamps against the node bounds, and `OpenGraph` is wired on both root
+   views.
 
 Verification on the branch:
 
 ```sh
-cargo test -p dragonglass-core -p dragonglass-ui   # 391 core + 106 UI tests
+cargo test -p dragonglass-core -p dragonglass-ui   # 391 core + 108 UI tests
 cargo fmt --all -- --check
 cargo clippy -p dragonglass-core -p dragonglass-ui --all-targets --all-features
 ```
@@ -444,8 +448,26 @@ cargo clippy -p dragonglass-core -p dragonglass-ui --all-targets --all-features
 The only clippy warnings are the pre-existing `flow.rs` ones (`large_enum_variant`
 and `too_many_arguments`), which are outside this change.
 
-**Remaining manual pass:** the GPUI app needs a display, so the desktop
-acceptance checks for pane clipping, node drag and hover were not run in the
-agent box. The code paths are covered by the clipping mask, the drag/pin tests
-and the hover paint state, but a human should still pan, zoom, drag and hover
-once on a desktop build.
+## 9. Desktop acceptance pass
+
+The app was run under Xvfb with the lavapipe Vulkan driver, a 20-note vault, and
+xdotool for input. Screenshots were captured with ImageMagick. The results:
+
+- **Clipping, right edge:** after dragging the graph to the right, graph pixels
+  stop at the pane edge. The outline strip (`x > 800`) had maximum HSL
+  saturation `0`; the canvas had `0.55`.
+- **Clipping, left edge:** after dragging left, the sidebar strip (`x < 240`)
+  had maximum HSL saturation `0`; the canvas stayed `0.55`.
+- **Zoom at the edge:** zooming at the right edge kept a node on screen and
+  both side strips at saturation `0`.
+- **Hover:** hovering `note-8` drew its halo, kept its edges and neighbours
+  bright, and dimmed the unrelated node.
+- **Drag:** dragging `note-8` moved it to the drop point, kept it pinned, and
+  let the other nodes settle around it.
+- **Forces:** the `forces` panel opened and the centre stepper moved the value
+  from `0.020` to `0.050`; the graph compacted.
+- **Shortcut:** `Ctrl+Shift+G` now opens the graph after the action wiring.
+
+The screenshots live in `target/graph-checks/` during the run and are not
+committed. This closes the manual acceptance pass for pane clipping, drag,
+hover, force controls and the shortcut.
