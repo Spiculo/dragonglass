@@ -12,6 +12,8 @@ pub struct Node {
     pub relative: String,
     /// Resolved outgoing links.
     pub links: usize,
+    /// Body word count, used to make larger notes larger in the graph.
+    pub words: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -29,6 +31,8 @@ pub struct Edge {
     pub from: usize,
     pub to: usize,
     pub kind: EdgeKind,
+    /// Number of references from `from` to `to` (repeated links or embeds).
+    pub weight: usize,
 }
 
 impl Edge {
@@ -76,16 +80,18 @@ pub fn build(notes: &[NoteRef]) -> Graph {
             id,
             relative: note.relative.clone(),
             links: 0,
+            words: 0,
         })
         .collect();
 
-    let mut edges = Vec::new();
-    let mut seen = HashSet::new();
+    let mut edges: Vec<Edge> = Vec::new();
+    let mut edge_index: HashMap<(usize, usize), usize> = HashMap::new();
 
     for (from, note_ref) in notes.iter().enumerate() {
         let Ok(note) = Note::load(&note_ref.path) else {
             continue;
         };
+        nodes[from].words = crate::stats::compute(&note.source).words;
         for link in note.links() {
             if link.target.is_empty() {
                 continue;
@@ -93,18 +99,22 @@ pub fn build(notes: &[NoteRef]) -> Graph {
             let Some(to) = index.resolve(&link.target) else {
                 continue;
             };
-            if seen.insert((from, to)) {
-                edges.push(Edge {
-                    from,
-                    to,
-                    kind: if link.embed {
-                        EdgeKind::Embed
-                    } else {
-                        EdgeKind::Link
-                    },
-                });
-                nodes[from].links += 1;
+            if let Some(index) = edge_index.get(&(from, to)).copied() {
+                edges[index].weight += 1;
+                continue;
             }
+            edge_index.insert((from, to), edges.len());
+            edges.push(Edge {
+                from,
+                to,
+                kind: if link.embed {
+                    EdgeKind::Embed
+                } else {
+                    EdgeKind::Link
+                },
+                weight: 1,
+            });
+            nodes[from].links += 1;
         }
     }
 
@@ -128,6 +138,7 @@ pub fn filter(graph: &Graph, query: &str) -> Graph {
                 id: nodes.len(),
                 relative: node.relative.clone(),
                 links: node.links,
+                words: node.words,
             });
         }
     }
@@ -140,6 +151,7 @@ pub fn filter(graph: &Graph, query: &str) -> Graph {
                 from: *remap.get(&edge.from)?,
                 to: *remap.get(&edge.to)?,
                 kind: edge.kind,
+                weight: edge.weight,
             })
         })
         .collect();
@@ -155,9 +167,14 @@ pub fn folder_of(relative: &str) -> &str {
     }
 }
 
-/// Radius of a node in canvas units. A note with more links gets a bigger circle.
-pub fn node_radius(links: usize) -> f32 {
-    (5.0 + (links as f32).sqrt() * 2.0).min(16.0)
+/// Radius of a node in canvas units.
+///
+/// The base size is 5. Outgoing links add up to about 9 and body length adds up
+/// to about 6, so a large, heavily linked note is visibly larger than a stub.
+pub fn node_radius(links: usize, words: usize) -> f32 {
+    let link_size = (links as f32).sqrt() * 2.0;
+    let word_size = ((words as f32).sqrt() / 5.0).min(14.0);
+    (5.0 + link_size + word_size).min(28.0)
 }
 
 /// The subgraph within `depth` hops of `root`, capped at `max_nodes`.
@@ -201,6 +218,7 @@ pub fn local(graph: &Graph, root: usize, depth: usize, max_nodes: usize) -> Grap
             id: new_id,
             relative: graph.nodes[*old_id].relative.clone(),
             links: graph.nodes[*old_id].links,
+            words: graph.nodes[*old_id].words,
         })
         .collect();
 
@@ -214,6 +232,7 @@ pub fn local(graph: &Graph, root: usize, depth: usize, max_nodes: usize) -> Grap
                 from,
                 to,
                 kind: edge.kind,
+                weight: edge.weight,
             })
         })
         .collect();
@@ -400,7 +419,8 @@ impl GraphLayout {
 
         // A weak centre pull and soft walls keep disconnected notes on screen.
         for (i, (x, y)) in self.positions.iter().enumerate() {
-            let radius = node_radius(graph.nodes[i].links) + self.params.padding;
+            let radius =
+                node_radius(graph.nodes[i].links, graph.nodes[i].words) + self.params.padding;
             disp[i].0 += (center.0 - x) * self.params.center_force;
             disp[i].1 += (center.1 - y) * self.params.center_force;
             if *x < radius {
@@ -449,7 +469,7 @@ impl GraphLayout {
         }
         // Forces can leave a tiny residual overlap at an edge. A few direct
         // separation passes make the final positions usable for hit-testing.
-        for _ in 0..6 {
+        for _ in 0..32 {
             self.resolve_collisions(graph, 2);
             self.clamp_to_bounds(graph);
         }
@@ -463,8 +483,8 @@ impl GraphLayout {
         for _ in 0..passes {
             for i in 0..n {
                 for j in (i + 1)..n {
-                    let min_distance = node_radius(graph.nodes[i].links)
-                        + node_radius(graph.nodes[j].links)
+                    let min_distance = node_radius(graph.nodes[i].links, graph.nodes[i].words)
+                        + node_radius(graph.nodes[j].links, graph.nodes[j].words)
                         + self.params.collision_gap;
                     let dx = self.positions[i].0 - self.positions[j].0;
                     let dy = self.positions[i].1 - self.positions[j].1;
@@ -502,7 +522,8 @@ impl GraphLayout {
     fn clamp_to_bounds(&mut self, graph: &Graph) {
         let n = self.positions.len().min(graph.nodes.len());
         for i in 0..n {
-            let radius = node_radius(graph.nodes[i].links) + self.params.padding;
+            let radius =
+                node_radius(graph.nodes[i].links, graph.nodes[i].words) + self.params.padding;
             let (x, y) = self.positions[i];
             self.positions[i].0 = clamp_axis(x, radius, self.params.width);
             self.positions[i].1 = clamp_axis(y, radius, self.params.height);
@@ -534,7 +555,7 @@ fn initial_positions(graph: &Graph, params: &LayoutParams) -> Vec<(f32, f32)> {
     let max_radius = graph
         .nodes
         .iter()
-        .map(|node| node_radius(node.links))
+        .map(|node| node_radius(node.links, node.words))
         .fold(0.0f32, f32::max);
     let ring =
         ((params.width.min(params.height) / 2.0) - max_radius - params.padding).max(10.0) * 0.75;
@@ -707,6 +728,7 @@ mod tests {
                 id,
                 relative: format!("note-{id}.md"),
                 links: id % 9,
+                words: id * 17,
             })
             .collect();
         let mut edges = Vec::new();
@@ -715,12 +737,14 @@ mod tests {
                 from: i,
                 to: (i + 1) % n,
                 kind: EdgeKind::Link,
+                weight: 1,
             });
             if i % 3 == 0 {
                 edges.push(Edge {
                     from: i,
                     to: (i + 7) % n,
                     kind: EdgeKind::Embed,
+                    weight: 1,
                 });
             }
         }
@@ -741,8 +765,8 @@ mod tests {
                 let dx = positions[i].0 - positions[j].0;
                 let dy = positions[i].1 - positions[j].1;
                 let distance = (dx * dx + dy * dy).sqrt();
-                let min = node_radius(graph.nodes[i].links)
-                    + node_radius(graph.nodes[j].links)
+                let min = node_radius(graph.nodes[i].links, graph.nodes[i].words)
+                    + node_radius(graph.nodes[j].links, graph.nodes[j].words)
                     + params.collision_gap;
                 assert!(
                     distance + 0.01 >= min,
@@ -760,7 +784,7 @@ mod tests {
         layout.settle(&graph);
 
         for (id, (x, y)) in layout.positions().iter().enumerate() {
-            let radius = node_radius(graph.nodes[id].links) + params.padding;
+            let radius = node_radius(graph.nodes[id].links, graph.nodes[id].words) + params.padding;
             assert!((*x >= radius - 0.01 && *x <= params.width - radius + 0.01));
             assert!((*y >= radius - 0.01 && *y <= params.height - radius + 0.01));
         }
@@ -811,10 +835,35 @@ mod tests {
             let b = layout.positions()[1];
             ((a.0 - b.0).powi(2) + (a.1 - b.1).powi(2)).sqrt()
         };
-        let minimum = node_radius(graph.nodes[0].links)
-            + node_radius(graph.nodes[1].links)
+        let minimum = node_radius(graph.nodes[0].links, graph.nodes[0].words)
+            + node_radius(graph.nodes[1].links, graph.nodes[1].words)
             + params.collision_gap;
         assert!(distance + 0.01 >= minimum);
+    }
+
+    #[test]
+    fn repeated_references_thicken_one_edge_and_count_one_link() {
+        let dir = vault("weights");
+        let notes = vec![
+            note(&dir, "a.md", "[[b]] and [[b]] and ![[b]]\n"),
+            note(&dir, "b.md", "b\n"),
+        ];
+        let graph = build(&notes);
+        assert_eq!(graph.nodes[0].links, 1);
+        assert_eq!(graph.edges.len(), 1);
+        assert_eq!(graph.edges[0].weight, 3);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn node_radius_uses_words_and_links() {
+        let small = node_radius(0, 10);
+        let long = node_radius(0, 5_000);
+        let linked = node_radius(40, 10);
+        assert!(long > small);
+        assert!(linked > small);
+        assert!(node_radius(1_000_000, 1_000_000) <= 28.0);
     }
 
     #[test]

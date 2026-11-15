@@ -392,7 +392,7 @@ impl GraphView {
             let dx = sx - pointer.0;
             let dy = sy - pointer.1;
             let distance = (dx * dx + dy * dy).sqrt();
-            let reach = graph::node_radius(node.links) * scale + NODE_HIT_PADDING;
+            let reach = graph::node_radius(node.links, node.words) * scale + NODE_HIT_PADDING;
             if distance <= reach && best.map(|(_, d)| distance < d).unwrap_or(true) {
                 best = Some((id, distance));
             }
@@ -633,7 +633,7 @@ fn graph_bounds(
         let Some((x, y)) = positions.get(id) else {
             continue;
         };
-        let radius = graph::node_radius(node.links) + padding;
+        let radius = graph::node_radius(node.links, node.words) + padding;
         min_x = min_x.min(x - radius);
         min_y = min_y.min(y - radius);
         max_x = max_x.max(x + radius);
@@ -685,6 +685,16 @@ impl Render for GraphView {
         let theme = *cx.global::<Theme>();
         let count = self.graph.nodes.len();
         let edges = self.graph.edges.len();
+        let scope = if self.focus.is_some() {
+            format!("local · depth {}", self.depth)
+        } else {
+            "global".to_string()
+        };
+        let edge_kind = if self.graph.edges.iter().any(|edge| edge.is_relation()) {
+            "relations"
+        } else {
+            "links"
+        };
 
         self.schedule_frame(window, cx);
 
@@ -749,8 +759,7 @@ impl Render for GraphView {
                         div()
                             .flex_shrink_0()
                             .child(format!(
-                                "graph: {count} notes / {edges} links · depth {}",
-                                self.depth
+                                "graph: {count} notes / {edges} {edge_kind} · {scope}"
                             )),
                     )
                     .child(
@@ -1081,7 +1090,7 @@ impl Element for GraphCanvas {
         let radii: Vec<f32> = graph
             .nodes
             .iter()
-            .map(|node| graph::node_radius(node.links) * scale)
+            .map(|node| graph::node_radius(node.links, node.words) * scale)
             .collect();
         let focus = focus
             .as_deref()
@@ -1262,82 +1271,33 @@ impl Element for GraphCanvas {
             let hovered = prepaint.hovered;
 
             // Edges first, so nodes sit on top. Plain links are solid; frontmatter
-            // relations are dashed and tinted, so the relation graph reads differently.
-            if let Some(hovered) = hovered {
-                let mut dim_links = PathBuilder::stroke(px(1.0));
-                let mut dim_relations =
-                    PathBuilder::stroke(px(1.0)).dash_array(&[px(4.0), px(3.0)]);
-                let mut hi_links = PathBuilder::stroke(px(1.5));
-                let mut hi_relations = PathBuilder::stroke(px(1.5)).dash_array(&[px(4.0), px(3.0)]);
-                let mut drew_dim_links = false;
-                let mut drew_dim_relations = false;
-                let mut drew_hi_links = false;
-                let mut drew_hi_relations = false;
-
-                for edge in &graph.edges {
-                    let Some(a) = centers.get(edge.from) else {
-                        continue;
-                    };
-                    let Some(b) = centers.get(edge.to) else {
-                        continue;
-                    };
-                    let incident = edge.from == hovered || edge.to == hovered;
-                    let (path, drew) = match (edge.is_relation(), incident) {
-                        (false, true) => (&mut hi_links, &mut drew_hi_links),
-                        (true, true) => (&mut hi_relations, &mut drew_hi_relations),
-                        (false, false) => (&mut dim_links, &mut drew_dim_links),
-                        (true, false) => (&mut dim_relations, &mut drew_dim_relations),
-                    };
-                    if !*drew {
-                        path.move_to(*a);
-                        *drew = true;
+            // relations are dashed and tinted. Width follows repeated references.
+            let mut edge_paths = Vec::new();
+            for edge in &graph.edges {
+                let Some(a) = centers.get(edge.from) else {
+                    continue;
+                };
+                let Some(b) = centers.get(edge.to) else {
+                    continue;
+                };
+                let dim = hovered.is_some_and(|node| edge.from != node && edge.to != node);
+                push_edge_path(&mut edge_paths, edge, *a, *b, dim);
+            }
+            for edge in edge_paths {
+                let color = if edge.dim {
+                    if edge.relation {
+                        theme.accent_text.opacity(0.25)
                     } else {
-                        path.line_to(*a);
+                        theme.border.opacity(0.25)
                     }
-                    path.line_to(*b);
-                }
-
-                paint_paths(
-                    window,
-                    dim_links,
-                    drew_dim_links,
-                    theme.border.opacity(0.25),
-                );
-                paint_paths(
-                    window,
-                    dim_relations,
-                    drew_dim_relations,
-                    theme.accent_text.opacity(0.25),
-                );
-                paint_paths(window, hi_links, drew_hi_links, theme.text);
-                paint_paths(window, hi_relations, drew_hi_relations, theme.accent_text);
-            } else {
-                let mut links = PathBuilder::stroke(px(1.0));
-                let mut relations = PathBuilder::stroke(px(1.0)).dash_array(&[px(4.0), px(3.0)]);
-                let mut drew_link = false;
-                let mut drew_relation = false;
-                for edge in &graph.edges {
-                    let Some(a) = centers.get(edge.from) else {
-                        continue;
-                    };
-                    let Some(b) = centers.get(edge.to) else {
-                        continue;
-                    };
-                    let (path, drew) = if edge.is_relation() {
-                        (&mut relations, &mut drew_relation)
-                    } else {
-                        (&mut links, &mut drew_link)
-                    };
-                    if !*drew {
-                        path.move_to(*a);
-                        *drew = true;
-                    } else {
-                        path.line_to(*a);
-                    }
-                    path.line_to(*b);
-                }
-                paint_paths(window, links, drew_link, theme.border);
-                paint_paths(window, relations, drew_relation, theme.accent_text);
+                } else if edge.relation {
+                    theme.accent_text
+                } else if hovered.is_some() {
+                    theme.text
+                } else {
+                    theme.border
+                };
+                paint_paths(window, edge.path, edge.started, color);
             }
 
             // Nodes.
@@ -1402,6 +1362,54 @@ impl Element for GraphCanvas {
             }
         });
     }
+}
+
+struct EdgePath {
+    bucket: usize,
+    relation: bool,
+    dim: bool,
+    path: PathBuilder,
+    started: bool,
+}
+
+fn push_edge_path(
+    paths: &mut Vec<EdgePath>,
+    edge: &graph::Edge,
+    a: Point<Pixels>,
+    b: Point<Pixels>,
+    dim: bool,
+) {
+    let bucket = edge.weight.clamp(1, 6);
+    let relation = edge.is_relation();
+    if let Some(existing) = paths
+        .iter_mut()
+        .find(|path| path.bucket == bucket && path.relation == relation && path.dim == dim)
+    {
+        if !existing.started {
+            existing.path.move_to(a);
+            existing.started = true;
+        } else {
+            existing.path.line_to(a);
+        }
+        existing.path.line_to(b);
+        return;
+    }
+
+    let width = 1.0 + (bucket - 1) as f32 * 0.45;
+    let mut path = if relation {
+        PathBuilder::stroke(px(width)).dash_array(&[px(4.0), px(3.0)])
+    } else {
+        PathBuilder::stroke(px(width))
+    };
+    path.move_to(a);
+    path.line_to(b);
+    paths.push(EdgePath {
+        bucket,
+        relation,
+        dim,
+        path,
+        started: true,
+    });
 }
 
 fn paint_paths(
@@ -1511,11 +1519,13 @@ mod tests {
                     id: 0,
                     relative: "a.md".to_string(),
                     links: 0,
+                    words: 100,
                 },
                 dragonglass_core::graph::Node {
                     id: 1,
                     relative: "b.md".to_string(),
                     links: 4,
+                    words: 900,
                 },
             ],
             edges: Vec::new(),

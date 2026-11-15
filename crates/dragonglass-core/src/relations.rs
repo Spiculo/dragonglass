@@ -240,6 +240,7 @@ pub fn graph(notes: &[NoteRef]) -> graph::Graph {
                 from,
                 to,
                 kind: graph::EdgeKind::Relation(kind.label()),
+                weight: 1,
             });
             if let Some(node) = graph.nodes.get_mut(from) {
                 node.links += 1;
@@ -468,7 +469,7 @@ mod tests {
     fn semantic_relations_extend_the_graph() {
         let dir = vault("graph");
         let notes = vec![
-            note(&dir, "a.md", "---\nrelated: b\n---\nno links\n"),
+            note(&dir, "a.md", "---\nrelated: \"[[b]]\"\n---\nno links\n"),
             note(&dir, "b.md", "b\n"),
         ];
         let plain = graph::build(&notes);

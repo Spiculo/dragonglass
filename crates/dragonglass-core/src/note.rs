@@ -28,9 +28,10 @@ impl Note {
         frontmatter::split(&self.source).frontmatter
     }
 
-    /// All wikilinks in the note.
+    /// All wikilinks in the note body. Frontmatter links are properties, not body links;
+    /// the relation graph reads the recognised YAML relation keys separately.
     pub fn links(&self) -> Vec<wikilink::Link> {
-        wikilink::parse(&self.source)
+        wikilink::parse(self.body())
     }
 
     /// All tags (frontmatter + inline).
