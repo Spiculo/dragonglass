@@ -17,12 +17,12 @@ serde_json = "1"
 # Math typesetting: KaTeX-compatible parsing/layout producing a platform-neutral
 # display list. Pinned exactly because the 0.1.x line moves quickly; the wrapper in
 # `src/math/` is the only place that talks to these crates.
-ratex-types = "=0.1.15"
+ratex-types = "=0.1.16"
 ratex-parser = "=0.1.15"
 ratex-layout = "=0.1.15"
-ratex-font = "=0.1.15"
+ratex-font = "=0.1.16"
 ratex-font-loader = { version = "=0.1.15", features = ["embed-fonts"] }
-ratex-katex-fonts = "=0.1.15"
+ratex-katex-fonts = "=0.1.16"
 ratex-svg = { version = "=0.1.15", features = ["embed-fonts"] }
 ab_glyph = "0.2"
 
