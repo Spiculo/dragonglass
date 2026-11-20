@@ -525,7 +525,7 @@ No vault-format or packaging changes beyond the font notices.
 
 | Risk | Mitigation |
 |---|---|
-| RaTeX is 0.1.x and iterates fast (24 releases in ~7 months) | Pin exact versions (`=0.1.15`), wrap behind `math::typeset`, keep the wrapper small; vendor the crates (MIT) if a release breaks us. |
+| RaTeX is 0.1.x and iterates fast (24 releases in ~7 months) | Pin exact versions, wrap behind `math::typeset`, keep the wrapper small; vendor the crates (MIT) if a release breaks us. |
 | GPUI's `paint_path` has no fill-rule/stroke controls | Split subpaths at `MoveTo`; validate against goldens; fall back to a raster scene for the specific formula if a shape is wrong. |
 | Inline flow regresses selection, tables or links | Feature-flag the old renderer; expand the reading-view regression checklist before switching; land M2 behind an env var for dogfooding. |
 | Font licensing/packaging mistakes | OFL notice + licence files in `packaging/`; CI check that the notices are present. |
@@ -572,16 +572,20 @@ All coordinates are f64 em units in a top-left origin, baseline at `y = height`.
 
 ```toml
 # crates/dragonglass-core/Cargo.toml
-ratex-types       = "=0.1.15"
+ratex-types       = "=0.1.16"
 ratex-parser      = "=0.1.15"          # mhchem is built in for 0.1.15
 ratex-layout      = "=0.1.15"
-ratex-font        = "=0.1.15"
+ratex-font        = "=0.1.16"
 ratex-font-loader = { version = "=0.1.15", features = ["embed-fonts"] }
 ratex-svg         = { version = "=0.1.15", features = ["embed-fonts"] }   # HTML export
 ab_glyph          = "0.2"              # glyph outlines for the painter
 ```
 
-Verified against the published 0.1.15 metadata: `ratex-font-loader` exposes `embed-fonts`
+Dependabot raised `ratex-types`, `ratex-font` and `ratex-katex-fonts` to 0.1.16 while the
+other RaTeX crates stayed at 0.1.15; their caret requirements resolve to one copy of each
+shared crate, and the math goldens pass on that combination.
+
+Verified against the published metadata: `ratex-font-loader` exposes `embed-fonts`
 (which pulls `ratex-katex-fonts`), and `ratex-svg`'s `embed-fonts` implies `standalone`, which
 is what enables outline glyphs in the SVG. `ratex-*` is MIT; the bundled fonts are OFL 1.1.
 
