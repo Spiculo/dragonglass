@@ -651,13 +651,20 @@ impl Element for FlowText {
                     if clicked {
                         if let Some(head) = head {
                             let local = head.offset.saturating_sub(base);
-                            if let Some(target) = up_layout.link_at(local) {
-                                if let Some(opener) = &opener {
-                                    opener(&target, window, cx);
-                                }
-                            } else if let Some(target) = up_layout.image_link_at(local, len) {
+                            // Images win over ordinary links: an image that failed to
+                            // decode is painted as its alt text but still has an href, and
+                            // it must open the lightbox, not the OS viewer.
+                            if let Some(target) = up_layout.image_link_at(local, len) {
                                 if let Some(on_image) = &on_image {
                                     on_image(&target, window, cx);
+                                }
+                            } else if let Some(target) = up_layout.link_at(local) {
+                                if crate::reading::is_image_target(&target) {
+                                    if let Some(on_image) = &on_image {
+                                        on_image(&target, window, cx);
+                                    }
+                                } else if let Some(opener) = &opener {
+                                    opener(&target, window, cx);
                                 }
                             }
                         }
@@ -785,6 +792,9 @@ impl Element for FlowText {
         }
     }
 }
+
+/// Whether a link target is an image file that should open in the lightbox.
+// (defined in `reading` so table cells can use it too)
 
 impl FlowLayout {
     /// The href of an image piece whose display range contains `offset`.

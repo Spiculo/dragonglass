@@ -34,15 +34,19 @@ A lot already works. This is a working application, not a mockup — but it is e
 - Reading view and a live-preview pane beside the editor; reading never edits the source
   except for task checkboxes, which apply a normal, undoable edit that marks the note dirty
   (save or autosave writes it); reading joins soft line breaks into paragraphs (hard breaks
-  stay), and gives every code fence a copy button
+  stay), gives every code fence a copy button, and scrolls wide code, tables and display
+  math horizontally instead of clipping them
 - One-sentence-per-line notes read as paragraphs; `tags:` chips in the properties header
   open a vault search, and frontmatter links are clickable
 - Reading selection: double-click a word, triple-click a paragraph, Shift-click to extend,
   Shift+arrows/Home/End for keyboard selection, drag past the edge to scroll, Escape to
   clear, and a "copied N characters" confirmation
 - Syntax highlighting, code fences, tables, task lists, footnotes, callouts and
-  `==highlights==`; Dynamic mode turns a table into an editable grid with add-row and
-  add-column buttons and drag handles for reordering rows and columns
+  `==highlights==`; Dynamic mode shows every table as a grid: click a cell to edit it,
+  drag or Shift-click to select a range, copy selected cells as TSV, Delete clears them,
+  and clicking a row or column grip selects it so Delete removes it; `+ Row` adds a row
+  below, `+` adds a column at the right, drag handles reorder rows and columns, and
+  clicking outside or pressing Escape leaves the grid
 - KaTeX-compatible math (`$…$` / `$$…$$`) via [RaTeX](https://github.com/erweixin/RaTeX),
   rendered natively and exported as vector SVG; display `$$…$$` blocks are typeset in the
   editor itself whenever the caret is outside the block, and show their LaTeX source again
@@ -75,8 +79,9 @@ A lot already works. This is a working application, not a mockup — but it is e
   edges and zoom-faded labels
 - Daily/weekly/monthly notes, templates, properties, bookmarks
 - Embeds and attachments (images, PDF, audio), transclusion, shared blocks; images honor
-  `![[img|300]]` width and alt text, click opens a lightbox with scroll-wheel zoom, drag
-  panning and double-click reset, and other attachments open in the OS viewer from a card
+  `![[img|300]]` width and alt text, click opens a lightbox in Viewer or Dynamic mode with
+  scroll-wheel zoom, drag panning and double-click reset, and other attachments open in the
+  OS viewer from a card
 - A/B versions with a line diff, document review, block move/duplicate/delete/extract
 - Recovery snapshots, browsable and restorable from **File recovery** in the palette
 - Conflict-safe saves: a save never overwrites a file that changed on disk; the app offers

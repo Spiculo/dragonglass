@@ -110,6 +110,12 @@ impl Render for PreviewWindow {
                 Some(self.opener.clone()),
                 Some(fold),
                 None,
+                {
+                    let weak = cx.entity().downgrade();
+                    Rc::new(move |cx: &mut App| {
+                        let _ = weak.update(cx, |_, cx| cx.notify());
+                    })
+                },
                 cx,
             ))
     }

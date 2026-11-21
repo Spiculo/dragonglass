@@ -7305,6 +7305,12 @@ impl Render for DragonGlassApp {
                     },
                 )
             };
+            let notify_reading: reading::ReadingNotifier = {
+                let weak = cx.entity().downgrade();
+                Rc::new(move |cx: &mut App| {
+                    let _ = weak.update(cx, |_, cx| cx.notify());
+                })
+            };
             Some(
                 div()
                     .flex_1()
@@ -7318,6 +7324,7 @@ impl Render for DragonGlassApp {
                         Some(opener),
                         Some(fold),
                         Some(toggle_task),
+                        notify_reading,
                         cx,
                     ))
                     .into_any_element(),

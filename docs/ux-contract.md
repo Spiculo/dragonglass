@@ -32,7 +32,7 @@ preview flag), 6 (a failed save keeps the note open), 7 (snackbar errors), 8 (IM
 | Reading | Ctrl/Cmd+E | Edit | Restore the source line of the visible block (Q1.2) |
 | Edit | Type | Edit (dirty) | Dirty is content-based; undo back to saved bytes is clean |
 | Reading | Click a task checkbox | Reading (dirty) | Only the `[ ]` / `[x]` marker changes; normal save, draft and autosave paths apply |
-| Dynamic | Click a table | Dynamic (table grid) | The grid covers the source lines; cell edits, add row/column and drag reordering write normal table markdown |
+| Dynamic | Click a table cell | Dynamic (table grid) | Every table is already drawn as a read-only grid; clicking a cell opens the editable grid. Drag or Shift-click selects a range, copy writes TSV, Delete/Backspace clears cells, and a selected row or column grip can be removed with the erase key. Edits, add row/column and drag reordering write normal table markdown |
 | Edit (dirty) | Idle 1.5 s | Edit (draft saved) | Draft written; no note write unless `autosave=on` |
 | Edit (dirty) | Save, disk unchanged | Edit (clean) | Fingerprint refreshed, draft deleted |
 | Edit (dirty) | Save, disk changed | Conflict | Nothing written; Reload / Keep mine / Compare / Save as copy |

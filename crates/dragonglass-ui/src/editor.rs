@@ -347,6 +347,8 @@ pub struct Editor {
     layout_tables: Rc<Vec<TableLayout>>,
     /// The table being edited as a grid in Dynamic mode, if any.
     table_edit: Option<TableEdit>,
+    /// Image shown by the Dynamic-mode lightbox overlay.
+    lightbox: Rc<RefCell<Option<crate::reading::Lightbox>>>,
     /// Live previews of formulas whose block contains the caret.
     live_math: Vec<LiveMath>,
     /// The buffer revision `display_math` was parsed from.
@@ -905,6 +907,9 @@ struct LiveMath {
 /// A table drawn as a grid over its rows. The separator row owns no rows of its own.
 #[derive(Debug, Clone)]
 struct TableLayout {
+    /// Source lines of the table, 0-based and inclusive.
+    first_line: usize,
+    last_line: usize,
     first_row: usize,
     /// Exclusive.
     last_row: usize,
@@ -927,6 +932,7 @@ struct EditorImage {
     line: usize,
     first_row: usize,
     row_count: usize,
+    path: PathBuf,
     data: Arc<RenderImage>,
     width: f32,
     height: f32,
@@ -1068,6 +1074,7 @@ impl Editor {
             layout_callouts: Rc::new(Vec::new()),
             layout_tables: Rc::new(Vec::new()),
             table_edit: None,
+            lightbox: Rc::new(RefCell::new(None)),
             live_math: Vec::new(),
             display_math_revision: u64::MAX,
             math_scenes: HashMap::new(),
@@ -1127,7 +1134,8 @@ impl Editor {
 
     /// Wrap or unwrap the current selection (or insert a marker pair at the caret).
     fn apply_style(&mut self, style: text_format::Style) {
-        if self.table_edit.is_some() || !self.can_mutate() || self.find.open {
+        if self.lightbox_open() || self.table_edit.is_some() || !self.can_mutate() || self.find.open
+        {
             return;
         }
 
@@ -1250,7 +1258,7 @@ impl Editor {
 
     /// Start a wikilink at the caret, or from the selected text as an alias.
     fn start_wikilink(&mut self) {
-        if self.table_edit.is_some() || self.reading || self.find.open {
+        if self.lightbox_open() || self.table_edit.is_some() || self.reading || self.find.open {
             return;
         }
         self.autocomplete = Autocomplete::default();
@@ -1481,6 +1489,7 @@ impl Editor {
         self.selecting = false;
         self.extra_cursors.clear();
         self.table_edit = None;
+        *self.lightbox.borrow_mut() = None;
         self.find.open = false;
         self.find.matches.clear();
         self.find.error = None;
@@ -1650,6 +1659,7 @@ impl Editor {
     pub fn set_dynamic_mode(&mut self, dynamic: bool) {
         if !dynamic {
             self.table_edit = None;
+            *self.lightbox.borrow_mut() = None;
         }
         if self.dynamic == dynamic {
             return;
@@ -1780,6 +1790,45 @@ impl Editor {
         }
     }
 
+    fn table_edit_begin_selection(
+        &mut self,
+        row: usize,
+        col: usize,
+        extend: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(edit) = self.table_edit.as_mut() {
+            edit.begin_selection(row, col, extend);
+            cx.notify();
+        }
+    }
+
+    fn table_edit_extend_selection(&mut self, row: usize, col: usize, cx: &mut Context<Self>) {
+        if let Some(edit) = self.table_edit.as_mut() {
+            edit.extend_selection(row, col);
+            cx.notify();
+        }
+    }
+
+    fn table_edit_select_row(&mut self, row: usize, cx: &mut Context<Self>) {
+        if let Some(edit) = self.table_edit.as_mut() {
+            edit.select_row(row);
+            cx.notify();
+        }
+    }
+
+    fn table_edit_select_column(&mut self, col: usize, cx: &mut Context<Self>) {
+        if let Some(edit) = self.table_edit.as_mut() {
+            edit.select_column(col);
+            cx.notify();
+        }
+    }
+
+    /// Whether the Dynamic-mode image lightbox is open.
+    fn lightbox_open(&self) -> bool {
+        self.lightbox.borrow().is_some()
+    }
+
     /// Apply a change to the table grid, write it to the buffer and repaint.
     fn table_edit_mutate(
         &mut self,
@@ -1818,7 +1867,11 @@ impl Editor {
     }
 
     fn table_edit_drop(&mut self, cx: &mut Context<Self>) {
+        if let Some(edit) = self.table_edit.as_mut() {
+            edit.finish_selection();
+        }
         let Some(drag) = self.table_edit.as_mut().and_then(|edit| edit.drag.take()) else {
+            cx.notify();
             return;
         };
         if let Some(edit) = self.table_edit.as_mut() {
@@ -1861,13 +1914,28 @@ impl Editor {
         let grid_rows = edit.rows.len() + 1;
         let row_height = (source_rows as f32 * line_height / grid_rows as f32).max(line_height);
         let top = line_height * layout.first_row as f32;
-        let height = row_height * grid_rows as f32;
-        let controls_width = 168.0;
+        // One extra row below the data rows holds the add-row control.
+        let height = row_height * (grid_rows + 1) as f32;
+        let grip_width = 18.0;
+        let add_column_width = 34.0;
 
         let column_count = edit.column_count().max(1);
         let drag = edit.drag;
+        let dragging = drag.is_some();
+        let drag_row = drag.filter(|drag| drag.axis == TableAxis::Row);
+        let drag_column = drag.filter(|drag| drag.axis == TableAxis::Column);
+        let cell_cursor = if dragging {
+            CursorStyle::ClosedHand
+        } else {
+            CursorStyle::IBeam
+        };
+        let grip_cursor = if dragging {
+            CursorStyle::ClosedHand
+        } else {
+            CursorStyle::OpenHand
+        };
 
-        // Header row: the cell grips start a column drag.
+        // Header row: cell grips start a column drag; the trailing cell adds a column.
         let mut header = div()
             .flex()
             .flex_row()
@@ -1876,10 +1944,12 @@ impl Editor {
             .bg(theme.chip)
             .border_b_1()
             .border_color(theme.border)
-            .child(div().w(px(18.0)).flex_shrink_0());
+            .child(div().w(px(grip_width)).flex_shrink_0());
         for col in 0..column_count {
             let active = edit.active_row == 0 && edit.active_col == col;
-            let target = drag.is_some_and(|drag| drag.axis == TableAxis::Column && drag.to == col);
+            let selected = edit.is_selected(0, col);
+            let is_dragged = drag_column.is_some_and(|drag| drag.from == col);
+            let is_target = drag_column.is_some_and(|drag| drag.to == col && drag.from != col);
             let text = edit.headers.get(col).cloned().unwrap_or_default();
             let cursor = if active { edit.cursor } else { 0 };
             let mut cell = div()
@@ -1887,7 +1957,7 @@ impl Editor {
                 .flex_1()
                 .min_w(px(0.0))
                 .h_full()
-                .px_2()
+                .px_3()
                 .flex()
                 .flex_row()
                 .items_center()
@@ -1895,18 +1965,23 @@ impl Editor {
                 .gap_1()
                 .border_r_1()
                 .border_color(theme.border)
-                .cursor(CursorStyle::IBeam)
+                .cursor(cell_cursor)
                 .on_mouse_down(
                     MouseButton::Left,
-                    cx.listener(move |this, _event, window, cx| {
+                    cx.listener(move |this, event: &MouseDownEvent, window, cx| {
                         window.focus(&this.focus_handle);
                         cx.stop_propagation();
-                        this.table_edit_activate(0, col, cx);
+                        this.table_edit_begin_selection(0, col, event.modifiers.shift, cx);
                     }),
                 )
-                .on_mouse_move(cx.listener(move |this, _event, _window, cx| {
-                    this.table_edit_drag_over(TableAxis::Column, col, cx);
-                }))
+                .on_mouse_move(
+                    cx.listener(move |this, event: &MouseMoveEvent, _window, cx| {
+                        if event.pressed_button == Some(MouseButton::Left) {
+                            this.table_edit_extend_selection(0, col, cx);
+                        }
+                        this.table_edit_drag_over(TableAxis::Column, col, cx);
+                    }),
+                )
                 .child(table_cell_text(&text, active, cursor, row_height, theme));
             cell = cell.child(
                 div()
@@ -1917,13 +1992,14 @@ impl Editor {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .cursor(CursorStyle::OpenHand)
+                    .cursor(grip_cursor)
                     .text_color(theme.muted)
                     .child("::")
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |this, _event, _window, cx| {
                             cx.stop_propagation();
+                            this.table_edit_select_column(col, cx);
                             this.table_edit_start_drag(TableAxis::Column, col, cx);
                         }),
                     )
@@ -1932,51 +2008,51 @@ impl Editor {
                     })),
             );
             if active {
-                cell = cell.bg(theme.accent.opacity(0.14));
-            } else if target {
-                cell = cell.bg(theme.accent.opacity(0.09));
+                cell = cell.bg(theme.accent.opacity(0.20));
+            } else if is_target {
+                cell = cell.bg(theme.accent.opacity(0.18));
+            } else if selected {
+                cell = cell.bg(theme.accent.opacity(0.10));
+            }
+            if is_dragged {
+                cell = cell.opacity(0.35);
+            }
+            if let Some(drag) = drag_column {
+                if drag.to == col && drag.from != col {
+                    // A line on the side the column will land on.
+                    cell = if drag.from < col {
+                        cell.border_r(px(2.0))
+                    } else {
+                        cell.border_l(px(2.0))
+                    }
+                    .border_color(theme.accent);
+                }
             }
             header = header.child(cell);
         }
-
-        // The controls live in the header row so the grid's height matches the source
-        // table exactly (the separator row contributes no painted row). Body rows reserve
-        // the same width, so header and body columns stay aligned.
-        let controls = div()
-            .w(px(controls_width))
-            .h_full()
-            .flex_shrink_0()
-            .flex()
-            .flex_row()
-            .items_center()
-            .justify_end()
-            .gap_1()
-            .px_1()
-            .child(table_tool_button(
-                "+ Row",
-                theme,
-                cx.listener(|this, _event, _window, cx| {
-                    cx.stop_propagation();
-                    this.table_edit_add_row(cx);
-                }),
-            ))
-            .child(table_tool_button(
-                "+ Col",
-                theme,
-                cx.listener(|this, _event, _window, cx| {
-                    cx.stop_propagation();
-                    this.table_edit_add_column(cx);
-                }),
-            ))
-            .child(table_tool_button(
-                "Done",
-                theme,
-                cx.listener(|this, _event, _window, cx| {
-                    cx.stop_propagation();
-                    this.close_table_edit(cx);
-                }),
-            ));
-        header = header.child(controls);
+        header = header.child(
+            div()
+                .id("table-add-column")
+                .w(px(add_column_width))
+                .h_full()
+                .flex_shrink_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .border_l_1()
+                .border_color(theme.border)
+                .text_color(theme.accent_text)
+                .cursor_pointer()
+                .hover(move |style| style.bg(theme.accent.opacity(0.10)))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _event, _window, cx| {
+                        cx.stop_propagation();
+                        this.table_edit_add_column(cx);
+                    }),
+                )
+                .child("+"),
+        );
 
         let mut body = div()
             .flex()
@@ -1986,8 +2062,9 @@ impl Editor {
             .overflow_hidden();
         for (index, row) in edit.rows.iter().enumerate() {
             let row_index = index + 1;
-            let target =
-                drag.is_some_and(|drag| drag.axis == TableAxis::Row && drag.to == row_index);
+            let is_dragged = drag_row.is_some_and(|drag| drag.from == row_index);
+            let is_target =
+                drag_row.is_some_and(|drag| drag.to == row_index && drag.from != row_index);
             let mut row_element = div()
                 .id(ElementId::Name(format!("table-row-{row_index}").into()))
                 .flex()
@@ -2004,19 +2081,20 @@ impl Editor {
                         .id(ElementId::Name(
                             format!("table-row-grip-{row_index}").into(),
                         ))
-                        .w(px(18.0))
+                        .w(px(grip_width))
                         .h_full()
                         .flex_shrink_0()
                         .flex()
                         .items_center()
                         .justify_center()
-                        .cursor(CursorStyle::OpenHand)
+                        .cursor(grip_cursor)
                         .text_color(theme.muted)
                         .child("::")
                         .on_mouse_down(
                             MouseButton::Left,
                             cx.listener(move |this, _event, _window, cx| {
                                 cx.stop_propagation();
+                                this.table_edit_select_row(row_index, cx);
                                 this.table_edit_start_drag(TableAxis::Row, row_index, cx);
                             }),
                         )
@@ -2024,13 +2102,27 @@ impl Editor {
                             this.table_edit_drag_over(TableAxis::Row, row_index, cx);
                         })),
                 );
-            if target {
-                row_element = row_element.bg(theme.accent.opacity(0.09));
+            if is_target {
+                row_element = row_element.bg(theme.accent.opacity(0.14));
+            }
+            if is_dragged {
+                row_element = row_element.opacity(0.35);
+            }
+            if let Some(drag) = drag_row {
+                if drag.to == row_index && drag.from != row_index {
+                    row_element = if drag.from < row_index {
+                        row_element.border_b(px(2.0))
+                    } else {
+                        row_element.border_t(px(2.0))
+                    }
+                    .border_color(theme.accent);
+                }
             }
             for col in 0..column_count {
                 let active = edit.active_row == row_index && edit.active_col == col;
+                let column_dragged = drag_column.is_some_and(|drag| drag.from == col);
                 let column_target =
-                    drag.is_some_and(|drag| drag.axis == TableAxis::Column && drag.to == col);
+                    drag_column.is_some_and(|drag| drag.to == col && drag.from != col);
                 let text = row.get(col).cloned().unwrap_or_default();
                 let cursor = if active { edit.cursor } else { 0 };
                 let mut cell = div()
@@ -2040,34 +2132,60 @@ impl Editor {
                     .flex_1()
                     .min_w(px(0.0))
                     .h_full()
-                    .px_2()
+                    .px_3()
                     .flex()
                     .items_center()
                     .border_r_1()
                     .border_color(theme.border)
-                    .cursor(CursorStyle::IBeam)
+                    .cursor(cell_cursor)
                     .on_mouse_down(
                         MouseButton::Left,
-                        cx.listener(move |this, _event, window, cx| {
+                        cx.listener(move |this, event: &MouseDownEvent, window, cx| {
                             window.focus(&this.focus_handle);
                             cx.stop_propagation();
-                            this.table_edit_activate(row_index, col, cx);
+                            this.table_edit_begin_selection(
+                                row_index,
+                                col,
+                                event.modifiers.shift,
+                                cx,
+                            );
                         }),
                     )
-                    .on_mouse_move(cx.listener(move |this, _event, _window, cx| {
-                        this.table_edit_drag_over(TableAxis::Column, col, cx);
-                    }))
+                    .on_mouse_move(
+                        cx.listener(move |this, event: &MouseMoveEvent, _window, cx| {
+                            if event.pressed_button == Some(MouseButton::Left) {
+                                this.table_edit_extend_selection(row_index, col, cx);
+                            }
+                            this.table_edit_drag_over(TableAxis::Column, col, cx);
+                        }),
+                    )
                     .child(table_cell_text(&text, active, cursor, row_height, theme));
+                let selected = edit.is_selected(row_index, col);
                 if active {
-                    cell = cell.bg(theme.accent.opacity(0.14));
+                    cell = cell.bg(theme.accent.opacity(0.20));
                 } else if column_target {
-                    cell = cell.bg(theme.accent.opacity(0.09));
+                    cell = cell.bg(theme.accent.opacity(0.18));
+                } else if selected {
+                    cell = cell.bg(theme.accent.opacity(0.10));
+                }
+                if column_dragged {
+                    cell = cell.opacity(0.35);
+                }
+                if let Some(drag) = drag_column {
+                    if drag.to == col && drag.from != col {
+                        cell = if drag.from < col {
+                            cell.border_r(px(2.0))
+                        } else {
+                            cell.border_l(px(2.0))
+                        }
+                        .border_color(theme.accent);
+                    }
                 }
                 row_element = row_element.child(cell);
             }
             row_element = row_element.child(
                 div()
-                    .w(px(controls_width))
+                    .w(px(add_column_width))
                     .h_full()
                     .flex_shrink_0()
                     .border_l_1()
@@ -2075,6 +2193,27 @@ impl Editor {
             );
             body = body.child(row_element);
         }
+
+        // The add-row control sits below the last data row.
+        let add_row = div()
+            .id("table-add-row")
+            .w_full()
+            .h(px(row_height))
+            .flex_shrink_0()
+            .flex()
+            .items_center()
+            .pl(px(grip_width + 8.0))
+            .text_color(theme.accent_text)
+            .cursor_pointer()
+            .hover(move |style| style.bg(theme.accent.opacity(0.08)))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _event, _window, cx| {
+                    cx.stop_propagation();
+                    this.table_edit_add_row(cx);
+                }),
+            )
+            .child("+ Row");
 
         Some(
             div()
@@ -2110,6 +2249,158 @@ impl Editor {
                 )
                 .child(header)
                 .child(body)
+                .child(add_row)
+                .into_any_element(),
+        )
+    }
+
+    /// Open the grid at an exact cell, used by clicks on a rendered table.
+    fn open_table_edit_at(
+        &mut self,
+        first_line: usize,
+        row: usize,
+        col: usize,
+        cx: &mut Context<Self>,
+    ) {
+        if self.open_table_edit(first_line, None, cx) {
+            self.table_edit_activate(row, col, cx);
+        }
+    }
+
+    /// A read-only table grid, shown in Dynamic mode even before the editor is opened.
+    ///
+    /// The cell under the pointer is the click target: it opens the editable grid with
+    /// that cell selected.
+    fn render_table_view(
+        &self,
+        ordinal: usize,
+        layout: &TableLayout,
+        theme: Theme,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let lines: Vec<String> = (layout.first_line..=layout.last_line)
+            .map(|line| self.buffer.line(line))
+            .collect();
+        let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+        let edit =
+            TableEdit::from_lines(layout.first_line, &refs, ordinal, self.buffer.revision())?;
+
+        let line_height = f32::from(self.line_height);
+        let source_rows = layout.last_row.saturating_sub(layout.first_row).max(1);
+        let grid_rows = edit.rows.len() + 1;
+        let row_height = (source_rows as f32 * line_height / grid_rows as f32).max(line_height);
+        let top = line_height * layout.first_row as f32;
+        let height = row_height * grid_rows as f32;
+        let column_count = edit.column_count().max(1);
+        let first_line = layout.first_line;
+
+        let mut header = div()
+            .flex()
+            .flex_row()
+            .h(px(row_height))
+            .flex_shrink_0()
+            .bg(theme.chip)
+            .border_b_1()
+            .border_color(theme.border);
+        for col in 0..column_count {
+            let text = edit.headers.get(col).cloned().unwrap_or_default();
+            header = header.child(
+                div()
+                    .id(ElementId::Name(
+                        format!("table-view-header-{ordinal}-{col}").into(),
+                    ))
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .h_full()
+                    .px_3()
+                    .flex()
+                    .items_center()
+                    .border_r_1()
+                    .border_color(theme.border)
+                    .cursor(CursorStyle::IBeam)
+                    .hover(move |style| style.bg(theme.hover))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _event, window, cx| {
+                            window.focus(&this.focus_handle);
+                            cx.stop_propagation();
+                            this.open_table_edit_at(first_line, 0, col, cx);
+                        }),
+                    )
+                    .child(table_cell_text(&text, false, 0, row_height, theme)),
+            );
+        }
+        let mut body = div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h(px(0.0))
+            .overflow_hidden();
+        for (index, row) in edit.rows.iter().enumerate() {
+            let row_index = index + 1;
+            let mut row_element = div()
+                .id(ElementId::Name(
+                    format!("table-view-row-{ordinal}-{row_index}").into(),
+                ))
+                .flex()
+                .flex_row()
+                .h(px(row_height))
+                .flex_shrink_0()
+                .border_b_1()
+                .border_color(theme.border);
+            for col in 0..column_count {
+                let text = row.get(col).cloned().unwrap_or_default();
+                row_element = row_element.child(
+                    div()
+                        .id(ElementId::Name(
+                            format!("table-view-cell-{ordinal}-{row_index}-{col}").into(),
+                        ))
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .h_full()
+                        .px_3()
+                        .flex()
+                        .items_center()
+                        .border_r_1()
+                        .border_color(theme.border)
+                        .cursor(CursorStyle::IBeam)
+                        .hover(move |style| style.bg(theme.hover))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _event, window, cx| {
+                                window.focus(&this.focus_handle);
+                                cx.stop_propagation();
+                                this.open_table_edit_at(first_line, row_index, col, cx);
+                            }),
+                        )
+                        .child(table_cell_text(&text, false, 0, row_height, theme)),
+                );
+            }
+            body = body.child(row_element);
+        }
+
+        Some(
+            div()
+                .id(ElementId::Name(format!("table-view-{ordinal}").into()))
+                .absolute()
+                .left_0()
+                .right_0()
+                .top(px(top))
+                .h(px(height))
+                .flex()
+                .flex_col()
+                .rounded_sm()
+                .overflow_hidden()
+                .bg(theme.panel)
+                .border_1()
+                .border_color(theme.border)
+                .text_size(px(f32::from(self.font_size)))
+                .text_color(theme.text)
+                .on_mouse_down(MouseButton::Left, |_event, _window, cx| {
+                    cx.stop_propagation();
+                })
+                .child(header)
+                .child(body)
                 .into_any_element(),
         )
     }
@@ -2136,6 +2427,7 @@ impl Editor {
         }
         if reading {
             self.table_edit = None;
+            *self.lightbox.borrow_mut() = None;
             // Enter reading at the block holding the caret.
             self.prepare_reading();
             let line = self.buffer.line_col().0;
@@ -2153,12 +2445,18 @@ impl Editor {
 
     /// Insert text at the caret (used by plugins).
     pub fn insert_at_cursor(&mut self, text: &str) {
+        if self.lightbox_open() {
+            return;
+        }
         self.table_edit = None;
         self.insert_text(text);
     }
 
     /// Append text to the end of the note.
     pub fn append_to_note(&mut self, text: &str) {
+        if self.lightbox_open() {
+            return;
+        }
         self.table_edit = None;
         self.buffer.set_cursor(self.buffer.len_chars());
         self.buffer.insert(text);
@@ -2466,7 +2764,7 @@ impl Editor {
 
     /// Move the block at the caret up. Returns whether anything changed.
     pub fn move_block_up(&mut self) -> bool {
-        if self.table_edit.is_some() {
+        if self.lightbox_open() || self.table_edit.is_some() {
             return false;
         }
         let text = self.buffer.text();
@@ -2481,7 +2779,7 @@ impl Editor {
 
     /// Move the block at the caret down. Returns whether anything changed.
     pub fn move_block_down(&mut self) -> bool {
-        if self.table_edit.is_some() {
+        if self.lightbox_open() || self.table_edit.is_some() {
             return false;
         }
         let text = self.buffer.text();
@@ -2496,7 +2794,7 @@ impl Editor {
 
     /// Duplicate the block at the caret.
     pub fn duplicate_block(&mut self) -> bool {
-        if self.table_edit.is_some() {
+        if self.lightbox_open() || self.table_edit.is_some() {
             return false;
         }
         let text = self.buffer.text();
@@ -2511,7 +2809,7 @@ impl Editor {
 
     /// Delete the block at the caret.
     pub fn delete_block(&mut self) -> bool {
-        if self.table_edit.is_some() {
+        if self.lightbox_open() || self.table_edit.is_some() {
             return false;
         }
         let text = self.buffer.text();
@@ -2808,7 +3106,9 @@ impl Editor {
         // Tables are drawn as a grid, so their pipes are structural while the caret is
         // elsewhere.
         let table_ranges = if self.dynamic {
-            table_blocks(&self.buffer, raw_block)
+            // Tables are always drawn as grids in Dynamic mode. The caret never reveals
+            // their pipes; editing happens in the grid instead.
+            table_blocks(&self.buffer, (usize::MAX, usize::MAX))
         } else {
             Vec::new()
         };
@@ -2966,17 +3266,17 @@ impl Editor {
             if is_hidden {
                 continue;
             }
+            let in_table = table_ranges
+                .iter()
+                .any(|(start, end)| line_index >= *start && line_index <= *end);
+            let concealed =
+                self.dynamic && (line_index < raw_block.0 || line_index > raw_block.1 || in_table);
             let reused = match self.line_cache.get(line_index).and_then(Option::as_ref) {
                 Some(cached)
                     if cached.in_code == in_code
                         && cached.language == language
-                        && cached.concealed
-                            == (self.dynamic
-                                && (line_index < raw_block.0 || line_index > raw_block.1))
-                        && cached.table
-                            == table_ranges
-                                .iter()
-                                .any(|(start, end)| line_index >= *start && line_index <= *end)
+                        && cached.concealed == concealed
+                        && cached.table == in_table
                         && self.buffer.line_eq(line_index, &cached.text) =>
                 {
                     // Clone the layout, not the `&LineLayout`.
@@ -2989,21 +3289,9 @@ impl Editor {
                 Some(layout) => layout,
                 None => {
                     let text = self.buffer.line(line_index);
-                    let in_table = table_ranges
-                        .iter()
-                        .any(|(start, end)| line_index >= *start && line_index <= *end);
                     LineLayout::shape(
-                        &text,
-                        in_code,
-                        &language,
-                        self.dynamic && (line_index < raw_block.0 || line_index > raw_block.1),
-                        in_table,
-                        &font,
-                        font_size,
-                        width,
-                        color,
-                        theme,
-                        window,
+                        &text, in_code, &language, concealed, in_table, &font, font_size, width,
+                        color, theme, window,
                     )
                 }
             };
@@ -3032,7 +3320,7 @@ impl Editor {
                     continue;
                 }
             }
-            let line_is_raw = line_index >= raw_block.0 && line_index <= raw_block.1;
+            let line_is_raw = line_index >= raw_block.0 && line_index <= raw_block.1 && !in_table;
             if self.dynamic
                 && !in_code
                 && !syntax::is_fence(&layout.text)
@@ -3054,54 +3342,64 @@ impl Editor {
             }
 
             // A standalone image embed outside the edited paragraph is drawn as an image,
-            // with empty rows reserved for its height.
-            if self.dynamic && !line_is_raw && !in_code {
-                if let Some((target, requested)) = image_embed(&layout.text) {
-                    if let Some(path) = self.resolve_embed(&target) {
-                        if let Some((data, image_width, image_height)) =
-                            crate::reading::inline_image(&path)
-                        {
-                            let (display_width, display_height, row_count) = editor_image_layout(
-                                image_width,
-                                image_height,
-                                width - 16.0,
-                                f32::from(self.line_height),
-                                requested,
-                            );
-                            let first_row = rows.len();
-                            let source_len = layout.text.chars().count();
-                            let display_len = layout.map.display.len();
-                            let display_byte =
-                                layout.map.display_offsets.last().copied().unwrap_or(0);
-                            for _ in 0..row_count {
-                                rows.push(blank_row.clone());
-                                metas.push(RowMeta {
-                                    line: line_index,
-                                    start: source_len,
-                                    end: source_len,
-                                    display_start: display_len,
-                                    display_end: display_len,
-                                    display_start_byte: display_byte,
-                                    map: layout.map.clone(),
-                                });
-                            }
-                            self.editor_images.push(EditorImage {
-                                line: line_index,
-                                first_row,
-                                row_count,
-                                data,
-                                width: display_width,
-                                height: display_height,
-                            });
-                            if line_index < self.line_cache.len() {
-                                self.line_cache[line_index] = Some(layout);
-                            } else {
-                                self.line_cache.push(Some(layout));
-                            }
-                            continue;
-                        }
+            // with empty rows reserved for its height. While the caret is on its source
+            // line, the image is replaced by the source, but the same number of rows is
+            // still reserved so content below (tables, headings) does not jump.
+            let image = if self.dynamic && !in_code {
+                image_embed(&layout.text).and_then(|(target, requested)| {
+                    let path = self.resolve_embed(&target)?;
+                    let (data, image_width, image_height) = crate::reading::inline_image(&path)?;
+                    let (display_width, display_height, row_count) = editor_image_layout(
+                        image_width,
+                        image_height,
+                        width - 16.0,
+                        f32::from(self.line_height),
+                        requested,
+                    );
+                    Some((path, data, display_width, display_height, row_count))
+                })
+            } else {
+                None
+            };
+            let mut reserved_image_rows = 0usize;
+            match (line_is_raw, image) {
+                (false, Some((path, data, display_width, display_height, row_count))) => {
+                    let first_row = rows.len();
+                    let source_len = layout.text.chars().count();
+                    let display_len = layout.map.display.len();
+                    let display_byte = layout.map.display_offsets.last().copied().unwrap_or(0);
+                    for _ in 0..row_count {
+                        rows.push(blank_row.clone());
+                        metas.push(RowMeta {
+                            line: line_index,
+                            start: source_len,
+                            end: source_len,
+                            display_start: display_len,
+                            display_end: display_len,
+                            display_start_byte: display_byte,
+                            map: layout.map.clone(),
+                        });
                     }
+                    self.editor_images.push(EditorImage {
+                        line: line_index,
+                        first_row,
+                        row_count,
+                        path,
+                        data,
+                        width: display_width,
+                        height: display_height,
+                    });
+                    if line_index < self.line_cache.len() {
+                        self.line_cache[line_index] = Some(layout);
+                    } else {
+                        self.line_cache.push(Some(layout));
+                    }
+                    continue;
                 }
+                (true, Some((_, _, _, _, row_count))) => {
+                    reserved_image_rows = row_count.saturating_sub(layout.rows.len());
+                }
+                _ => {}
             }
 
             if let Some(&block) = block_start.get(&line_index) {
@@ -3126,6 +3424,23 @@ impl Editor {
                 });
             }
             rows.extend(layout.rows.iter().cloned());
+            if reserved_image_rows > 0 {
+                let source_len = layout.text.chars().count();
+                let display_len = layout.map.display.len();
+                let display_byte = layout.map.display_offsets.last().copied().unwrap_or(0);
+                for _ in 0..reserved_image_rows {
+                    rows.push(blank_row.clone());
+                    metas.push(RowMeta {
+                        line: line_index,
+                        start: source_len,
+                        end: source_len,
+                        display_start: display_len,
+                        display_end: display_len,
+                        display_start_byte: display_byte,
+                        map: layout.map.clone(),
+                    });
+                }
+            }
             if let Some(&block) = block_end.get(&line_index) {
                 let first_row = blocks[block].first_row;
                 if first_row != usize::MAX {
@@ -3190,7 +3505,9 @@ impl Editor {
                 .filter(|((_, (first, last)), divider)| {
                     *first != usize::MAX && *last > *first && *divider != usize::MAX
                 })
-                .map(|((_, (first, last)), divider)| TableLayout {
+                .map(|(((start, end), (first, last)), divider)| TableLayout {
+                    first_line: *start,
+                    last_line: *end,
                     first_row: first,
                     last_row: last,
                     divider_row: divider,
@@ -3286,6 +3603,7 @@ impl Editor {
     pub fn apply_recovery(&mut self, text: &str, line: usize, col: usize) {
         self.buffer.replace(0..self.buffer.len_chars(), text);
         self.table_edit = None;
+        *self.lightbox.borrow_mut() = None;
         self.set_cursor_position(line, col);
         self.reset_layout_cache();
         self.properties_revision = u64::MAX;
@@ -4104,6 +4422,9 @@ impl Editor {
     }
 
     fn insert_text(&mut self, text: &str) {
+        if self.lightbox_open() {
+            return;
+        }
         if self.extra_cursors.is_empty() {
             if let Some(selection) = self.selection() {
                 self.buffer.replace(selection, text);
@@ -4120,6 +4441,9 @@ impl Editor {
     }
 
     fn backspace(&mut self, _: &Backspace, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.lightbox_open() {
+            return;
+        }
         if self.table_edit_mutate(cx, |edit| edit.backspace()) {
             return;
         }
@@ -4160,7 +4484,10 @@ impl Editor {
     }
 
     fn delete(&mut self, _: &Delete, _window: &mut Window, cx: &mut Context<Self>) {
-        if self.table_edit_mutate(cx, |edit| edit.delete()) {
+        if self.lightbox_open() {
+            return;
+        }
+        if self.table_edit_mutate(cx, |edit| edit.delete_key()) {
             return;
         }
         if !self.can_mutate() {
@@ -4384,6 +4711,9 @@ impl Editor {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.lightbox_open() {
+            return;
+        }
         if self.table_edit_mutate(cx, |edit| edit.delete_word_left()) {
             return;
         }
@@ -4406,6 +4736,9 @@ impl Editor {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.lightbox_open() {
+            return;
+        }
         if self.table_edit_mutate(cx, |edit| edit.delete_word_right()) {
             return;
         }
@@ -4452,7 +4785,7 @@ impl Editor {
     }
 
     fn select_left(&mut self, _: &SelectLeft, _window: &mut Window, cx: &mut Context<Self>) {
-        if self.table_edit_mutate(cx, |edit| edit.move_left()) {
+        if self.table_edit_mutate(cx, |edit| edit.extend_left()) {
             return;
         }
         if self.reading {
@@ -4467,7 +4800,7 @@ impl Editor {
     }
 
     fn select_right(&mut self, _: &SelectRight, _window: &mut Window, cx: &mut Context<Self>) {
-        if self.table_edit_mutate(cx, |edit| edit.move_right()) {
+        if self.table_edit_mutate(cx, |edit| edit.extend_right()) {
             return;
         }
         if self.reading {
@@ -4482,7 +4815,7 @@ impl Editor {
     }
 
     fn select_up(&mut self, _: &SelectUp, _window: &mut Window, cx: &mut Context<Self>) {
-        if self.table_edit_mutate(cx, |edit| edit.move_up()) {
+        if self.table_edit_mutate(cx, |edit| edit.extend_up()) {
             return;
         }
         if self.reading {
@@ -4497,7 +4830,7 @@ impl Editor {
     }
 
     fn select_down(&mut self, _: &SelectDown, _window: &mut Window, cx: &mut Context<Self>) {
-        if self.table_edit_mutate(cx, |edit| edit.move_down()) {
+        if self.table_edit_mutate(cx, |edit| edit.extend_down()) {
             return;
         }
         if self.reading {
@@ -4598,6 +4931,12 @@ impl Editor {
     }
 
     fn on_select_all(&mut self, _: &SelectAll, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.lightbox_open() {
+            return;
+        }
+        if self.table_edit_mutate(cx, |edit| edit.select_all()) {
+            return;
+        }
         if self.reading {
             self.reading_content.select_all();
             cx.notify();
@@ -4616,10 +4955,7 @@ impl Editor {
     /// Copy the current selection (reading or editing) and report what happened.
     pub fn copy_selection(&mut self, cx: &mut Context<Self>) {
         if let Some(edit) = &self.table_edit {
-            let text = edit
-                .cell(edit.active_row, edit.active_col)
-                .cloned()
-                .unwrap_or_default();
+            let text = edit.copy_text();
             let count = text.chars().count();
             cx.write_to_clipboard(ClipboardItem::new_string(text));
             self.report(
@@ -4663,23 +4999,17 @@ impl Editor {
     }
 
     fn cut(&mut self, _: &Cut, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.lightbox_open() {
+            return;
+        }
         if self.table_edit.is_some() {
             let text = self
                 .table_edit
                 .as_ref()
-                .and_then(|edit| edit.cell(edit.active_row, edit.active_col))
-                .cloned()
+                .map(|edit| edit.copy_text())
                 .unwrap_or_default();
             cx.write_to_clipboard(ClipboardItem::new_string(text));
-            self.table_edit_mutate(cx, |edit| {
-                let len = edit
-                    .cell(edit.active_row, edit.active_col)
-                    .map(|cell| cell.chars().count())
-                    .unwrap_or(0);
-                for _ in 0..len {
-                    edit.backspace();
-                }
-            });
+            self.table_edit_mutate(cx, |edit| edit.clear_selected());
             return;
         }
         if !self.can_mutate() {
@@ -4700,6 +5030,9 @@ impl Editor {
     }
 
     fn undo(&mut self, _: &Undo, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.lightbox_open() {
+            return;
+        }
         if self.table_edit.take().is_some() {
             cx.notify();
         }
@@ -4716,6 +5049,9 @@ impl Editor {
     }
 
     fn redo(&mut self, _: &Redo, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.lightbox_open() {
+            return;
+        }
         if self.table_edit.take().is_some() {
             cx.notify();
         }
@@ -4732,6 +5068,9 @@ impl Editor {
     }
 
     fn enter(&mut self, _: &Enter, window: &mut Window, cx: &mut Context<Self>) {
+        if self.lightbox_open() {
+            return;
+        }
         if self.table_edit_mutate(cx, |edit| edit.next_cell()) {
             return;
         }
@@ -4796,9 +5135,12 @@ impl Editor {
     }
 
     fn paste(&mut self, _: &Paste, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.lightbox_open() {
+            return;
+        }
         if self.table_edit.is_some() {
             if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
-                self.table_edit_mutate(cx, |edit| edit.insert_text(&text));
+                self.table_edit_mutate(cx, |edit| edit.paste_text(&text));
             }
             return;
         }
@@ -5082,6 +5424,9 @@ impl Editor {
 
     /// Tab: accept an autocomplete suggestion, otherwise indent the selection or caret.
     fn indent(&mut self, _: &Indent, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.lightbox_open() {
+            return;
+        }
         if self.table_edit_mutate(cx, |edit| edit.next_cell()) {
             return;
         }
@@ -5104,6 +5449,9 @@ impl Editor {
 
     /// Shift+Tab: remove one indent step from the selected lines or the caret's line.
     fn outdent(&mut self, _: &Outdent, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.lightbox_open() {
+            return;
+        }
         if self.table_edit_mutate(cx, |edit| edit.previous_cell()) {
             return;
         }
@@ -5221,6 +5569,9 @@ impl Editor {
 
     /// Open the in-note find bar, optionally with the replacement field.
     pub fn open_find(&mut self, replace: bool) {
+        if self.lightbox_open() {
+            return;
+        }
         self.table_edit = None;
         if self.reading {
             // In-page find: it never leaves reading mode and never edits the note.
@@ -5245,6 +5596,9 @@ impl Editor {
     /// Escape closes the find bar, leaves Vim insert/visual mode, or drops extra carets.
     /// Returns whether the editor consumed the key.
     pub fn handle_escape(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.lightbox.borrow_mut().take().is_some() {
+            return true;
+        }
         if self.close_table_edit(cx) {
             return true;
         }
@@ -5901,6 +6255,38 @@ impl Editor {
         Some(self.buffer.char_index_at(meta.line, source_col))
     }
 
+    /// The image under a window-space point, from the geometry of the last paint.
+    fn image_at_point(&self, position: Point<Pixels>) -> Option<PathBuf> {
+        let bounds = self.last_bounds?;
+        if !bounds.contains(&position) {
+            return None;
+        }
+        let column_width = f32::from(bounds.size.width);
+        let line_height = f32::from(self.line_height);
+        for image in &self.editor_images {
+            let width = image.width.min((column_width - 16.0).max(1.0));
+            let height = image.height;
+            let left = bounds.left() + px(((column_width - width) / 2.0).max(0.0));
+            let block_height = line_height * image.row_count as f32;
+            let top = bounds.top()
+                + px(line_height * image.first_row as f32)
+                + px(((block_height - height) / 2.0).max(0.0));
+            let rect = Bounds::new(point(left, top), size(px(width), px(height)));
+            if rect.contains(&position) {
+                return Some(image.path.clone());
+            }
+        }
+
+        // The image rows are blank in the text layout; clicking anywhere on them should
+        // still open the image. Map the pointer to a source line and match the embed line.
+        let index = self.index_for_point(position)?;
+        let (line, _) = self.buffer.line_col_at(index);
+        self.editor_images
+            .iter()
+            .find(|image| image.line == line)
+            .map(|image| image.path.clone())
+    }
+
     /// Fold or unfold a heading when its gutter marker is clicked.
     fn fold_from_gutter(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) -> bool {
         let Some(bounds) = self.last_bounds else {
@@ -5940,6 +6326,9 @@ impl Editor {
         cx: &mut Context<Self>,
     ) {
         if self.reading {
+            return;
+        }
+        if self.lightbox_open() {
             return;
         }
         if self.table_edit.is_some() {
@@ -5994,6 +6383,12 @@ impl Editor {
             cx.notify();
         }
         if self.fold_from_gutter(event.position, cx) {
+            return;
+        }
+        if let Some(path) = self.image_at_point(event.position) {
+            *self.lightbox.borrow_mut() = Some(crate::reading::Lightbox::new(path));
+            self.selecting = false;
+            cx.notify();
             return;
         }
         let Some(index) = self.index_for_point(event.position) else {
@@ -6157,10 +6552,32 @@ impl Render for Editor {
         self.refresh_properties();
         self.refresh_stats(cx);
 
-        let table_overlay = if !reading && self.dynamic {
-            self.render_table_edit(theme, cx)
+        // The table grids are absolutely positioned from `layout_tables`. Reflow before
+        // building them so a caret move that hides or reveals an image cannot leave a grid
+        // at the previous row range for a frame (which looks like a duplicate table).
+        if !reading && self.cache_width > 0.0 {
+            let width = self.cache_width;
+            self.lay_out(window, theme, width, theme.text);
+        }
+
+        let table_overlays: Vec<AnyElement> = if !reading && self.dynamic {
+            let mut overlays = Vec::new();
+            for (ordinal, layout) in self.layout_tables.iter().enumerate() {
+                let active = self
+                    .table_edit
+                    .as_ref()
+                    .is_some_and(|edit| edit.table_ordinal == ordinal);
+                if active {
+                    if let Some(overlay) = self.render_table_edit(theme, cx) {
+                        overlays.push(overlay);
+                    }
+                } else if let Some(overlay) = self.render_table_view(ordinal, layout, theme, cx) {
+                    overlays.push(overlay);
+                }
+            }
+            overlays
         } else {
-            None
+            Vec::new()
         };
 
         let body: AnyElement = if reading {
@@ -6207,6 +6624,12 @@ impl Render for Editor {
                             },
                         )
                     };
+                    let notify_reading: crate::reading::ReadingNotifier = {
+                        let weak = cx.entity().downgrade();
+                        Rc::new(move |cx: &mut App| {
+                            let _ = weak.update(cx, |_, cx| cx.notify());
+                        })
+                    };
                     self.reading_content.element(
                         self.vault_root.clone(),
                         theme,
@@ -6214,6 +6637,7 @@ impl Render for Editor {
                         self.link_opener.clone(),
                         Some(fold),
                         Some(toggle_task),
+                        notify_reading,
                         cx,
                     )
                 })
@@ -6247,13 +6671,39 @@ impl Render for Editor {
                                 .min_w(px(0.0))
                                 .overflow_hidden()
                                 .px_6()
+                                // The table grid paints one row below the table for the
+                                // add-row control. Reserve that row so it is not clipped
+                                // when the table is the last block in the note.
+                                .when(self.table_edit.is_some(), |d| {
+                                    d.pb(px(f32::from(self.line_height) * 2.0))
+                                })
                                 .child(EditorText {
                                     editor: cx.entity(),
                                 })
-                                .children(table_overlay),
+                                .children(table_overlays),
                         ),
                 )
                 .into_any_element()
+        };
+
+        let editor_lightbox = if self.reading {
+            None
+        } else {
+            self.lightbox.borrow().clone().map(|state| {
+                let notify: crate::reading::ReadingNotifier = {
+                    let weak = cx.entity().downgrade();
+                    Rc::new(move |cx: &mut App| {
+                        let _ = weak.update(cx, |_, cx| cx.notify());
+                    })
+                };
+                crate::reading::render_lightbox(
+                    state,
+                    self.cache_width.max(360.0),
+                    self.lightbox.clone(),
+                    notify,
+                    theme,
+                )
+            })
         };
 
         let autocomplete_bar = if self.autocomplete.open {
@@ -6808,7 +7258,8 @@ impl Render for Editor {
                                 .child(bar)
                                 .into_any_element(),
                         }
-                    })),
+                    }))
+                    .children(editor_lightbox),
             )
             .when_some(format_bar, |d, bar| d.child(bar))
             .when(self.context_menu.is_some(), |d| {
@@ -6904,6 +7355,9 @@ impl EntityInputHandler for Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.lightbox_open() {
+            return;
+        }
         if self.table_edit_mutate(cx, |edit| edit.finish_text(new_text)) {
             self.marked_range = None;
             return;
@@ -7002,6 +7456,9 @@ impl EntityInputHandler for Editor {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.lightbox_open() {
+            return;
+        }
         if self.table_edit_mutate(cx, |edit| edit.mark_text(new_text)) {
             self.marked_range = None;
             return;
@@ -8715,27 +9172,6 @@ fn table_cell_text(
                 .whitespace_nowrap()
                 .child(after),
         )
-        .into_any_element()
-}
-
-/// A compact button in the table grid's control row.
-fn table_tool_button(
-    label: &'static str,
-    theme: Theme,
-    handler: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
-) -> AnyElement {
-    div()
-        .id(ElementId::Name(format!("table-tool-{label}").into()))
-        .px_2()
-        .py(px(1.0))
-        .rounded_sm()
-        .bg(theme.chip)
-        .text_xs()
-        .text_color(theme.accent_text)
-        .cursor_pointer()
-        .hover(move |style| style.bg(theme.hover))
-        .on_mouse_down(MouseButton::Left, handler)
-        .child(label)
         .into_any_element()
 }
 

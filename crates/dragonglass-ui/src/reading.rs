@@ -164,6 +164,9 @@ pub type ImageOpener = Rc<dyn Fn(&str, &mut Window, &mut App)>;
 /// Toggles a task checkbox: `(block index, new checked state)`.
 pub type TaskToggle = Rc<dyn Fn(usize, bool, &mut Window, &mut App)>;
 
+/// Asks the view that owns a reading pane to render again.
+pub type ReadingNotifier = Rc<dyn Fn(&mut App)>;
+
 /// Opens a non-image attachment with the operating system's default application.
 pub type FileOpener = Rc<dyn Fn(&str, &mut Window, &mut App)>;
 
@@ -180,7 +183,7 @@ pub(crate) struct Lightbox {
 }
 
 impl Lightbox {
-    fn new(path: PathBuf) -> Self {
+    pub(crate) fn new(path: PathBuf) -> Self {
         Self {
             path,
             zoom: 1.0,
@@ -797,8 +800,13 @@ impl ReadingCache {
         if self.version.0 != version.0 {
             self.list_state.reset(blocks.len());
         } else {
+            // An edit (ticking a task, for example) must keep the reader where it was.
+            // Splicing re-measures items, which otherwise resets a variable-height list
+            // to the top.
+            let scroll = self.list_state.logical_scroll_top();
             let old_count = self.blocks.len();
             self.list_state.splice(0..old_count, blocks.len());
+            self.list_state.scroll_to(scroll);
         }
 
         self.selection.borrow_mut().clear();
@@ -1455,6 +1463,7 @@ impl ReadingCache {
         opener: Option<LinkOpener>,
         on_fold: Option<FoldToggle>,
         on_task: Option<TaskToggle>,
+        notify: ReadingNotifier,
         cx: &mut App,
     ) -> impl IntoElement {
         // A popup can ask for a block hidden by a fold: unfold, reflow, then scroll to it.
@@ -1546,8 +1555,10 @@ impl ReadingCache {
         let next_block = Cell::new(self.blocks.len());
         let on_image: ImageOpener = {
             let lightbox = lightbox.clone();
-            Rc::new(move |path, window, _cx| {
+            let notify = notify.clone();
+            Rc::new(move |path, window, cx| {
                 *lightbox.borrow_mut() = Some(Lightbox::new(PathBuf::from(path)));
+                notify(cx);
                 window.refresh();
             })
         };
@@ -1713,6 +1724,7 @@ impl ReadingCache {
                     state,
                     pane_width_for_lightbox.get(),
                     lightbox.clone(),
+                    notify.clone(),
                     theme,
                 )
             }))
@@ -1724,10 +1736,11 @@ impl ReadingCache {
 /// GPUI 0.2 has no pinch event, so the trackpad's scroll gesture zooms, a drag pans and a
 /// double-click returns to the fitted view. Every handler mutates the shared state and
 /// asks for one repaint; the state is not an entity of its own.
-fn render_lightbox(
+pub(crate) fn render_lightbox(
     state: Lightbox,
     pane_width: f32,
     lightbox: Rc<RefCell<Option<Lightbox>>>,
+    notify: ReadingNotifier,
     theme: Theme,
 ) -> AnyElement {
     let available_width = if pane_width > 0.0 {
@@ -1758,6 +1771,11 @@ fn render_lightbox(
     let up_state = lightbox.clone();
     let up_state_out = lightbox.clone();
     let double_state = lightbox.clone();
+    let notify_move = notify.clone();
+    let notify_up_out = notify.clone();
+    let notify_wheel = notify.clone();
+    let notify_image = notify.clone();
+    let notify_button = notify.clone();
 
     let zoom_out = lightbox.clone();
     let zoom_in = lightbox.clone();
@@ -1777,38 +1795,64 @@ fn render_lightbox(
         .items_center()
         .justify_center()
         .bg(gpui::hsla(0.0, 0.0, 0.0, 0.86))
-        .on_mouse_down(MouseButton::Left, move |_event, window, _cx| {
-            // Clicking the backdrop (not the image or a control) closes the viewer.
-            *drag_state.borrow_mut() = None;
-            window.refresh();
-        })
-        .on_mouse_move(move |event, window, _cx| {
-            let mut state = move_state.borrow_mut();
-            let Some(state) = state.as_mut() else {
-                return;
-            };
-            if !state.dragging {
-                return;
-            }
-            let position = (f32::from(event.position.x), f32::from(event.position.y));
-            if let Some((last_x, last_y)) = state.drag_origin {
-                state.pan_x += position.0 - last_x;
-                state.pan_y += position.1 - last_y;
-            }
-            state.drag_origin = Some(position);
-            window.refresh();
-        })
-        .on_mouse_up(MouseButton::Left, move |_event, window, _cx| {
-            if let Some(state) = up_state.borrow_mut().as_mut() {
-                state.dragging = false;
-                state.drag_origin = None;
+        .on_mouse_down(MouseButton::Left, {
+            let notify = notify.clone();
+            move |_event, window, cx| {
+                // Clicking the backdrop (not the image or a control) closes the viewer.
+                *drag_state.borrow_mut() = None;
+                notify(cx);
                 window.refresh();
             }
         })
-        .on_mouse_up_out(MouseButton::Left, move |_event, window, _cx| {
-            if let Some(state) = up_state_out.borrow_mut().as_mut() {
+        .on_mouse_move(move |event, window, cx| {
+            {
+                let mut guard = move_state.borrow_mut();
+                let Some(state) = guard.as_mut() else {
+                    return;
+                };
+                if !state.dragging {
+                    return;
+                }
+                let position = (f32::from(event.position.x), f32::from(event.position.y));
+                if let Some((last_x, last_y)) = state.drag_origin {
+                    state.pan_x += position.0 - last_x;
+                    state.pan_y += position.1 - last_y;
+                }
+                state.drag_origin = Some(position);
+            }
+            notify_move(cx);
+            window.refresh();
+        })
+        .on_mouse_up(MouseButton::Left, {
+            let notify = notify.clone();
+            move |_event, window, cx| {
+                let moved = {
+                    let mut guard = up_state.borrow_mut();
+                    let Some(state) = guard.as_mut() else {
+                        return;
+                    };
+                    state.dragging = false;
+                    state.drag_origin = None;
+                    true
+                };
+                if moved {
+                    notify(cx);
+                    window.refresh();
+                }
+            }
+        })
+        .on_mouse_up_out(MouseButton::Left, move |_event, window, cx| {
+            let moved = {
+                let mut guard = up_state_out.borrow_mut();
+                let Some(state) = guard.as_mut() else {
+                    return;
+                };
                 state.dragging = false;
                 state.drag_origin = None;
+                true
+            };
+            if moved {
+                notify_up_out(cx);
                 window.refresh();
             }
         })
@@ -1819,8 +1863,16 @@ fn render_lightbox(
                 gpui::ScrollDelta::Pixels(point) => f32::from(point.y),
                 gpui::ScrollDelta::Lines(point) => point.y * 24.0,
             };
-            if let Some(state) = wheel_state.borrow_mut().as_mut() {
+            let changed = {
+                let mut guard = wheel_state.borrow_mut();
+                let Some(state) = guard.as_mut() else {
+                    return;
+                };
                 state.zoom_by((-dy * 0.0025).exp());
+                true
+            };
+            if changed {
+                notify_wheel(cx);
                 window.refresh();
             }
         })
@@ -1842,25 +1894,28 @@ fn render_lightbox(
                         .cursor(CursorStyle::OpenHand)
                         .on_mouse_down(MouseButton::Left, move |event, window, cx| {
                             cx.stop_propagation();
-                            let mut state = double_state.borrow_mut();
-                            let Some(state) = state.as_mut() else {
-                                return;
-                            };
-                            if event.click_count >= 2 {
-                                if (state.zoom - 1.0).abs() < 0.01 {
-                                    state.zoom = 2.0;
-                                    state.pan_x = 0.0;
-                                    state.pan_y = 0.0;
+                            {
+                                let mut guard = double_state.borrow_mut();
+                                let Some(state) = guard.as_mut() else {
+                                    return;
+                                };
+                                if event.click_count >= 2 {
+                                    if (state.zoom - 1.0).abs() < 0.01 {
+                                        state.zoom = 2.0;
+                                        state.pan_x = 0.0;
+                                        state.pan_y = 0.0;
+                                    } else {
+                                        state.reset();
+                                    }
                                 } else {
-                                    state.reset();
+                                    state.dragging = true;
+                                    state.drag_origin = Some((
+                                        f32::from(event.position.x),
+                                        f32::from(event.position.y),
+                                    ));
                                 }
-                            } else {
-                                state.dragging = true;
-                                state.drag_origin = Some((
-                                    f32::from(event.position.x),
-                                    f32::from(event.position.y),
-                                ));
                             }
+                            notify_image(cx);
                             window.refresh();
                         })
                         .child(picture),
@@ -1888,12 +1943,17 @@ fn render_lightbox(
                         .flex()
                         .items_center()
                         .gap_1()
-                        .child(lightbox_button("-", theme, move |window| {
-                            if let Some(state) = zoom_out.borrow_mut().as_mut() {
-                                state.zoom_by(1.0 / 1.25);
-                                window.refresh();
-                            }
-                        }))
+                        .child(lightbox_button(
+                            "-",
+                            theme,
+                            notify_button.clone(),
+                            move |window| {
+                                if let Some(state) = zoom_out.borrow_mut().as_mut() {
+                                    state.zoom_by(1.0 / 1.25);
+                                    window.refresh();
+                                }
+                            },
+                        ))
                         .child(
                             div()
                                 .px_2()
@@ -1904,22 +1964,33 @@ fn render_lightbox(
                                 .text_color(theme.muted)
                                 .child(percent),
                         )
-                        .child(lightbox_button("+", theme, move |window| {
-                            if let Some(state) = zoom_in.borrow_mut().as_mut() {
-                                state.zoom_by(1.25);
-                                window.refresh();
-                            }
-                        }))
-                        .child(lightbox_button("reset", theme, move |window| {
-                            if let Some(state) = reset.borrow_mut().as_mut() {
-                                state.reset();
-                                window.refresh();
-                            }
-                        })),
+                        .child(lightbox_button(
+                            "+",
+                            theme,
+                            notify_button.clone(),
+                            move |window| {
+                                if let Some(state) = zoom_in.borrow_mut().as_mut() {
+                                    state.zoom_by(1.25);
+                                    window.refresh();
+                                }
+                            },
+                        ))
+                        .child(lightbox_button(
+                            "reset",
+                            theme,
+                            notify_button.clone(),
+                            move |window| {
+                                if let Some(state) = reset.borrow_mut().as_mut() {
+                                    state.reset();
+                                    window.refresh();
+                                }
+                            },
+                        )),
                 )
                 .child(div().absolute().top_3().right_4().child(lightbox_button(
                     "\u{00D7}",
                     theme,
+                    notify_button.clone(),
                     move |window| {
                         *close.borrow_mut() = None;
                         window.refresh();
@@ -1933,6 +2004,7 @@ fn render_lightbox(
 fn lightbox_button(
     label: &'static str,
     theme: Theme,
+    notify: ReadingNotifier,
     action: impl Fn(&mut Window) + 'static,
 ) -> AnyElement {
     div()
@@ -1950,6 +2022,7 @@ fn lightbox_button(
         .on_mouse_down(MouseButton::Left, move |_event, window, cx| {
             cx.stop_propagation();
             action(window);
+            notify(cx);
         })
         .child(label)
         .into_any_element()
@@ -2207,7 +2280,7 @@ fn render_block(block: Block, block_index: Option<usize>, ctx: &RenderCtx) -> An
             .w_full()
             .bg(theme.border)
             .into_any_element(),
-        Block::Math { tex } => render_math(&tex, ctx),
+        Block::Math { tex } => render_math(&tex, block_index, ctx),
         Block::Footnote { id, text } => {
             // `[id] text` is the display form; selection offsets start after the marker.
             let base = id.len() + 3;
@@ -2401,7 +2474,7 @@ fn block_texts(block: &Block) -> Vec<&str> {
 }
 
 /// A display formula, centred and scaled down when it is wider than the reading column.
-fn render_math(tex: &str, ctx: &RenderCtx) -> AnyElement {
+fn render_math(tex: &str, block: Option<usize>, ctx: &RenderCtx) -> AnyElement {
     const FONT_SIZE: f32 = 17.0;
     // Usable width inside the reading column.
     let max_width: f32 = (ctx.measure - 44.0).max(320.0);
@@ -2411,13 +2484,27 @@ fn render_math(tex: &str, ctx: &RenderCtx) -> AnyElement {
     };
 
     let width = scene.width() as f32 * FONT_SIZE;
-    let scale = if width > max_width {
-        (max_width / width).max(0.6)
-    } else {
-        1.0
-    };
+    let math = MathElement::new(scene, FONT_SIZE, ctx.theme.text);
 
-    MathElement::new(scene, FONT_SIZE * scale, ctx.theme.text).into_any_element()
+    // A wide formula keeps its reading size and scrolls horizontally instead of shrinking
+    // into an unreadable block.
+    if width > max_width {
+        let key = format!("{:?}:{tex}", block);
+        div()
+            .id(content_id("math-scroll", &key))
+            .w_full()
+            .min_w(px(0.0))
+            .overflow_x_scroll()
+            .child(div().w(px(width)).flex().justify_center().child(math))
+            .into_any_element()
+    } else {
+        div()
+            .w_full()
+            .flex()
+            .justify_center()
+            .child(math)
+            .into_any_element()
+    }
 }
 
 /// Unsupported or malformed TeX: show the source, never a silent blank.
@@ -2607,6 +2694,7 @@ fn rich_text_styled(
                 selection: ctx.selection.clone(),
                 links,
                 opener: ctx.opener.cloned(),
+                on_image: ctx.on_image.cloned(),
                 list_state: ctx.list_state.cloned(),
                 block_count: ctx.block_count,
                 find: ctx
@@ -2824,6 +2912,7 @@ fn code_block(text: &str, language: &str, block: Option<usize>, ctx: &RenderCtx)
                 selection: ctx.selection.clone(),
                 links: Vec::new(),
                 opener: ctx.opener.cloned(),
+                on_image: ctx.on_image.cloned(),
                 list_state: ctx.list_state.cloned(),
                 block_count: ctx.block_count,
                 find: ctx
@@ -2843,6 +2932,15 @@ fn code_block(text: &str, language: &str, block: Option<usize>, ctx: &RenderCtx)
     text.hash(&mut hasher);
     language.hash(&mut hasher);
     let id = format!("reading-code-{:x}", hasher.finish());
+
+    // Monospace code does not wrap. Give the scroll content an explicit width from the
+    // longest line so lines wider than the reading column can be scrolled left and right.
+    let max_chars = lines
+        .iter()
+        .map(|line| line.chars().count())
+        .max()
+        .unwrap_or(0);
+    let content_width = (max_chars as f32 * 8.0 + 16.0).max(1.0);
 
     let language = language.trim();
     let copy_button = {
@@ -2900,10 +2998,19 @@ fn code_block(text: &str, language: &str, block: Option<usize>, ctx: &RenderCtx)
         .child(
             div()
                 .id(ElementId::Name(format!("{id}-scroll").into()))
+                .w_full()
+                .min_w(px(0.0))
                 .flex()
                 .flex_col()
                 .overflow_x_scroll()
-                .children(rendered),
+                .child(
+                    div()
+                        .w(px(content_width))
+                        .flex_shrink_0()
+                        .flex()
+                        .flex_col()
+                        .children(rendered),
+                ),
         )
         .into_any_element()
 }
@@ -2973,6 +3080,14 @@ fn is_word_char(ch: char) -> bool {
     ch.is_alphanumeric() || ch == '_'
 }
 
+/// A stable element id derived from content, for independent scroll containers.
+fn content_id(prefix: &str, content: &str) -> ElementId {
+    use std::collections::hash_map::DefaultHasher;
+    let mut hasher = DefaultHasher::new();
+    content.hash(&mut hasher);
+    ElementId::Name(format!("{prefix}-{:016x}", hasher.finish()).into())
+}
+
 /// A GFM pipe table, with the same inline math/highlight treatment as prose.
 fn render_table(
     align: &[Align],
@@ -3024,15 +3139,27 @@ fn render_table(
         .collect();
 
     div()
+        .id(content_id(
+            "table-scroll",
+            &format!("{block:?}:{}", headers.join("|")),
+        ))
         .w_full()
-        .border_1()
-        .border_color(theme.border)
-        .rounded_md()
-        .overflow_hidden()
-        .flex()
-        .flex_col()
-        .child(header)
-        .children(body)
+        .min_w(px(0.0))
+        .py_2()
+        .overflow_x_scroll()
+        .child(
+            div()
+                .w_full()
+                .min_w(px(headers.len().max(1) as f32 * 120.0))
+                .border_1()
+                .border_color(theme.border)
+                .rounded_md()
+                .overflow_hidden()
+                .flex()
+                .flex_col()
+                .child(header)
+                .children(body),
+        )
         .into_any_element()
 }
 
@@ -3061,8 +3188,8 @@ fn table_row(
         .map(|(index, cell)| {
             let mut cell_element = div()
                 .flex_1()
-                .min_w(px(0.0))
-                .px_3()
+                .min_w(px(120.0))
+                .px_4()
                 .py_2()
                 .border_r_1()
                 .border_color(theme.border);
@@ -3329,7 +3456,7 @@ pub(crate) fn inline_image(path: &Path) -> DecodedImage {
     })
 }
 
-fn is_image(target: &str) -> bool {
+pub(crate) fn is_image(target: &str) -> bool {
     matches!(
         Path::new(target)
             .extension()
@@ -3338,6 +3465,16 @@ fn is_image(target: &str) -> bool {
             .as_deref(),
         Some("png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "svg" | "avif" | "ico")
     )
+}
+
+/// Whether a link target points at a local image and should open the lightbox instead of
+/// the operating system's viewer.
+pub(crate) fn is_image_target(target: &str) -> bool {
+    if target.starts_with("http://") || target.starts_with("https://") {
+        return false;
+    }
+    let path = target.split(['#', '?']).next().unwrap_or(target);
+    is_image(path)
 }
 
 /// A non-note, non-image file: PDF, audio, video.
@@ -3457,6 +3594,8 @@ struct SelectableText {
     selection: Rc<RefCell<ReadSelection>>,
     links: Vec<(Range<usize>, String)>,
     opener: Option<LinkOpener>,
+    /// Image links open the reading lightbox instead of the OS viewer.
+    on_image: Option<ImageOpener>,
     /// The reading list and its size, so dragging past the viewport can scroll.
     list_state: Option<ListState>,
     block_count: usize,
@@ -3667,6 +3806,7 @@ impl Element for SelectableText {
         let up_selection = self.selection.clone();
         let up_links = self.links.clone();
         let up_opener = self.opener.clone();
+        let up_on_image = self.on_image.clone();
         window.on_mouse_event(
             move |event: &MouseUpEvent, phase, window: &mut Window, cx: &mut App| {
                 if phase != DispatchPhase::Bubble {
@@ -3694,7 +3834,11 @@ impl Element for SelectableText {
                         if let Some((_, target)) =
                             up_links.iter().find(|(range, _)| range.contains(&local))
                         {
-                            if let Some(opener) = &up_opener {
+                            if is_image_target(target) {
+                                if let Some(on_image) = &up_on_image {
+                                    on_image(target, window, cx);
+                                }
+                            } else if let Some(opener) = &up_opener {
                                 opener(target, window, cx);
                             }
                         }
@@ -4212,6 +4356,15 @@ mod tests {
         cache.find_next(false);
         let after: Vec<String> = cache.blocks.iter().map(block_display).collect();
         assert_eq!(before, after);
+    }
+
+    #[test]
+    fn local_image_links_are_recognised() {
+        assert!(is_image_target("attachments/photo.PNG"));
+        assert!(is_image_target("photo.webp#fragment"));
+        assert!(is_image_target("photo.jpg?raw=1"));
+        assert!(!is_image_target("https://example.com/photo.png"));
+        assert!(!is_image_target("notes/Index.md"));
     }
 
     #[test]
