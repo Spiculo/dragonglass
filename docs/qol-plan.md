@@ -7,8 +7,8 @@ transitions between them.
 
 > **Status (current tree):** every P0 and P1 item is implemented, including the shared
 > save/draft/session/fingerprint contract, reading and editing continuity, back/forward,
-> in-page find, selection and copy, reader typography (size, width, line height, typeface,
-> theme), zen mode, transclusion, media, and the editor's live preview (Q2.12: hiding markers
+> in-page find, selection and copy, reader typography (size, line height, typeface, theme),
+> panel shortcuts, zen mode, transclusion, media, and the editor's live preview (Q2.12: hiding markers
 > and rendering images, rules, callouts, tables and display formulas in place outside the
 > caret's paragraph). Android has find/replace with options, a markdown toolbar and pickers,
 > syntax highlighting, row actions, conflict and save-failure sheets, progress/cancel and
@@ -149,6 +149,11 @@ unchanged; copy/select still work.
 and both `EntityInputHandler` insert paths divert to reading navigation (j/k/g/G, Space) or the
 in-page find field, so typing and IME text never reach the buffer. Selection and copy keep
 working; the mode switch is pinned by a status line that names the note as read-only.
+
+**Exception (desktop):** ticking a task checkbox in the reader calls
+`Editor::toggle_reading_task`, which changes only the `[ ]` / `[x]` marker in the buffer. The
+note becomes dirty and follows the normal save, draft and autosave paths, so the change is
+visible and undoable rather than silent.
 
 #### Q0.2 Conflict-safe save — D · A · S · M–L
 Add a shared save contract in core: `DocumentFingerprint { mtime, size, content_hash }`,
@@ -449,17 +454,21 @@ contain math or images.
 Move hardcoded sizes/width into persisted `ReaderSettings`: body size, line height, measure
 (px), font family (sans/serif/mono for code), and zoom. Align the metadata header with the
 body measure. Expose the same settings on mobile preview.
-**Done when:** changing size/width updates all open readers and split previews immediately
-and survives relaunch; no horizontal scroll appears at 320 px width.
+**Done when:** changing size, line height or typeface updates all open readers and split
+previews immediately and survives relaunch; no horizontal scroll appears at 320 px width.
 
-**Landed (desktop):** `reading::ReaderSettings` (body size, measure, line height, typeface)
-is a GPUI global backed by `reader_size`, `reader_width`, `reader_line_height` and
-`reader_font` in `config.txt`, with Settings rows that cycle comfortable values. Body text,
-list items, quotes and callouts use the line height and typeface, the column width bounds
-every block, display math scales to the measure, and open readers plus the split preview
-repaint immediately. Zoom is the body-size control: it scales the text without changing the
-column. The mobile preview exposes the same values through the shared FFI (Q4.7).
-**Remaining:** nothing functional; the metadata header already sits inside the measure.
+**Landed (desktop):** `reading::ReaderSettings` (body size, line height, typeface) is a GPUI
+global backed by `reader_size`, `reader_line_height` and `reader_font` in `config.txt`, with
+Settings rows that cycle comfortable values. Body text, list items, quotes and callouts use
+the line height and typeface; the reading column fills the pane and the metadata header
+shares the same width. Display math scales to the measured pane width, and open readers plus
+the split preview repaint immediately. Zoom is the body-size control: it scales the text
+without changing the column. The serif typeface is the platform book face — New York on
+macOS, Cambria on Windows, DejaVu Serif on Linux — rather than Georgia. The desktop Settings
+page no longer exposes a column width; `reader_width` stays in the config as the mobile
+measure and as the first-frame math fallback. The mobile preview exposes the same values
+through the shared FFI (Q4.7).
+**Remaining:** nothing functional; the metadata header already fills the pane with the body.
 
 #### Q2.5 Zen / focus reading — D · M
 Add a distraction-free mode that hides the tab bar, sidebar, outline and relations, centers
@@ -470,10 +479,16 @@ not jump when panels hide.
 
 **Landed:** Zen mode (`Ctrl/Cmd+Alt+Z`, also in the palette) hides the tab bar, sidebar,
 outline and relations with one command; Escape leaves it. The reading column and editor keep
-their own width and scroll, so hiding the panels does not move the document. In zen the
-reader dims every paragraph outside the section being read (`FocusMode` global). Settings has
-a Panels section that toggles the sidebar, outline and relations independently and saves the
-choice in `config.txt`, so the layout survives relaunch.
+their own scroll, so hiding the panels does not move the document's place. In zen the reader
+dims every paragraph outside the section being read (`FocusMode` global). Settings has a
+Panels section that toggles the sidebar, outline and relations independently and saves the
+choice in `config.txt`.
+**Landed (panel controls):** the same toggles are palette commands and default shortcuts —
+`Ctrl/Cmd+Alt+B` for the file sidebar, `Ctrl/Cmd+Alt+O` for the outline and `Ctrl/Cmd+Alt+L`
+for relations. Toggling invalidates the shaped rows immediately, and a window-bounds observer
+reflows all editors whenever the window width changes, so text never keeps an old wrap width
+or paints under a panel. The editor and the reader both fill the center pane instead of using
+fixed column caps.
 
 #### Q2.6 Media actually renders — D · A · M–L
 Render inline images (not just standalone embeds), honor `![[img|300]]` width/alt, support
@@ -618,7 +633,9 @@ pipe concealment.
 **Landed (view selector):** the editor header has a three-way select — **Full editor**
 (raw markdown), **Dynamic** (live-preview substitutions) and **Viewer** (the reader). It
 replaces the old EDIT/READ toggle and persists per tab in session v2; Full turns every
-substitution and marker concealment off.
+substitution and marker concealment off. The menu is anchored by its right edge and painted
+through GPUI's deferred layer, so it opens into the editor and stays above the outline and
+relations panels instead of disappearing behind them.
 **Landed (live formula):** the block holding the caret now typesets its `$$…$$` formula in
 the same layout pass and paints it under the source on three reserved rows, scaled to fit
 the column and the reserved height, so the result is visible while typing. Errors and
@@ -916,13 +933,15 @@ the existing dark overrides; pinch-to-zoom is enabled without the floating zoom 
 the WebView only reloads when the rendered document changes, so mode switches keep the page.
 **Landed (settings):** Android has a Reader settings sheet (from the note-list menu) with
 text size and column width steppers, stored in the vault config through the shared FFI
-(`readerSettings` / `setReaderSettings`) and applied to the preview stylesheet; the values
-match the desktop reader's `reader_size`/`reader_width`.
+(`readerSettings` / `setReaderSettings`) and applied to the preview stylesheet; size and
+typeface match the desktop reader, while column width stays a mobile measure because the
+desktop reader fills its pane.
 **Landed (font and theme):** the Reader settings sheet also picks the typeface (sans, serif
 or mono) — stored as `reader_font` in the vault config and applied to the preview stylesheet,
 with code kept monospace — and the app theme (system, light or dark), stored on the device and
 applied to both the Compose colours and the preview's dark overrides. The typeface is shared
-with the desktop through the config; the desktop reading view does not consume it yet.
+with the desktop through the config, and the desktop reading view consumes the same
+`reader_font` value.
 
 #### P2 — polish (schedule after P0/P1)
 - Mobile: graph layout off the main thread, pan/zoom, share/deep-link entry, vault

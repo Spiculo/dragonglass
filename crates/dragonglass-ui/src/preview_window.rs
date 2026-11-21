@@ -5,8 +5,8 @@ use std::path::PathBuf;
 use std::rc::Rc;
 
 use gpui::{
-    div, prelude::*, px, size, App, Bounds, Context, Entity, FocusHandle, Render, Subscription,
-    TextRun, Window, WindowBounds, WindowOptions,
+    div, prelude::*, px, size, App, Bounds, Context, Entity, FocusHandle, KeyDownEvent, Render,
+    Subscription, TextRun, Window, WindowBounds, WindowOptions,
 };
 
 use crate::editor::Editor;
@@ -98,12 +98,18 @@ impl Render for PreviewWindow {
             .size_full()
             .bg(theme.bg)
             .text_color(theme.text)
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _window, cx| {
+                if event.keystroke.key == "escape" && this.reading.close_lightbox() {
+                    cx.notify();
+                }
+            }))
             .child(self.reading.element(
                 Some(self.vault_root.clone()),
                 theme,
                 template,
                 Some(self.opener.clone()),
                 Some(fold),
+                None,
                 cx,
             ))
     }

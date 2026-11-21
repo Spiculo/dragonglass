@@ -24,8 +24,8 @@ use dragonglass_core::markdown;
 use dragonglass_core::math::{self, MathOptions, MathScene, MathStyle};
 use dragonglass_core::{blocks, git, history, stats, syntax, templates, wrap, Buffer};
 use gpui::{
-    actions, anchored, div, fill, point, prelude::*, px, relative, size, AnyElement, App, Bounds,
-    ClipboardEntry, ClipboardItem, Context, Corner, Corners, CursorStyle, ElementId,
+    actions, anchored, deferred, div, fill, point, prelude::*, px, relative, size, AnyElement, App,
+    Bounds, ClipboardEntry, ClipboardItem, Context, Corner, Corners, CursorStyle, ElementId,
     ElementInputHandler, Entity, EntityInputHandler, ExternalPaths, FocusHandle, Focusable,
     GlobalElementId, ImageFormat, InspectorElementId, KeyBinding, KeyDownEvent, LayoutId,
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point, Render,
@@ -35,6 +35,7 @@ use gpui::{
 
 use crate::math_element::{paint_scene, MathElement};
 use crate::reading::{word_range, LinkOpener, ReadingCache};
+use crate::table_edit::{TableAxis, TableDrag, TableEdit};
 use crate::theme::Theme;
 use crate::vim::{Mode as VimMode, Vim};
 
@@ -344,6 +345,8 @@ pub struct Editor {
     layout_callouts: Rc<Vec<CalloutLayout>>,
     /// Table blocks drawn as a grid.
     layout_tables: Rc<Vec<TableLayout>>,
+    /// The table being edited as a grid in Dynamic mode, if any.
+    table_edit: Option<TableEdit>,
     /// Live previews of formulas whose block contains the caret.
     live_math: Vec<LiveMath>,
     /// The buffer revision `display_math` was parsed from.
@@ -1064,6 +1067,7 @@ impl Editor {
             editor_images: Vec::new(),
             layout_callouts: Rc::new(Vec::new()),
             layout_tables: Rc::new(Vec::new()),
+            table_edit: None,
             live_math: Vec::new(),
             display_math_revision: u64::MAX,
             math_scenes: HashMap::new(),
@@ -1123,7 +1127,7 @@ impl Editor {
 
     /// Wrap or unwrap the current selection (or insert a marker pair at the caret).
     fn apply_style(&mut self, style: text_format::Style) {
-        if !self.can_mutate() || self.find.open {
+        if self.table_edit.is_some() || !self.can_mutate() || self.find.open {
             return;
         }
 
@@ -1246,7 +1250,7 @@ impl Editor {
 
     /// Start a wikilink at the caret, or from the selected text as an alias.
     fn start_wikilink(&mut self) {
-        if self.reading || self.find.open {
+        if self.table_edit.is_some() || self.reading || self.find.open {
             return;
         }
         self.autocomplete = Autocomplete::default();
@@ -1476,6 +1480,7 @@ impl Editor {
         self.anchor = None;
         self.selecting = false;
         self.extra_cursors.clear();
+        self.table_edit = None;
         self.find.open = false;
         self.find.matches.clear();
         self.find.error = None;
@@ -1643,6 +1648,9 @@ impl Editor {
     /// Enable or disable in-editor previews. Turning them off re-shapes the document so
     /// markers and substituted blocks return to source.
     pub fn set_dynamic_mode(&mut self, dynamic: bool) {
+        if !dynamic {
+            self.table_edit = None;
+        }
         if self.dynamic == dynamic {
             return;
         }
@@ -1653,6 +1661,457 @@ impl Editor {
 
     pub fn toggle_reading_mode(&mut self) {
         self.set_reading_mode(!self.reading);
+    }
+
+    /// Tick or untick a task checkbox from the reading view.
+    ///
+    /// Reading is otherwise read-only. This is the one deliberate exception: the marker is
+    /// changed in the buffer, so the note becomes dirty and the normal save, draft and
+    /// autosave paths apply.
+    pub fn toggle_reading_task(&mut self, block: usize, checked: bool, cx: &mut Context<Self>) {
+        let Some(line) = self.reading_content.block_start_line(block) else {
+            return;
+        };
+        let text = self.buffer.line(line);
+        let Some(col) = task_marker_col(&text) else {
+            return;
+        };
+        let at = self.buffer.char_index_at(line, col);
+        let marker = if checked { "x" } else { " " };
+        if self.buffer.slice(at..at + 1) == marker {
+            return;
+        }
+        self.buffer.replace(at..at + 1, marker);
+        self.anchor = None;
+        self.marked_range = None;
+        self.refresh_autocomplete();
+        cx.notify();
+    }
+
+    /// Open the in-place grid editor for the table containing `line`.
+    ///
+    /// A click on any table line in Dynamic mode lands here. The grid covers the source
+    /// lines while it is open, so the pipes never need to be edited by hand.
+    fn open_table_edit(
+        &mut self,
+        line: usize,
+        char_col: Option<usize>,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let tables = table_blocks(&self.buffer, (usize::MAX, usize::MAX));
+        let Some((ordinal, (start, end))) = tables
+            .iter()
+            .enumerate()
+            .find(|(_, (start, end))| *start <= line && line <= *end)
+            .map(|(ordinal, range)| (ordinal, *range))
+        else {
+            return false;
+        };
+        let lines: Vec<String> = (start..=end).map(|line| self.buffer.line(line)).collect();
+        let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+        let Some(mut edit) = TableEdit::from_lines(start, &refs, ordinal, self.buffer.revision())
+        else {
+            return false;
+        };
+        let row = if line <= start + 1 {
+            0
+        } else {
+            (line - start - 1).min(edit.rows.len())
+        };
+        let col = char_col
+            .map(|col| {
+                let line_text = self.buffer.line(line);
+                crate::table_edit::column_at_char(&line_text, col)
+            })
+            .unwrap_or(0);
+        edit.activate(row, col);
+        self.table_edit = Some(edit);
+        self.selecting = false;
+        self.anchor = None;
+        self.extra_cursors.clear();
+        self.pending_link_start = false;
+        self.swallow_bracket = false;
+        self.autocomplete = Autocomplete::default();
+        cx.notify();
+        true
+    }
+
+    /// Close the table grid. Every cell change already reached the buffer.
+    fn close_table_edit(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(edit) = self.table_edit.take() else {
+            return false;
+        };
+        // Leave the caret below the table so Dynamic mode paints the finished grid
+        // instead of falling back to raw pipes.
+        let next = edit.last_line.saturating_add(1);
+        if next < self.buffer.line_count() {
+            self.set_cursor_position(next, 0);
+        }
+        self.anchor = None;
+        cx.notify();
+        true
+    }
+
+    /// Regenerate the table's markdown from the grid state and replace its lines.
+    fn commit_table_edit(&mut self) {
+        let Some(mut edit) = self.table_edit.clone() else {
+            return;
+        };
+        let start = self.buffer.char_index_at(edit.first_line, 0);
+        let end = self
+            .buffer
+            .char_index_at(edit.last_line, self.buffer.line_char_len(edit.last_line));
+        let text = edit.markdown();
+        if self.buffer.slice(start..end) == text {
+            return;
+        }
+        self.buffer.replace(start..end, &text);
+        edit.last_line = edit.first_line + 1 + edit.rows.len();
+        edit.revision = self.buffer.revision();
+        self.table_edit = Some(edit);
+        self.anchor = None;
+        self.marked_range = None;
+    }
+
+    fn table_edit_activate(&mut self, row: usize, col: usize, cx: &mut Context<Self>) {
+        if let Some(edit) = self.table_edit.as_mut() {
+            edit.activate(row, col);
+            cx.notify();
+        }
+    }
+
+    /// Apply a change to the table grid, write it to the buffer and repaint.
+    fn table_edit_mutate(
+        &mut self,
+        cx: &mut Context<Self>,
+        change: impl FnOnce(&mut TableEdit),
+    ) -> bool {
+        let Some(edit) = self.table_edit.as_mut() else {
+            return false;
+        };
+        change(edit);
+        self.commit_table_edit();
+        cx.notify();
+        true
+    }
+
+    fn table_edit_start_drag(&mut self, axis: TableAxis, index: usize, cx: &mut Context<Self>) {
+        if let Some(edit) = self.table_edit.as_mut() {
+            edit.drag = Some(TableDrag {
+                axis,
+                from: index,
+                to: index,
+            });
+            cx.notify();
+        }
+    }
+
+    fn table_edit_drag_over(&mut self, axis: TableAxis, index: usize, cx: &mut Context<Self>) {
+        if let Some(edit) = self.table_edit.as_mut() {
+            if let Some(drag) = edit.drag.as_mut() {
+                if drag.axis == axis && drag.to != index {
+                    drag.to = index;
+                    cx.notify();
+                }
+            }
+        }
+    }
+
+    fn table_edit_drop(&mut self, cx: &mut Context<Self>) {
+        let Some(drag) = self.table_edit.as_mut().and_then(|edit| edit.drag.take()) else {
+            return;
+        };
+        if let Some(edit) = self.table_edit.as_mut() {
+            match drag.axis {
+                TableAxis::Row => edit.move_row(drag.from, drag.to),
+                TableAxis::Column => edit.move_column(drag.from, drag.to),
+            }
+        }
+        self.commit_table_edit();
+        cx.notify();
+    }
+
+    fn table_edit_add_row(&mut self, cx: &mut Context<Self>) {
+        if let Some(edit) = self.table_edit.as_mut() {
+            edit.add_row();
+        }
+        self.commit_table_edit();
+        cx.notify();
+    }
+
+    fn table_edit_add_column(&mut self, cx: &mut Context<Self>) {
+        if let Some(edit) = self.table_edit.as_mut() {
+            edit.add_column();
+        }
+        self.commit_table_edit();
+        cx.notify();
+    }
+
+    /// The grid that covers a table's source lines in Dynamic mode.
+    fn render_table_edit(&self, theme: Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let edit = self.table_edit.as_ref()?;
+        let Some(layout) = self.layout_tables.get(edit.table_ordinal) else {
+            // The table was raw on the frame the grid opened. `lay_out` has now rebuilt
+            // the table ranges, so request one more frame to paint the overlay.
+            cx.notify();
+            return None;
+        };
+        let line_height = f32::from(self.line_height);
+        let source_rows = layout.last_row.saturating_sub(layout.first_row).max(1);
+        let grid_rows = edit.rows.len() + 1;
+        let row_height = (source_rows as f32 * line_height / grid_rows as f32).max(line_height);
+        let top = line_height * layout.first_row as f32;
+        let height = row_height * grid_rows as f32;
+        let controls_width = 168.0;
+
+        let column_count = edit.column_count().max(1);
+        let drag = edit.drag;
+
+        // Header row: the cell grips start a column drag.
+        let mut header = div()
+            .flex()
+            .flex_row()
+            .h(px(row_height))
+            .flex_shrink_0()
+            .bg(theme.chip)
+            .border_b_1()
+            .border_color(theme.border)
+            .child(div().w(px(18.0)).flex_shrink_0());
+        for col in 0..column_count {
+            let active = edit.active_row == 0 && edit.active_col == col;
+            let target = drag.is_some_and(|drag| drag.axis == TableAxis::Column && drag.to == col);
+            let text = edit.headers.get(col).cloned().unwrap_or_default();
+            let cursor = if active { edit.cursor } else { 0 };
+            let mut cell = div()
+                .id(ElementId::Name(format!("table-header-{col}").into()))
+                .flex_1()
+                .min_w(px(0.0))
+                .h_full()
+                .px_2()
+                .flex()
+                .flex_row()
+                .items_center()
+                .justify_between()
+                .gap_1()
+                .border_r_1()
+                .border_color(theme.border)
+                .cursor(CursorStyle::IBeam)
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _event, window, cx| {
+                        window.focus(&this.focus_handle);
+                        cx.stop_propagation();
+                        this.table_edit_activate(0, col, cx);
+                    }),
+                )
+                .on_mouse_move(cx.listener(move |this, _event, _window, cx| {
+                    this.table_edit_drag_over(TableAxis::Column, col, cx);
+                }))
+                .child(table_cell_text(&text, active, cursor, row_height, theme));
+            cell = cell.child(
+                div()
+                    .id(ElementId::Name(format!("table-column-grip-{col}").into()))
+                    .w(px(10.0))
+                    .h_full()
+                    .flex_shrink_0()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .cursor(CursorStyle::OpenHand)
+                    .text_color(theme.muted)
+                    .child("::")
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _event, _window, cx| {
+                            cx.stop_propagation();
+                            this.table_edit_start_drag(TableAxis::Column, col, cx);
+                        }),
+                    )
+                    .on_mouse_move(cx.listener(move |this, _event, _window, cx| {
+                        this.table_edit_drag_over(TableAxis::Column, col, cx);
+                    })),
+            );
+            if active {
+                cell = cell.bg(theme.accent.opacity(0.14));
+            } else if target {
+                cell = cell.bg(theme.accent.opacity(0.09));
+            }
+            header = header.child(cell);
+        }
+
+        // The controls live in the header row so the grid's height matches the source
+        // table exactly (the separator row contributes no painted row). Body rows reserve
+        // the same width, so header and body columns stay aligned.
+        let controls = div()
+            .w(px(controls_width))
+            .h_full()
+            .flex_shrink_0()
+            .flex()
+            .flex_row()
+            .items_center()
+            .justify_end()
+            .gap_1()
+            .px_1()
+            .child(table_tool_button(
+                "+ Row",
+                theme,
+                cx.listener(|this, _event, _window, cx| {
+                    cx.stop_propagation();
+                    this.table_edit_add_row(cx);
+                }),
+            ))
+            .child(table_tool_button(
+                "+ Col",
+                theme,
+                cx.listener(|this, _event, _window, cx| {
+                    cx.stop_propagation();
+                    this.table_edit_add_column(cx);
+                }),
+            ))
+            .child(table_tool_button(
+                "Done",
+                theme,
+                cx.listener(|this, _event, _window, cx| {
+                    cx.stop_propagation();
+                    this.close_table_edit(cx);
+                }),
+            ));
+        header = header.child(controls);
+
+        let mut body = div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h(px(0.0))
+            .overflow_hidden();
+        for (index, row) in edit.rows.iter().enumerate() {
+            let row_index = index + 1;
+            let target =
+                drag.is_some_and(|drag| drag.axis == TableAxis::Row && drag.to == row_index);
+            let mut row_element = div()
+                .id(ElementId::Name(format!("table-row-{row_index}").into()))
+                .flex()
+                .flex_row()
+                .h(px(row_height))
+                .flex_shrink_0()
+                .border_b_1()
+                .border_color(theme.border)
+                .on_mouse_move(cx.listener(move |this, _event, _window, cx| {
+                    this.table_edit_drag_over(TableAxis::Row, row_index, cx);
+                }))
+                .child(
+                    div()
+                        .id(ElementId::Name(
+                            format!("table-row-grip-{row_index}").into(),
+                        ))
+                        .w(px(18.0))
+                        .h_full()
+                        .flex_shrink_0()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .cursor(CursorStyle::OpenHand)
+                        .text_color(theme.muted)
+                        .child("::")
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _event, _window, cx| {
+                                cx.stop_propagation();
+                                this.table_edit_start_drag(TableAxis::Row, row_index, cx);
+                            }),
+                        )
+                        .on_mouse_move(cx.listener(move |this, _event, _window, cx| {
+                            this.table_edit_drag_over(TableAxis::Row, row_index, cx);
+                        })),
+                );
+            if target {
+                row_element = row_element.bg(theme.accent.opacity(0.09));
+            }
+            for col in 0..column_count {
+                let active = edit.active_row == row_index && edit.active_col == col;
+                let column_target =
+                    drag.is_some_and(|drag| drag.axis == TableAxis::Column && drag.to == col);
+                let text = row.get(col).cloned().unwrap_or_default();
+                let cursor = if active { edit.cursor } else { 0 };
+                let mut cell = div()
+                    .id(ElementId::Name(
+                        format!("table-cell-{row_index}-{col}").into(),
+                    ))
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .h_full()
+                    .px_2()
+                    .flex()
+                    .items_center()
+                    .border_r_1()
+                    .border_color(theme.border)
+                    .cursor(CursorStyle::IBeam)
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _event, window, cx| {
+                            window.focus(&this.focus_handle);
+                            cx.stop_propagation();
+                            this.table_edit_activate(row_index, col, cx);
+                        }),
+                    )
+                    .on_mouse_move(cx.listener(move |this, _event, _window, cx| {
+                        this.table_edit_drag_over(TableAxis::Column, col, cx);
+                    }))
+                    .child(table_cell_text(&text, active, cursor, row_height, theme));
+                if active {
+                    cell = cell.bg(theme.accent.opacity(0.14));
+                } else if column_target {
+                    cell = cell.bg(theme.accent.opacity(0.09));
+                }
+                row_element = row_element.child(cell);
+            }
+            row_element = row_element.child(
+                div()
+                    .w(px(controls_width))
+                    .h_full()
+                    .flex_shrink_0()
+                    .border_l_1()
+                    .border_color(theme.border),
+            );
+            body = body.child(row_element);
+        }
+
+        Some(
+            div()
+                .id("table-editor")
+                .absolute()
+                .left_0()
+                .right_0()
+                .top(px(top))
+                .h(px(height))
+                .flex()
+                .flex_col()
+                .rounded_sm()
+                .overflow_hidden()
+                .bg(theme.panel)
+                .border_1()
+                .border_color(theme.accent)
+                .text_size(px(f32::from(self.font_size)))
+                .text_color(theme.text)
+                .on_mouse_down(MouseButton::Left, |_event, _window, cx| {
+                    cx.stop_propagation();
+                })
+                .on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(|this, _event, _window, cx| {
+                        this.table_edit_drop(cx);
+                    }),
+                )
+                .on_mouse_up_out(
+                    MouseButton::Left,
+                    cx.listener(|this, _event, _window, cx| {
+                        this.table_edit_drop(cx);
+                    }),
+                )
+                .child(header)
+                .child(body)
+                .into_any_element(),
+        )
     }
 
     /// Make the reading view reflect the current buffer before mapping positions.
@@ -1676,6 +2135,7 @@ impl Editor {
             return;
         }
         if reading {
+            self.table_edit = None;
             // Enter reading at the block holding the caret.
             self.prepare_reading();
             let line = self.buffer.line_col().0;
@@ -1693,11 +2153,13 @@ impl Editor {
 
     /// Insert text at the caret (used by plugins).
     pub fn insert_at_cursor(&mut self, text: &str) {
+        self.table_edit = None;
         self.insert_text(text);
     }
 
     /// Append text to the end of the note.
     pub fn append_to_note(&mut self, text: &str) {
+        self.table_edit = None;
         self.buffer.set_cursor(self.buffer.len_chars());
         self.buffer.insert(text);
         self.anchor = None;
@@ -2004,6 +2466,9 @@ impl Editor {
 
     /// Move the block at the caret up. Returns whether anything changed.
     pub fn move_block_up(&mut self) -> bool {
+        if self.table_edit.is_some() {
+            return false;
+        }
         let text = self.buffer.text();
         match blocks::move_up(&text, self.cursor_line()) {
             Some(edit) => {
@@ -2016,6 +2481,9 @@ impl Editor {
 
     /// Move the block at the caret down. Returns whether anything changed.
     pub fn move_block_down(&mut self) -> bool {
+        if self.table_edit.is_some() {
+            return false;
+        }
         let text = self.buffer.text();
         match blocks::move_down(&text, self.cursor_line()) {
             Some(edit) => {
@@ -2028,6 +2496,9 @@ impl Editor {
 
     /// Duplicate the block at the caret.
     pub fn duplicate_block(&mut self) -> bool {
+        if self.table_edit.is_some() {
+            return false;
+        }
         let text = self.buffer.text();
         match blocks::duplicate(&text, self.cursor_line()) {
             Some(edit) => {
@@ -2040,6 +2511,9 @@ impl Editor {
 
     /// Delete the block at the caret.
     pub fn delete_block(&mut self) -> bool {
+        if self.table_edit.is_some() {
+            return false;
+        }
         let text = self.buffer.text();
         match blocks::delete(&text, self.cursor_line()) {
             Some(edit) => {
@@ -2262,6 +2736,9 @@ impl Editor {
 
     /// Fold or unfold the heading containing the caret.
     fn toggle_fold(&mut self, _: &ToggleFold, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.table_edit.is_some() {
+            return;
+        }
         if self.toggle_fold_at_cursor() {
             cx.notify();
         }
@@ -2320,7 +2797,12 @@ impl Editor {
         // The paragraph holding the caret stays raw, so moving to another paragraph
         // changes which markers are hidden.
         let caret_line = self.buffer.line_col().0;
-        let raw_block = self.raw_block_for_line(caret_line);
+        let raw_block = if self.table_edit.is_some() {
+            // Keep the table concealed (pipes hidden) while its grid covers the source.
+            (usize::MAX, usize::MAX)
+        } else {
+            self.raw_block_for_line(caret_line)
+        };
         let block_changed = self.layout_raw_block != raw_block;
         let dynamic_changed = self.layout_dynamic != self.dynamic;
         // Tables are drawn as a grid, so their pipes are structural while the caret is
@@ -2803,6 +3285,7 @@ impl Editor {
     /// Replace the buffer with a recovered draft, as one undoable edit.
     pub fn apply_recovery(&mut self, text: &str, line: usize, col: usize) {
         self.buffer.replace(0..self.buffer.len_chars(), text);
+        self.table_edit = None;
         self.set_cursor_position(line, col);
         self.reset_layout_cache();
         self.properties_revision = u64::MAX;
@@ -3637,6 +4120,9 @@ impl Editor {
     }
 
     fn backspace(&mut self, _: &Backspace, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.table_edit_mutate(cx, |edit| edit.backspace()) {
+            return;
+        }
         if self.reading {
             if self.reading_content.find_open() {
                 self.reading_content.find_backspace();
@@ -3674,6 +4160,9 @@ impl Editor {
     }
 
     fn delete(&mut self, _: &Delete, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.table_edit_mutate(cx, |edit| edit.delete()) {
+            return;
+        }
         if !self.can_mutate() {
             return;
         }
@@ -3700,6 +4189,9 @@ impl Editor {
     }
 
     fn left(&mut self, _: &Left, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.table_edit_mutate(cx, |edit| edit.move_left()) {
+            return;
+        }
         if self.reading {
             return;
         }
@@ -3709,6 +4201,9 @@ impl Editor {
     }
 
     fn right(&mut self, _: &Right, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.table_edit_mutate(cx, |edit| edit.move_right()) {
+            return;
+        }
         if self.reading {
             return;
         }
@@ -3718,6 +4213,9 @@ impl Editor {
     }
 
     fn up(&mut self, _: &Up, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.table_edit_mutate(cx, |edit| edit.move_up()) {
+            return;
+        }
         if self.reading {
             self.reading_content.scroll_blocks(-1);
             cx.notify();
@@ -3733,6 +4231,9 @@ impl Editor {
     }
 
     fn down(&mut self, _: &Down, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.table_edit_mutate(cx, |edit| edit.move_down()) {
+            return;
+        }
         if self.reading {
             self.reading_content.scroll_blocks(1);
             cx.notify();
@@ -3748,6 +4249,9 @@ impl Editor {
     }
 
     fn page_up(&mut self, _: &PageUp, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.table_edit_mutate(cx, |edit| edit.move_page(-1)) {
+            return;
+        }
         if self.reading {
             self.reading_content.scroll_screen(-1);
             cx.notify();
@@ -3760,6 +4264,9 @@ impl Editor {
     }
 
     fn page_down(&mut self, _: &PageDown, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.table_edit_mutate(cx, |edit| edit.move_page(1)) {
+            return;
+        }
         if self.reading {
             self.reading_content.scroll_screen(1);
             cx.notify();
@@ -3772,6 +4279,9 @@ impl Editor {
     }
 
     fn home(&mut self, _: &Home, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.table_edit_mutate(cx, |edit| edit.move_home()) {
+            return;
+        }
         if self.reading {
             self.reading_content.scroll_blocks(isize::MIN / 2);
             cx.notify();
@@ -3782,6 +4292,9 @@ impl Editor {
     }
 
     fn end(&mut self, _: &End, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.table_edit_mutate(cx, |edit| edit.move_end()) {
+            return;
+        }
         if self.reading {
             self.reading_content.scroll_blocks(isize::MAX / 2);
             cx.notify();
@@ -3792,6 +4305,9 @@ impl Editor {
     }
 
     fn word_left(&mut self, _: &WordLeft, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.table_edit_mutate(cx, |edit| edit.move_left()) {
+            return;
+        }
         if self.reading {
             return;
         }
@@ -3800,6 +4316,9 @@ impl Editor {
     }
 
     fn word_right(&mut self, _: &WordRight, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.table_edit_mutate(cx, |edit| edit.move_right()) {
+            return;
+        }
         if self.reading {
             return;
         }
@@ -3808,6 +4327,9 @@ impl Editor {
     }
 
     fn paragraph_up(&mut self, _: &ParagraphUp, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.table_edit_mutate(cx, |edit| edit.move_up()) {
+            return;
+        }
         if self.reading {
             self.reading_content.scroll_blocks(-1);
             cx.notify();
@@ -3818,6 +4340,9 @@ impl Editor {
     }
 
     fn paragraph_down(&mut self, _: &ParagraphDown, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.table_edit_mutate(cx, |edit| edit.move_down()) {
+            return;
+        }
         if self.reading {
             self.reading_content.scroll_blocks(1);
             cx.notify();
@@ -3828,6 +4353,9 @@ impl Editor {
     }
 
     fn document_start(&mut self, _: &DocumentStart, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.table_edit_mutate(cx, |edit| edit.move_start()) {
+            return;
+        }
         if self.reading {
             self.reading_content.scroll_blocks(isize::MIN / 2);
             cx.notify();
@@ -3838,6 +4366,9 @@ impl Editor {
     }
 
     fn document_end(&mut self, _: &DocumentEnd, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.table_edit_mutate(cx, |edit| edit.move_finish()) {
+            return;
+        }
         if self.reading {
             self.reading_content.scroll_blocks(isize::MAX / 2);
             cx.notify();
@@ -3853,6 +4384,9 @@ impl Editor {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.table_edit_mutate(cx, |edit| edit.delete_word_left()) {
+            return;
+        }
         if !self.can_mutate() {
             return;
         }
@@ -3872,6 +4406,9 @@ impl Editor {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.table_edit_mutate(cx, |edit| edit.delete_word_right()) {
+            return;
+        }
         if !self.can_mutate() {
             return;
         }
@@ -3915,6 +4452,9 @@ impl Editor {
     }
 
     fn select_left(&mut self, _: &SelectLeft, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.table_edit_mutate(cx, |edit| edit.move_left()) {
+            return;
+        }
         if self.reading {
             self.reading_content
                 .extend_selection(crate::reading::SelectionMotion::Left);
@@ -3927,6 +4467,9 @@ impl Editor {
     }
 
     fn select_right(&mut self, _: &SelectRight, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.table_edit_mutate(cx, |edit| edit.move_right()) {
+            return;
+        }
         if self.reading {
             self.reading_content
                 .extend_selection(crate::reading::SelectionMotion::Right);
@@ -3939,6 +4482,9 @@ impl Editor {
     }
 
     fn select_up(&mut self, _: &SelectUp, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.table_edit_mutate(cx, |edit| edit.move_up()) {
+            return;
+        }
         if self.reading {
             self.reading_content
                 .extend_selection(crate::reading::SelectionMotion::Up);
@@ -3951,6 +4497,9 @@ impl Editor {
     }
 
     fn select_down(&mut self, _: &SelectDown, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.table_edit_mutate(cx, |edit| edit.move_down()) {
+            return;
+        }
         if self.reading {
             self.reading_content
                 .extend_selection(crate::reading::SelectionMotion::Down);
@@ -3963,6 +4512,9 @@ impl Editor {
     }
 
     fn select_home(&mut self, _: &SelectHome, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.table_edit_mutate(cx, |edit| edit.move_home()) {
+            return;
+        }
         if self.reading {
             self.reading_content
                 .extend_selection(crate::reading::SelectionMotion::LineStart);
@@ -3975,6 +4527,9 @@ impl Editor {
     }
 
     fn select_end(&mut self, _: &SelectEnd, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.table_edit_mutate(cx, |edit| edit.move_end()) {
+            return;
+        }
         if self.reading {
             self.reading_content
                 .extend_selection(crate::reading::SelectionMotion::LineEnd);
@@ -4060,6 +4615,20 @@ impl Editor {
 
     /// Copy the current selection (reading or editing) and report what happened.
     pub fn copy_selection(&mut self, cx: &mut Context<Self>) {
+        if let Some(edit) = &self.table_edit {
+            let text = edit
+                .cell(edit.active_row, edit.active_col)
+                .cloned()
+                .unwrap_or_default();
+            let count = text.chars().count();
+            cx.write_to_clipboard(ClipboardItem::new_string(text));
+            self.report(
+                crate::StatusKind::Info,
+                &format!("copied {count} character(s)"),
+                cx,
+            );
+            return;
+        }
         if self.reading {
             match self.reading_content.selected_text() {
                 Some(text) => {
@@ -4094,6 +4663,25 @@ impl Editor {
     }
 
     fn cut(&mut self, _: &Cut, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.table_edit.is_some() {
+            let text = self
+                .table_edit
+                .as_ref()
+                .and_then(|edit| edit.cell(edit.active_row, edit.active_col))
+                .cloned()
+                .unwrap_or_default();
+            cx.write_to_clipboard(ClipboardItem::new_string(text));
+            self.table_edit_mutate(cx, |edit| {
+                let len = edit
+                    .cell(edit.active_row, edit.active_col)
+                    .map(|cell| cell.chars().count())
+                    .unwrap_or(0);
+                for _ in 0..len {
+                    edit.backspace();
+                }
+            });
+            return;
+        }
         if !self.can_mutate() {
             return;
         }
@@ -4112,6 +4700,9 @@ impl Editor {
     }
 
     fn undo(&mut self, _: &Undo, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.table_edit.take().is_some() {
+            cx.notify();
+        }
         if !self.can_mutate() {
             return;
         }
@@ -4125,6 +4716,9 @@ impl Editor {
     }
 
     fn redo(&mut self, _: &Redo, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.table_edit.take().is_some() {
+            cx.notify();
+        }
         if !self.can_mutate() {
             return;
         }
@@ -4138,6 +4732,9 @@ impl Editor {
     }
 
     fn enter(&mut self, _: &Enter, window: &mut Window, cx: &mut Context<Self>) {
+        if self.table_edit_mutate(cx, |edit| edit.next_cell()) {
+            return;
+        }
         if self.reading {
             if self.reading_content.find_open() {
                 let backwards = window.modifiers().shift;
@@ -4199,6 +4796,12 @@ impl Editor {
     }
 
     fn paste(&mut self, _: &Paste, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.table_edit.is_some() {
+            if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
+                self.table_edit_mutate(cx, |edit| edit.insert_text(&text));
+            }
+            return;
+        }
         if !self.can_mutate() {
             return;
         }
@@ -4346,6 +4949,9 @@ impl Editor {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.table_edit.is_some() {
+            return;
+        }
         self.move_block_up();
         cx.notify();
     }
@@ -4356,6 +4962,9 @@ impl Editor {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.table_edit.is_some() {
+            return;
+        }
         self.move_block_down();
         cx.notify();
     }
@@ -4396,11 +5005,17 @@ impl Editor {
     }
 
     fn toggle_bold(&mut self, _: &ToggleBold, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.table_edit.is_some() {
+            return;
+        }
         self.apply_style(text_format::Style::Bold);
         cx.notify();
     }
 
     fn toggle_italic(&mut self, _: &ToggleItalic, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.table_edit.is_some() {
+            return;
+        }
         self.apply_style(text_format::Style::Italic);
         cx.notify();
     }
@@ -4411,6 +5026,9 @@ impl Editor {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.table_edit.is_some() {
+            return;
+        }
         self.apply_style(text_format::Style::Strikethrough);
         cx.notify();
     }
@@ -4421,6 +5039,9 @@ impl Editor {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.table_edit.is_some() {
+            return;
+        }
         self.apply_style(text_format::Style::Highlight);
         cx.notify();
     }
@@ -4431,11 +5052,17 @@ impl Editor {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.table_edit.is_some() {
+            return;
+        }
         self.apply_style(text_format::Style::InlineCode);
         cx.notify();
     }
 
     fn toggle_comment(&mut self, _: &ToggleComment, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.table_edit.is_some() {
+            return;
+        }
         self.apply_style(text_format::Style::Comment);
         cx.notify();
     }
@@ -4446,12 +5073,18 @@ impl Editor {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.table_edit.is_some() {
+            return;
+        }
         self.start_wikilink();
         cx.notify();
     }
 
     /// Tab: accept an autocomplete suggestion, otherwise indent the selection or caret.
     fn indent(&mut self, _: &Indent, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.table_edit_mutate(cx, |edit| edit.next_cell()) {
+            return;
+        }
         if self.reading {
             // Tab steps through links in reading mode; Enter follows the selected one.
             self.reading_content.focus_next_link(false);
@@ -4471,6 +5104,9 @@ impl Editor {
 
     /// Shift+Tab: remove one indent step from the selected lines or the caret's line.
     fn outdent(&mut self, _: &Outdent, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.table_edit_mutate(cx, |edit| edit.previous_cell()) {
+            return;
+        }
         if self.reading {
             self.reading_content.focus_next_link(true);
             cx.notify();
@@ -4585,6 +5221,7 @@ impl Editor {
 
     /// Open the in-note find bar, optionally with the replacement field.
     pub fn open_find(&mut self, replace: bool) {
+        self.table_edit = None;
         if self.reading {
             // In-page find: it never leaves reading mode and never edits the note.
             self.reading_content.open_find();
@@ -4608,6 +5245,9 @@ impl Editor {
     /// Escape closes the find bar, leaves Vim insert/visual mode, or drops extra carets.
     /// Returns whether the editor consumed the key.
     pub fn handle_escape(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.close_table_edit(cx) {
+            return true;
+        }
         if self.mode_menu.take().is_some() {
             return true;
         }
@@ -4942,6 +5582,9 @@ impl Editor {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.table_edit.is_some() {
+            return;
+        }
         self.select_next_occurrence();
         cx.notify();
     }
@@ -4952,6 +5595,9 @@ impl Editor {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.table_edit.is_some() {
+            return;
+        }
         self.add_cursor_vertical(-1);
         cx.notify();
     }
@@ -4962,6 +5608,9 @@ impl Editor {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.table_edit.is_some() {
+            return;
+        }
         self.add_cursor_vertical(1);
         cx.notify();
     }
@@ -5293,6 +5942,10 @@ impl Editor {
         if self.reading {
             return;
         }
+        if self.table_edit.is_some() {
+            // Cell text is plain; do not start a wikilink or eat a bracket.
+            return;
+        }
         if self.find.open {
             // Tab and Shift+Tab move between the pattern and the replacement field.
             if event.keystroke.key == "tab" && self.find.replace {
@@ -5335,12 +5988,28 @@ impl Editor {
         self.dismiss_autocomplete();
         self.context_menu = None;
         window.focus(&self.focus_handle);
+        // A click that reaches the editor is outside the table grid (the grid stops
+        // propagation), so dismiss the grid and let the click place the caret normally.
+        if self.table_edit.take().is_some() {
+            cx.notify();
+        }
         if self.fold_from_gutter(event.position, cx) {
             return;
         }
         let Some(index) = self.index_for_point(event.position) else {
             return;
         };
+
+        // In Dynamic mode a click on a table opens its editable grid instead of placing
+        // the caret between pipes. Alt-click keeps the multi-cursor gesture.
+        if self.dynamic && !event.modifiers.alt {
+            let (line, col) = self.buffer.line_col_at(index);
+            let text = self.buffer.line(line);
+            if crate::table_edit::is_table_line(&text) && self.open_table_edit(line, Some(col), cx)
+            {
+                return;
+            }
+        }
 
         // Double click selects a word, triple click the line under the pointer.
         if event.click_count >= 2 {
@@ -5443,13 +6112,21 @@ impl Render for Editor {
         self.keep_cursor_visible();
         self.schedule_draft(cx);
 
+        // Another action (undo, an external reload) moved the buffer under the table
+        // grid; close it rather than show stale cells.
+        if self
+            .table_edit
+            .as_ref()
+            .is_some_and(|edit| edit.revision != self.buffer.revision())
+        {
+            self.table_edit = None;
+        }
+
         // Text style for rich runs (highlights) in reading mode.
         let style = window.text_style();
         let mut reader_font = style.font();
         if let Some(settings) = cx.try_global::<crate::reading::ReaderSettings>() {
-            if let Some(family) = settings.font.family() {
-                reader_font.family = family.into();
-            }
+            settings.font.apply(&mut reader_font);
         }
         let run_template = TextRun {
             len: 0,
@@ -5468,9 +6145,23 @@ impl Render for Editor {
             .unwrap_or_else(|| "Untitled".to_string());
         let dirty = self.buffer.is_dirty();
         let reading = self.reading;
+        if std::env::var_os("DG_LOG_RENDER").is_some() {
+            eprintln!(
+                "DG render reading={} dynamic={} version={:?}",
+                reading,
+                self.dynamic,
+                self.document_version()
+            );
+        }
 
         self.refresh_properties();
         self.refresh_stats(cx);
+
+        let table_overlay = if !reading && self.dynamic {
+            self.render_table_edit(theme, cx)
+        } else {
+            None
+        };
 
         let body: AnyElement = if reading {
             let version = self.document_version();
@@ -5502,12 +6193,27 @@ impl Render for Editor {
                             window.refresh();
                         })
                     };
+                    let toggle_task: crate::reading::TaskToggle = {
+                        let weak = cx.entity().downgrade();
+                        Rc::new(
+                            move |index: usize,
+                                  checked: bool,
+                                  window: &mut Window,
+                                  cx: &mut App| {
+                                let _ = weak.update(cx, |editor, cx| {
+                                    editor.toggle_reading_task(index, checked, cx);
+                                });
+                                window.refresh();
+                            },
+                        )
+                    };
                     self.reading_content.element(
                         self.vault_root.clone(),
                         theme,
                         run_template.clone(),
                         self.link_opener.clone(),
                         Some(fold),
+                        Some(toggle_task),
                         cx,
                     )
                 })
@@ -5536,15 +6242,15 @@ impl Render for Editor {
                         })
                         .child(
                             div()
+                                .relative()
                                 .flex_1()
                                 .min_w(px(0.0))
                                 .overflow_hidden()
                                 .px_6()
-                                .child(div().w_full().max_w(px(880.0)).mx_auto().child(
-                                    EditorText {
-                                        editor: cx.entity(),
-                                    },
-                                )),
+                                .child(EditorText {
+                                    editor: cx.entity(),
+                                })
+                                .children(table_overlay),
                         ),
                 )
                 .into_any_element()
@@ -5833,27 +6539,35 @@ impl Render for Editor {
                         .into_any_element()
                 })
                 .collect();
-            anchored()
-                .position(position)
-                .anchor(Corner::TopLeft)
-                .snap_to_window_with_margin(px(8.0))
-                .child(
-                    div()
-                        .id("mode-menu")
-                        .flex()
-                        .flex_col()
-                        .w(px(160.0))
-                        .py_1()
-                        .rounded_md()
-                        .bg(theme.panel)
-                        .border_1()
-                        .border_color(theme.border)
-                        .on_mouse_down(MouseButton::Left, |_event, _window, cx| {
-                            cx.stop_propagation();
-                        })
-                        .children(rows),
-                )
-                .into_any_element()
+            deferred(
+                anchored()
+                    .position(position)
+                    // The selector sits at the right edge of the editor pane. Anchor the
+                    // menu by its right edge so it opens into the editor instead of over
+                    // the outline/relations panels. `deferred` paints it after every panel,
+                    // so it cannot be covered if the window is narrow.
+                    .anchor(Corner::TopRight)
+                    .offset(point(px(-4.0), px(2.0)))
+                    .snap_to_window_with_margin(px(8.0))
+                    .child(
+                        div()
+                            .id("mode-menu")
+                            .flex()
+                            .flex_col()
+                            .w(px(160.0))
+                            .py_1()
+                            .rounded_md()
+                            .bg(theme.panel)
+                            .border_1()
+                            .border_color(theme.border)
+                            .on_mouse_down(MouseButton::Left, |_event, _window, cx| {
+                                cx.stop_propagation();
+                            })
+                            .children(rows),
+                    ),
+            )
+            .with_priority(10)
+            .into_any_element()
         });
 
         let (line, column) = self.buffer.line_col();
@@ -6177,6 +6891,9 @@ impl EntityInputHandler for Editor {
     }
 
     fn unmark_text(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {
+        if let Some(edit) = self.table_edit.as_mut() {
+            edit.unmark();
+        }
         self.marked_range = None;
     }
 
@@ -6187,6 +6904,10 @@ impl EntityInputHandler for Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.table_edit_mutate(cx, |edit| edit.finish_text(new_text)) {
+            self.marked_range = None;
+            return;
+        }
         if self.reading {
             if self.reading_content.find_open() {
                 self.reading_content.find_append(new_text);
@@ -6281,6 +7002,10 @@ impl EntityInputHandler for Editor {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.table_edit_mutate(cx, |edit| edit.mark_text(new_text)) {
+            self.marked_range = None;
+            return;
+        }
         if !self.can_mutate() {
             return;
         }
@@ -7941,6 +8666,95 @@ fn callout_kind(line: &str) -> Option<String> {
     (!kind.is_empty()).then_some(kind)
 }
 
+/// Render one grid cell. The active cell shows a text caret at `cursor`.
+fn table_cell_text(
+    text: &str,
+    active: bool,
+    cursor: usize,
+    row_height: f32,
+    theme: Theme,
+) -> AnyElement {
+    if !active {
+        return div()
+            .w_full()
+            .min_w(px(0.0))
+            .overflow_hidden()
+            .whitespace_nowrap()
+            .child(text.to_string())
+            .into_any_element();
+    }
+
+    let chars: Vec<char> = text.chars().collect();
+    let at = cursor.min(chars.len());
+    let before: String = chars[..at].iter().collect();
+    let after: String = chars[at..].iter().collect();
+    div()
+        .w_full()
+        .min_w(px(0.0))
+        .flex()
+        .items_center()
+        .overflow_hidden()
+        .child(
+            div()
+                .min_w(px(0.0))
+                .overflow_hidden()
+                .whitespace_nowrap()
+                .child(before),
+        )
+        .child(
+            div()
+                .w(px(1.5))
+                .h(px((row_height - 6.0).max(12.0)))
+                .flex_shrink_0()
+                .bg(theme.accent),
+        )
+        .child(
+            div()
+                .min_w(px(0.0))
+                .overflow_hidden()
+                .whitespace_nowrap()
+                .child(after),
+        )
+        .into_any_element()
+}
+
+/// A compact button in the table grid's control row.
+fn table_tool_button(
+    label: &'static str,
+    theme: Theme,
+    handler: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
+) -> AnyElement {
+    div()
+        .id(ElementId::Name(format!("table-tool-{label}").into()))
+        .px_2()
+        .py(px(1.0))
+        .rounded_sm()
+        .bg(theme.chip)
+        .text_xs()
+        .text_color(theme.accent_text)
+        .cursor_pointer()
+        .hover(move |style| style.bg(theme.hover))
+        .on_mouse_down(MouseButton::Left, handler)
+        .child(label)
+        .into_any_element()
+}
+
+/// Column of the ` ` / `x` inside a task marker on `line`, if it is a task item.
+fn task_marker_col(line: &str) -> Option<usize> {
+    let indent = line.chars().take_while(|ch| ch.is_whitespace()).count();
+    let trimmed = line.trim_start();
+    let bullet = ["- ", "* ", "+ "]
+        .iter()
+        .find_map(|bullet| trimmed.strip_prefix(bullet).map(|_| bullet.chars().count()))?;
+    let rest = &trimmed[bullet..];
+    let rest_start = rest.len() - rest.trim_start().len();
+    let rest = rest.trim_start();
+    let marker = ["[ ]", "[x]", "[X]"]
+        .iter()
+        .find(|marker| rest.starts_with(**marker))?;
+    Some(indent + bullet + rest_start + marker.chars().count() - 2)
+}
+
 /// Whether a line is a table's `|---|:--:|` separator row.
 fn is_table_separator(line: &str) -> bool {
     let trimmed = line.trim();
@@ -8283,6 +9097,15 @@ mod tests {
         // Without the table flag the pipes stay.
         let plain = conceal_text("| a | b |", true, false);
         assert_eq!(plain.display.iter().collect::<String>(), "| a | b |");
+    }
+
+    #[test]
+    fn task_markers_are_located_in_list_items() {
+        assert_eq!(task_marker_col("- [ ] todo"), Some(3));
+        assert_eq!(task_marker_col("  * [x] done"), Some(5));
+        assert_eq!(task_marker_col("+ [X] done"), Some(3));
+        assert_eq!(task_marker_col("- plain"), None);
+        assert_eq!(task_marker_col("1. [ ] ordered"), None);
     }
 
     #[test]

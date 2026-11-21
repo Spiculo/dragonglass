@@ -51,7 +51,8 @@ pub type FoldToggle = Rc<dyn Fn(usize, &mut Window, &mut App)>;
 pub struct ReaderSettings {
     /// Body text size in points.
     pub body_size: f32,
-    /// Maximum width of the reading column, in pixels.
+    /// First-frame width for display math. The reader replaces it with the measured pane
+    /// width after layout, so body text and formulas fill the pane.
     pub measure: f32,
     /// Line height as a multiple of the body size.
     pub line_height: f32,
@@ -69,12 +70,60 @@ pub enum ReaderFont {
 }
 
 impl ReaderFont {
-    /// The family to apply, or `None` to keep the template's own family.
-    pub fn family(self) -> Option<&'static str> {
+    /// Apply the typeface and its platform fallbacks to a text run.
+    ///
+    /// The serif face is chosen per platform: Georgia is available everywhere but has
+    /// poor screen rendering at small sizes on macOS. New York is the system serif there,
+    /// Cambria on Windows, and DejaVu Serif on Linux.
+    pub fn apply(self, font: &mut gpui::Font) {
         match self {
-            ReaderFont::Sans => None,
-            ReaderFont::Serif => Some("Georgia"),
-            ReaderFont::Mono => Some("Menlo"),
+            ReaderFont::Sans => {}
+            ReaderFont::Serif => {
+                #[cfg(target_os = "macos")]
+                {
+                    font.family = ".New York".into();
+                }
+                #[cfg(target_os = "windows")]
+                {
+                    font.family = "Cambria".into();
+                }
+                #[cfg(all(unix, not(target_os = "macos")))]
+                {
+                    font.family = "DejaVu Serif".into();
+                }
+                font.fallbacks = Some(gpui::FontFallbacks(std::sync::Arc::new(vec![
+                    "Iowan Old Style".to_string(),
+                    "Charter".to_string(),
+                    "Cambria".to_string(),
+                    "Georgia".to_string(),
+                    "Noto Serif".to_string(),
+                    "DejaVu Serif".to_string(),
+                    "Liberation Serif".to_string(),
+                    "Times New Roman".to_string(),
+                ])));
+            }
+            ReaderFont::Mono => {
+                #[cfg(target_os = "macos")]
+                {
+                    font.family = "Menlo".into();
+                }
+                #[cfg(target_os = "windows")]
+                {
+                    font.family = "Consolas".into();
+                }
+                #[cfg(all(unix, not(target_os = "macos")))]
+                {
+                    font.family = "DejaVu Sans Mono".into();
+                }
+                font.fallbacks = Some(gpui::FontFallbacks(std::sync::Arc::new(vec![
+                    "SF Mono".to_string(),
+                    "Menlo".to_string(),
+                    "Cascadia Mono".to_string(),
+                    "Consolas".to_string(),
+                    "DejaVu Sans Mono".to_string(),
+                    "Liberation Mono".to_string(),
+                ])));
+            }
         }
     }
 
@@ -112,8 +161,46 @@ pub type CopyHandler = Rc<dyn Fn(&str, &mut Window, &mut App)>;
 /// Opens an image in the reading lightbox.
 pub type ImageOpener = Rc<dyn Fn(&str, &mut Window, &mut App)>;
 
+/// Toggles a task checkbox: `(block index, new checked state)`.
+pub type TaskToggle = Rc<dyn Fn(usize, bool, &mut Window, &mut App)>;
+
 /// Opens a non-image attachment with the operating system's default application.
 pub type FileOpener = Rc<dyn Fn(&str, &mut Window, &mut App)>;
+
+/// Zoom state for the reading lightbox. The image is painted at its natural size times
+/// `scale * zoom`; pan is a pixel offset from the centred position.
+#[derive(Clone, Debug)]
+pub(crate) struct Lightbox {
+    pub path: PathBuf,
+    pub zoom: f32,
+    pub pan_x: f32,
+    pub pan_y: f32,
+    dragging: bool,
+    drag_origin: Option<(f32, f32)>,
+}
+
+impl Lightbox {
+    fn new(path: PathBuf) -> Self {
+        Self {
+            path,
+            zoom: 1.0,
+            pan_x: 0.0,
+            pan_y: 0.0,
+            dragging: false,
+            drag_origin: None,
+        }
+    }
+
+    fn reset(&mut self) {
+        self.zoom = 1.0;
+        self.pan_x = 0.0;
+        self.pan_y = 0.0;
+    }
+
+    fn zoom_by(&mut self, factor: f32) {
+        self.zoom = (self.zoom * factor).clamp(0.25, 8.0);
+    }
+}
 
 /// A point in the reading view: a block and a byte offset into its display text.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -242,6 +329,8 @@ struct RenderCtx<'a> {
     folded: &'a HashSet<usize>,
     /// Called with a heading's block index when its fold chevron is clicked.
     on_fold: Option<&'a FoldToggle>,
+    /// Called with a task block's index and its new checked state.
+    on_task: Option<&'a TaskToggle>,
     /// Copies text to the clipboard (code fences have a copy button).
     copy: Option<&'a CopyHandler>,
     /// In-page find, so matches can be painted behind the text.
@@ -551,13 +640,15 @@ pub struct ReadingCache {
     /// without copying the match list every frame.
     find: Rc<ReadingFind>,
     /// Image shown in the lightbox overlay, if any.
-    lightbox: Rc<RefCell<Option<PathBuf>>>,
+    lightbox: Rc<RefCell<Option<Lightbox>>>,
     /// A block a popup asked the reader to reveal on the next render.
     reveal_block: Rc<RefCell<Option<usize>>>,
     /// Parsed transcluded notes, revalidated by modification time.
     embeds: EmbedCache,
     /// Formulas typeset for transcluded notes.
     embed_math: EmbedMath,
+    /// Width of the list pane, captured after layout. Display math shrinks to fit it.
+    pane_width: Rc<Cell<f32>>,
 }
 
 impl ReadingCache {
@@ -581,6 +672,7 @@ impl ReadingCache {
             reveal_block: Rc::new(RefCell::new(None)),
             embeds: Rc::new(RefCell::new(HashMap::new())),
             embed_math: Rc::new(RefCell::new(HashMap::new())),
+            pane_width: Rc::new(Cell::new(0.0)),
             footnote_popup: None,
             folded: HashSet::new(),
             pending_folds: None,
@@ -647,6 +739,14 @@ impl ReadingCache {
         };
         let spans_valid = source == original;
         let (blocks, spans) = markdown::parse_blocks_spanned(&source);
+        if std::env::var_os("DG_LOG_RENDER").is_some() {
+            eprintln!(
+                "DG reading update version={:?} bytes={} blocks={}",
+                version,
+                source.len(),
+                blocks.len()
+            );
+        }
         self.properties = frontmatter::display_properties(&source);
 
         // Typeset every formula once per document version. Scenes are in em, so the painter
@@ -741,6 +841,11 @@ impl ReadingCache {
     /// Close the image lightbox. Returns whether one was open.
     pub fn close_lightbox(&mut self) -> bool {
         self.lightbox.borrow_mut().take().is_some()
+    }
+
+    /// Whether the image lightbox is showing.
+    pub fn lightbox_open(&self) -> bool {
+        self.lightbox.borrow().is_some()
     }
 
     pub fn find_open(&self) -> bool {
@@ -1341,6 +1446,7 @@ impl ReadingCache {
         true
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn element(
         &mut self,
         vault_root: Option<PathBuf>,
@@ -1348,6 +1454,7 @@ impl ReadingCache {
         template: TextRun,
         opener: Option<LinkOpener>,
         on_fold: Option<FoldToggle>,
+        on_task: Option<TaskToggle>,
         cx: &mut App,
     ) -> impl IntoElement {
         // A popup can ask for a block hidden by a fold: unfold, reflow, then scroll to it.
@@ -1420,6 +1527,9 @@ impl ReadingCache {
             .try_global::<ReaderSettings>()
             .copied()
             .unwrap_or_default();
+        let pane_width = self.pane_width.clone();
+        let pane_width_for_list = pane_width.clone();
+        let pane_width_for_lightbox = pane_width.clone();
         let footnote_popup = self.footnote_popup.clone();
         let blocks = self.blocks.clone();
         let attachments = self.attachments.clone();
@@ -1437,7 +1547,7 @@ impl ReadingCache {
         let on_image: ImageOpener = {
             let lightbox = lightbox.clone();
             Rc::new(move |path, window, _cx| {
-                *lightbox.borrow_mut() = Some(PathBuf::from(path));
+                *lightbox.borrow_mut() = Some(Lightbox::new(PathBuf::from(path)));
                 window.refresh();
             })
         };
@@ -1453,90 +1563,114 @@ impl ReadingCache {
             .size_full()
             .flex()
             .flex_col()
-            .px_8()
+            .px_6()
             .py_6()
             .text_color(theme.text)
             .children(metadata)
-            .child(div().flex_1().min_h(px(0.0)).child({
-                // Zen mode dims everything outside the section being read.
-                let active_section = if focus {
-                    self.current_heading().and_then(|name| {
-                        let headings: Vec<(usize, u8, String)> = blocks
-                            .iter()
-                            .enumerate()
-                            .filter_map(|(at, block)| match block {
-                                Block::Heading { level, text } => Some((at, *level, text.clone())),
-                                _ => None,
-                            })
-                            .collect();
-                        let position = headings.iter().position(|(_, _, text)| *text == name)?;
-                        let (start, level, _) = headings[position];
-                        let end = headings[position + 1..]
-                            .iter()
-                            .find(|(_, other, _)| *other <= level)
-                            .map(|(at, _, _)| *at)
-                            .unwrap_or(blocks.len());
-                        Some(start..end)
+            .child(
+                div()
+                    .flex_1()
+                    .min_h(px(0.0))
+                    .on_children_prepainted(move |bounds, window, _cx| {
+                        let Some(bounds) = bounds.first() else {
+                            return;
+                        };
+                        let width = f32::from(bounds.size.width);
+                        if (width - pane_width_for_list.get()).abs() > 0.5 {
+                            pane_width_for_list.set(width);
+                            window.refresh();
+                        }
                     })
-                } else {
-                    None
-                };
-                list(list_state.clone(), move |index, _window, _cx| {
-                    let Some(block) = blocks.get(index).cloned() else {
-                        return div().into_any_element();
-                    };
-                    if hidden.get(index).copied().unwrap_or(false) {
-                        return div().w_full().h(px(0.0)).into_any_element();
-                    }
+                    .child({
+                        // Zen mode dims everything outside the section being read.
+                        let active_section = if focus {
+                            self.current_heading().and_then(|name| {
+                                let headings: Vec<(usize, u8, String)> = blocks
+                                    .iter()
+                                    .enumerate()
+                                    .filter_map(|(at, block)| match block {
+                                        Block::Heading { level, text } => {
+                                            Some((at, *level, text.clone()))
+                                        }
+                                        _ => None,
+                                    })
+                                    .collect();
+                                let position =
+                                    headings.iter().position(|(_, _, text)| *text == name)?;
+                                let (start, level, _) = headings[position];
+                                let end = headings[position + 1..]
+                                    .iter()
+                                    .find(|(_, other, _)| *other <= level)
+                                    .map(|(at, _, _)| *at)
+                                    .unwrap_or(blocks.len());
+                                Some(start..end)
+                            })
+                        } else {
+                            None
+                        };
+                        list(list_state.clone(), move |index, _window, _cx| {
+                            let Some(block) = blocks.get(index).cloned() else {
+                                return div().into_any_element();
+                            };
+                            if hidden.get(index).copied().unwrap_or(false) {
+                                return div().w_full().h(px(0.0)).into_any_element();
+                            }
 
-                    let ctx = RenderCtx {
-                        vault_root: vault_root.as_deref(),
-                        attachments: attachments.as_deref(),
-                        selection: &selection,
-                        opener: opener.as_ref(),
-                        math: &math,
-                        folded: &folded,
-                        on_fold: on_fold.as_ref(),
-                        copy: Some(&copy),
-                        find: Some(&find),
-                        on_image: Some(&on_image),
-                        open_file: Some(&open_file),
-                        embeds: Some(&embeds),
-                        embed_math: Some(&embed_math),
-                        next_block: Some(&next_block),
-                        list_state: Some(&list_state),
-                        block_count: blocks.len(),
-                        blocks: blocks.as_slice(),
-                        depth: 0,
-                        theme,
-                        template: &template,
-                        body_size: reader.body_size,
-                        measure: reader.measure,
-                        line_height: reader.line_height,
-                    };
+                            let ctx = RenderCtx {
+                                vault_root: vault_root.as_deref(),
+                                attachments: attachments.as_deref(),
+                                selection: &selection,
+                                opener: opener.as_ref(),
+                                math: &math,
+                                folded: &folded,
+                                on_fold: on_fold.as_ref(),
+                                on_task: on_task.as_ref(),
+                                copy: Some(&copy),
+                                find: Some(&find),
+                                on_image: Some(&on_image),
+                                open_file: Some(&open_file),
+                                embeds: Some(&embeds),
+                                embed_math: Some(&embed_math),
+                                next_block: Some(&next_block),
+                                list_state: Some(&list_state),
+                                block_count: blocks.len(),
+                                blocks: blocks.as_slice(),
+                                depth: 0,
+                                theme,
+                                template: &template,
+                                body_size: reader.body_size,
+                                measure: {
+                                    let measured = pane_width.get();
+                                    if measured > 0.0 {
+                                        measured
+                                    } else {
+                                        reader.measure
+                                    }
+                                },
+                                line_height: reader.line_height,
+                            };
 
-                    let dimmed = active_section
-                        .as_ref()
-                        .is_some_and(|range| !range.contains(&index));
+                            let dimmed = active_section
+                                .as_ref()
+                                .is_some_and(|range| !range.contains(&index));
 
-                    let mut item = div()
-                        .w_full()
-                        .max_w(px(reader.measure))
-                        .mx_auto()
-                        .px_2()
-                        .pb_3()
-                        .when(dimmed, |d| d.opacity(0.35));
-                    // Display math is centred by the item itself: the list gives each
-                    // item the full column width, but a shrink-to-fit child would
-                    // otherwise sit at the left edge.
-                    if matches!(block, Block::Math { .. }) {
-                        item = item.flex().justify_center().py_3();
-                    }
-                    item.child(render_block(block, Some(index), &ctx))
-                        .into_any_element()
-                })
-                .size_full()
-            }))
+                            let mut item = div()
+                                .w_full()
+                                .px_4()
+                                .pb_3()
+                                .when(dimmed, |d| d.opacity(0.35));
+                            // Display math is centred by the item itself: the list gives each
+                            // item the full column width, but a shrink-to-fit child would
+                            // otherwise sit at the left edge.
+                            if matches!(block, Block::Math { .. }) {
+                                item = item.flex().justify_center().py_3();
+                            }
+                            item.child(render_block(block, Some(index), &ctx))
+                                .into_any_element()
+                        })
+                        .size_full()
+                    }),
+            )
             .children(
                 footnote_popup
                     .clone()
@@ -1574,35 +1708,251 @@ impl ReadingCache {
                     .child(popup)
                     .into_any_element()
             }))
-            .children(self.lightbox.borrow().as_ref().map(|path| {
-                let close = lightbox.clone();
-                div()
-                    .id("lightbox")
-                    .absolute()
-                    .top_0()
-                    .left_0()
-                    .right_0()
-                    .bottom_0()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .bg(gpui::hsla(0.0, 0.0, 0.0, 0.82))
-                    .on_mouse_down(MouseButton::Left, move |_event, window, _cx| {
-                        // Clicking the backdrop (not the image) closes the viewer.
-                        *close.borrow_mut() = None;
-                        window.refresh();
-                    })
-                    .child(
-                        div()
-                            .p_4()
-                            .on_mouse_down(MouseButton::Left, |_event, _window, cx| {
-                                cx.stop_propagation();
-                            })
-                            .child(img(path.clone()).max_w(px(1200.0)).max_h(px(900.0))),
-                    )
-                    .into_any_element()
+            .children(self.lightbox.borrow().clone().map(|state| {
+                render_lightbox(
+                    state,
+                    pane_width_for_lightbox.get(),
+                    lightbox.clone(),
+                    theme,
+                )
             }))
     }
+}
+
+/// The image lightbox: a dimmed pane, a zoomable image and a small control strip.
+///
+/// GPUI 0.2 has no pinch event, so the trackpad's scroll gesture zooms, a drag pans and a
+/// double-click returns to the fitted view. Every handler mutates the shared state and
+/// asks for one repaint; the state is not an entity of its own.
+fn render_lightbox(
+    state: Lightbox,
+    pane_width: f32,
+    lightbox: Rc<RefCell<Option<Lightbox>>>,
+    theme: Theme,
+) -> AnyElement {
+    let available_width = if pane_width > 0.0 {
+        (pane_width - 72.0).max(320.0)
+    } else {
+        1120.0
+    };
+    let decoded = inline_image(&state.path);
+    let picture: AnyElement = match &decoded {
+        Some((data, width, height)) => {
+            let width = *width;
+            let height = *height;
+            let base = (available_width / width).min(760.0 / height).min(1.0);
+            let w = width * base * state.zoom;
+            let h = height * base * state.zoom;
+            img(data.clone()).w(px(w)).h(px(h)).into_any_element()
+        }
+        // SVG and other formats the decoder cannot read still open, just without zoom.
+        None => img(state.path.clone())
+            .max_w(px(1200.0))
+            .max_h(px(900.0))
+            .into_any_element(),
+    };
+
+    let drag_state = lightbox.clone();
+    let wheel_state = lightbox.clone();
+    let move_state = lightbox.clone();
+    let up_state = lightbox.clone();
+    let up_state_out = lightbox.clone();
+    let double_state = lightbox.clone();
+
+    let zoom_out = lightbox.clone();
+    let zoom_in = lightbox.clone();
+    let reset = lightbox.clone();
+    let close = lightbox.clone();
+
+    let percent = format!("{}%", (state.zoom * 100.0).round() as i32);
+
+    div()
+        .id("lightbox")
+        .absolute()
+        .top_0()
+        .left_0()
+        .right_0()
+        .bottom_0()
+        .flex()
+        .items_center()
+        .justify_center()
+        .bg(gpui::hsla(0.0, 0.0, 0.0, 0.86))
+        .on_mouse_down(MouseButton::Left, move |_event, window, _cx| {
+            // Clicking the backdrop (not the image or a control) closes the viewer.
+            *drag_state.borrow_mut() = None;
+            window.refresh();
+        })
+        .on_mouse_move(move |event, window, _cx| {
+            let mut state = move_state.borrow_mut();
+            let Some(state) = state.as_mut() else {
+                return;
+            };
+            if !state.dragging {
+                return;
+            }
+            let position = (f32::from(event.position.x), f32::from(event.position.y));
+            if let Some((last_x, last_y)) = state.drag_origin {
+                state.pan_x += position.0 - last_x;
+                state.pan_y += position.1 - last_y;
+            }
+            state.drag_origin = Some(position);
+            window.refresh();
+        })
+        .on_mouse_up(MouseButton::Left, move |_event, window, _cx| {
+            if let Some(state) = up_state.borrow_mut().as_mut() {
+                state.dragging = false;
+                state.drag_origin = None;
+                window.refresh();
+            }
+        })
+        .on_mouse_up_out(MouseButton::Left, move |_event, window, _cx| {
+            if let Some(state) = up_state_out.borrow_mut().as_mut() {
+                state.dragging = false;
+                state.drag_origin = None;
+                window.refresh();
+            }
+        })
+        .on_scroll_wheel(move |event, window, cx| {
+            // Keep the reading list from scrolling behind the lightbox.
+            cx.stop_propagation();
+            let dy = match event.delta {
+                gpui::ScrollDelta::Pixels(point) => f32::from(point.y),
+                gpui::ScrollDelta::Lines(point) => point.y * 24.0,
+            };
+            if let Some(state) = wheel_state.borrow_mut().as_mut() {
+                state.zoom_by((-dy * 0.0025).exp());
+                window.refresh();
+            }
+        })
+        .child(
+            div()
+                .id("lightbox-viewport")
+                .relative()
+                .w_full()
+                .h_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .overflow_hidden()
+                .child(
+                    div()
+                        .id("lightbox-image")
+                        .ml(px(state.pan_x))
+                        .mt(px(state.pan_y))
+                        .cursor(CursorStyle::OpenHand)
+                        .on_mouse_down(MouseButton::Left, move |event, window, cx| {
+                            cx.stop_propagation();
+                            let mut state = double_state.borrow_mut();
+                            let Some(state) = state.as_mut() else {
+                                return;
+                            };
+                            if event.click_count >= 2 {
+                                if (state.zoom - 1.0).abs() < 0.01 {
+                                    state.zoom = 2.0;
+                                    state.pan_x = 0.0;
+                                    state.pan_y = 0.0;
+                                } else {
+                                    state.reset();
+                                }
+                            } else {
+                                state.dragging = true;
+                                state.drag_origin = Some((
+                                    f32::from(event.position.x),
+                                    f32::from(event.position.y),
+                                ));
+                            }
+                            window.refresh();
+                        })
+                        .child(picture),
+                )
+                .child(
+                    div()
+                        .absolute()
+                        .bottom_3()
+                        .left_0()
+                        .right_0()
+                        .flex()
+                        .justify_center()
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(gpui::hsla(0.0, 0.0, 1.0, 0.62))
+                                .child("scroll to zoom  ·  drag to pan  ·  double-click to reset"),
+                        ),
+                )
+                .child(
+                    div()
+                        .absolute()
+                        .bottom_3()
+                        .right_4()
+                        .flex()
+                        .items_center()
+                        .gap_1()
+                        .child(lightbox_button("-", theme, move |window| {
+                            if let Some(state) = zoom_out.borrow_mut().as_mut() {
+                                state.zoom_by(1.0 / 1.25);
+                                window.refresh();
+                            }
+                        }))
+                        .child(
+                            div()
+                                .px_2()
+                                .py_1()
+                                .rounded_md()
+                                .bg(theme.panel)
+                                .text_xs()
+                                .text_color(theme.muted)
+                                .child(percent),
+                        )
+                        .child(lightbox_button("+", theme, move |window| {
+                            if let Some(state) = zoom_in.borrow_mut().as_mut() {
+                                state.zoom_by(1.25);
+                                window.refresh();
+                            }
+                        }))
+                        .child(lightbox_button("reset", theme, move |window| {
+                            if let Some(state) = reset.borrow_mut().as_mut() {
+                                state.reset();
+                                window.refresh();
+                            }
+                        })),
+                )
+                .child(div().absolute().top_3().right_4().child(lightbox_button(
+                    "\u{00D7}",
+                    theme,
+                    move |window| {
+                        *close.borrow_mut() = None;
+                        window.refresh();
+                    },
+                ))),
+        )
+        .into_any_element()
+}
+
+/// A small lightbox control button.
+fn lightbox_button(
+    label: &'static str,
+    theme: Theme,
+    action: impl Fn(&mut Window) + 'static,
+) -> AnyElement {
+    div()
+        .id(ElementId::Name(format!("lightbox-{label}").into()))
+        .px_2()
+        .py_1()
+        .rounded_md()
+        .bg(theme.panel)
+        .border_1()
+        .border_color(theme.border)
+        .text_xs()
+        .text_color(theme.text)
+        .cursor_pointer()
+        .hover(move |style| style.bg(theme.hover))
+        .on_mouse_down(MouseButton::Left, move |_event, window, cx| {
+            cx.stop_propagation();
+            action(window);
+        })
+        .child(label)
+        .into_any_element()
 }
 
 impl Default for ReadingCache {
@@ -1654,6 +2004,7 @@ fn render_blocks(blocks: &Rc<Vec<Block>>, ctx: &RenderCtx) -> AnyElement {
     let nested = RenderCtx {
         vault_root: ctx.vault_root,
         on_fold: None,
+        on_task: None,
         blocks: &[],
         depth: ctx.depth + 1,
         template: &template,
@@ -1792,6 +2143,29 @@ fn render_block(block: Block, block_index: Option<usize>, ctx: &RenderCtx) -> An
                 Some(false) => ("\u{2610}".to_string(), theme.muted),
                 None => (marker, theme.muted),
             };
+            let mut checkbox: AnyElement = div()
+                .w(px(24.0))
+                .flex_shrink_0()
+                .text_color(marker_color)
+                .child(marker.clone())
+                .into_any_element();
+            if let (Some(checked), Some(index), Some(on_task)) = (checked, block_index, ctx.on_task)
+            {
+                let on_task = on_task.clone();
+                checkbox = div()
+                    .id(ElementId::Name(format!("task-{index}").into()))
+                    .w(px(24.0))
+                    .flex_shrink_0()
+                    .text_color(marker_color)
+                    .cursor_pointer()
+                    .hover(move |style| style.text_color(theme.text))
+                    .on_mouse_down(MouseButton::Left, move |_event, window, cx| {
+                        cx.stop_propagation();
+                        on_task(index, !checked, window, cx);
+                    })
+                    .child(marker)
+                    .into_any_element();
+            }
             div()
                 .flex()
                 .flex_row()
@@ -1803,13 +2177,7 @@ fn render_block(block: Block, block_index: Option<usize>, ctx: &RenderCtx) -> An
                         .w(px(8.0 + depth.min(8) as f32 * 16.0))
                         .flex_shrink_0(),
                 )
-                .child(
-                    div()
-                        .w(px(24.0))
-                        .flex_shrink_0()
-                        .text_color(marker_color)
-                        .child(marker),
-                )
+                .child(checkbox)
                 // The text must be the one flexible child: without `flex_1` its
                 // max-content width becomes the row's width, the row outgrows the
                 // reading column, and every later block loses the column's alignment.
@@ -1973,6 +2341,7 @@ impl<'a> RenderCtx<'a> {
             math: self.math,
             folded: self.folded,
             on_fold: self.on_fold,
+            on_task: self.on_task,
             copy: self.copy,
             find: self.find,
             on_image: self.on_image,
@@ -3474,6 +3843,22 @@ fn block_for_progress(progress: f32, block_count: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reader_typefaces_apply_platform_families_and_fallbacks() {
+        let mut font = gpui::font(".SystemUIFont");
+        ReaderFont::Sans.apply(&mut font);
+        assert_eq!(font.family.as_ref(), ".SystemUIFont");
+
+        ReaderFont::Serif.apply(&mut font);
+        assert_ne!(font.family.as_ref(), ".SystemUIFont");
+        assert_ne!(font.family.as_ref(), "Georgia");
+        assert!(font.fallbacks.is_some());
+
+        ReaderFont::Mono.apply(&mut font);
+        assert_ne!(font.family.as_ref(), ".SystemUIFont");
+        assert!(font.fallbacks.is_some());
+    }
 
     #[test]
     fn restored_reading_folds_survive_the_first_parse() {

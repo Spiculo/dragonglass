@@ -724,6 +724,13 @@ fn heading(trimmed: &str) -> Option<(u8, String)> {
     Some((level as u8, text))
 }
 
+/// Parse the first lines of `lines` as a GFM table, if they form one.
+///
+/// Used by the editor's in-place table editor, which parses just the table's own lines.
+pub fn parse_table(lines: &[&str]) -> Option<Block> {
+    table_at(lines, 0).map(|(block, _)| block)
+}
+
 /// A GFM pipe table: header row, delimiter row, then zero or more body rows.
 fn table_at(lines: &[&str], start: usize) -> Option<(Block, usize)> {
     if start + 1 >= lines.len() {

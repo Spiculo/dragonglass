@@ -25,7 +25,8 @@ pub struct Config {
     pub font_size: u16,
     /// Reading view body text size in points.
     pub reader_size: u16,
-    /// Reading view column width in pixels.
+    /// Reading view column width in pixels for clients that still use a measure.
+    /// The desktop reader fills its pane and only uses this as the first-frame math width.
     pub reader_width: u16,
     /// Reading body font: `sans`, `serif` or `mono`.
     pub reader_font: String,

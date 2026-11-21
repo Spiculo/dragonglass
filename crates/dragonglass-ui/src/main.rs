@@ -17,6 +17,7 @@ mod math_element;
 mod platform;
 mod preview_window;
 mod reading;
+mod table_edit;
 mod theme;
 mod vault_picker;
 mod vim;
@@ -66,6 +67,9 @@ const HOTKEYS: &[(&str, &str, &str)] = &[
     ("ReopenClosedTab", "secondary+shift+t", "Reopen closed tab"),
     ("SaveAs", "secondary+shift+s", "Save note as"),
     ("ToggleZen", "secondary+alt+z", "Zen mode"),
+    ("ToggleSidebar", "secondary+alt+b", "Toggle sidebar"),
+    ("ToggleOutline", "secondary+alt+o", "Toggle outline"),
+    ("ToggleRelations", "secondary+alt+l", "Toggle relations"),
     ("NavBack", "secondary+[", "Back"),
     ("NavForward", "secondary+]", "Forward"),
     ("NextTab", "ctrl-tab", "Next tab"),
@@ -141,6 +145,9 @@ fn bind_named(cx: &mut App, key: &str, action: &str) {
         "ReopenClosedTab" => cx.bind_keys([KeyBinding::new(key, ReopenClosedTab, None)]),
         "SaveAs" => cx.bind_keys([KeyBinding::new(key, SaveAs, None)]),
         "ToggleZen" => cx.bind_keys([KeyBinding::new(key, ToggleZen, None)]),
+        "ToggleSidebar" => cx.bind_keys([KeyBinding::new(key, ToggleSidebar, None)]),
+        "ToggleOutline" => cx.bind_keys([KeyBinding::new(key, ToggleOutline, None)]),
+        "ToggleRelations" => cx.bind_keys([KeyBinding::new(key, ToggleRelations, None)]),
         "NavBack" => cx.bind_keys([KeyBinding::new(key, NavBack, None)]),
         "NavForward" => cx.bind_keys([KeyBinding::new(key, NavForward, None)]),
         "NextTab" => cx.bind_keys([KeyBinding::new(key, NextTab, None)]),
@@ -190,6 +197,9 @@ actions!(
         ReopenClosedTab,
         SaveAs,
         ToggleZen,
+        ToggleSidebar,
+        ToggleOutline,
+        ToggleRelations,
         ReloadConflicted,
         KeepMine,
         CompareConflicted,
@@ -301,6 +311,9 @@ enum CommandId {
     SaveAs,
     History,
     Zen,
+    ToggleSidebar,
+    ToggleOutline,
+    ToggleRelations,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -702,7 +715,6 @@ struct DragonGlassApp {
     graph_view: Option<gpui::Entity<GraphView>>,
     show_graph: bool,
     relations: Vec<relations::NoteRelations>,
-    show_relations: bool,
     /// Panel widths in pixels, adjustable by dragging the splitters.
     sidebar_width: f32,
     outline_width: f32,
@@ -780,6 +792,10 @@ struct DragonGlassApp {
     /// Scroll fractions seen on each side, so a sync only reacts to real movement.
     last_editor_progress: f32,
     last_preview_progress: f32,
+    /// Last window width seen by the bounds observer, so a resize invalidates shaped text.
+    last_viewport_width: f32,
+    /// Keeps the bounds observer alive for the lifetime of the window.
+    bounds_subscription: Option<gpui::Subscription>,
     /// A link waiting for the user to confirm opening it.
     pending_url: Option<String>,
     /// Which background alias-index build is current, so a stale one is dropped.
@@ -1752,7 +1768,7 @@ impl DragonGlassApp {
         self.show_diff = false;
         self.normalize_splits();
         self.refresh_properties(cx);
-        if self.show_relations {
+        if self.config.show_relations {
             self.relations = relations::build(&self.note_refs);
         }
         self.remember_session(cx);
@@ -1860,7 +1876,7 @@ impl DragonGlassApp {
             self.show_diff = false;
             self.normalize_splits();
             self.refresh_properties(cx);
-            if self.show_relations {
+            if self.config.show_relations {
                 self.relations = relations::build(&self.note_refs);
             }
             self.remember_session(cx);
@@ -1947,6 +1963,28 @@ impl DragonGlassApp {
             },
         );
         cx.notify();
+    }
+
+    fn toggle_sidebar(&mut self, _: &ToggleSidebar, _window: &mut Window, cx: &mut Context<Self>) {
+        self.toggle_panel("sidebar", cx);
+    }
+
+    fn toggle_outline_panel(
+        &mut self,
+        _: &ToggleOutline,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.toggle_panel("outline", cx);
+    }
+
+    fn toggle_relations(
+        &mut self,
+        _: &ToggleRelations,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.toggle_panel("relations", cx);
     }
 
     /// Mouse back/forward buttons use the same history as the shortcuts.
@@ -2262,7 +2300,7 @@ impl DragonGlassApp {
             self.tree = tree::build_with_dirs(&self.note_refs, &vault.folders());
             self.notes = self.note_refs.len();
             self.full_graph = graph::build(&self.note_refs);
-            if self.show_relations {
+            if self.config.show_relations {
                 self.relations = relations::build(&self.note_refs);
             }
         }
@@ -2758,6 +2796,21 @@ impl DragonGlassApp {
                     command_item("Delete current note", "", CommandId::DeleteNote),
                     command_item("Save note as", "", CommandId::SaveAs),
                     command_item("Toggle zen mode", "secondary-alt+z", CommandId::Zen),
+                    command_item(
+                        "Toggle sidebar",
+                        "secondary-alt+b",
+                        CommandId::ToggleSidebar,
+                    ),
+                    command_item(
+                        "Toggle outline",
+                        "secondary-alt+o",
+                        CommandId::ToggleOutline,
+                    ),
+                    command_item(
+                        "Toggle relations panel",
+                        "secondary-alt+l",
+                        CommandId::ToggleRelations,
+                    ),
                     command_item("File recovery", "", CommandId::History),
                     command_item("Check for updates", "", CommandId::CheckUpdates),
                     command_item("Graph view", "secondary+shift+g", CommandId::OpenGraph),
@@ -3077,12 +3130,7 @@ impl DragonGlassApp {
 
     /// Toggle the editorial relations panel, rebuilding it from disk each time it opens.
     fn open_relations(&mut self, _: &OpenRelations, _window: &mut Window, cx: &mut Context<Self>) {
-        self.show_relations = !self.show_relations;
-        if self.show_relations {
-            self.relations = relations::build(&self.note_refs);
-            self.set_status(StatusKind::Info, "document relations".to_string());
-        }
-        cx.notify();
+        self.toggle_panel("relations", cx);
     }
 
     /// A link graph that also includes frontmatter relationships.
@@ -3211,7 +3259,7 @@ impl DragonGlassApp {
                 });
                 self.cache_epoch = self.cache_epoch.wrapping_add(1);
                 self.refresh_properties(cx);
-                if self.show_relations {
+                if self.config.show_relations {
                     self.relations = relations::build(&self.note_refs);
                 }
                 (
@@ -3670,9 +3718,13 @@ impl DragonGlassApp {
             return;
         }
 
-        if self.show_relations {
-            self.show_relations = false;
+        if self.config.show_relations {
+            self.toggle_panel("relations", cx);
             window.focus(&self.editor.focus_handle(cx));
+            return;
+        }
+
+        if self.preview_content.close_lightbox() {
             cx.notify();
             return;
         }
@@ -4480,6 +4532,8 @@ impl DragonGlassApp {
                 scroll_sync_generation: 0,
                 last_editor_progress: -1.0,
                 last_preview_progress: -1.0,
+                last_viewport_width: 0.0,
+                bounds_subscription: None,
                 pending_url: None,
                 index_generation: 0,
                 outline_scroll: UniformListScrollHandle::new(),
@@ -4492,7 +4546,6 @@ impl DragonGlassApp {
                 graph_view: None,
                 show_graph: false,
                 relations: self.relations.clone(),
-                show_relations: self.show_relations && !minimal,
                 sidebar_width: self.sidebar_width,
                 outline_width: self.outline_width,
                 relations_width: self.relations_width,
@@ -4542,7 +4595,7 @@ impl DragonGlassApp {
 
         let view = sibling.clone();
         let returns = sibling.downgrade();
-        let _ = cx.open_window(options, move |window, cx| {
+        let window = cx.open_window(options, move |window, cx| {
             // Closing a popped-out window returns its tabs to the window it came from, so
             // closing the window is the merge gesture: no separate button is needed.
             let child = returns.clone();
@@ -4561,6 +4614,11 @@ impl DragonGlassApp {
             });
             view.clone()
         });
+        if let Ok(window) = window {
+            let _ = window.update(cx, |app, window, cx| {
+                app.install_window_bounds_watcher(window, cx);
+            });
+        }
     }
 
     /// Watch the vault for external edits. Event-driven: the watcher thread blocks, so idle
@@ -4733,33 +4791,19 @@ impl DragonGlassApp {
         cx.notify();
     }
 
-    /// Cycle the reading body size / measure through a short list of comfortable values.
-    fn cycle_reader_setting(&mut self, width: bool, cx: &mut Context<Self>) {
-        if width {
-            const STEPS: [u16; 5] = [640, 720, 780, 900, 1040];
-            let next = STEPS
-                .iter()
-                .position(|step| *step == self.config.reader_width)
-                .map(|index| STEPS[(index + 1) % STEPS.len()])
-                .unwrap_or(STEPS[0]);
-            self.config.reader_width = next;
-        } else {
-            const STEPS: [u16; 8] = [13, 14, 15, 16, 17, 18, 20, 22];
-            let next = STEPS
-                .iter()
-                .position(|step| *step == self.config.reader_size)
-                .map(|index| STEPS[(index + 1) % STEPS.len()])
-                .unwrap_or(STEPS[2]);
-            self.config.reader_size = next;
-        }
+    /// Cycle the reading body size through a short list of comfortable values.
+    fn cycle_reader_size(&mut self, cx: &mut Context<Self>) {
+        const STEPS: [u16; 8] = [13, 14, 15, 16, 17, 18, 20, 22];
+        let next = STEPS
+            .iter()
+            .position(|step| *step == self.config.reader_size)
+            .map(|index| STEPS[(index + 1) % STEPS.len()])
+            .unwrap_or(STEPS[2]);
+        self.config.reader_size = next;
         let (kind, message) = match config::save(&self.vault_root, &self.config) {
             Ok(()) => (
                 StatusKind::Info,
-                if width {
-                    format!("reading width: {} px", self.config.reader_width)
-                } else {
-                    format!("reading text: {} px", self.config.reader_size)
-                },
+                format!("reading text: {} px", self.config.reader_size),
             ),
             Err(error) => (
                 StatusKind::Warn,
@@ -4873,12 +4917,44 @@ impl DragonGlassApp {
             "outline" => self.config.show_outline,
             _ => self.config.show_relations,
         };
+        if panel == "relations" && on {
+            self.relations = relations::build(&self.note_refs);
+        }
+        // The center pane changes width. Invalidate the shaped rows now so the text
+        // reflows even before the window bounds observer sees the new size.
+        let editors: Vec<Entity<Editor>> = self.tabs.iter().map(|tab| tab.editor.clone()).collect();
+        for editor in editors {
+            editor.update(cx, |editor, _| editor.invalidate_layout());
+        }
         let message = match config::save(&self.vault_root, &self.config) {
             Ok(()) => format!("{panel}: {}", if on { "shown" } else { "hidden" }),
             Err(error) => format!("{panel} changed (not saved: {error})"),
         };
         self.set_status(StatusKind::Info, message);
         cx.notify();
+    }
+
+    /// Reflow every editor when the window width changes.
+    ///
+    /// The first frame can be laid out before the platform window has its final size, so
+    /// shaped rows would otherwise keep a stale wrap width and paint under a side panel.
+    fn install_window_bounds_watcher(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let subscription = cx.observe_window_bounds(window, |this, window, cx| {
+            let width = f32::from(window.viewport_size().width);
+            if (width - this.last_viewport_width).abs() < 0.5 {
+                return;
+            }
+            this.last_viewport_width = width;
+            let editors: Vec<Entity<Editor>> =
+                this.tabs.iter().map(|tab| tab.editor.clone()).collect();
+            for editor in editors {
+                editor.update(cx, |editor, _| editor.invalidate_layout());
+            }
+            this.last_editor_progress = -1.0;
+            this.last_preview_progress = -1.0;
+            this.editor.update(cx, |_, cx| cx.notify());
+        });
+        self.bounds_subscription = Some(subscription);
     }
 
     /// Cycle the reading line height through comfortable values.
@@ -5087,8 +5163,7 @@ impl DragonGlassApp {
             "vim" => self.toggle_vim(cx),
             "snippets" => self.toggle_snippets(cx),
             "autosave" => self.toggle_autosave(cx),
-            "reader-size" => self.cycle_reader_setting(false, cx),
-            "reader-width" => self.cycle_reader_setting(true, cx),
+            "reader-size" => self.cycle_reader_size(cx),
             "reader-line" => self.cycle_reader_line_height(cx),
             "reader-font" => self.cycle_reader_font(cx),
             "scroll-sync" => self.toggle_scroll_sync(cx),
@@ -5323,6 +5398,21 @@ impl DragonGlassApp {
                         "relations",
                         theme,
                     ))
+                    .child(info(
+                        "Toggle sidebar",
+                        &platform::label("secondary-alt+b"),
+                        theme,
+                    ))
+                    .child(info(
+                        "Toggle outline",
+                        &platform::label("secondary-alt+o"),
+                        theme,
+                    ))
+                    .child(info(
+                        "Toggle relations",
+                        &platform::label("secondary-alt+l"),
+                        theme,
+                    ))
                     .child(heading("Editor", theme))
                     .child(row(
                         "setting-vim",
@@ -5350,13 +5440,6 @@ impl DragonGlassApp {
                         "Reading text size",
                         format!("{} px", self.config.reader_size),
                         "reader-size",
-                        theme,
-                    ))
-                    .child(row(
-                        "setting-reader-width",
-                        "Reading width",
-                        format!("{} px", self.config.reader_width),
-                        "reader-width",
                         theme,
                     ))
                     .child(row(
@@ -6184,6 +6267,21 @@ impl DragonGlassApp {
                                     cx.notify();
                                     return;
                                 }
+                                CommandId::ToggleSidebar => {
+                                    self.close_panel(window, cx);
+                                    self.toggle_panel("sidebar", cx);
+                                    return;
+                                }
+                                CommandId::ToggleOutline => {
+                                    self.close_panel(window, cx);
+                                    self.toggle_panel("outline", cx);
+                                    return;
+                                }
+                                CommandId::ToggleRelations => {
+                                    self.close_panel(window, cx);
+                                    self.toggle_panel("relations", cx);
+                                    return;
+                                }
                                 CommandId::ToggleVim => {
                                     self.toggle_vim(cx);
                                     self.close_panel(window, cx);
@@ -6411,13 +6509,7 @@ impl DragonGlassApp {
                                 }
                                 CommandId::Relations => {
                                     self.close_panel(window, cx);
-                                    self.relations = relations::build(&self.note_refs);
-                                    self.show_relations = true;
-                                    self.set_status(
-                                        StatusKind::Info,
-                                        "document relations".to_string(),
-                                    );
-                                    cx.notify();
+                                    self.toggle_panel("relations", cx);
                                     return;
                                 }
                                 CommandId::RelationGraph => {
@@ -7180,9 +7272,7 @@ impl Render for DragonGlassApp {
             let style = window.text_style();
             let mut template_font = style.font();
             if let Some(reader) = cx.try_global::<ReaderSettings>() {
-                if let Some(family) = reader.font.family() {
-                    template_font.family = family.into();
-                }
+                reader.font.apply(&mut template_font);
             }
             let template = gpui::TextRun {
                 len: 0,
@@ -7204,6 +7294,17 @@ impl Render for DragonGlassApp {
                     window.refresh();
                 })
             };
+            let toggle_task: reading::TaskToggle = {
+                let editor = self.editor.clone();
+                Rc::new(
+                    move |index: usize, checked: bool, window: &mut Window, cx: &mut App| {
+                        editor.update(cx, |editor, cx| {
+                            editor.toggle_reading_task(index, checked, cx);
+                        });
+                        window.refresh();
+                    },
+                )
+            };
             Some(
                 div()
                     .flex_1()
@@ -7216,6 +7317,7 @@ impl Render for DragonGlassApp {
                         template,
                         Some(opener),
                         Some(fold),
+                        Some(toggle_task),
                         cx,
                     ))
                     .into_any_element(),
@@ -7597,7 +7699,7 @@ impl Render for DragonGlassApp {
             )
         };
 
-        let relations_panel: Option<AnyElement> = if self.show_relations {
+        let relations_panel: Option<AnyElement> = if self.config.show_relations {
             let me = cx.entity();
             let active = self.active.clone();
             let entries = active
@@ -8366,6 +8468,18 @@ impl Render for DragonGlassApp {
             .size_full()
             .bg(theme.bg)
             .text_color(theme.text)
+            .capture_key_down(cx.listener(|app, event: &KeyDownEvent, _window, cx| {
+                // The split preview's lightbox is a modal: keep keys away from the
+                // editor behind it, and let Escape close it.
+                if !app.preview_content.lightbox_open() {
+                    return;
+                }
+                if event.keystroke.key == "escape" {
+                    app.preview_content.close_lightbox();
+                    cx.notify();
+                }
+                cx.stop_propagation();
+            }))
             .on_drop::<TabDrag>(cx.listener(Self::drop_on_window))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_drag_release_out))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::finish_resize))
@@ -8410,6 +8524,9 @@ impl Render for DragonGlassApp {
             .on_action(cx.listener(Self::compare_draft))
             .on_action(cx.listener(Self::discard_draft))
             .on_action(cx.listener(Self::toggle_zen))
+            .on_action(cx.listener(Self::toggle_sidebar))
+            .on_action(cx.listener(Self::toggle_outline_panel))
+            .on_action(cx.listener(Self::toggle_relations))
             .on_action(cx.listener(Self::nav_back))
             .on_action(cx.listener(Self::nav_forward))
             .on_action(cx.listener(Self::copy_selection))
@@ -8605,8 +8722,11 @@ fn install_menus(cx: &mut App) {
                 MenuItem::action("Reading Mode", editor::ToggleReading),
                 MenuItem::action("Toggle Theme", ToggleTheme),
                 MenuItem::separator(),
+                MenuItem::action("Toggle Sidebar", ToggleSidebar),
+                MenuItem::action("Toggle Outline", ToggleOutline),
+                MenuItem::action("Toggle Relations", ToggleRelations),
+                MenuItem::separator(),
                 MenuItem::action("Graph View", OpenGraph),
-                MenuItem::action("Document Relations", OpenRelations),
                 MenuItem::separator(),
                 MenuItem::action("Read and Write Side by Side", ToggleSideBySide),
                 MenuItem::action("Two Editors Side by Side", ToggleSplitEditor),
@@ -8940,6 +9060,11 @@ fn open_vault_window(vault_path: PathBuf, uri_note: Option<String>, cx: &mut App
     };
     let initial_snippets = store::load_overrides(&store::snippets_dir(&vault_root));
     let initial_graph = graph::build(&note_refs);
+    let initial_relations = if initial_config.show_relations {
+        relations::build(&note_refs)
+    } else {
+        Vec::new()
+    };
     let initial_suggestions: Rc<Vec<(String, String)>> = Rc::new(
         note_refs
             .iter()
@@ -9155,6 +9280,8 @@ fn open_vault_window(vault_path: PathBuf, uri_note: Option<String>, cx: &mut App
             scroll_sync_generation: 0,
             last_editor_progress: -1.0,
             last_preview_progress: -1.0,
+            last_viewport_width: 0.0,
+            bounds_subscription: None,
             pending_url: None,
             index_generation: 0,
             outline_scroll: UniformListScrollHandle::new(),
@@ -9166,8 +9293,7 @@ fn open_vault_window(vault_path: PathBuf, uri_note: Option<String>, cx: &mut App
             full_graph: initial_graph.clone(),
             graph_view: None,
             show_graph: false,
-            relations: Vec::new(),
-            show_relations: false,
+            relations: initial_relations,
             sidebar_width: 240.0,
             outline_width: 200.0,
             relations_width: 240.0,
@@ -9231,6 +9357,7 @@ fn open_vault_window(vault_path: PathBuf, uri_note: Option<String>, cx: &mut App
         .expect("failed to open window");
 
     let _ = window.update(cx, |view, window, cx| {
+        view.install_window_bounds_watcher(window, cx);
         if view.config.scroll_sync && view.split_preview {
             view.start_scroll_sync(cx);
         }

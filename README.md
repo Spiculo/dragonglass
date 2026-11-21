@@ -31,16 +31,18 @@ A lot already works. This is a working application, not a mockup — but it is e
 
 **Editing**
 - Source editor with a rope buffer, undo/redo, IME, word wrap and a line-number gutter
-- Reading view and a live-preview pane beside the editor; reading is strictly read-only,
-  joins soft line breaks into paragraphs (hard breaks stay), and gives every code fence a
-  copy button
+- Reading view and a live-preview pane beside the editor; reading never edits the source
+  except for task checkboxes, which apply a normal, undoable edit that marks the note dirty
+  (save or autosave writes it); reading joins soft line breaks into paragraphs (hard breaks
+  stay), and gives every code fence a copy button
 - One-sentence-per-line notes read as paragraphs; `tags:` chips in the properties header
   open a vault search, and frontmatter links are clickable
 - Reading selection: double-click a word, triple-click a paragraph, Shift-click to extend,
   Shift+arrows/Home/End for keyboard selection, drag past the edge to scroll, Escape to
   clear, and a "copied N characters" confirmation
 - Syntax highlighting, code fences, tables, task lists, footnotes, callouts and
-  `==highlights==`
+  `==highlights==`; Dynamic mode turns a table into an editable grid with add-row and
+  add-column buttons and drag handles for reordering rows and columns
 - KaTeX-compatible math (`$…$` / `$$…$$`) via [RaTeX](https://github.com/erweixin/RaTeX),
   rendered natively and exported as vector SVG; display `$$…$$` blocks are typeset in the
   editor itself whenever the caret is outside the block, and show their LaTeX source again
@@ -57,8 +59,13 @@ A lot already works. This is a working application, not a mockup — but it is e
 - Wikilink, tag and slash-command autocomplete while typing
 - Command palette with live filtering, clickable rows and keyboard auto-scroll, a settings
   page (`Ctrl+,`), configurable hotkeys, light/dark themes and snippets
-- Reading typography: text size and column width are settings, applied to every open reader
-  and the split preview immediately and stored per vault
+- Reading typography: text size, line height and typeface (sans, serif or mono) are settings,
+  applied to every open reader and the split preview immediately and stored per vault; the
+  reading column fills the pane, and the serif face is the platform book face (New York on
+  macOS) instead of Georgia
+- Collapsible panels: the file sidebar, outline and relations panel toggle from the command
+  palette or `Ctrl/Cmd+Alt+B`, `Ctrl/Cmd+Alt+O` and `Ctrl/Cmd+Alt+L`, and remember their
+  state per vault
 
 **Vault and knowledge**
 - File tree with new note/folder, rename, move and delete to a recoverable trash
@@ -68,8 +75,8 @@ A lot already works. This is a working application, not a mockup — but it is e
   edges and zoom-faded labels
 - Daily/weekly/monthly notes, templates, properties, bookmarks
 - Embeds and attachments (images, PDF, audio), transclusion, shared blocks; images honor
-  `![[img|300]]` width and alt text, click opens a lightbox, and other attachments open in
-  the OS viewer from a card
+  `![[img|300]]` width and alt text, click opens a lightbox with scroll-wheel zoom, drag
+  panning and double-click reset, and other attachments open in the OS viewer from a card
 - A/B versions with a line diff, document review, block move/duplicate/delete/extract
 - Recovery snapshots, browsable and restorable from **File recovery** in the palette
 - Conflict-safe saves: a save never overwrites a file that changed on disk; the app offers

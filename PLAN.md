@@ -400,12 +400,13 @@ Cmd+Q and the window close button share one exit gate: a dirty buffer offers **S
 quit**, **Quit without saving** or **Cancel**, and a save that fails or conflicts keeps the
 app open with the error and the conflict bar.
 
-The first batch from [`docs/qol-plan.md`](docs/qol-plan.md) is in. Reading mode is now
-strictly read-only: every mutating action and both IME insert paths check one `can_mutate()`
-gate, so keyboard input, paste, cut, undo/redo and formatting leave the source untouched
-while selection and copy still work. Reading also joins soft line breaks into paragraphs and
-keeps the hard breaks (two trailing spaces or a backslash), and every code fence has a copy
-button.
+The first batch from [`docs/qol-plan.md`](docs/qol-plan.md) is in. Reading mode is
+read-only: every mutating action and both IME insert paths check one `can_mutate()` gate, so
+keyboard input, paste, cut, undo/redo and formatting leave the source untouched while
+selection and copy still work. Ticking a task checkbox is the one deliberate exception: it
+changes only the marker, as an undoable edit that marks the note dirty. Reading also joins
+soft line breaks into paragraphs and keeps the hard breaks (two trailing spaces or a
+backslash), and every code fence has a copy button.
 
 Feedback is typed and transient: the header status line carries a kind (info, success,
 warning, error), expires on its own with a one-shot timer, and errors stay until they are
@@ -472,8 +473,14 @@ as `[[selected text]]` without opening the picker.
 mode, snippets and the daily/weekly/monthly/templates/attachments folders. Values are written
 to `.dragon-glass/config.txt`, so they remain plain text and per vault.
 
-It also carries the reading typography: text size and column width (`reader_size`,
-`reader_width`), applied to every open reader and the split preview as soon as they change.
+It also carries the reading typography: text size, line height and typeface (`reader_size`,
+`reader_line_height`, `reader_font`), applied to every open reader and the split preview as
+soon as they change. The reading column fills the pane; `reader_width` remains the measure
+used by mobile and by display math on the first frame. The serif typeface is the platform
+book face (New York on macOS, Cambria on Windows, DejaVu Serif on Linux), not Georgia.
+
+The file sidebar, outline and relations panel can be hidden from the command palette or with
+`Ctrl/Cmd+Alt+B`, `Ctrl/Cmd+Alt+O` and `Ctrl/Cmd+Alt+L`; the choice is saved in `config.txt`.
 
 Vim mode is optional and per vault (`vim_mode=true` in `.dragon-glass/config.txt`, the
 command palette, or `Ctrl+Alt+V`). It covers normal/visual/visual-line/insert modes,
