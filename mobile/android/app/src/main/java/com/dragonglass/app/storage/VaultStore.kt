@@ -78,7 +78,7 @@ class VaultStore(private val context: Context) {
         onProgress: (Int, Long) -> Unit = { _, _ -> },
         isCancelled: () -> Boolean = { false },
     ): StoredVault {
-        takePermission(treeUri, write = false)
+        takePermission(treeUri, write = true)
 
         val source = DocumentFile.fromTreeUri(context, treeUri)
             ?: throw IllegalStateException("The selected folder is not readable")
@@ -146,7 +146,7 @@ class VaultStore(private val context: Context) {
     ): Int {
         for (child in source.listFiles()) {
             if (isCancelled()) throw TransferCancelled()
-            val name = child.name ?: continue
+            val name = safeName(child.name) ?: continue
             // Dot folders are Obsidian/git metadata; the app has its own.
             if (name.startsWith(".")) continue
             if (child.isDirectory) {
@@ -266,7 +266,7 @@ class VaultStore(private val context: Context) {
     ): Int {
         for (child in source.listFiles()) {
             if (isCancelled()) throw TransferCancelled()
-            val name = child.name ?: continue
+            val name = safeName(child.name) ?: continue
             if (name.startsWith(".")) continue
             val relative = if (prefix.isEmpty()) name else "$prefix/$name"
             if (child.isDirectory) {
@@ -333,6 +333,15 @@ class VaultStore(private val context: Context) {
         val parsed = Uri.parse(uri)
         takePermission(parsed, write = true)
         return DocumentFile.fromTreeUri(context, parsed)
+    }
+
+    private fun safeName(raw: String?): String? {
+        val name = raw
+            ?.substringAfterLast('/')
+            ?.substringAfterLast('\\')
+            ?.trim()
+        if (name.isNullOrEmpty() || name == "." || name == "..") return null
+        return name
     }
 
     private fun takePermission(treeUri: Uri, write: Boolean) {

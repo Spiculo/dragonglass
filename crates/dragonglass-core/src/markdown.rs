@@ -647,12 +647,14 @@ pub struct Heading {
 /// Headings in document order, with source line numbers. Frontmatter is skipped but
 /// still counted, and headings inside fenced code are ignored.
 pub fn headings(src: &str) -> Vec<Heading> {
-    let body = frontmatter::split(src).body;
-    let offset = src.len().saturating_sub(body.len());
-    let prefix_lines = src[..offset].matches('\n').count();
+    let cleaned = strip_comments(src);
+    let body = frontmatter::split(&cleaned).body;
+    let offset = cleaned.len().saturating_sub(body.len());
+    let prefix_lines = cleaned[..offset].matches('\n').count();
 
     let mut out = Vec::new();
     let mut in_fence = false;
+    let mut in_display_math = false;
     // The last plain paragraph line, which a following `===`/`---` underlines.
     let mut previous: Option<(usize, String)> = None;
 
@@ -665,6 +667,19 @@ pub fn headings(src: &str) -> Vec<Heading> {
             continue;
         }
         if in_fence {
+            continue;
+        }
+
+        let display_delimiter = trimmed == "$$";
+        if display_delimiter || (trimmed.starts_with("$$") && trimmed.ends_with("$$")) {
+            if display_delimiter {
+                in_display_math = !in_display_math;
+            }
+            // A one-line `$$…$$` block contributes no heading either.
+            previous = None;
+            continue;
+        }
+        if in_display_math {
             continue;
         }
 
@@ -920,6 +935,14 @@ mod tests {
                 text: "Real".into()
             }]
         );
+    }
+
+    #[test]
+    fn comments_and_math_do_not_create_outline_headings() {
+        let source = "%%hidden%%\n---\n\n$$\n# not a heading\n$$\n\n# Real\n";
+        let found = headings(source);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].text, "Real");
     }
 
     #[test]

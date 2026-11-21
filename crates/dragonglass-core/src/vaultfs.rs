@@ -35,7 +35,50 @@ fn checked(root: &Path, relative: &str) -> Result<(String, PathBuf)> {
     if relative.is_empty() {
         return Err(Error::InvalidPath(relative));
     }
-    Ok((relative.clone(), root.join(relative)))
+    let path = root.join(&relative);
+    ensure_parent_contained(root, &path)?;
+    Ok((relative, path))
+}
+
+/// Reject a path whose nearest existing parent resolves outside the vault.
+///
+/// The final component may not exist yet, but a symlinked directory is enough to make
+/// `create_dir_all` or a write land outside the vault. Canonicalizing the nearest existing
+/// ancestor catches that without requiring the note itself to exist.
+fn ensure_parent_contained(root: &Path, path: &Path) -> Result<()> {
+    let root = root
+        .canonicalize()
+        .map_err(|_| Error::InvalidPath(path.display().to_string()))?;
+    let mut ancestor = path.parent().unwrap_or(root.as_path());
+    while !ancestor.exists() {
+        let Some(parent) = ancestor.parent() else {
+            return Err(Error::InvalidPath(path.display().to_string()));
+        };
+        ancestor = parent;
+    }
+    let resolved = ancestor
+        .canonicalize()
+        .map_err(|_| Error::InvalidPath(path.display().to_string()))?;
+    if !resolved.starts_with(&root) {
+        return Err(Error::InvalidPath(path.display().to_string()));
+    }
+    Ok(())
+}
+
+/// Validate a destination path that does not exist yet, preserving legal names.
+///
+/// The parent must already resolve inside the vault; the final component may be new.
+fn restore_target(root: &Path, relative: &str) -> Result<(String, PathBuf)> {
+    let relative = relative.replace('\\', "/");
+    if relative.is_empty()
+        || Path::new(&relative).is_absolute()
+        || relative.split('/').any(|part| part == "..")
+    {
+        return Err(Error::InvalidPath(relative));
+    }
+    let path = root.join(&relative);
+    ensure_parent_contained(root, &path)?;
+    Ok((relative, path))
 }
 
 /// Validate a path that already exists on disk. Unlike `checked`, this keeps the name
@@ -48,7 +91,17 @@ fn existing(root: &Path, relative: &str) -> Result<(String, PathBuf)> {
     {
         return Err(Error::InvalidPath(relative));
     }
-    Ok((relative.clone(), root.join(relative)))
+    let path = root.join(&relative);
+    let root = root
+        .canonicalize()
+        .map_err(|_| Error::InvalidPath(relative.clone()))?;
+    let resolved = path
+        .canonicalize()
+        .map_err(|_| Error::InvalidPath(relative.clone()))?;
+    if !resolved.starts_with(&root) {
+        return Err(Error::InvalidPath(relative));
+    }
+    Ok((relative, path))
 }
 
 /// Create a new markdown note. Adds `.md` when the name has no markdown extension.
@@ -143,9 +196,14 @@ pub fn trash(root: &Path, relative: &str) -> Result<PathBuf> {
     }
 
     std::fs::create_dir_all(&base)?;
-    let destination = base.join("entry");
-    std::fs::rename(&path, &destination)?;
+    // Write the metadata first. A crash after this point leaves a stamp with no entry,
+    // which `list_trash` skips; a crash after the rename leaves a complete entry.
     write_trash_meta(&base, &relative)?;
+    let destination = base.join("entry");
+    if let Err(error) = std::fs::rename(&path, &destination) {
+        let _ = std::fs::remove_dir_all(&base);
+        return Err(error.into());
+    }
     Ok(destination)
 }
 
@@ -248,7 +306,7 @@ pub fn restore(root: &Path, trash_relative: &str) -> Result<String> {
             }
         },
     };
-    let (original, target) = checked(root, &original)?;
+    let (original, target) = restore_target(root, &original)?;
     if target.exists() {
         return Err(Error::AlreadyExists(original));
     }
@@ -290,6 +348,13 @@ pub fn empty_trash(root: &Path) -> Result<usize> {
 /// Reconstruct the original relative path of a legacy trash entry by descending while each
 /// directory has exactly one child. Returns `None` when two entries were trashed together.
 fn legacy_entry(base: &Path) -> Option<String> {
+    // Current-layout stamps use an `entry` child and rely on `meta.json`. A missing meta
+    // file means the delete was interrupted; treating `entry` as a legacy path would
+    // restore it under `vault/entry/...`.
+    if base.join(TRASH_ENTRY).exists() {
+        return None;
+    }
+
     let mut current = base.to_path_buf();
     let mut relative = String::new();
 
@@ -348,6 +413,19 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_directories_cannot_escape_the_vault() {
+        let root = temp_root("symlink");
+        let outside = temp_root("symlink-outside");
+        std::os::unix::fs::symlink(&outside, root.join("linked")).unwrap();
+        assert!(create_note(&root, "linked/escaped.md", "no").is_err());
+        assert!(!outside.join("escaped.md").exists());
+        assert!(create_folder(&root, "linked/folder").is_err());
+        std::fs::remove_dir_all(&root).unwrap();
+        std::fs::remove_dir_all(&outside).unwrap();
     }
 
     #[test]
@@ -462,6 +540,37 @@ mod tests {
             std::fs::read_to_string(root.join("old.md")).unwrap(),
             "legacy"
         );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_preserves_legal_names_and_skips_interrupted_stamps() {
+        let root = temp_root("trash-colon");
+        std::fs::write(root.join("a:b.md"), "colon").unwrap();
+        let trashed = trash(&root, "a:b.md").unwrap();
+        assert!(trashed.exists());
+        let listed = list_trash(&root).unwrap();
+        let entry = listed
+            .iter()
+            .find(|entry| entry.original == "a:b.md")
+            .expect("colon note is listed");
+        restore(&root, &entry.trash_relative).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(root.join("a:b.md")).unwrap(),
+            "colon"
+        );
+
+        // A stamp with `entry` but no meta.json is an interrupted delete. It must not be
+        // reported as a legacy path named `entry`.
+        let broken = trash_root(&root).join("0000000000003");
+        std::fs::create_dir_all(&broken).unwrap();
+        std::fs::write(broken.join("entry"), "orphan").unwrap();
+        assert!(list_trash(&root)
+            .unwrap()
+            .iter()
+            .all(|entry| entry.original != "entry"));
+
         std::fs::remove_dir_all(&root).unwrap();
     }
 

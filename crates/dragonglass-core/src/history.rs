@@ -46,6 +46,16 @@ pub fn list(root: &Path, relative: &str) -> Vec<String> {
 }
 
 pub fn read(root: &Path, relative: &str, id: &str) -> Result<String> {
+    // Snapshot ids come from `list`, but the CLI exposes them as user input.
+    if id.is_empty()
+        || id == "."
+        || id == ".."
+        || id.contains('/')
+        || id.contains('\\')
+        || id.contains("..")
+    {
+        return Err(crate::Error::InvalidPath(id.to_string()));
+    }
     Ok(std::fs::read_to_string(dir(root, relative).join(id))?)
 }
 
@@ -88,6 +98,14 @@ mod tests {
         assert_eq!(read(&root, "notes/a.md", &ids[0]).unwrap(), "first");
         assert_eq!(read(&root, "notes/a.md", &ids[1]).unwrap(), "second");
 
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn snapshot_ids_cannot_escape_the_history_directory() {
+        let root = temp_root("traversal");
+        assert!(read(&root, "a.md", "../../../secret.txt").is_err());
+        assert!(read(&root, "a.md", "..%2F..").is_err());
         std::fs::remove_dir_all(&root).unwrap();
     }
 

@@ -262,9 +262,19 @@ fn register_uri(args: Vec<String>, unregister: bool) -> Result<()> {
 
     let exe = match explicit {
         Some(path) => path,
-        None => std::env::current_exe()
-            .map(|path| path.to_string_lossy().to_string())
-            .map_err(|_| anyhow!("cannot determine the executable path; pass it as an argument"))?,
+        None => {
+            let current = std::env::current_exe().map_err(|_| {
+                anyhow!("cannot determine the executable path; pass it as an argument")
+            })?;
+            // The CLI and the GUI often ship side by side. Register the GUI: it accepts
+            // `dragonglass://` URLs; running the CLI with one treats it as a vault path.
+            let app = current.with_file_name("dragon-glass-app");
+            if app.is_file() {
+                app.to_string_lossy().to_string()
+            } else {
+                current.to_string_lossy().to_string()
+            }
+        }
     };
 
     let steps = if unregister {
@@ -353,7 +363,7 @@ fn desktop_file_path() -> PathBuf {
 #[cfg(target_os = "linux")]
 fn register_plan(exe: &str) -> Vec<Step> {
     let contents = format!(
-        "[Desktop Entry]\nType=Application\nName=Dragon Glass\nExec={exe} %u\n\
+        "[Desktop Entry]\nType=Application\nName=Dragon Glass\nExec=\"{exe}\" %u\n\
          Terminal=false\nMimeType=x-scheme-handler/dragonglass;\nNoDisplay=true\n"
     );
 
@@ -556,6 +566,16 @@ fn import_cmd(args: Vec<String>) -> Result<()> {
 
     let mut written = 0usize;
     let mut used: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // Never overwrite a note from an earlier import (or a user note with the same name).
+    if let Ok(entries) = std::fs::read_dir(&out_dir) {
+        for entry in entries.flatten() {
+            if entry.path().extension().and_then(|ext| ext.to_str()) == Some("md") {
+                if let Some(stem) = entry.path().file_stem().and_then(|stem| stem.to_str()) {
+                    used.insert(stem.to_string());
+                }
+            }
+        }
+    }
 
     for note in &notes {
         let base = sanitize_file_name(&note.title);
@@ -714,11 +734,30 @@ fn check_update(args: Vec<String>) -> Result<()> {
 }
 
 fn serve(args: Vec<String>) -> Result<()> {
+    let allow_remote = args.iter().any(|arg| arg == "--allow-remote");
+    let args: Vec<String> = args
+        .into_iter()
+        .filter(|arg| arg != "--allow-remote")
+        .collect();
     let root = PathBuf::from(args.first().cloned().unwrap_or_else(|| ".".to_string()));
     let addr = args
         .get(1)
         .cloned()
         .unwrap_or_else(|| "127.0.0.1:7456".to_string());
+
+    if !allow_remote {
+        use std::net::ToSocketAddrs;
+        let loopback = addr
+            .to_socket_addrs()
+            .ok()
+            .map(|mut addresses| addresses.all(|address| address.ip().is_loopback()))
+            .unwrap_or(false);
+        if !loopback {
+            bail!(
+                "{addr} is not a loopback address; the notes API is local-only (pass --allow-remote to override)"
+            );
+        }
+    }
 
     println!("serving {} at http://{addr}", display_path(&root));
     api::serve(&root, &addr).map_err(Into::into)

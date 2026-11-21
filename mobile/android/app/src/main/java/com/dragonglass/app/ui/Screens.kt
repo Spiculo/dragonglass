@@ -1751,7 +1751,11 @@ private fun DetailsSheet(vm: DragonGlassViewModel, onDismiss: () -> Unit) {
                             .fillMaxWidth()
                             .clickable {
                                 onDismiss()
-                                vm.openRelation(relation.target)
+                                if (relation.kind == "shared tag") {
+                                    vm.filterByTag(relation.target)
+                                } else {
+                                    vm.openRelation(relation.target)
+                                }
                             }
                             .padding(vertical = 4.dp),
                     ) {

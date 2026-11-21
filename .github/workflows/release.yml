@@ -73,7 +73,7 @@ jobs:
         if: runner.os == 'Windows'
         run: |
           choco install innosetup --no-progress -y
-          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" packaging\windows\dragon-glass.iss
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" /DAppVersion=${{ steps.version.outputs.value }} packaging\windows\dragon-glass.iss
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v7

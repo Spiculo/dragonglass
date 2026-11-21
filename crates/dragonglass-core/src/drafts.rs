@@ -103,9 +103,12 @@ fn drafts_dir(root: &Path) -> PathBuf {
 }
 
 /// One stable file per note, so repeated writes replace the previous draft.
+///
+/// The note path is hashed exactly as stored (with `/` separators) and with its case
+/// preserved. Lowercasing collided on case-sensitive filesystems and made the payload
+/// check in `load` reject the draft.
 fn draft_file(root: &Path, note: &str) -> PathBuf {
-    let mut normalized = note.replace('\\', "/");
-    normalized.make_ascii_lowercase();
+    let normalized = note.replace('\\', "/");
     drafts_dir(root).join(format!("{:016x}.draft", hash_text(&normalized)))
 }
 
@@ -122,8 +125,9 @@ pub fn save(root: &Path, draft: &Draft) -> Result<()> {
 pub fn load(root: &Path, note: &str) -> Option<Draft> {
     let text = std::fs::read_to_string(draft_file(root, note)).ok()?;
     let draft = Draft::from_text(&text)?;
-    // The hashed name is the lookup key; check the payload agrees.
-    if draft.note != note {
+    // The hashed name is the lookup key; check the payload agrees. Separator style may
+    // differ between clients, so compare the normalized path.
+    if draft.note.replace('\\', "/") != note.replace('\\', "/") {
         return None;
     }
     Some(draft)
@@ -239,6 +243,29 @@ mod tests {
 
         discard(&dir, "notes/a.md");
         assert_eq!(load(&dir, "notes/a.md"), None);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn case_only_note_paths_get_distinct_drafts() {
+        let dir = temp_dir("case");
+        let a = Draft {
+            note: "Notes/A.md".to_string(),
+            line: 1,
+            col: 2,
+            at: 3,
+            base: None,
+            text: "upper".to_string(),
+        };
+        let b = Draft {
+            note: "notes/a.md".to_string(),
+            text: "lower".to_string(),
+            ..a.clone()
+        };
+        save(&dir, &a).unwrap();
+        save(&dir, &b).unwrap();
+        assert_eq!(load(&dir, "Notes/A.md"), Some(a));
+        assert_eq!(load(&dir, "notes/a.md"), Some(b));
         std::fs::remove_dir_all(dir).unwrap();
     }
 

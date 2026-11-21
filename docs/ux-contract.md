@@ -70,7 +70,7 @@ local-only; nothing here starts background work.
 | `MobileVault.documentFingerprint(relative)` | Capture the baseline before editing |
 | `MobileVault.saveDocumentWithFingerprint(relative, text, expectedHash?)` | Conflict-safe save; returns `saved` / `conflict` (with the disk hash) / `error` |
 | `saveDraft` / `loadDraft` / `discardDraft` | Crash-recovery drafts, written from a lifecycle hook |
-| `readerSettings` / `setReaderSettings(size, width, font, lineHeight)` | Typography shared with desktop (`reader_*` keys in `config.txt`); size, line height and typeface apply everywhere, width is the mobile measure because desktop readers fill their pane |
+| `readerSettings` / `setReaderSettings(size, measure, font, lineHeight)` | Typography shared with desktop (`reader_*` keys in `config.txt`); size, line height and typeface apply everywhere, measure is the mobile width because desktop readers fill their pane |
 | `syncState(changed, untracked, ahead, behind, conflicts, busy, failed)` | One sync state machine: idle, dirty, syncing, conflict, error |
 | `resolveLinkFragment(source, fragment)` | `#Heading` / `#^block` to a 1-based source line |
 | `findInText(source, pattern, regex, case, wholeWord)` | UTF-16 match ranges for a text field |

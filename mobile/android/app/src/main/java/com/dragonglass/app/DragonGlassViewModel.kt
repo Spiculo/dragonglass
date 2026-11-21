@@ -473,17 +473,21 @@ class DragonGlassViewModel(application: Application) : AndroidViewModel(applicat
     fun saveConflictCopy() {
         val note = selected ?: return
         val text = source
-        val stem = note.substringBeforeLast('.')
-        val extension = note.substringAfterLast('.', "md")
+        val slash = note.lastIndexOf('/')
+        val directory = if (slash >= 0) note.substring(0, slash + 1) else ""
+        val file = note.substring(slash + 1)
+        val dot = file.lastIndexOf('.')
+        val stem = if (dot > 0) file.substring(0, dot) else file
+        val extension = if (dot > 0) file.substring(dot) else ".md"
         viewModelScope.launch {
             val result = runCatching {
                 withContext(Dispatchers.IO) {
                     val loaded = ensureVault()
-                    var candidate = "$stem (conflict).$extension"
+                    var candidate = "$directory$stem (conflict)$extension"
                     var index = 1
                     while (File(vaultDirectory, candidate).exists()) {
                         index++
-                        candidate = "$stem (conflict $index).$extension"
+                        candidate = "$directory$stem (conflict $index)$extension"
                     }
                     loaded.createNote(candidate, text)
                     candidate

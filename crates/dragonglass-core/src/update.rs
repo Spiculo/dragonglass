@@ -44,6 +44,12 @@ pub fn is_newer(current: &str, latest: &str) -> bool {
 
 /// Read the advertised version from a file path or a plain `http://` URL.
 pub fn fetch(source: &str) -> Result<String> {
+    if source.starts_with("https://") {
+        return Err(crate::Error::Io(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "HTTPS update sources are not supported; use http:// or a local file",
+        )));
+    }
     match source.strip_prefix("http://") {
         Some(rest) => http_get(rest),
         None => Ok(std::fs::read_to_string(source)?.trim().to_string()),
@@ -61,6 +67,8 @@ pub fn latest_if_newer(current: &str, source: &str) -> Result<Option<String>> {
 }
 
 fn http_get(host_and_path: &str) -> Result<String> {
+    use std::net::ToSocketAddrs;
+
     let (host, path) = match host_and_path.split_once('/') {
         Some((host, path)) => (host, format!("/{path}")),
         None => (host_and_path, "/".to_string()),
@@ -70,15 +78,34 @@ fn http_get(host_and_path: &str) -> Result<String> {
     } else {
         format!("{host}:80")
     };
+    let socket = addr.to_socket_addrs()?.next().ok_or_else(|| {
+        crate::Error::Io(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("cannot resolve {host}"),
+        ))
+    })?;
 
-    let mut stream = TcpStream::connect(&addr)?;
+    let mut stream = TcpStream::connect_timeout(&socket, Duration::from_secs(5))?;
     stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(5)))?;
 
     let request = format!("GET {path} HTTP/1.0\r\nHost: {host}\r\nConnection: close\r\n\r\n");
     stream.write_all(request.as_bytes())?;
 
+    // Never trust a server to bound its response: read at most 64 KiB.
     let mut response = String::new();
-    stream.read_to_string(&mut response)?;
+    stream.take(64 * 1024).read_to_string(&mut response)?;
+
+    let status = response
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .unwrap_or("");
+    if !status.starts_with('2') {
+        return Err(crate::Error::Io(std::io::Error::other(format!(
+            "update server returned HTTP {status}"
+        ))));
+    }
 
     Ok(response
         .split("\r\n\r\n")

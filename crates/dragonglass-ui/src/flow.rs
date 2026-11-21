@@ -127,6 +127,7 @@ struct FlowLine {
     descent: Pixels,
 }
 
+#[allow(clippy::large_enum_variant)]
 enum PlacedPiece {
     Text {
         shaped: ShapedLine,
@@ -794,8 +795,6 @@ impl Element for FlowText {
 }
 
 /// Whether a link target is an image file that should open in the lightbox.
-// (defined in `reading` so table cells can use it too)
-
 impl FlowLayout {
     /// The href of an image piece whose display range contains `offset`.
     fn image_link_at(&self, offset: usize, len: usize) -> Option<String> {
@@ -895,6 +894,7 @@ impl FlowLayout {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn flow_selection_quads(
     layout: &FlowLayout,
     block: Option<usize>,

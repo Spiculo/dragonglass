@@ -7,7 +7,9 @@
 ; available from a terminal after install.
 
 #define AppName "Dragon Glass"
-#define AppVersion "0.0.1"
+#ifndef AppVersion
+  #define AppVersion "0.0.1"
+#endif
 #define AppPublisher "Dragon Glass contributors"
 #define AppExe "dragon-glass-app.exe"
 #define CliExe "dragon-glass.exe"
@@ -19,6 +21,7 @@ AppVersion={#AppVersion}
 AppPublisher={#AppPublisher}
 DefaultDirName={autopf}\{#AppName}
 DefaultGroupName={#AppName}
+PrivilegesRequired=lowest
 DisableProgramGroupPage=yes
 OutputDir=..\..\dist
 OutputBaseFilename=dragon-glass-{#AppVersion}-setup

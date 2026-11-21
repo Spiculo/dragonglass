@@ -1,6 +1,6 @@
 # Dragon Glass QOL plan: editing and reading flows
 
-**Status:** Proposal — November 2026
+**Status:** Implemented; remaining items are listed below — November 2026
 **Applies to:** desktop (Windows, Linux, macOS), Android vertical slice, planned iOS client
 **Focus:** the two loops users repeat all day — **edit a note** and **read a note** — and the
 transitions between them.
@@ -269,7 +269,7 @@ unknown keys. Cap state per tab and prune tabs that vanished.
 **Done when:** open 3 tabs at different positions/modes, quit, relaunch, and every tab is
 within one line/one block/16 px of its previous position.
 
-**Landed:** `session.txt` is versioned and human-readable (`tab=note|reading|line|col|scroll|block`),
+**Landed:** `session.txt` is versioned and human-readable (`tab=note|reading|line|col|scroll|reading_block|anchor|folds|reading_folds|dynamic`),
 tolerant of unknown keys and malformed fields, capped at 32 tabs, and version 1 files still
 load. Each tab round-trips its mode, caret line and column, editor scroll offset and reading
 top block; startup reopens every saved tab whose file still exists, prunes missing files and

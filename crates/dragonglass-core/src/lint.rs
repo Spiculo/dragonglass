@@ -248,7 +248,9 @@ fn check_relations(src: &str, resolver: &NoteIndex, issues: &mut Vec<Issue>) {
             .or_insert(index + 2);
     }
 
-    for property in frontmatter::properties(src).unwrap_or_default() {
+    for property in
+        frontmatter::properties(src).unwrap_or_else(|_| frontmatter::display_properties(src))
+    {
         let Some(kind) = relations::relation_key(&property.key) else {
             continue;
         };

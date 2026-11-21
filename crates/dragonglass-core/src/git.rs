@@ -9,7 +9,7 @@
 use std::path::Path;
 use std::process::Command;
 
-use crate::{Error, Result};
+use crate::{storage, Error, Result};
 
 /// Commit identity override. Each field is optional: a missing field falls back to the
 /// user's own `git config` (`user.name` / `user.email`).
@@ -144,6 +144,33 @@ pub fn is_repo(root: &Path) -> bool {
 
 pub fn init(root: &Path) -> Result<()> {
     run(root, &["init", "-b", "main"])?;
+    ensure_gitignore(root)?;
+    Ok(())
+}
+
+/// Keep Dragon Glass' private state out of the user's repository.
+///
+/// Drafts contain unsaved text, trash contains deleted notes and snapshots contain old
+/// versions. The Android client writes the same defaults; doing it here makes the desktop
+/// and mobile behavior identical.
+fn ensure_gitignore(root: &Path) -> Result<()> {
+    const DEFAULTS: &[&str] = &[".dragon-glass/", ".DS_Store", "Thumbs.db", "*.tmp"];
+    let path = root.join(".gitignore");
+    let mut contents = std::fs::read_to_string(&path).unwrap_or_default();
+    let mut changed = false;
+    for line in DEFAULTS {
+        if !contents.lines().any(|existing| existing.trim() == *line) {
+            if !contents.is_empty() && !contents.ends_with('\n') {
+                contents.push('\n');
+            }
+            contents.push_str(line);
+            contents.push('\n');
+            changed = true;
+        }
+    }
+    if changed {
+        storage::write_atomic(&path, &contents)?;
+    }
     Ok(())
 }
 
@@ -187,6 +214,10 @@ pub struct DiffStat {
 /// Untracked files count every line as added; a tracked, unchanged file is `0 / 0`.
 pub fn file_diff(root: &Path, relative: &str) -> Result<DiffStat> {
     let path = relative.replace('\\', "/");
+    if path.is_empty() || Path::new(&path).is_absolute() || path.split('/').any(|part| part == "..")
+    {
+        return Err(Error::InvalidPath(path));
+    }
 
     if let Ok(output) = run(root, &["diff", "--numstat", "HEAD", "--", &path]) {
         if let Some(stat) = parse_numstat(&output) {
@@ -225,6 +256,7 @@ fn parse_numstat(output: &str) -> Option<DiffStat> {
 /// `author` overrides `user.name` / `user.email` for this commit only. When `None`, `git`
 /// uses the user's own configuration, so desktop commits keep the user's normal identity.
 pub fn commit_all(root: &Path, message: &str, author: Option<&Author>) -> Result<bool> {
+    ensure_gitignore(root)?;
     run(root, &["add", "-A"])?;
 
     let staged = run(root, &["diff", "--cached", "--name-only"])?;
@@ -364,7 +396,13 @@ fn is_conflict_code(code: &str) -> bool {
 }
 
 fn run(root: &Path, args: &[&str]) -> Result<String> {
-    let output = Command::new("git").args(args).current_dir(root).output()?;
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(root)
+        // A credential prompt in a GUI/CLI process has no terminal to answer it; fail
+        // visibly instead of hanging forever.
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .output()?;
     if !output.status.success() {
         return Err(Error::Git {
             command: format!("git {}", args.join(" ")),
@@ -455,6 +493,9 @@ mod tests {
         init(&dir).unwrap();
         assert!(is_repo(&dir));
 
+        // `init` writes `.gitignore`; commit it before expecting a clean tree.
+        assert!(commit_all(&dir, "ignore", Some(&test_author())).unwrap());
+
         let clean = status(&dir).unwrap();
         assert!(clean.is_clean());
         assert_eq!(clean.branch, "main");
@@ -518,6 +559,24 @@ mod tests {
                 email: None,
             })
         );
+    }
+
+    #[test]
+    fn init_keeps_private_state_out_of_git() {
+        let dir = temp_repo("ignore-private");
+        init(&dir).unwrap();
+        std::fs::write(dir.join(".gitignore"), "target/\n").unwrap();
+        std::fs::create_dir_all(dir.join(".dragon-glass/drafts")).unwrap();
+        std::fs::write(dir.join(".dragon-glass/drafts/x.draft"), "secret").unwrap();
+        std::fs::write(dir.join("note.md"), "# hello\n").unwrap();
+
+        commit_all(&dir, "first", Some(&test_author())).unwrap();
+        let tracked = run(&dir, &["ls-files"]).unwrap();
+        assert!(!tracked.contains(".dragon-glass"));
+        let ignore = std::fs::read_to_string(dir.join(".gitignore")).unwrap();
+        assert!(ignore.contains(".dragon-glass/"));
+        assert!(ignore.contains("target/"));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

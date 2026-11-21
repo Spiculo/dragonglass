@@ -119,6 +119,16 @@ pub fn split_math(text: &str) -> Vec<(String, bool)> {
 /// superscripts with Unicode scripts where the font has them. `\\` becomes a line break so
 /// aligned environments can be drawn as separate lines.
 pub fn to_unicode(tex: &str) -> String {
+    to_unicode_depth(tex, 0)
+}
+
+/// Nesting limit for recursive groups. TeX from a note must never overflow the stack.
+const MAX_MATH_DEPTH: usize = 64;
+
+fn to_unicode_depth(tex: &str, depth: usize) -> String {
+    if depth >= MAX_MATH_DEPTH {
+        return tex.to_string();
+    }
     let chars: Vec<char> = tex.chars().collect();
     let mut out = String::new();
     let mut i = 0;
@@ -160,9 +170,9 @@ pub fn to_unicode(tex: &str) -> String {
                     "frac" | "dfrac" | "tfrac" => {
                         let (numerator, next) = group(&chars, i);
                         let (denominator, after) = group(&chars, next);
-                        out.push_str(&parenthesize(&to_unicode(&numerator)));
+                        out.push_str(&parenthesize(&to_unicode_depth(&numerator, depth + 1)));
                         out.push('/');
-                        out.push_str(&parenthesize(&to_unicode(&denominator)));
+                        out.push_str(&parenthesize(&to_unicode_depth(&denominator, depth + 1)));
                         i = after;
                     }
                     "binom" => {
@@ -170,18 +180,18 @@ pub fn to_unicode(tex: &str) -> String {
                         let (bottom, after) = group(&chars, next);
                         out.push_str(&format!(
                             "C({}, {})",
-                            to_unicode(&top).trim(),
-                            to_unicode(&bottom).trim()
+                            to_unicode_depth(&top, depth + 1).trim(),
+                            to_unicode_depth(&bottom, depth + 1).trim()
                         ));
                         i = after;
                     }
                     "sqrt" => {
                         let (index, next) = bracket(&chars, i);
                         let (argument, after) = group(&chars, next);
-                        let root = to_unicode(&argument);
+                        let root = to_unicode_depth(&argument, depth + 1);
                         match index.filter(|index| !index.trim().is_empty()) {
                             Some(index) => {
-                                let index = to_unicode(&index);
+                                let index = to_unicode_depth(&index, depth + 1);
                                 out.push_str(&format!("{}({root})", script(index.trim(), true)))
                             }
                             None => {
@@ -207,42 +217,42 @@ pub fn to_unicode(tex: &str) -> String {
                     }
                     "hat" | "widehat" => {
                         let (argument, next) = group(&chars, i);
-                        out.push_str(&accent(&to_unicode(&argument), '\u{0302}'));
+                        out.push_str(&accent(&to_unicode_depth(&argument, depth + 1), '\u{0302}'));
                         i = next;
                     }
                     "bar" | "overline" => {
                         let (argument, next) = group(&chars, i);
-                        out.push_str(&accent(&to_unicode(&argument), '\u{0305}'));
+                        out.push_str(&accent(&to_unicode_depth(&argument, depth + 1), '\u{0305}'));
                         i = next;
                     }
                     "tilde" | "widetilde" => {
                         let (argument, next) = group(&chars, i);
-                        out.push_str(&accent(&to_unicode(&argument), '\u{0303}'));
+                        out.push_str(&accent(&to_unicode_depth(&argument, depth + 1), '\u{0303}'));
                         i = next;
                     }
                     "vec" => {
                         let (argument, next) = group(&chars, i);
-                        out.push_str(&accent(&to_unicode(&argument), '\u{20D7}'));
+                        out.push_str(&accent(&to_unicode_depth(&argument, depth + 1), '\u{20D7}'));
                         i = next;
                     }
                     "dot" => {
                         let (argument, next) = group(&chars, i);
-                        out.push_str(&accent(&to_unicode(&argument), '\u{0307}'));
+                        out.push_str(&accent(&to_unicode_depth(&argument, depth + 1), '\u{0307}'));
                         i = next;
                     }
                     "ddot" => {
                         let (argument, next) = group(&chars, i);
-                        out.push_str(&accent(&to_unicode(&argument), '\u{0308}'));
+                        out.push_str(&accent(&to_unicode_depth(&argument, depth + 1), '\u{0308}'));
                         i = next;
                     }
                     "check" => {
                         let (argument, next) = group(&chars, i);
-                        out.push_str(&accent(&to_unicode(&argument), '\u{030C}'));
+                        out.push_str(&accent(&to_unicode_depth(&argument, depth + 1), '\u{030C}'));
                         i = next;
                     }
                     "underbrace" | "overbrace" => {
                         let (argument, next) = group(&chars, i);
-                        out.push_str(&to_unicode(&argument));
+                        out.push_str(&to_unicode_depth(&argument, depth + 1));
                         i = next;
                     }
                     "phantom" | "hphantom" | "vphantom" => {
@@ -277,7 +287,10 @@ pub fn to_unicode(tex: &str) -> String {
                     }
                     "pmod" => {
                         let (argument, next) = group(&chars, i);
-                        out.push_str(&format!(" (mod {})", to_unicode(&argument).trim()));
+                        out.push_str(&format!(
+                            " (mod {})",
+                            to_unicode_depth(&argument, depth + 1).trim()
+                        ));
                         i = next;
                     }
                     "bmod" | "mod" => out.push_str(" mod "),
@@ -304,7 +317,7 @@ pub fn to_unicode(tex: &str) -> String {
                         let (_, next) = bracket(&chars, i);
                         let (argument, after) = group(&chars, next);
                         out.push(if name == "xrightarrow" { '→' } else { '←' });
-                        let label = to_unicode(&argument);
+                        let label = to_unicode_depth(&argument, depth + 1);
                         if !label.trim().is_empty() {
                             out.push_str(&format!("({})", label.trim()));
                         }
@@ -321,7 +334,10 @@ pub fn to_unicode(tex: &str) -> String {
             '^' | '_' => {
                 let superscript = chars[i] == '^';
                 let (fragment, next) = group(&chars, i + 1);
-                out.push_str(&script(&to_unicode(&fragment), superscript));
+                out.push_str(&script(
+                    &to_unicode_depth(&fragment, depth + 1),
+                    superscript,
+                ));
                 i = next;
             }
             '{' | '}' => i += 1,
@@ -706,6 +722,14 @@ fn symbol(name: &str) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn deeply_nested_groups_do_not_overflow_the_stack() {
+        let tex = "\\sqrt{".repeat(2_000);
+        let _ = to_unicode(&tex);
+        let tex = "\\frac{1}{".repeat(2_000);
+        let _ = to_unicode(&tex);
+    }
 
     #[test]
     fn converts_scripts() {

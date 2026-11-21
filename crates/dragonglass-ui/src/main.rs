@@ -3007,13 +3007,11 @@ impl DragonGlassApp {
             },
         );
 
-        self.set_status(
-            StatusKind::Error,
-            match workspace::save(&self.vault_root, &self.workspaces) {
-                Ok(()) => format!("workspace saved: {name}"),
-                Err(e) => format!("could not save workspace: {e}"),
-            },
-        );
+        let (kind, message) = match workspace::save(&self.vault_root, &self.workspaces) {
+            Ok(()) => (StatusKind::Success, format!("workspace saved: {name}")),
+            Err(e) => (StatusKind::Error, format!("could not save workspace: {e}")),
+        };
+        self.set_status(kind, message);
         cx.notify();
     }
 
@@ -3059,7 +3057,12 @@ impl DragonGlassApp {
         let note = self.active.clone();
         let outcome = plugins::run_command(plugin, &command_id, &self.vault_root, note.as_deref());
 
-        self.set_status(StatusKind::Error, {
+        let kind = if outcome.is_ok() {
+            StatusKind::Success
+        } else {
+            StatusKind::Error
+        };
+        self.set_status(kind, {
             let mut applied: Vec<&'static str> = Vec::new();
             let message = match outcome {
                 Ok(output) => {
@@ -3174,17 +3177,21 @@ impl DragonGlassApp {
         };
 
         let content = self.editor.read(cx).text();
-        self.set_status(
-            StatusKind::Error,
-            match versions::save(&self.vault_root, &relative, label, &content) {
-                Ok(version) => format!(
+        let (kind, message) = match versions::save(&self.vault_root, &relative, label, &content) {
+            Ok(version) => (
+                StatusKind::Success,
+                format!(
                     "saved version {} ({} bytes)",
                     version.display_label(),
                     version.bytes
                 ),
-                Err(error) => format!("could not save version: {error}"),
-            },
-        );
+            ),
+            Err(error) => (
+                StatusKind::Error,
+                format!("could not save version: {error}"),
+            ),
+        };
+        self.set_status(kind, message);
         cx.notify();
     }
 
@@ -3245,11 +3252,21 @@ impl DragonGlassApp {
         };
 
         // Promoting replaces the note on disk; never discard unsaved edits doing it.
-        self.editor.update(cx, |editor, _cx| {
+        let saved = self.editor.update(cx, |editor, _cx| {
             if editor.is_dirty() {
-                let _ = editor.save();
+                editor.save().is_ok() && !editor.is_dirty()
+            } else {
+                true
             }
         });
+        if !saved {
+            self.set_status(
+                StatusKind::Error,
+                "save the note before promoting a version".to_string(),
+            );
+            cx.notify();
+            return;
+        }
 
         let (kind, message) = match versions::promote(&self.vault_root, &relative, id) {
             Ok(_) => {
@@ -3281,13 +3298,14 @@ impl DragonGlassApp {
         let Some(relative) = self.active.clone() else {
             return;
         };
-        self.set_status(
-            StatusKind::Error,
-            match versions::remove(&self.vault_root, &relative, id) {
-                Ok(()) => format!("deleted version {id}"),
-                Err(error) => format!("could not delete version: {error}"),
-            },
-        );
+        let (kind, message) = match versions::remove(&self.vault_root, &relative, id) {
+            Ok(()) => (StatusKind::Success, format!("deleted version {id}")),
+            Err(error) => (
+                StatusKind::Error,
+                format!("could not delete version: {error}"),
+            ),
+        };
+        self.set_status(kind, message);
         cx.notify();
     }
 
@@ -3527,7 +3545,13 @@ impl DragonGlassApp {
                                         .on_mouse_down(
                                             MouseButton::Left,
                                             cx.listener(move |this, _event, window, cx| {
+                                                let previous = this.active_tab;
                                                 this.activate_tab(index, cx);
+                                                if previous != index {
+                                                    this.split_tabs.push(previous);
+                                                    this.split_tabs.sort_unstable();
+                                                    this.split_tabs.dedup();
+                                                }
                                                 let handle = this.editor.focus_handle(cx);
                                                 window.focus(&handle);
                                             }),
@@ -3557,7 +3581,13 @@ impl DragonGlassApp {
                                         .on_mouse_down(
                                             MouseButton::Left,
                                             cx.listener(move |this, _event, window, cx| {
+                                                let previous = this.active_tab;
                                                 this.activate_tab(index, cx);
+                                                if previous != index {
+                                                    this.split_tabs.push(previous);
+                                                    this.split_tabs.sort_unstable();
+                                                    this.split_tabs.dedup();
+                                                }
                                                 let handle = this.editor.focus_handle(cx);
                                                 window.focus(&handle);
                                             }),
@@ -3876,6 +3906,8 @@ impl DragonGlassApp {
                     tab.conflict = false;
                 }
                 self.conflict = false;
+                let autosave = self.config.autosave;
+                editor.update(cx, |editor, _cx| editor.set_autosave(autosave));
                 self.set_status(StatusKind::Info, "reloaded from disk");
                 window.focus(&self.editor.focus_handle(cx));
             }
@@ -3897,6 +3929,8 @@ impl DragonGlassApp {
                     tab.conflict = false;
                 }
                 self.conflict = false;
+                let autosave = self.config.autosave;
+                editor.update(cx, |editor, _cx| editor.set_autosave(autosave));
                 self.set_status(StatusKind::Success, "kept your version");
                 window.focus(&self.editor.focus_handle(cx));
             }
@@ -4178,6 +4212,7 @@ impl DragonGlassApp {
 
         let first = self.tabs.len();
         self.tabs.extend(tabs);
+        self.configure_editors(cx);
         self.activate_tab(first, cx);
         self.set_status(
             StatusKind::Info,
@@ -4211,6 +4246,7 @@ impl DragonGlassApp {
             self.tabs.push(tab);
             self.tabs.len() - 1
         };
+        self.configure_editors(cx);
 
         match drop {
             TabDrop::Merge => {
@@ -4700,6 +4736,8 @@ impl DragonGlassApp {
                     cx.notify();
                 }
             });
+        } else {
+            self.preview_content.close_lightbox();
         }
         self.set_status(
             StatusKind::Info,
@@ -5136,13 +5174,14 @@ impl DragonGlassApp {
             }
         }
 
-        self.set_status(
-            StatusKind::Error,
-            match config::save(&self.vault_root, &self.config) {
-                Ok(()) => format!("{}: saved", key.label()),
-                Err(error) => format!("{}: not saved ({error})", key.label()),
-            },
-        );
+        let (kind, message) = match config::save(&self.vault_root, &self.config) {
+            Ok(()) => (StatusKind::Success, format!("{}: saved", key.label())),
+            Err(error) => (
+                StatusKind::Error,
+                format!("{}: not saved ({error})", key.label()),
+            ),
+        };
+        self.set_status(kind, message);
         cx.notify();
     }
 
@@ -5652,14 +5691,12 @@ impl DragonGlassApp {
         };
 
         let added = bookmarks::toggle(&mut self.bookmarks, &active);
-        self.set_status(
-            StatusKind::Error,
-            match bookmarks::save(&self.vault_root, &self.bookmarks) {
-                Ok(()) if added => format!("bookmarked {active}"),
-                Ok(()) => format!("removed bookmark {active}"),
-                Err(e) => format!("could not save bookmarks: {e}"),
-            },
-        );
+        let (kind, message) = match bookmarks::save(&self.vault_root, &self.bookmarks) {
+            Ok(()) if added => (StatusKind::Success, format!("bookmarked {active}")),
+            Ok(()) => (StatusKind::Info, format!("removed bookmark {active}")),
+            Err(e) => (StatusKind::Error, format!("could not save bookmarks: {e}")),
+        };
+        self.set_status(kind, message);
         cx.notify();
     }
 
@@ -5689,25 +5726,28 @@ impl DragonGlassApp {
 
     fn run_git_action(&mut self, action: GitAction) {
         let root = self.vault_root.clone();
-        self.set_status(
-            StatusKind::Error,
-            match action {
-                GitAction::Init => match git::init(&root) {
-                    Ok(()) => "initialized git repository".to_string(),
-                    Err(e) => format!("git init failed: {e}"),
-                },
-                GitAction::Pull => match git::pull(&root) {
-                    Ok(outcome) => describe_outcome(outcome),
-                    Err(e) => format!("git pull failed: {e}"),
-                },
-                GitAction::Push => match git::push(&root) {
-                    Ok(outcome) => describe_outcome(outcome),
-                    Err(e) => format!("git push failed: {e}"),
-                },
-                GitAction::Refresh => "status refreshed".to_string(),
-                GitAction::Commit => "unreachable".to_string(),
+        let message = match action {
+            GitAction::Init => match git::init(&root) {
+                Ok(()) => "initialized git repository".to_string(),
+                Err(e) => format!("git init failed: {e}"),
             },
-        );
+            GitAction::Pull => match git::pull(&root) {
+                Ok(outcome) => describe_outcome(outcome),
+                Err(e) => format!("git pull failed: {e}"),
+            },
+            GitAction::Push => match git::push(&root) {
+                Ok(outcome) => describe_outcome(outcome),
+                Err(e) => format!("git push failed: {e}"),
+            },
+            GitAction::Refresh => "status refreshed".to_string(),
+            GitAction::Commit => "unreachable".to_string(),
+        };
+        let kind = if message.contains("failed") || message == "unreachable" {
+            StatusKind::Error
+        } else {
+            StatusKind::Success
+        };
+        self.set_status(kind, message);
         self.refresh_git();
     }
 
@@ -7296,11 +7336,14 @@ impl Render for DragonGlassApp {
             };
             let toggle_task: reading::TaskToggle = {
                 let editor = self.editor.clone();
+                let preview_lines = self.preview_content.block_start_lines();
                 Rc::new(
                     move |index: usize, checked: bool, window: &mut Window, cx: &mut App| {
-                        editor.update(cx, |editor, cx| {
-                            editor.toggle_reading_task(index, checked, cx);
-                        });
+                        if let Some(line) = preview_lines.get(index).copied() {
+                            editor.update(cx, |editor, cx| {
+                                editor.toggle_reading_task_at_line(line, checked, cx);
+                            });
+                        }
                         window.refresh();
                     },
                 )

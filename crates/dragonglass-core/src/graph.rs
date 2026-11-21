@@ -179,7 +179,7 @@ pub fn node_radius(links: usize, words: usize) -> f32 {
 
 /// The subgraph within `depth` hops of `root`, capped at `max_nodes`.
 pub fn local(graph: &Graph, root: usize, depth: usize, max_nodes: usize) -> Graph {
-    if graph.nodes.is_empty() || root >= graph.nodes.len() {
+    if max_nodes == 0 || graph.nodes.is_empty() || root >= graph.nodes.len() {
         return Graph::default();
     }
 

@@ -2,7 +2,8 @@
 
 Status: landed on branch `fix/graph-node-layout`. All phases are implemented;
 force controls are session-local for now.
-Scope: the desktop GPUI graph view. Android has no graph view yet.
+Scope: the desktop GPUI graph view. Android has a read-only graph rendering (no desktop
+force controls).
 
 ## 1. Problems in the current implementation
 
@@ -468,13 +469,12 @@ The branch contains the plan, the code commits below and the docs on
 Verification on the branch:
 
 ```sh
-cargo test -p dragonglass-core -p dragonglass-ui   # 393 core + 109 UI tests
+cargo test -p dragonglass-core -p dragonglass-ui   # 401 core + 124 UI tests
 cargo fmt --all -- --check
 cargo clippy -p dragonglass-core -p dragonglass-ui --all-targets --all-features
 ```
 
-The only clippy warnings are the pre-existing `flow.rs` ones (`large_enum_variant`
-and `too_many_arguments`), which are outside this change.
+The UI clippy allow lists are documented in `flow.rs` and `table_edit.rs`.
 
 ## 9. Desktop acceptance pass
 

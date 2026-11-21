@@ -2,9 +2,9 @@ PackageIdentifier: DragonGlass.DragonGlass
 PackageVersion: 0.0.1
 PackageLocale: en-US
 Publisher: Dragon Glass contributors
-PublisherUrl: https://github.com/anomalyco/dragonglass
+PublisherUrl: https://github.com/Spiculo/dragonglass
 PackageName: Dragon Glass
-PackageUrl: https://github.com/anomalyco/dragonglass
+PackageUrl: https://github.com/Spiculo/dragonglass
 License: GPL-3.0-or-later
 LicenseUrl: https://www.gnu.org/licenses/gpl-3.0.txt
 ShortDescription: Native, local-first markdown knowledge base

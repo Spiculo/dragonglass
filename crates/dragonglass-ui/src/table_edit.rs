@@ -374,6 +374,7 @@ impl TableEdit {
         self.cursor = self.active_text().chars().count();
     }
 
+    #[cfg(test)]
     pub fn insert_text(&mut self, text: &str) {
         self.prepare_typing();
         self.marked = None;

@@ -102,13 +102,12 @@ A lot already works. This is a working application, not a mockup — but it is e
 **Not there yet:** notarized macOS builds, Mermaid diagrams, a community (online)
 theme/plugin store, end-to-end-encrypted sync, and full mobile parity (an Android vertical
 slice and an assessed iOS path exist). See [`PLAN.md`](PLAN.md) for the full roadmap and
-[`docs/ux-contract.md`](docs/ux-contract.md) for the edit/read invariants every client must
-keep.
-the decisions behind it.
+the decisions behind it, and [`docs/ux-contract.md`](docs/ux-contract.md) for the edit/read
+invariants every client must keep.
 
 ## Build from source
 
-Requirements: Rust **1.85+** (stable) and `git`.
+Requirements: Rust **1.97+** (stable) and `git`.
 
 On Windows, install the MSVC toolchain and Visual Studio Build Tools with the "Desktop
 development with C++" workload. No other system libraries are needed.
@@ -279,10 +278,10 @@ cargo fmt --all -- --check
 cargo clippy --all-targets --all-features
 ```
 
-CI runs those checks on Windows, Linux and macOS. The GPUI app is built on Windows and
-Linux on every push; the macOS bundle runs on manual dispatch to save runner minutes. See
-[`CONTRIBUTING.md`](CONTRIBUTING.md) for the ground rules, and
-[`PLAN.md`](PLAN.md) for architecture, phases and settled design decisions.
+CI runs `cargo fmt`, clippy and `cargo test` on Windows, Linux and macOS. The GPUI app is
+built and tested on Windows and Linux on every push; the macOS bundle runs on manual
+dispatch to save runner minutes. See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the ground
+rules, and [`PLAN.md`](PLAN.md) for architecture, phases and settled design decisions.
 
 ## Project layout
 

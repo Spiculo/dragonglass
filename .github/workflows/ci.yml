@@ -127,3 +127,7 @@ jobs:
           if (-not $fxc) { throw "fxc.exe was not found in the Windows SDK" }
           $fxc.DirectoryName | Out-File -FilePath $env:GITHUB_PATH -Append
       - run: cargo build -p dragonglass-ui
+      - name: Test UI
+        run: cargo test -p dragonglass-ui
+      - name: Clippy UI
+        run: cargo clippy -p dragonglass-ui --all-targets --all-features

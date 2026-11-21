@@ -36,7 +36,7 @@ modules:
       - install -Dm755 target/release/dragon-glass-app /app/bin/dragon-glass-app
       - install -Dm755 target/release/dragon-glass /app/bin/dragon-glass
       - install -Dm644 packaging/linux/dragon-glass.desktop /app/share/applications/io.github.dragonglass.DragonGlass.desktop
-      - install -Dm644 packaging/windows/dragon-glass.ico /app/share/icons/hicolor/32x32/apps/io.github.dragonglass.DragonGlass.png
+      - install -Dm644 packaging/logo.png /app/share/icons/hicolor/256x256/apps/io.github.dragonglass.DragonGlass.png
     sources:
       - type: dir
         path: ../../..

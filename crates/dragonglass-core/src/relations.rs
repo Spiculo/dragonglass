@@ -268,7 +268,8 @@ pub fn relation_key(key: &str) -> Option<RelationKind> {
 }
 
 fn semantic_relations(src: &str) -> Vec<(RelationKind, String)> {
-    let properties = frontmatter::properties(src).unwrap_or_default();
+    let properties =
+        frontmatter::properties(src).unwrap_or_else(|_| frontmatter::display_properties(src));
     let mut out = Vec::new();
 
     for property in properties {

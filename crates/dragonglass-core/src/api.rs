@@ -83,6 +83,11 @@ pub fn handle(target: &str, root: &Path) -> Response {
         }
         "/note" => {
             let relative = param(query_string, "path").unwrap_or_default();
+            // Only indexed Markdown notes are served. `.git`, `.dragon-glass` and other
+            // private vault files are not notes even though they live under the root.
+            if !notes.iter().any(|note| note.relative == relative) {
+                return text(404, "note not found");
+            }
             match read_within(root, &relative) {
                 Ok(content) => Response {
                     status: 200,
@@ -106,8 +111,16 @@ pub fn serve(root: &Path, addr: &str) -> std::io::Result<()> {
             continue;
         };
 
+        // A single slow or reset connection must not stop the server for everyone.
+        let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
+        let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(5)));
+
         let mut buffer = [0u8; 8192];
-        let read = stream.read(&mut buffer)?;
+        let read = match stream.read(&mut buffer) {
+            Ok(0) => continue,
+            Ok(read) => read,
+            Err(_) => continue,
+        };
         let request = String::from_utf8_lossy(&buffer[..read]);
 
         let target = request
@@ -125,8 +138,11 @@ pub fn serve(root: &Path, addr: &str) -> std::io::Result<()> {
             response.body.len()
         );
 
-        stream.write_all(head.as_bytes())?;
-        stream.write_all(response.body.as_bytes())?;
+        if stream.write_all(head.as_bytes()).is_err()
+            || stream.write_all(response.body.as_bytes()).is_err()
+        {
+            continue;
+        }
     }
 
     Ok(())
@@ -310,7 +326,7 @@ mod tests {
         // A file that exists, but outside the vault.
         std::fs::write(container.join("secret.md"), "secret\n").unwrap();
 
-        assert_eq!(handle("/note?path=../secret.md", &vault).status, 403);
+        assert_eq!(handle("/note?path=../secret.md", &vault).status, 404);
         assert_eq!(handle("/nope", &vault).status, 404);
 
         std::fs::remove_dir_all(&container).unwrap();

@@ -1,10 +1,10 @@
 # Math typesetting (LaTeX) — spec
 
-**Status:** Proposed
+**Status:** Implemented (M0–M4)
 **Date:** 2026-10-30
 **Owner:** Felipe
 **Applies to:** `dragonglass-core`, `dragonglass-ui`, `dragonglass-cli`
-**Replaces:** the Unicode transliteration in `crates/dragonglass-core/src/math.rs`
+**Replaces:** the Unicode transliteration in `crates/dragonglass-core/src/math/plain.rs`
 
 ---
 
@@ -593,7 +593,7 @@ is what enables outline glyphs in the SVG. `ratex-*` is MIT; the bundled fonts a
 
 | File | Change |
 |---|---|
-| `crates/dragonglass-core/src/math.rs` | Split into `math/{mod,engine,plain,outline,export}.rs`; `to_unicode` → `plain::to_unicode` |
+| `crates/dragonglass-core/src/math.rs` | Split into `math/{mod,engine,plain,outline}.rs`; `to_unicode` → `plain::to_unicode` |
 | `crates/dragonglass-core/src/inline.rs` | Keep the raw TeX on math spans instead of storing transliterated text |
 | `crates/dragonglass-core/src/markdown.rs` | `Block::Math` unchanged; add `\[…\]`/`\(…\)` recognition |
 | `crates/dragonglass-core/src/html.rs` | Inline SVG per formula |

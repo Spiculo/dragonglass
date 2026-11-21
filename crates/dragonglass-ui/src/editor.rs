@@ -332,6 +332,9 @@ pub struct Editor {
     /// to allocate a copy of the whole document on every scroll frame.
     properties: Vec<Property>,
     properties_revision: u64,
+    /// False when the frontmatter contains YAML the strict parser cannot represent. The
+    /// property panel may display it, but editing it would rewrite unknown keys.
+    properties_editable: bool,
     /// Increments when a different document is loaded, so caches can tell "new note,
     /// revision 0" apart from "same note, revision 0".
     doc_generation: u64,
@@ -1067,6 +1070,7 @@ impl Editor {
             scroll_handle: ScrollHandle::new(),
             properties: Vec::new(),
             properties_revision: u64::MAX,
+            properties_editable: true,
             doc_generation: 0,
             reading_content: ReadingCache::new(),
             display_math: Rc::new(Vec::new()),
@@ -1490,6 +1494,8 @@ impl Editor {
         self.extra_cursors.clear();
         self.table_edit = None;
         *self.lightbox.borrow_mut() = None;
+        self.reading_content.close_lightbox();
+        self.reading_content.close_find();
         self.find.open = false;
         self.find.matches.clear();
         self.find.error = None;
@@ -1666,6 +1672,7 @@ impl Editor {
         }
         self.dynamic = dynamic;
         self.cache_revision = u64::MAX;
+        self.display_math_revision = u64::MAX;
         self.line_cache.clear();
     }
 
@@ -1682,6 +1689,16 @@ impl Editor {
         let Some(line) = self.reading_content.block_start_line(block) else {
             return;
         };
+        self.toggle_reading_task_at_line(line, checked, cx);
+    }
+
+    /// Tick a task by source line, for callbacks that render a different reading cache.
+    pub fn toggle_reading_task_at_line(
+        &mut self,
+        line: usize,
+        checked: bool,
+        cx: &mut Context<Self>,
+    ) {
         let text = self.buffer.line(line);
         let Some(col) = task_marker_col(&text) else {
             return;
@@ -1719,7 +1736,15 @@ impl Editor {
         };
         let lines: Vec<String> = (start..=end).map(|line| self.buffer.line(line)).collect();
         let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
-        let Some(mut edit) = TableEdit::from_lines(start, &refs, ordinal, self.buffer.revision())
+        // The painted table list omits tables hidden by folds, so the index from the raw
+        // table scan may not match it. Resolve by source line instead.
+        let table_ordinal = self
+            .layout_tables
+            .iter()
+            .position(|layout| layout.first_line == start)
+            .unwrap_or(ordinal);
+        let Some(mut edit) =
+            TableEdit::from_lines(start, &refs, table_ordinal, self.buffer.revision())
         else {
             return false;
         };
@@ -2445,7 +2470,7 @@ impl Editor {
 
     /// Insert text at the caret (used by plugins).
     pub fn insert_at_cursor(&mut self, text: &str) {
-        if self.lightbox_open() {
+        if !self.can_mutate() || self.lightbox_open() {
             return;
         }
         self.table_edit = None;
@@ -2454,7 +2479,7 @@ impl Editor {
 
     /// Append text to the end of the note.
     pub fn append_to_note(&mut self, text: &str) {
-        if self.lightbox_open() {
+        if !self.can_mutate() || self.lightbox_open() {
             return;
         }
         self.table_edit = None;
@@ -2741,6 +2766,10 @@ impl Editor {
 
     /// Replace the selection when there is one, otherwise insert at the caret.
     pub fn replace_selection_or_insert(&mut self, text: &str) {
+        if !self.can_mutate() || self.lightbox_open() {
+            return;
+        }
+        self.table_edit = None;
         if let Some(range) = self.selection() {
             self.buffer.replace(range, text);
             self.anchor = None;
@@ -2751,6 +2780,10 @@ impl Editor {
 
     /// Insert a template at the caret and honour a `{{cursor}}` marker.
     pub fn insert_template(&mut self, text: &str) {
+        if !self.can_mutate() || self.lightbox_open() {
+            return;
+        }
+        self.table_edit = None;
         let (text, cursor) = templates::strip_cursor(text);
         let start = self
             .selection()
@@ -2853,6 +2886,9 @@ impl Editor {
         self.last_shaped = Rc::new(Vec::new());
         self.cache_revision = u64::MAX;
         self.caret_follow = None;
+        self.display_math_revision = u64::MAX;
+        self.stats_cache = (u64::MAX, stats::Stats::default());
+        self.git_stat_key = None;
         // Folds are keyed by heading index, which a replaced document invalidates.
         self.folded.clear();
         self.fold_revision = self.fold_revision.wrapping_add(1);
@@ -2863,6 +2899,7 @@ impl Editor {
     pub fn invalidate_layout(&mut self) {
         self.line_cache.clear();
         self.cache_revision = u64::MAX;
+        self.display_math_revision = u64::MAX;
     }
 
     /// Freeze text wrapping while a splitter drag changes the editor width, then reflow
@@ -3831,11 +3868,37 @@ impl Editor {
         let revision = self.buffer.revision();
         if revision != self.properties_revision {
             // Frontmatter lives at the top of the note, so only parse a leading window
-            // instead of copying the whole document on every keystroke.
+            // instead of copying the whole document on every keystroke. When the opening
+            // fence is present but the closing fence is beyond the window, fall back to the
+            // full document so a long property block is never silently treated as empty.
             let lines = self.buffer.line_count().min(FRONTMATTER_LINE_WINDOW);
             let end = self.buffer.char_index_at(lines, 0);
             let head = self.buffer.slice(0..end);
-            self.properties = frontmatter::properties(&head).unwrap_or_default();
+            let after_bom = head.strip_prefix('\u{feff}').unwrap_or(&head);
+            let opens = after_bom.starts_with("---\n") || after_bom.starts_with("---\r\n");
+            let complete = frontmatter::split(&head).frontmatter.is_some();
+            let source = if opens && !complete {
+                self.buffer.text()
+            } else {
+                head
+            };
+            let full_split = frontmatter::split(&source);
+            if opens && full_split.frontmatter.is_none() {
+                // Unterminated frontmatter: show what is there, but never rewrite it.
+                self.properties = frontmatter::display_properties(&source);
+                self.properties_editable = false;
+            } else {
+                match frontmatter::properties(&source) {
+                    Ok(properties) => {
+                        self.properties = properties;
+                        self.properties_editable = true;
+                    }
+                    Err(_) => {
+                        self.properties = frontmatter::display_properties(&source);
+                        self.properties_editable = false;
+                    }
+                }
+            }
             self.properties_revision = revision;
         }
     }
@@ -3877,7 +3940,21 @@ impl Editor {
 
     /// Replace the frontmatter with `properties`, keep the body, and save.
     pub fn set_properties(&mut self, properties: &[Property]) -> std::io::Result<()> {
-        let updated = frontmatter::with_properties(&self.buffer.text(), properties);
+        self.refresh_properties();
+        if !self.properties_editable {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "this frontmatter contains YAML Dragon Glass cannot safely rewrite",
+            ));
+        }
+        let text = self.buffer.text();
+        if frontmatter::properties(&text).is_err() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "this frontmatter contains YAML Dragon Glass cannot safely rewrite",
+            ));
+        }
+        let updated = frontmatter::with_properties(&text, properties);
         self.buffer = Buffer::from_text(&updated);
         self.properties_revision = u64::MAX;
         self.reset_layout_cache();
@@ -4422,7 +4499,7 @@ impl Editor {
     }
 
     fn insert_text(&mut self, text: &str) {
-        if self.lightbox_open() {
+        if !self.can_mutate() || self.lightbox_open() {
             return;
         }
         if self.extra_cursors.is_empty() {
@@ -4717,6 +4794,11 @@ impl Editor {
         if self.table_edit_mutate(cx, |edit| edit.delete_word_left()) {
             return;
         }
+        if self.find.open {
+            self.find_backspace();
+            cx.notify();
+            return;
+        }
         if !self.can_mutate() {
             return;
         }
@@ -4740,6 +4822,11 @@ impl Editor {
             return;
         }
         if self.table_edit_mutate(cx, |edit| edit.delete_word_right()) {
+            return;
+        }
+        if self.find.open {
+            self.find_backspace();
+            cx.notify();
             return;
         }
         if !self.can_mutate() {
@@ -5094,10 +5181,6 @@ impl Editor {
             }
             return;
         }
-        if self.accept_autocomplete() {
-            cx.notify();
-            return;
-        }
         if self.find.open {
             let backwards = window.modifiers().shift;
             if self.find.field == FindField::Replacement && !backwards {
@@ -5105,6 +5188,10 @@ impl Editor {
             } else {
                 self.find_next(backwards);
             }
+            cx.notify();
+            return;
+        }
+        if self.accept_autocomplete() {
             cx.notify();
             return;
         }
@@ -5572,6 +5659,7 @@ impl Editor {
         if self.lightbox_open() {
             return;
         }
+        self.autocomplete = Autocomplete::default();
         self.table_edit = None;
         if self.reading {
             // In-page find: it never leaves reading mode and never edits the note.
@@ -5627,6 +5715,8 @@ impl Editor {
         }
         if self.find.open {
             self.find.open = false;
+            self.find.matches.clear();
+            self.find.current = 0;
             self.find.error = None;
             self.find.message = None;
             return true;
@@ -6428,6 +6518,8 @@ impl Editor {
 
         if self.find.open {
             self.find.open = false;
+            self.find.matches.clear();
+            self.find.current = 0;
             self.find.error = None;
             self.find.message = None;
         }
@@ -8661,33 +8753,35 @@ impl Element for EditorText {
         }
 
         let mut find_quads = Vec::new();
-        for (index, matched) in editor.find.matches.iter().enumerate() {
-            let color = if index == editor.find.current {
-                theme.accent.opacity(0.45)
-            } else {
-                theme.accent.opacity(0.20)
-            };
-            for row_index in visible.clone() {
-                let meta = &metas[row_index];
-                if hidden_lines.contains(&meta.line) {
-                    continue;
+        if editor.find.open {
+            for (index, matched) in editor.find.matches.iter().enumerate() {
+                let color = if index == editor.find.current {
+                    theme.accent.opacity(0.45)
+                } else {
+                    theme.accent.opacity(0.20)
+                };
+                for row_index in visible.clone() {
+                    let meta = &metas[row_index];
+                    if hidden_lines.contains(&meta.line) {
+                        continue;
+                    }
+                    let line_start = editor.buffer.char_index_at(meta.line, 0);
+                    let start = matched.start.max(line_start + meta.start);
+                    let end = matched.end.min(line_start + meta.end);
+                    if start >= end {
+                        continue;
+                    }
+                    let x0 = rows[row_index].x_for_index(row_byte(meta, start - line_start));
+                    let x1 = rows[row_index].x_for_index(row_byte(meta, end - line_start));
+                    let top = bounds.top() + line_height * row_index as f32;
+                    find_quads.push(fill(
+                        Bounds::from_corners(
+                            point(bounds.left() + x0, top),
+                            point(bounds.left() + x1, top + line_height),
+                        ),
+                        color,
+                    ));
                 }
-                let line_start = editor.buffer.char_index_at(meta.line, 0);
-                let start = matched.start.max(line_start + meta.start);
-                let end = matched.end.min(line_start + meta.end);
-                if start >= end {
-                    continue;
-                }
-                let x0 = rows[row_index].x_for_index(row_byte(meta, start - line_start));
-                let x1 = rows[row_index].x_for_index(row_byte(meta, end - line_start));
-                let top = bounds.top() + line_height * row_index as f32;
-                find_quads.push(fill(
-                    Bounds::from_corners(
-                        point(bounds.left() + x0, top),
-                        point(bounds.left() + x1, top + line_height),
-                    ),
-                    color,
-                ));
             }
         }
 
@@ -9205,7 +9299,7 @@ fn is_table_separator(line: &str) -> bool {
     !cells.is_empty()
         && cells.iter().all(|cell| {
             let cell = cell.trim_start_matches(':').trim_end_matches(':');
-            !cell.is_empty() && cell.chars().all(|ch| ch == '-')
+            cell.len() >= 3 && cell.chars().all(|ch| ch == '-')
         })
 }
 
@@ -9214,9 +9308,15 @@ fn table_blocks(buffer: &Buffer, raw_block: (usize, usize)) -> Vec<(usize, usize
     let count = buffer.line_count();
     let mut blocks = Vec::new();
     let mut line = 0usize;
+    let mut in_fence = false;
     while line + 1 < count {
         let header = buffer.line(line);
-        if !header.contains('|') || !is_table_separator(&buffer.line(line + 1)) {
+        if syntax::is_fence(&header) {
+            in_fence = !in_fence;
+            line += 1;
+            continue;
+        }
+        if in_fence || !header.contains('|') || !is_table_separator(&buffer.line(line + 1)) {
             line += 1;
             continue;
         }
@@ -9512,7 +9612,7 @@ mod tests {
     #[test]
     fn table_separators_and_blocks_are_recognised() {
         assert!(is_table_separator("| --- | --- |"));
-        assert!(is_table_separator("|---|:--:|"));
+        assert!(is_table_separator("|---|:---:|"));
         assert!(is_table_separator("| :--- | ---: |"));
         assert!(!is_table_separator("| a | b |"));
         assert!(!is_table_separator("---"));
@@ -9524,6 +9624,12 @@ mod tests {
         assert!(table_blocks(&table, (0, 0)).is_empty());
         let prose = Buffer::from_text("a | b\nplain\n");
         assert!(table_blocks(&prose, (usize::MAX, usize::MAX)).is_empty());
+        // Short delimiters are not tables, matching the core parser.
+        let short = Buffer::from_text("| a | b |\n| - | - |\n| 1 | 2 |\n");
+        assert!(table_blocks(&short, (usize::MAX, usize::MAX)).is_empty());
+        // A pipe table inside a code fence remains code.
+        let fenced = Buffer::from_text("```md\n| a | b |\n| --- | --- |\n| 1 | 2 |\n```\n");
+        assert!(table_blocks(&fenced, (usize::MAX, usize::MAX)).is_empty());
     }
 
     #[test]

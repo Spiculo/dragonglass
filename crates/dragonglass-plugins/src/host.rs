@@ -16,16 +16,30 @@
 
 use std::path::Path;
 
-use wasmtime::{Engine, Instance, Module, Store};
+use wasmtime::{Config, Engine, Instance, Module, Store, StoreLimitsBuilder};
 
 use crate::{Error, PluginInfo, Result};
 
+const FUEL: u64 = 20_000_000;
+const MAX_MEMORY: usize = 64 * 1024 * 1024;
+const MAX_OUTPUT: usize = 8 * 1024 * 1024;
+
 /// Execute `code` with `input`, returning the plugin's output.
 pub fn run_code(code: &[u8], input: &str) -> Result<String> {
-    let engine = Engine::default();
+    let mut config = Config::new();
+    config.consume_fuel(true);
+    config.max_wasm_stack(512 * 1024);
+    let engine = Engine::new(&config)?;
     let module = Module::new(&engine, code)?;
 
-    let mut store = Store::new(&engine, ());
+    let limits = StoreLimitsBuilder::new()
+        .memory_size(MAX_MEMORY)
+        .table_elements(10_000)
+        .instances(10)
+        .build();
+    let mut store = Store::new(&engine, limits);
+    store.limiter(|limits| limits);
+    store.set_fuel(FUEL)?;
     let instance = Instance::new(&mut store, &module, &[])?;
 
     let memory = instance
@@ -35,17 +49,35 @@ pub fn run_code(code: &[u8], input: &str) -> Result<String> {
     let run = instance.get_typed_func::<(i32, i32), i64>(&mut store, "run")?;
 
     let input_bytes = input.as_bytes();
-    let pointer = alloc.call(&mut store, input_bytes.len() as i32)?;
+    let input_len = i32::try_from(input_bytes.len())
+        .map_err(|_| Error::InvalidRequest("plugin input is too large".to_string()))?;
+    let pointer = alloc.call(&mut store, input_len)?;
+    if pointer < 0
+        || memory.data_size(&store) < (pointer as usize).saturating_add(input_bytes.len())
+    {
+        return Err(Error::InvalidRequest(
+            "plugin alloc returned an out-of-bounds pointer".to_string(),
+        ));
+    }
     memory.write(&mut store, pointer as usize, input_bytes)?;
 
-    let packed = run.call(&mut store, (pointer, input_bytes.len() as i32))?;
+    let packed = run.call(&mut store, (pointer, input_len))?;
     let out_pointer = ((packed >> 32) & 0xffff_ffff) as usize;
     let out_length = (packed & 0xffff_ffff) as usize;
 
-    let mut output = vec![0u8; out_length];
-    memory.read(&store, out_pointer, &mut output)?;
+    // Never trust the plugin's length: validate before allocating or copying.
+    let size = memory.data_size(&store);
+    if out_length > MAX_OUTPUT
+        || out_pointer > size
+        || out_length > size.saturating_sub(out_pointer)
+    {
+        return Err(Error::InvalidRequest(
+            "plugin returned an out-of-bounds output".to_string(),
+        ));
+    }
+    let bytes = memory.data(&store)[out_pointer..out_pointer + out_length].to_vec();
 
-    Ok(String::from_utf8_lossy(&output).into_owned())
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 /// Load a plugin from disk and run one of its commands.
@@ -110,5 +142,30 @@ mod tests {
     fn missing_exports_are_reported() {
         let incomplete = "(module (memory (export \"memory\") 1))";
         assert!(run_code(incomplete.as_bytes(), "").is_err());
+    }
+
+    #[test]
+    fn oversized_output_is_rejected_without_allocating_it() {
+        const HUGE: &str = r#"
+(module
+  (memory (export "memory") 1)
+  (func (export "alloc") (param i32) (result i32) (i32.const 64))
+  (func (export "run") (param i32) (param i32) (result i64)
+    (i64.or (i64.shl (i64.const 0) (i64.const 32)) (i64.const 0xffffffff))))
+"#;
+        assert!(run_code(HUGE.as_bytes(), "").is_err());
+    }
+
+    #[test]
+    fn infinite_plugins_run_out_of_fuel() {
+        const SPIN: &str = r#"
+(module
+  (memory (export "memory") 1)
+  (func (export "alloc") (param i32) (result i32) (i32.const 64))
+  (func (export "run") (param i32) (param i32) (result i64)
+    (loop $again (br $again))
+    (i64.const 0)))
+"#;
+        assert!(run_code(SPIN.as_bytes(), "").is_err());
     }
 }

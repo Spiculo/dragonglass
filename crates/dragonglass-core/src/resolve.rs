@@ -137,7 +137,9 @@ pub fn normalize(target: &str) -> String {
 pub fn frontmatter_keys(src: &str) -> Vec<String> {
     let mut keys = Vec::new();
 
-    for property in frontmatter::properties(src).unwrap_or_default() {
+    for property in
+        frontmatter::properties(src).unwrap_or_else(|_| frontmatter::display_properties(src))
+    {
         if !ALIAS_KEYS
             .iter()
             .any(|key| property.key.trim().eq_ignore_ascii_case(key))

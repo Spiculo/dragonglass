@@ -77,7 +77,8 @@ pub fn run_query(notes: &[NoteRef], query: &Query) -> Vec<Row> {
         let Ok(note) = Note::load(&note_ref.path) else {
             continue;
         };
-        let properties = frontmatter::properties(&note.source).unwrap_or_default();
+        let properties = frontmatter::properties(&note.source)
+            .unwrap_or_else(|_| frontmatter::display_properties(&note.source));
 
         if let Some(tag) = &query.tag {
             if !note

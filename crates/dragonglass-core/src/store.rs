@@ -32,7 +32,11 @@ pub fn scan(store: &Path) -> Vec<Package> {
 
     for entry in entries.filter_map(|entry| entry.ok()) {
         let dir = entry.path();
-        if !dir.is_dir() {
+        // Do not follow a symlinked package directory out of the store.
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if !file_type.is_dir() {
             continue;
         }
         let Ok(id) = dir
@@ -206,7 +210,15 @@ fn copy_dir(from: &Path, to: &Path) -> Result<()> {
     for entry in std::fs::read_dir(from)? {
         let entry = entry?;
         let target = to.join(entry.file_name());
-        if entry.file_type()?.is_dir() {
+        let file_type = entry.file_type()?;
+        if file_type.is_symlink() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("package contains a symlink: {}", entry.path().display()),
+            )
+            .into());
+        }
+        if file_type.is_dir() {
             copy_dir(&entry.path(), &target)?;
         } else {
             std::fs::copy(entry.path(), &target)?;

@@ -730,6 +730,12 @@ impl ReadingCache {
         // Folds are per document; an edit keeps them, a different note does not.
         if self.version.0 != version.0 {
             self.folded.clear();
+            *self.lightbox.borrow_mut() = None;
+            let find = Rc::make_mut(&mut self.find);
+            find.open = false;
+            find.matches.clear();
+            find.current = 0;
+            find.error = None;
         }
         if let Some(folds) = self.pending_folds.take() {
             self.folded = folds;
@@ -831,6 +837,14 @@ impl ReadingCache {
             }
         }
         fallback.or_else(|| (!self.blocks.is_empty()).then_some(0))
+    }
+
+    /// The first source line of every block, for callers that render a different cache.
+    pub fn block_start_lines(&self) -> Rc<Vec<usize>> {
+        if !self.spans_valid {
+            return Rc::new(Vec::new());
+        }
+        Rc::new(self.spans.iter().map(|span| span.first_line).collect())
     }
 
     /// The first source line of a block, 0-based.
@@ -969,9 +983,11 @@ impl ReadingCache {
             match find_engine::find_all(&text, &pattern, options) {
                 Ok(found) => {
                     for found in found {
+                        let start = char_to_byte(&text, found.range.start);
+                        let end = char_to_byte(&text, found.range.end);
                         find.matches.push(ReadingMatch {
                             block: index,
-                            range: found.range,
+                            range: start..end,
                         });
                         if find.matches.len() >= 1000 {
                             break 'blocks;
@@ -1015,12 +1031,12 @@ impl ReadingCache {
             } else {
                 let text = block_display(block);
                 let from = if index == start.block {
-                    start.offset.min(text.len())
+                    char_boundary_at_or_before(&text, start.offset)
                 } else {
                     0
                 };
                 let to = if index == end.block {
-                    end.offset.min(text.len())
+                    char_boundary_at_or_before(&text, end.offset)
                 } else {
                     text.len()
                 };
@@ -1278,6 +1294,7 @@ impl ReadingCache {
                     offset += 1;
                 }
                 for span in inline::parse(text) {
+                    let length = span_display_len(&span);
                     if span.href.is_some() && !span.text.is_empty() {
                         let start = ReadPoint {
                             block: index,
@@ -1285,11 +1302,11 @@ impl ReadingCache {
                         };
                         let end = ReadPoint {
                             block: index,
-                            offset: offset + span.text.len(),
+                            offset: offset + length,
                         };
                         links.push((start, end));
                     }
-                    offset += span.text.len();
+                    offset += length;
                 }
             }
         }
@@ -1320,10 +1337,7 @@ impl ReadingCache {
 
         let (start, end) = links[next];
         let mut selection = self.selection.borrow_mut();
-        selection.anchor = Some(ReadPoint {
-            block: end.block,
-            offset: end.offset.saturating_sub(1),
-        });
+        selection.anchor = Some(end);
         selection.head = Some(start);
         selection.down = None;
         selection.dragging = false;
@@ -1356,9 +1370,12 @@ impl ReadingCache {
             }
             for span in inline::parse(text) {
                 if let Some(href) = &span.href {
-                    links.push((offset..offset + span.text.len(), href.clone()));
+                    let length = span_display_len(&span);
+                    links.push((offset..offset + length, href.clone()));
+                    offset += length;
+                } else {
+                    offset += span_display_len(&span);
                 }
-                offset += span.text.len();
             }
         }
         links
@@ -1556,8 +1573,14 @@ impl ReadingCache {
         let on_image: ImageOpener = {
             let lightbox = lightbox.clone();
             let notify = notify.clone();
+            let root = vault_root.clone();
+            let attachments = attachments.clone();
             Rc::new(move |path, window, cx| {
-                *lightbox.borrow_mut() = Some(Lightbox::new(PathBuf::from(path)));
+                let resolved = root
+                    .as_deref()
+                    .and_then(|root| resolve_file(root, attachments.as_deref(), path))
+                    .unwrap_or_else(|| PathBuf::from(path));
+                *lightbox.borrow_mut() = Some(Lightbox::new(resolved));
                 notify(cx);
                 window.refresh();
             })
@@ -3579,6 +3602,31 @@ fn inline_display(text: &str) -> String {
         .collect()
 }
 
+/// Length of a span in the display text. Math spans include their `$` delimiters.
+fn span_display_len(span: &inline::Inline) -> usize {
+    span.math
+        .as_ref()
+        .map(|tex| tex.len() + 2)
+        .unwrap_or(span.text.len())
+}
+
+/// Character offset → UTF-8 byte offset in `text`.
+fn char_to_byte(text: &str, chars: usize) -> usize {
+    text.char_indices()
+        .nth(chars)
+        .map(|(byte, _)| byte)
+        .unwrap_or(text.len())
+}
+
+/// Clamp a byte offset to the nearest UTF-8 boundary at or before it.
+fn char_boundary_at_or_before(text: &str, offset: usize) -> usize {
+    let mut offset = offset.min(text.len());
+    while offset > 0 && !text.is_char_boundary(offset) {
+        offset -= 1;
+    }
+    offset
+}
+
 /// A `StyledText` that can be drag-selected and whose links are clickable.
 ///
 /// Reading blocks are laid out as separate elements, so each text piece reports its own
@@ -4135,6 +4183,14 @@ mod tests {
     #[test]
     fn inline_display_keeps_math_delimiters() {
         assert_eq!(inline_display("a $x^2$ b"), "a $x^2$ b");
+    }
+
+    #[test]
+    fn focus_link_handles_multibyte_text() {
+        let mut cache = ReadingCache::new();
+        cache.update((1, 0), "See [café](https://example.com) now.\n", None);
+        assert!(cache.focus_next_link(false));
+        assert_eq!(cache.selected_text().as_deref(), Some("café"));
     }
 
     #[test]

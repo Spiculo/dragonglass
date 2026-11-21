@@ -10,15 +10,17 @@
 //! ```text
 //! version=2
 //! active=0
-//! tab=notes/a.md|1|12|3|0.0|4
+//! tab=notes/a.md|1|12|3|0.0|4|17|1,3||1
 //! ```
 //!
-//! A `tab` line is `note|reading|line|col|scroll|reading_block|anchor|folds`. The note is
-//! vault-relative and empty for an untitled tab; `reading` is `0` or `1`; the rest are
-//! 0-based cursor columns, the editor's vertical scroll offset in pixels, the reading view's
-//! top block, the selection anchor as a character index (empty when there is no selection)
-//! and a comma-separated list of folded heading indices. Unknown keys and malformed fields
-//! are ignored, and version 1 files (`note=…`, `reading=…`) still load as a single tab.
+//! A `tab` line is `note|reading|line|col|scroll|reading_block|anchor|folds|reading_folds|dynamic`.
+//! The note is vault-relative and empty for an untitled tab; `reading` is `0` or `1`; the
+//! rest are 0-based cursor columns, the editor's vertical scroll offset in pixels, the
+//! reading view's top block, the selection anchor as a character index (empty when there is
+//! no selection), comma-separated folded heading indices for the editor and reader, and
+//! whether Dynamic mode is on. `%` and `|` in the note path are percent-escaped. Unknown
+//! keys and malformed fields are ignored, and version 1 files (`note=…`, `reading=…`) still
+//! load as a single tab.
 
 use std::path::{Path, PathBuf};
 
@@ -89,7 +91,7 @@ impl Session {
                 .collect();
             out.push_str(&format!(
                 "tab={}|{}|{}|{}|{:.1}|{}|{}|{}|{}|{}\n",
-                tab.note,
+                escape_note(&tab.note),
                 u8::from(tab.reading),
                 tab.line,
                 tab.col,
@@ -169,10 +171,19 @@ impl Session {
     }
 }
 
+/// Encode a note path for the pipe-separated session line.
+fn escape_note(note: &str) -> String {
+    note.replace('%', "%25").replace('|', "%7C")
+}
+
+fn unescape_note(note: &str) -> String {
+    note.replace("%7C", "|").replace("%25", "%")
+}
+
 /// Parse one `tab=` line, tolerating missing or unreadable trailing fields.
 fn parse_tab(value: &str) -> Option<TabSession> {
     let mut fields = value.split('|');
-    let note = fields.next()?.trim().to_string();
+    let note = unescape_note(fields.next()?.trim());
     let mut tab = TabSession {
         note,
         ..TabSession::default()
@@ -292,6 +303,20 @@ mod tests {
             tabs: vec![TabSession::default()],
         };
         assert_eq!(Session::from_text(&session.to_text()), session);
+    }
+
+    #[test]
+    fn roundtrips_a_pipe_in_the_note_path() {
+        let session = Session {
+            version: 2,
+            active: 0,
+            tabs: vec![TabSession {
+                note: "notes/a|b.md".to_string(),
+                ..TabSession::default()
+            }],
+        };
+        let restored = Session::from_text(&session.to_text());
+        assert_eq!(restored.tabs[0].note, "notes/a|b.md");
     }
 
     #[test]

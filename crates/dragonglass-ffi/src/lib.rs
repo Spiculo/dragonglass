@@ -616,9 +616,11 @@ impl MobileVault {
     /// Move a note or folder to the vault trash. Returns its trash-relative path.
     pub fn trash_note(&self, relative: String) -> Result<String, MobileError> {
         let path = vaultfs::trash(&self.root, &relative)?;
-        let trashed = path
+        // `trash` returns `<stamp>/entry`; callers restore the stamp directory.
+        let stamp = path.parent().unwrap_or(&path);
+        let trashed = stamp
             .strip_prefix(&self.root)
-            .unwrap_or(&path)
+            .unwrap_or(stamp)
             .to_string_lossy()
             .replace('\\', "/");
         self.refresh()?;
@@ -885,14 +887,41 @@ impl MobileVault {
     /// Reject paths that could escape the vault before touching the filesystem.
     fn writable_path(&self, relative: &str) -> Result<PathBuf, MobileError> {
         let relative = relative.replace('\\', "/");
+        let path = std::path::Path::new(&relative);
         if relative.is_empty()
+            || path.is_absolute()
+            || path.components().any(|component| {
+                matches!(
+                    component,
+                    std::path::Component::Prefix(_) | std::path::Component::RootDir
+                )
+            })
             || relative
                 .split('/')
                 .any(|part| part.is_empty() || part == "." || part == "..")
         {
             return Err(MobileError::new(format!("invalid note path: {relative}")));
         }
-        Ok(self.root.join(relative))
+        let path = self.root.join(relative);
+        // A symlinked directory inside the vault must not redirect a write outside it.
+        let root = self
+            .root
+            .canonicalize()
+            .map_err(|_| MobileError::new("vault is unavailable"))?;
+        let mut ancestor = path.parent().unwrap_or(root.as_path());
+        while !ancestor.exists() {
+            let Some(parent) = ancestor.parent() else {
+                return Err(MobileError::new("invalid note path"));
+            };
+            ancestor = parent;
+        }
+        let resolved = ancestor
+            .canonicalize()
+            .map_err(|_| MobileError::new("invalid note path"))?;
+        if !resolved.starts_with(&root) {
+            return Err(MobileError::new("path outside vault"));
+        }
+        Ok(path)
     }
 
     fn readable_path(&self, relative: &str) -> Result<PathBuf, MobileError> {

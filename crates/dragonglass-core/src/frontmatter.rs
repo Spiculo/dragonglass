@@ -28,7 +28,7 @@ pub fn split(src: &str) -> Split<'_> {
     else {
         return Split {
             frontmatter: None,
-            body: src,
+            body: s,
         };
     };
 
@@ -49,7 +49,7 @@ pub fn split(src: &str) -> Split<'_> {
     // Unterminated fence: treat the whole document as body.
     Split {
         frontmatter: None,
-        body: src,
+        body: s,
     }
 }
 
@@ -131,6 +131,22 @@ pub fn properties(src: &str) -> Result<Vec<Property>> {
                         items.push(unquote(item.trim()));
                         continue;
                     }
+                }
+            }
+            return Err(Error::UnsupportedFrontmatter {
+                line: index + 1,
+                text: trimmed.to_string(),
+            });
+        }
+
+        // A block list may also be written without indentation:
+        //   Tags:
+        //   - a
+        if let Some(item) = trimmed.strip_prefix("- ") {
+            if let Some(prop) = open_list.and_then(|i| properties.get_mut(i)) {
+                if let PropertyValue::List(items) = &mut prop.value {
+                    items.push(unquote(item.trim()));
+                    continue;
                 }
             }
             return Err(Error::UnsupportedFrontmatter {
@@ -359,6 +375,25 @@ mod tests {
         let r = split(s);
         assert_eq!(r.frontmatter, Some("title: x\n"));
         assert_eq!(r.body, "body");
+    }
+
+    #[test]
+    fn a_bom_does_not_hide_the_first_heading() {
+        let src = "\u{feff}# Heading\n\nbody\n";
+        assert_eq!(split(src).body, "# Heading\n\nbody\n");
+    }
+
+    #[test]
+    fn parses_unindented_block_lists() {
+        let src = "---\nTags:\n- one\n- two\n---\nbody\n";
+        let found = properties(src).unwrap();
+        assert_eq!(
+            found,
+            vec![Property {
+                key: "Tags".into(),
+                value: PropertyValue::List(vec!["one".into(), "two".into()]),
+            }]
+        );
     }
 
     #[test]

@@ -20,8 +20,8 @@ trap 'rm -rf "$APPDIR"' EXIT
 install -Dm755 "$REPO/target/release/dragon-glass-app" "$APPDIR/usr/bin/dragon-glass-app"
 install -Dm755 "$REPO/target/release/dragon-glass" "$APPDIR/usr/bin/dragon-glass"
 install -Dm644 "$HERE/dragon-glass.desktop" "$APPDIR/usr/share/applications/dragon-glass.desktop"
-install -Dm644 "$REPO/packaging/windows/dragon-glass.ico" \
-  "$APPDIR/usr/share/icons/hicolor/32x32/apps/dragon-glass.png"
+install -Dm644 "$REPO/packaging/logo.png" \
+  "$APPDIR/usr/share/icons/hicolor/256x256/apps/dragon-glass.png"
 install -Dm644 "$REPO/LICENSE" "$APPDIR/usr/share/doc/dragon-glass/copyright"
 
 # Pull in the GTK/Vulkan/X11 libraries the app links against.

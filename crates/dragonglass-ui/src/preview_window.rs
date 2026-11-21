@@ -35,10 +35,10 @@ impl PreviewWindow {
             focus_handle: cx.focus_handle(),
         });
 
-        let view_for_observer = view.clone();
+        let view_for_observer = view.downgrade();
         let subscription = cx.observe(&editor, move |editor, cx| {
             let version = editor.read(cx).document_version();
-            view_for_observer.update(cx, |this, cx| {
+            let _ = view_for_observer.update(cx, |this, cx| {
                 if this.reading.needs_update(version) {
                     cx.notify();
                 }

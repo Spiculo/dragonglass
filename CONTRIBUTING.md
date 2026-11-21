@@ -16,7 +16,7 @@ By participating you agree to the [Code of Conduct](CODE_OF_CONDUCT.md).
 
 ## Set up
 
-You need Rust 1.85+ (stable) and `git`. Linux system packages are listed in the
+You need Rust 1.97+ (stable) and `git`. Linux system packages are listed in the
 [README](README.md#build-from-source); on macOS the Xcode Command Line Tools are enough
 (a full Xcode install is not needed).
 
@@ -38,10 +38,12 @@ cargo fmt --all -- --check
 cargo clippy --all-targets --all-features
 cargo test
 cargo build -p dragonglass-ui
+cargo test -p dragonglass-ui
+cargo clippy -p dragonglass-ui --all-targets --all-features
 ```
 
 The first three use the workspace's default members (core, CLI and plugins). The UI is
-built separately because GPUI is heavy.
+built, tested and linted separately because GPUI is heavy.
 
 If you change parser, editor or layout behaviour, add or update a test in
 `dragonglass-core` when the logic can live there. The core crate is deliberately headless

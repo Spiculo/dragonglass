@@ -257,16 +257,21 @@ fn parse_into(chars: &[char], base: Style, href: Option<&str>, out: &mut Vec<Inl
                 if let Some((label_end, dest_end)) = link_bounds(chars, open) {
                     let label: String = chars[open + 1..label_end].iter().collect();
                     let destination: String = chars[label_end + 2..dest_end].iter().collect();
-                    let href = link_destination(&destination);
-                    flush(&mut buffer, base, href.as_deref(), out);
+                    let link_href = link_destination(&destination);
+                    flush(&mut buffer, base, href, out);
                     let mut style = base;
                     style.link = true;
                     style.image = ch == '!';
                     if label.trim().is_empty() {
-                        push_span(out, destination.trim().to_string(), style, href.as_deref());
+                        push_span(
+                            out,
+                            destination.trim().to_string(),
+                            style,
+                            link_href.as_deref(),
+                        );
                     } else {
                         let label_chars: Vec<char> = label.chars().collect();
-                        parse_into(&label_chars, style, href.as_deref(), out);
+                        parse_into(&label_chars, style, link_href.as_deref(), out);
                     }
                     i = dest_end + 1;
                     continue;

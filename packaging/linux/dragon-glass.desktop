@@ -3,6 +3,7 @@ Type=Application
 Name=Dragon Glass
 Comment=Native, local-first markdown knowledge base
 Exec=dragon-glass-app %u
+Icon=dragon-glass
 Terminal=false
 Categories=Office;Utility;TextEditor;
 MimeType=x-scheme-handler/dragonglass;

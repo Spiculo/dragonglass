@@ -44,6 +44,9 @@ pub enum Error {
 
     #[error("plugin does not export `{0}`")]
     MissingExport(&'static str),
+
+    #[error("invalid plugin request: {0}")]
+    InvalidRequest(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
