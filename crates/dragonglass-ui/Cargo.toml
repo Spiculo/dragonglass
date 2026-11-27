@@ -24,7 +24,7 @@ image = { version = "0.25.1", default-features = false, features = [
     "png",
     "webp",
 ] }
-notify = "8.2"
+notify = "9.0"
 smallvec = "1"
 smol = "2"
 
